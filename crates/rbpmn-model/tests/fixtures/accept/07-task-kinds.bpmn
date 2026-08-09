@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:rbpmn="https://rbpmn.dev/schema/1.0"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:message id="m_conf" name="ShipmentConfirmed"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:serviceTask id="st" name="Charge card" rbpmn:topic="payments"/>
+    <bpmn:userTask id="ut" name="Review order"/>
+    <bpmn:receiveTask id="rt" name="Await confirmation" messageRef="m_conf"
+                      rbpmn:correlationKey="/orderId"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="st"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="st" targetRef="ut"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ut" targetRef="rt"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="rt" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

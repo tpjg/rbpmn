@@ -1,0 +1,610 @@
+//! The linter: whitelist enforcement plus structural analysis, producing
+//! machine-readable diagnostics. Staged per scope:
+//!
+//!   1. element rules (whitelist, bindings, timers, messages)
+//!   2. graph rules (well-formedness, conditions, event gateways, boundaries)
+//!   3. region analysis (`balanced-gateways`) — only when 1+2 found no errors
+//!      in the scope, because its assumptions depend on them.
+
+mod regions;
+mod structure;
+
+use crate::condition;
+use crate::diagnostics::{Diagnostic, Severity, rule};
+use crate::iso8601;
+use crate::model::*;
+use crate::parse::RBPMN_NS;
+use std::collections::BTreeMap;
+use structure::Graph;
+
+pub fn lint(defs: &Definitions) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+
+    for id in &defs.missing_ids {
+        out.push(Diagnostic::error(
+            rule::BPMN_STRUCTURE,
+            id,
+            "element is missing its required id attribute",
+        ));
+    }
+
+    duplicate_ids(defs, &mut out);
+
+    for p in &defs.processes {
+        lint_scope(defs, &p.body, &p.id, true, &mut out);
+    }
+
+    out
+}
+
+fn lint_scope(
+    defs: &Definitions,
+    scope: &FlowScope,
+    owner: &str,
+    is_process: bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    let start = out.len();
+
+    element_rules(defs, scope, is_process, out);
+
+    let g = Graph::build(scope);
+    if !g.has_duplicate_ids {
+        structure::check(&g, owner, out);
+        condition_rules(&g, out);
+        event_gateway_rules(&g, out);
+        boundary_rules(defs, &g, out);
+
+        let scope_clean = !out[start..].iter().any(|d| d.severity == Severity::Error);
+        if scope_clean {
+            regions::check(&g, out);
+        }
+    }
+
+    for node in &scope.nodes {
+        if let NodeKind::SubProcess(sp) = &node.kind {
+            // Event subprocesses are already rejected wholesale; linting their
+            // body against embedded-subprocess rules would mislead.
+            if !sp.triggered_by_event {
+                lint_scope(defs, &sp.body, &node.id, false, out);
+            }
+        }
+    }
+}
+
+fn duplicate_ids(defs: &Definitions, out: &mut Vec<Diagnostic>) {
+    let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
+
+    fn walk<'a>(scope: &'a FlowScope, counts: &mut BTreeMap<&'a str, u32>) {
+        for n in &scope.nodes {
+            *counts.entry(n.id.as_str()).or_default() += 1;
+            if let NodeKind::SubProcess(sp) = &n.kind {
+                walk(&sp.body, counts);
+            }
+        }
+        for f in &scope.flows {
+            *counts.entry(f.id.as_str()).or_default() += 1;
+        }
+    }
+
+    for p in &defs.processes {
+        *counts.entry(p.id.as_str()).or_default() += 1;
+        walk(&p.body, &mut counts);
+    }
+    for m in &defs.messages {
+        *counts.entry(m.id.as_str()).or_default() += 1;
+    }
+    for e in &defs.errors {
+        *counts.entry(e.id.as_str()).or_default() += 1;
+    }
+
+    for (id, count) in counts {
+        if count > 1 {
+            out.push(Diagnostic::error(
+                rule::BPMN_STRUCTURE,
+                id,
+                format!("duplicate id: used {count} times — ids must be unique"),
+            ));
+        }
+    }
+}
+
+fn element_rules(
+    defs: &Definitions,
+    scope: &FlowScope,
+    is_process: bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    for node in &scope.nodes {
+        let id = &node.id;
+
+        if let Some(loop_kind) = &node.loop_kind {
+            let msg = match loop_kind {
+                LoopKind::MultiInstance => {
+                    "multi-instance activities are not supported (planned post-v1)"
+                }
+                LoopKind::Standard => {
+                    "standardLoopCharacteristics is not supported — model the loop \
+                     explicitly with an exclusive gateway around the whole block"
+                }
+            };
+            out.push(Diagnostic::error(rule::NO_UNSUPPORTED_ELEMENT, id, msg));
+        }
+
+        match &node.kind {
+            NodeKind::InclusiveGateway => out.push(Diagnostic::error(
+                rule::NO_INCLUSIVE_GATEWAY,
+                id,
+                "inclusive gateways are not supported: the converging side requires \
+                 non-local reachability analysis that cannot be implemented correctly \
+                 in general. Rewrite as a parallel split/join whose branches each \
+                 start with an exclusive skip-bypass gateway (parallel + skip pattern)",
+            )),
+            NodeKind::CallActivity => out.push(Diagnostic::error(
+                rule::NO_CALL_ACTIVITY,
+                id,
+                "call activities are not supported: definitions are islands. Deploy \
+                 the callee as its own process and interact via a message throw event \
+                 to its message start event, correlating replies with a correlation key",
+            )),
+            NodeKind::Unsupported { tag } => out.push(Diagnostic::error(
+                rule::NO_UNSUPPORTED_ELEMENT,
+                id,
+                unsupported_message(tag),
+            )),
+            NodeKind::SubProcess(sp) => {
+                if sp.triggered_by_event {
+                    out.push(Diagnostic::error(
+                        rule::NO_UNSUPPORTED_ELEMENT,
+                        id,
+                        "event subprocesses are not supported (planned for v4)",
+                    ));
+                }
+            }
+            NodeKind::ServiceTask(binding) => {
+                if binding.topic.as_deref().is_none_or(str::is_empty) {
+                    let mut msg = format!(
+                        "service task must declare its work-item topic: \
+                         rbpmn:topic=\"...\" (xmlns:rbpmn=\"{RBPMN_NS}\")"
+                    );
+                    if !binding.foreign.is_empty() {
+                        msg.push_str(&format!(
+                            " — found vendor binding(s) {} which rbpmn ignores",
+                            binding.foreign.join(", ")
+                        ));
+                    }
+                    out.push(Diagnostic::error(rule::SERVICE_TASK_TOPIC, id, msg));
+                    if !binding.foreign.is_empty() {
+                        out.push(Diagnostic::warn(
+                            rule::NO_FOREIGN_IMPLEMENTATION,
+                            id,
+                            format!(
+                                "service task is bound only via vendor extension(s) \
+                                 {} — rbpmn ignores foreign namespaces; declare \
+                                 rbpmn:topic instead",
+                                binding.foreign.join(", ")
+                            ),
+                        ));
+                    }
+                }
+            }
+            NodeKind::Start(trigger) => match trigger {
+                StartTrigger::None => {}
+                StartTrigger::Message(binding) => {
+                    if is_process {
+                        check_message_binding(defs, id, binding, out);
+                    } else {
+                        out.push(Diagnostic::error(
+                            rule::NO_UNSUPPORTED_ELEMENT,
+                            id,
+                            "message start events are only supported on top-level \
+                             processes; an embedded subprocess starts with a plain \
+                             (none) start event",
+                        ));
+                    }
+                }
+                StartTrigger::Timer(_) => out.push(Diagnostic::error(
+                    rule::NO_UNSUPPORTED_ELEMENT,
+                    id,
+                    "timer start events are not supported in v1 — start instances \
+                     from application code, or via a message",
+                )),
+                StartTrigger::Unsupported { tag } => out.push(Diagnostic::error(
+                    rule::NO_UNSUPPORTED_ELEMENT,
+                    id,
+                    format!("'{tag}' start events are not supported (v1: none, message)"),
+                )),
+            },
+            NodeKind::End(kind) => match kind {
+                EndKind::None | EndKind::Terminate => {}
+                EndKind::Message(binding) => check_message_binding(defs, id, binding, out),
+                EndKind::Unsupported { tag } => out.push(Diagnostic::error(
+                    rule::NO_UNSUPPORTED_ELEMENT,
+                    id,
+                    format!("'{tag}' end events are not supported (v1: none, terminate, message)"),
+                )),
+            },
+            NodeKind::Catch(trigger) => match trigger {
+                CatchTrigger::Message(binding) => check_message_binding(defs, id, binding, out),
+                CatchTrigger::Timer(spec) => check_timer(id, spec, out),
+                CatchTrigger::Unsupported { tag } => out.push(Diagnostic::error(
+                    rule::NO_UNSUPPORTED_ELEMENT,
+                    id,
+                    format!(
+                        "'{tag}' intermediate catch events are not supported \
+                         (v1: message, timer)"
+                    ),
+                )),
+            },
+            NodeKind::Throw(kind) => match kind {
+                ThrowKind::Message(binding) => check_message_binding(defs, id, binding, out),
+                ThrowKind::None => out.push(Diagnostic::error(
+                    rule::NO_UNSUPPORTED_ELEMENT,
+                    id,
+                    "none intermediate throw events have no effect and are not supported",
+                )),
+                ThrowKind::Unsupported { tag } => out.push(Diagnostic::error(
+                    rule::NO_UNSUPPORTED_ELEMENT,
+                    id,
+                    format!("'{tag}' throw events are not supported (v1: message)"),
+                )),
+            },
+            NodeKind::Boundary(b) => {
+                if !b.cancel_activity {
+                    out.push(Diagnostic::error(
+                        rule::NO_UNSUPPORTED_ELEMENT,
+                        id,
+                        "non-interrupting boundary events are not supported in v1 \
+                         (planned for v2)",
+                    ));
+                }
+                match &b.trigger {
+                    BoundaryTrigger::Timer(spec) => check_timer(id, spec, out),
+                    BoundaryTrigger::Error { .. } => {}
+                    BoundaryTrigger::Message(_) => out.push(Diagnostic::error(
+                        rule::NO_UNSUPPORTED_ELEMENT,
+                        id,
+                        "message boundary events are not supported in v1 \
+                         (v1 boundary events: timer, error)",
+                    )),
+                    BoundaryTrigger::None => out.push(Diagnostic::error(
+                        rule::BPMN_STRUCTURE,
+                        id,
+                        "boundary event requires an event definition (timer or error)",
+                    )),
+                    BoundaryTrigger::Unsupported { tag } => out.push(Diagnostic::error(
+                        rule::NO_UNSUPPORTED_ELEMENT,
+                        id,
+                        format!("'{tag}' boundary events are not supported (v1: timer, error)"),
+                    )),
+                }
+            }
+            NodeKind::ReceiveTask(binding) => check_message_binding(defs, id, binding, out),
+            NodeKind::UserTask
+            | NodeKind::ExclusiveGateway { .. }
+            | NodeKind::ParallelGateway
+            | NodeKind::EventBasedGateway => {}
+        }
+    }
+}
+
+fn unsupported_message(tag: &str) -> String {
+    let hint = match tag {
+        "scriptTask" => " — compute in application code (a service task handler) instead",
+        "sendTask" => " — use a message intermediate throw event instead",
+        "manualTask" => " — use a user task instead",
+        "businessRuleTask" => " — planned post-v1 via DMN; until then compute the \
+             decision in application code and store the result as a variable",
+        "task" => " — the abstract task has no execution semantics; use a \
+             service, user or receive task",
+        "complexGateway" => " — model the routing explicitly with exclusive/parallel gateways",
+        _ => "",
+    };
+    format!("'{tag}' is not in the supported BPMN subset{hint}")
+}
+
+fn check_timer(id: &str, spec: &TimerSpec, out: &mut Vec<Diagnostic>) {
+    match spec {
+        TimerSpec::Date(s) => {
+            if let Err(msg) = iso8601::validate_datetime(s) {
+                out.push(Diagnostic::error(
+                    rule::TIMER_ISO8601,
+                    id,
+                    format!("invalid timeDate: {msg}"),
+                ));
+            }
+        }
+        TimerSpec::Duration(s) => {
+            if let Err(msg) = iso8601::validate_duration(s) {
+                out.push(Diagnostic::error(
+                    rule::TIMER_ISO8601,
+                    id,
+                    format!("invalid timeDuration: {msg}"),
+                ));
+            }
+        }
+        TimerSpec::Cycle(_) => out.push(Diagnostic::error(
+            rule::NO_UNSUPPORTED_ELEMENT,
+            id,
+            "repeating timer cycles (timeCycle) are not supported in v1 — planned \
+             for v2 with non-interrupting boundary timers",
+        )),
+        TimerSpec::Missing => out.push(Diagnostic::error(
+            rule::TIMER_ISO8601,
+            id,
+            "timer event definition needs a timeDate or timeDuration",
+        )),
+    }
+}
+
+fn check_message_binding(
+    defs: &Definitions,
+    id: &str,
+    binding: &MessageBinding,
+    out: &mut Vec<Diagnostic>,
+) {
+    match binding.message_ref.as_deref() {
+        None => out.push(Diagnostic::error(
+            rule::MESSAGE_HAS_CORRELATION,
+            id,
+            "message event must reference a message definition (messageRef)",
+        )),
+        Some(mref) => match defs.messages.iter().find(|m| m.id == mref) {
+            None => out.push(Diagnostic::error(
+                rule::MESSAGE_HAS_CORRELATION,
+                id,
+                format!("messageRef '{mref}' does not resolve to a message definition"),
+            )),
+            Some(m) => {
+                if m.name.as_deref().is_none_or(str::is_empty) {
+                    out.push(Diagnostic::error(
+                        rule::MESSAGE_HAS_CORRELATION,
+                        id,
+                        format!(
+                            "message '{mref}' needs a name — the name is what \
+                             correlate() addresses"
+                        ),
+                    ));
+                }
+            }
+        },
+    }
+
+    match binding.correlation_key.as_deref() {
+        None | Some("") => out.push(Diagnostic::error(
+            rule::MESSAGE_HAS_CORRELATION,
+            id,
+            format!(
+                "declare rbpmn:correlationKey (xmlns:rbpmn=\"{RBPMN_NS}\"): a JSON \
+                 pointer into the instance variables, e.g. /orderId"
+            ),
+        )),
+        Some(key) => {
+            if let Err(msg) = condition::validate_pointer(key) {
+                out.push(Diagnostic::error(
+                    rule::MESSAGE_HAS_CORRELATION,
+                    id,
+                    format!("invalid rbpmn:correlationKey: {msg}"),
+                ));
+            }
+        }
+    }
+}
+
+fn condition_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
+    let is_exclusive_split =
+        |v: usize| matches!(g.node(v).kind, NodeKind::ExclusiveGateway { .. }) && g.out_deg(v) > 1;
+
+    // Conditions are only legal on the outgoing flows of an exclusive split;
+    // those flows are checked exhaustively below.
+    for (fi, endpoints) in g.endpoints.iter().enumerate() {
+        let Some((src, _)) = endpoints else { continue };
+        let flow = g.flow(fi);
+        if flow.condition.is_some() && !is_exclusive_split(*src) {
+            out.push(Diagnostic::error(
+                rule::CONDITIONS_ARE_TRIVIAL,
+                &flow.id,
+                format!(
+                    "conditions are only supported on the outgoing flows of an \
+                     exclusive gateway split (this flow leaves a {})",
+                    g.node(*src).kind.describe()
+                ),
+            ));
+        }
+    }
+
+    for v in 0..g.scope.nodes.len() {
+        let NodeKind::ExclusiveGateway { default_flow } = &g.node(v).kind else {
+            continue;
+        };
+        if g.out_deg(v) <= 1 {
+            continue;
+        }
+        let gateway_id = &g.node(v).id;
+
+        let default_fi = match default_flow.as_deref() {
+            None => {
+                out.push(Diagnostic::error(
+                    rule::CONDITIONS_ARE_TRIVIAL,
+                    gateway_id,
+                    "exclusive split needs a default flow (the `default` attribute) \
+                     so no token can get stuck when every condition is false",
+                ));
+                None
+            }
+            Some(d) => {
+                let fi = g.flow_out[v].iter().find(|&&fi| g.flow(fi).id == d).copied();
+                if fi.is_none() {
+                    out.push(Diagnostic::error(
+                        rule::CONDITIONS_ARE_TRIVIAL,
+                        gateway_id,
+                        format!("default flow '{d}' is not an outgoing flow of this gateway"),
+                    ));
+                }
+                fi
+            }
+        };
+
+        for &fi in &g.flow_out[v] {
+            let flow = g.flow(fi);
+            if Some(fi) == default_fi {
+                if flow.condition.is_some() {
+                    out.push(Diagnostic::error(
+                        rule::CONDITIONS_ARE_TRIVIAL,
+                        &flow.id,
+                        "the default flow must not carry a condition",
+                    ));
+                }
+                continue;
+            }
+            match &flow.condition {
+                None => out.push(Diagnostic::error(
+                    rule::CONDITIONS_ARE_TRIVIAL,
+                    &flow.id,
+                    "flow out of an exclusive split needs a condition \
+                     (or mark it as the gateway's default flow)",
+                )),
+                Some(src) => {
+                    if let Err(e) = condition::parse(src) {
+                        out.push(Diagnostic::error(
+                            rule::CONDITIONS_ARE_TRIVIAL,
+                            &flow.id,
+                            format!(
+                                "condition does not match the grammar \
+                                 `<json-pointer> <op> <literal>` with and/or: {e}"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn event_gateway_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
+    for v in 0..g.scope.nodes.len() {
+        if !matches!(g.node(v).kind, NodeKind::EventBasedGateway) {
+            continue;
+        }
+        if g.out_deg(v) < 2 {
+            out.push(Diagnostic::error(
+                rule::EVENT_GATEWAY_STRUCTURE,
+                &g.node(v).id,
+                "event-based gateway needs at least two alternatives to race",
+            ));
+        }
+        for &fi in &g.flow_out[v] {
+            let t = g.tgt(fi);
+            let target = g.node(t);
+            let supported_target = matches!(
+                target.kind,
+                NodeKind::Catch(CatchTrigger::Message(_))
+                    | NodeKind::Catch(CatchTrigger::Timer(_))
+                    | NodeKind::ReceiveTask(_)
+            );
+            if !supported_target {
+                out.push(Diagnostic::error(
+                    rule::EVENT_GATEWAY_STRUCTURE,
+                    &target.id,
+                    format!(
+                        "event-based gateway alternatives must be message/timer \
+                         catch events or receive tasks, found {}",
+                        target.kind.describe()
+                    ),
+                ));
+            } else if g.in_deg(t) != 1 {
+                out.push(Diagnostic::error(
+                    rule::EVENT_GATEWAY_STRUCTURE,
+                    &target.id,
+                    "an event-based gateway's target must have exactly one incoming \
+                     flow (from the gateway) — it is armed only by the gateway",
+                ));
+            }
+        }
+    }
+}
+
+fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
+    for v in 0..g.scope.nodes.len() {
+        let NodeKind::Boundary(b) = &g.node(v).kind else {
+            continue;
+        };
+        let id = &g.node(v).id;
+
+        let host = match b.attached_to.as_deref() {
+            None => {
+                out.push(Diagnostic::error(
+                    rule::BPMN_STRUCTURE,
+                    id,
+                    "boundary event must declare attachedToRef",
+                ));
+                continue;
+            }
+            Some(h) => match g.idx.get(h) {
+                None => {
+                    out.push(Diagnostic::error(
+                        rule::BPMN_STRUCTURE,
+                        id,
+                        format!("attachedToRef '{h}' does not resolve within this scope"),
+                    ));
+                    continue;
+                }
+                Some(&host) => host,
+            },
+        };
+
+        let host_kind = &g.node(host).kind;
+        if !host_kind.is_supported_boundary_host() {
+            out.push(Diagnostic::error(
+                rule::BOUNDARY_ON_SUPPORTED_HOST,
+                id,
+                format!(
+                    "boundary events cannot attach to a {} — supported hosts: \
+                     service task, user task, receive task, embedded subprocess",
+                    host_kind.describe()
+                ),
+            ));
+            continue;
+        }
+
+        if let BoundaryTrigger::Error { error_ref } = &b.trigger {
+            if !matches!(
+                host_kind,
+                NodeKind::ServiceTask(_) | NodeKind::SubProcess(_)
+            ) {
+                out.push(Diagnostic::error(
+                    rule::BOUNDARY_ON_SUPPORTED_HOST,
+                    id,
+                    "error boundary events attach to service tasks or subprocesses — \
+                     v1 errors are raised by service-task failures past their retry budget",
+                ));
+            }
+            match error_ref.as_deref() {
+                None => out.push(Diagnostic::error(
+                    rule::BPMN_STRUCTURE,
+                    id,
+                    "error boundary event must reference an error definition (errorRef)",
+                )),
+                Some(eref) => match defs.errors.iter().find(|e| e.id == eref) {
+                    None => out.push(Diagnostic::error(
+                        rule::BPMN_STRUCTURE,
+                        id,
+                        format!("errorRef '{eref}' does not resolve to an error definition"),
+                    )),
+                    Some(e) => {
+                        if e.code.as_deref().is_none_or(str::is_empty) {
+                            out.push(Diagnostic::error(
+                                rule::BPMN_STRUCTURE,
+                                id,
+                                format!(
+                                    "error '{eref}' needs an errorCode — boundary \
+                                     matching is by code"
+                                ),
+                            ));
+                        }
+                    }
+                },
+            }
+        }
+    }
+}

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error no-unsupported-element @ s2
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:rbpmn="https://rbpmn.dev/schema/1.0"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:message id="m1" name="Trigger"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:subProcess id="sp">
+      <bpmn:startEvent id="s2" rbpmn:correlationKey="/orderId">
+        <bpmn:messageEventDefinition messageRef="m1"/>
+      </bpmn:startEvent>
+      <bpmn:userTask id="ti" name="Inner"/>
+      <bpmn:endEvent id="e2"/>
+      <bpmn:sequenceFlow id="fi1" sourceRef="s2" targetRef="ti"/>
+      <bpmn:sequenceFlow id="fi2" sourceRef="ti" targetRef="e2"/>
+    </bpmn:subProcess>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sp"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="sp" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:userTask id="ut" name="Approve"/>
+    <bpmn:boundaryEvent id="bt" attachedToRef="ut">
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration>PT1H</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:userTask id="t_esc" name="Escalate"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:endEvent id="e_esc"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ut"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ut" targetRef="end"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="bt" targetRef="t_esc"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="t_esc" targetRef="e_esc"/>
+  </bpmn:process>
+</bpmn:definitions>

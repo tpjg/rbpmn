@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error balanced-gateways @ ps
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:userTask id="ta" name="A"/>
+    <bpmn:userTask id="tb" name="B"/>
+    <bpmn:endEvent id="e_a"/>
+    <bpmn:endEvent id="e_b"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="ta"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ps" targetRef="tb"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="ta" targetRef="e_a"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="tb" targetRef="e_b"/>
+  </bpmn:process>
+</bpmn:definitions>

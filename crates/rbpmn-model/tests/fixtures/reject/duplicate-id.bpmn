@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error bpmn-structure @ t
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:userTask id="t" name="Work"/>
+    <bpmn:userTask id="t" name="Duplicate"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="t"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

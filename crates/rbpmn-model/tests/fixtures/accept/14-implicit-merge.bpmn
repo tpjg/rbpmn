@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <!-- Implicit XOR merge (activity with two incoming flows) outside any
+       parallel region: unambiguous per spec, allowed without warning. -->
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:exclusiveGateway id="xs" default="f_b"/>
+    <bpmn:userTask id="ta" name="Path A"/>
+    <bpmn:userTask id="tb" name="Path B"/>
+    <bpmn:userTask id="m" name="Continue"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="xs"/>
+    <bpmn:sequenceFlow id="f_a" sourceRef="xs" targetRef="ta">
+      <bpmn:conditionExpression>/a == true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_b" sourceRef="xs" targetRef="tb"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ta" targetRef="m"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="tb" targetRef="m"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="m" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

@@ -1,0 +1,11 @@
+[package]
+name = "rbpmn-model"
+description = "BPMN parsing, validation and linting for the rbpmn engine. Dependency-light: no IO, no async runtime, WASM-compatible."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+roxmltree.workspace = true
+serde.workspace = true
+thiserror.workspace = true

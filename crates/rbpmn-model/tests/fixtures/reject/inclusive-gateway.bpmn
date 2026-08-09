@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error no-inclusive-gateway @ is
+  error no-inclusive-gateway @ ij
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:inclusiveGateway id="is"/>
+    <bpmn:userTask id="ta" name="A"/>
+    <bpmn:userTask id="tb" name="B"/>
+    <bpmn:inclusiveGateway id="ij"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="is"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="is" targetRef="ta"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="is" targetRef="tb"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="ta" targetRef="ij"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="tb" targetRef="ij"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="ij" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

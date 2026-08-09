@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error conditions-are-trivial @ xs
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:exclusiveGateway id="xs"/>
+    <bpmn:userTask id="ta" name="A"/>
+    <bpmn:userTask id="tb" name="B"/>
+    <bpmn:endEvent id="e_a"/>
+    <bpmn:endEvent id="e_b"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="xs"/>
+    <bpmn:sequenceFlow id="f_a" sourceRef="xs" targetRef="ta">
+      <bpmn:conditionExpression>/a == true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_b" sourceRef="xs" targetRef="tb">
+      <bpmn:conditionExpression>/b == true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f2" sourceRef="ta" targetRef="e_a"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="tb" targetRef="e_b"/>
+  </bpmn:process>
+</bpmn:definitions>

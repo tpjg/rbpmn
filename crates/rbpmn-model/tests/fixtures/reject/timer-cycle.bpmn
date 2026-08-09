@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error no-unsupported-element @ c
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:intermediateCatchEvent id="c">
+      <bpmn:timerEventDefinition>
+        <bpmn:timeCycle>R/PT30D</bpmn:timeCycle>
+      </bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="c"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="c" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

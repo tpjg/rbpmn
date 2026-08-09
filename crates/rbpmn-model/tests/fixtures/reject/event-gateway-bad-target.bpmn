@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error event-gateway-structure @ ut
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:rbpmn="https://rbpmn.dev/schema/1.0"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:message id="m1" name="PaymentReceived"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:eventBasedGateway id="ebg"/>
+    <bpmn:userTask id="ut" name="Not an event"/>
+    <bpmn:intermediateCatchEvent id="c" rbpmn:correlationKey="/orderId">
+      <bpmn:messageEventDefinition messageRef="m1"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="e_a"/>
+    <bpmn:endEvent id="e_b"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ebg"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ebg" targetRef="ut"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ebg" targetRef="c"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="ut" targetRef="e_a"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="c" targetRef="e_b"/>
+  </bpmn:process>
+</bpmn:definitions>

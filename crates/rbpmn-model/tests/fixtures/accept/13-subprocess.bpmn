@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:subProcess id="sp" name="Fulfil order">
+      <bpmn:startEvent id="s2"/>
+      <bpmn:userTask id="ti" name="Pick items"/>
+      <bpmn:endEvent id="e2"/>
+      <bpmn:sequenceFlow id="fi1" sourceRef="s2" targetRef="ti"/>
+      <bpmn:sequenceFlow id="fi2" sourceRef="ti" targetRef="e2"/>
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="bt" attachedToRef="sp">
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration>P2D</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:userTask id="t_late" name="Chase warehouse"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:endEvent id="e_late"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sp"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="sp" targetRef="end"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="bt" targetRef="t_late"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="t_late" targetRef="e_late"/>
+  </bpmn:process>
+</bpmn:definitions>

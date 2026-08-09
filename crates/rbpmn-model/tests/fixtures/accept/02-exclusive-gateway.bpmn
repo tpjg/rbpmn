@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:exclusiveGateway id="xs" name="Amount?" default="f_lo"/>
+    <bpmn:userTask id="t_hi" name="Approve manually"/>
+    <bpmn:userTask id="t_lo" name="Auto approve"/>
+    <bpmn:exclusiveGateway id="xj"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="xs"/>
+    <bpmn:sequenceFlow id="f_hi" sourceRef="xs" targetRef="t_hi">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">/amount &gt;= 100 and (/tier == "gold" or /vip == true)</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_lo" sourceRef="xs" targetRef="t_lo"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="t_hi" targetRef="xj"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="t_lo" targetRef="xj"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="xj" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

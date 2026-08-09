@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error conditions-are-trivial @ f_a
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <!-- A condition on a parallel split's outgoing flow is ignored by the spec
+       — which is exactly the kind of silent surprise we reject. -->
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:userTask id="ta" name="A"/>
+    <bpmn:userTask id="tb" name="B"/>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f_a" sourceRef="ps" targetRef="ta">
+      <bpmn:conditionExpression>/a == true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_b" sourceRef="ps" targetRef="tb"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ta" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="tb" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="pj" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

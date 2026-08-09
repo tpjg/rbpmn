@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:rbpmn="https://rbpmn.dev/schema/1.0"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:error id="err_pay" name="PaymentFailed" errorCode="PAYMENT_FAILED"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:serviceTask id="st" name="Charge card" rbpmn:topic="payments"/>
+    <bpmn:boundaryEvent id="be" attachedToRef="st">
+      <bpmn:errorEventDefinition errorRef="err_pay"/>
+    </bpmn:boundaryEvent>
+    <bpmn:userTask id="t_fix" name="Handle failed payment"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:endEvent id="e_fail"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="st"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="st" targetRef="end"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="be" targetRef="t_fix"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="t_fix" targetRef="e_fail"/>
+  </bpmn:process>
+</bpmn:definitions>

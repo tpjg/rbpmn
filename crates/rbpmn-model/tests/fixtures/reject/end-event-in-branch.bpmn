@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error balanced-gateways @ e_leak
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <!-- A plain end event inside a parallel branch consumes the branch token
+       and the join can never fire. -->
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:userTask id="ta" name="A"/>
+    <bpmn:exclusiveGateway id="xs" default="f_d"/>
+    <bpmn:userTask id="td" name="Dead branch"/>
+    <bpmn:endEvent id="e_leak"/>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:endEvent id="e_ok"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="ta"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ta" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="ps" targetRef="xs"/>
+    <bpmn:sequenceFlow id="f_c" sourceRef="xs" targetRef="pj">
+      <bpmn:conditionExpression>/skip == true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_d" sourceRef="xs" targetRef="td"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="td" targetRef="e_leak"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="pj" targetRef="e_ok"/>
+  </bpmn:process>
+</bpmn:definitions>

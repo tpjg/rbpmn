@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error no-unsupported-element @ script
+  error no-unsupported-element @ sig
+  error no-unsupported-element @ cplx
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:scriptTask id="script" name="Compute" scriptFormat="javascript"/>
+    <bpmn:intermediateCatchEvent id="sig">
+      <bpmn:signalEventDefinition/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:complexGateway id="cplx"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="script"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="script" targetRef="sig"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="sig" targetRef="cplx"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="cplx" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

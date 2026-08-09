@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="p1"/>
+    <bpmn:parallelGateway id="p2"/>
+    <bpmn:userTask id="ta" name="A"/>
+    <bpmn:userTask id="tb" name="B"/>
+    <bpmn:parallelGateway id="j2"/>
+    <bpmn:userTask id="tc" name="C"/>
+    <bpmn:parallelGateway id="j1"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="p1"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="p1" targetRef="p2"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="p2" targetRef="ta"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="p2" targetRef="tb"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="ta" targetRef="j2"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="tb" targetRef="j2"/>
+    <bpmn:sequenceFlow id="f7" sourceRef="j2" targetRef="j1"/>
+    <bpmn:sequenceFlow id="f8" sourceRef="p1" targetRef="tc"/>
+    <bpmn:sequenceFlow id="f9" sourceRef="tc" targetRef="j1"/>
+    <bpmn:sequenceFlow id="f10" sourceRef="j1" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

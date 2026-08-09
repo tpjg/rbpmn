@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error single-start-event @ p
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s1"/>
+    <bpmn:startEvent id="s2"/>
+    <bpmn:userTask id="t" name="Work"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="s1" targetRef="t"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="s2" targetRef="t"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="t" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error no-implicit-split @ t
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <!-- An activity with two outgoing flows is an implicit parallel split per
+       spec (inclusive if conditions are added) — the OR gateway through the
+       back door. Rejected: use an explicit gateway. -->
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:userTask id="t" name="Work"/>
+    <bpmn:endEvent id="e_a"/>
+    <bpmn:endEvent id="e_b"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="t"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e_a"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="t" targetRef="e_b"/>
+  </bpmn:process>
+</bpmn:definitions>

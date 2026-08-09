@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error bpmn-structure @ f_x
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <!-- A sequence flow from inside a subprocess to an element outside it:
+       tokens cannot cross a scope boundary. -->
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:subProcess id="sp">
+      <bpmn:startEvent id="s2"/>
+      <bpmn:userTask id="ti" name="Inner"/>
+      <bpmn:endEvent id="e2"/>
+      <bpmn:sequenceFlow id="fi1" sourceRef="s2" targetRef="ti"/>
+      <bpmn:sequenceFlow id="fi2" sourceRef="ti" targetRef="e2"/>
+      <bpmn:sequenceFlow id="f_x" sourceRef="ti" targetRef="t_out"/>
+    </bpmn:subProcess>
+    <bpmn:userTask id="t_out" name="Outer"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sp"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="sp" targetRef="t_out"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="t_out" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

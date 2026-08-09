@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error balanced-gateways @ m
+  warn implicit-merge-after-parallel @ m
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <!-- Two parallel branches merging implicitly at an activity: the spec's
+       uncontrolled merge runs the task twice — the classic trap. -->
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:userTask id="ta" name="A"/>
+    <bpmn:userTask id="tb" name="B"/>
+    <bpmn:userTask id="tc" name="C"/>
+    <bpmn:userTask id="m" name="Merged"/>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="ta"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ps" targetRef="tb"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="ps" targetRef="tc"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="ta" targetRef="m"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="tb" targetRef="m"/>
+    <bpmn:sequenceFlow id="f7" sourceRef="m" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f8" sourceRef="tc" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f9" sourceRef="pj" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

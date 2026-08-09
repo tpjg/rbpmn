@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error bpmn-structure @ be
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:rbpmn="https://rbpmn.dev/schema/1.0"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:serviceTask id="st" name="Charge card" rbpmn:topic="payments"/>
+    <bpmn:boundaryEvent id="be" attachedToRef="st">
+      <bpmn:errorEventDefinition/>
+    </bpmn:boundaryEvent>
+    <bpmn:userTask id="th" name="Handle"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:endEvent id="e2"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="st"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="st" targetRef="end"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="be" targetRef="th"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="th" targetRef="e2"/>
+  </bpmn:process>
+</bpmn:definitions>

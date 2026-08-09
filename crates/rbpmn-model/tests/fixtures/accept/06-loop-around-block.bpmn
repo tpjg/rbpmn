@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <!-- A sequential loop wrapping a whole parallel block: XOR join at entry,
+       XOR split with condition + default at exit. -->
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:exclusiveGateway id="xj_loop"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:userTask id="ta" name="A"/>
+    <bpmn:userTask id="tb" name="B"/>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:exclusiveGateway id="xs_loop" default="f_done"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="xj_loop"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="xj_loop" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ps" targetRef="ta"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="ps" targetRef="tb"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="ta" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="tb" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f7" sourceRef="pj" targetRef="xs_loop"/>
+    <bpmn:sequenceFlow id="f_again" sourceRef="xs_loop" targetRef="xj_loop">
+      <bpmn:conditionExpression>/again == true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_done" sourceRef="xs_loop" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

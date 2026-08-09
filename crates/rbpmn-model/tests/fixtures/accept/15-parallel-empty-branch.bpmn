@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <!-- A direct split->join edge is an empty branch delivering its token
+       straight to the join. Pointless but harmless and spec-valid. -->
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:userTask id="t" name="Work"/>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f_direct" sourceRef="ps" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f_t" sourceRef="ps" targetRef="t"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="pj" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

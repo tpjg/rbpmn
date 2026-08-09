@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:rbpmn="https://rbpmn.dev/schema/1.0"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:message id="m_start" name="OrderPlaced"/>
+  <bpmn:message id="m_notify" name="WarehouseNotified"/>
+  <bpmn:message id="m_reply" name="WarehouseAck"/>
+  <bpmn:message id="m_done" name="OrderShipped"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s_msg" rbpmn:correlationKey="/orderId">
+      <bpmn:messageEventDefinition messageRef="m_start"/>
+    </bpmn:startEvent>
+    <bpmn:intermediateThrowEvent id="th" rbpmn:correlationKey="/orderId">
+      <bpmn:messageEventDefinition messageRef="m_notify"/>
+    </bpmn:intermediateThrowEvent>
+    <bpmn:intermediateCatchEvent id="c" rbpmn:correlationKey="/orderId">
+      <bpmn:messageEventDefinition messageRef="m_reply"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="e_msg" rbpmn:correlationKey="/orderId">
+      <bpmn:messageEventDefinition messageRef="m_done"/>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s_msg" targetRef="th"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="th" targetRef="c"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="c" targetRef="e_msg"/>
+  </bpmn:process>
+</bpmn:definitions>

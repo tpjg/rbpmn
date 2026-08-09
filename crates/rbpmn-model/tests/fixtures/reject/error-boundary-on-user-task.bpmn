@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error boundary-on-supported-host @ be
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <!-- v1 errors are raised by failing service tasks; a user task cannot raise
+       one, so an error boundary on it could never fire. -->
+  <bpmn:error id="err1" name="Oops" errorCode="OOPS"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:userTask id="ut" name="Approve"/>
+    <bpmn:boundaryEvent id="be" attachedToRef="ut">
+      <bpmn:errorEventDefinition errorRef="err1"/>
+    </bpmn:boundaryEvent>
+    <bpmn:userTask id="th" name="Handle"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:endEvent id="e2"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ut"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ut" targetRef="end"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="be" targetRef="th"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="th" targetRef="e2"/>
+  </bpmn:process>
+</bpmn:definitions>

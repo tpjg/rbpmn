@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <!-- A branch may cancel the whole instance with a terminate end event; its
+       other arm must still deliver the branch token to the join. -->
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:userTask id="ta" name="Work"/>
+    <bpmn:userTask id="tb" name="Check"/>
+    <bpmn:exclusiveGateway id="xs" default="f_go"/>
+    <bpmn:endEvent id="e_term">
+      <bpmn:terminateEventDefinition/>
+    </bpmn:endEvent>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="ta"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ta" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="ps" targetRef="tb"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="tb" targetRef="xs"/>
+    <bpmn:sequenceFlow id="f_cancel" sourceRef="xs" targetRef="e_term">
+      <bpmn:conditionExpression>/cancelled == true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_go" sourceRef="xs" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="pj" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

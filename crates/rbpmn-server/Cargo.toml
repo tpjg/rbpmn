@@ -1,0 +1,21 @@
+[package]
+name = "rbpmn-server"
+description = "Small standalone HTTP server wrapping the rbpmn engine, for deployments that don't embed the Rust library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rbpmn-model = { path = "../rbpmn-model" }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "sensitive-headers", "request-id", "util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+subtle = "2"
+sha2 = "0.10"
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

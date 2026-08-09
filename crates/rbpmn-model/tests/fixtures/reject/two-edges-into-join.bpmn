@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error balanced-gateways @ ps
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <!-- An exclusive split inside a branch whose arms reach the join on two
+       separate flows: only one token ever arrives, the join waits forever. -->
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:exclusiveGateway id="xs" default="f_x2"/>
+    <bpmn:userTask id="tx" name="Extra step"/>
+    <bpmn:userTask id="tb" name="Other branch"/>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="xs"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ps" targetRef="tb"/>
+    <bpmn:sequenceFlow id="f_x1" sourceRef="xs" targetRef="pj">
+      <bpmn:conditionExpression>/skip == true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_x2" sourceRef="xs" targetRef="tx"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="tx" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="tb" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="pj" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>

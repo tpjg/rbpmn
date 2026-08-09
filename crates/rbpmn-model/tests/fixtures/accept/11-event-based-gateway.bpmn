@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:rbpmn="https://rbpmn.dev/schema/1.0"
+                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:message id="m_paid" name="PaymentReceived"/>
+  <bpmn:message id="m_cancel" name="OrderCancelled"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:eventBasedGateway id="ebg"/>
+    <bpmn:intermediateCatchEvent id="c_paid" rbpmn:correlationKey="/orderId">
+      <bpmn:messageEventDefinition messageRef="m_paid"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="c_cancel" rbpmn:correlationKey="/orderId">
+      <bpmn:messageEventDefinition messageRef="m_cancel"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="c_late">
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration>P3D</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="e_paid"/>
+    <bpmn:endEvent id="e_cancel"/>
+    <bpmn:endEvent id="e_late"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ebg"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ebg" targetRef="c_paid"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ebg" targetRef="c_cancel"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="ebg" targetRef="c_late"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="c_paid" targetRef="e_paid"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="c_cancel" targetRef="e_cancel"/>
+    <bpmn:sequenceFlow id="f7" sourceRef="c_late" targetRef="e_late"/>
+  </bpmn:process>
+</bpmn:definitions>
