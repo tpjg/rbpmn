@@ -54,11 +54,11 @@ impl<'a> Graph<'a> {
         let mut host_of = vec![None; n];
         let mut boundaries = vec![Vec::new(); n];
         for (i, node) in scope.nodes.iter().enumerate() {
-            if let NodeKind::Boundary(b) = &node.kind {
-                if let Some(host) = b.attached_to.as_deref().and_then(|h| idx.get(h)) {
-                    host_of[i] = Some(*host);
-                    boundaries[*host].push(i);
-                }
+            if let NodeKind::Boundary(b) = &node.kind
+                && let Some(host) = b.attached_to.as_deref().and_then(|h| idx.get(h))
+            {
+                host_of[i] = Some(*host);
+                boundaries[*host].push(i);
             }
         }
 
@@ -269,9 +269,9 @@ pub fn check(g: &Graph, owner: &str, out: &mut Vec<Diagnostic>) {
                 }
             }
         }
-        for i in 0..g.scope.nodes.len() {
+        for (i, &reached) in reachable.iter().enumerate() {
             // Nodes with zero incoming flows already got a cardinality error.
-            if !reachable[i]
+            if !reached
                 && g.in_deg(i) > 0
                 && !matches!(g.node(i).kind, NodeKind::Unsupported { .. })
             {
@@ -304,9 +304,9 @@ pub fn check(g: &Graph, owner: &str, out: &mut Vec<Diagnostic>) {
                 }
             }
         }
-        for i in 0..g.scope.nodes.len() {
+        for (i, &reaches) in reaches_end.iter().enumerate() {
             // Dead ends (zero outgoing) already got a cardinality error.
-            if !reaches_end[i]
+            if !reaches
                 && g.out_deg(i) > 0
                 && !matches!(g.node(i).kind, NodeKind::Unsupported { .. })
             {

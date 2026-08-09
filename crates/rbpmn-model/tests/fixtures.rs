@@ -33,9 +33,12 @@ fn parse_expectations(xml: &str, path: &Path) -> Vec<Expected> {
         );
     };
     let rest = &xml[start + "expect-diagnostics:".len()..];
-    let end = rest
-        .find("-->")
-        .unwrap_or_else(|| panic!("{}: unterminated expect-diagnostics comment", path.display()));
+    let end = rest.find("-->").unwrap_or_else(|| {
+        panic!(
+            "{}: unterminated expect-diagnostics comment",
+            path.display()
+        )
+    });
     rest[..end]
         .lines()
         .map(str::trim)
@@ -113,7 +116,12 @@ fn fixture_corpus() {
 
             let has_errors = rbpmn_model::has_errors(&checked.diagnostics);
             if dir == "accept" && has_errors {
-                writeln!(failures, "{}: accept fixture produced errors", path.display()).unwrap();
+                writeln!(
+                    failures,
+                    "{}: accept fixture produced errors",
+                    path.display()
+                )
+                .unwrap();
             }
             if dir == "reject" && !has_errors {
                 writeln!(
@@ -126,6 +134,9 @@ fn fixture_corpus() {
         }
     }
 
-    assert!(total >= 40, "fixture corpus unexpectedly small: {total} files");
+    assert!(
+        total >= 40,
+        "fixture corpus unexpectedly small: {total} files"
+    );
     assert!(failures.is_empty(), "\n{failures}");
 }

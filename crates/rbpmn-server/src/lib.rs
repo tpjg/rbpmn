@@ -1,0 +1,245 @@
+//! rbpmn-server: a small, security-conscious HTTP wrapper around the rbpmn
+//! engine, for deployments that don't embed the Rust library directly.
+//!
+//! Security posture (see docs/http-security.md at the repo root):
+//!   * every /v1 route requires a static bearer token, compared in constant
+//!     time against SHA-256 hashes (multiple tokens allowed, for rotation)
+//!   * plain HTTP, loopback bind by default; non-loopback binds are refused
+//!     unless explicitly allowed, and are expected to sit behind a
+//!     TLS-terminating reverse proxy
+//!   * request body limit, request timeout, Authorization never logged
+//!
+//! Endpoints grow with the engine phases; today only the linter is exposed.
+
+use axum::extract::DefaultBodyLimit;
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router, extract::Request, extract::State};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::iter::once;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use subtle::ConstantTimeEq;
+use tower::ServiceBuilder;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
+use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::TraceLayer;
+
+/// Deploy payloads are BPMN XML; 5 MiB is generous for any real model.
+const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Below this length a token is guessable enough that we refuse to start.
+const MIN_TOKEN_CHARS: usize = 32;
+
+pub const DEFAULT_BIND: &str = "127.0.0.1:7420";
+
+/// Accepted API tokens, stored only as SHA-256 hashes.
+pub struct Tokens {
+    hashes: Vec<[u8; 32]>,
+}
+
+impl Tokens {
+    /// Parses tokens from raw entries; blank lines and `#` comments are
+    /// skipped. Refuses tokens under [`MIN_TOKEN_CHARS`].
+    pub fn parse<I>(entries: I) -> Result<Self, String>
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let mut hashes = Vec::new();
+        for entry in entries {
+            let token = entry.as_ref().trim();
+            if token.is_empty() || token.starts_with('#') {
+                continue;
+            }
+            if token.chars().count() < MIN_TOKEN_CHARS {
+                return Err(format!(
+                    "API token too short ({} chars, minimum {MIN_TOKEN_CHARS}) — \
+                     generate one with `openssl rand -hex 32`",
+                    token.chars().count()
+                ));
+            }
+            hashes.push(Sha256::digest(token.as_bytes()).into());
+        }
+        if hashes.is_empty() {
+            return Err("no API tokens configured".to_string());
+        }
+        Ok(Tokens { hashes })
+    }
+
+    pub fn from_env() -> Result<Self, String> {
+        if let Ok(value) = std::env::var("RBPMN_API_TOKEN") {
+            return Self::parse(value.split(','));
+        }
+        if let Ok(path) = std::env::var("RBPMN_API_TOKEN_FILE") {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read RBPMN_API_TOKEN_FILE '{path}': {e}"))?;
+            return Self::parse(content.lines());
+        }
+        Err(
+            "no API token configured: set RBPMN_API_TOKEN (comma-separated for rotation) \
+             or RBPMN_API_TOKEN_FILE (one token per line)"
+                .to_string(),
+        )
+    }
+
+    /// Constant-time membership test: hash the presented token, compare
+    /// against every stored hash without short-circuiting.
+    pub fn verify(&self, presented: &str) -> bool {
+        let h: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
+        let mut ok = subtle::Choice::from(0u8);
+        for stored in &self.hashes {
+            ok |= h.as_slice().ct_eq(stored.as_slice());
+        }
+        ok.into()
+    }
+
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+}
+
+/// The server speaks plain HTTP: anything beyond loopback must be a
+/// deliberate decision, with TLS termination in front.
+pub fn validate_bind(addr: &SocketAddr, allow_non_loopback: bool) -> Result<(), String> {
+    if addr.ip().is_loopback() || allow_non_loopback {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to bind {addr}: not a loopback address. rbpmn-server speaks \
+             plain HTTP; expose it beyond localhost only behind a TLS-terminating \
+             reverse proxy, then set RBPMN_ALLOW_NON_LOOPBACK=true. \
+             See docs/http-security.md"
+        ))
+    }
+}
+
+struct AppState {
+    tokens: Tokens,
+}
+
+type SharedState = Arc<AppState>;
+
+pub fn app(tokens: Tokens) -> Router {
+    let state: SharedState = Arc::new(AppState { tokens });
+
+    let protected = Router::new()
+        .route("/v1/definitions/lint", post(lint_definitions))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer,
+        ));
+
+    Router::new()
+        .route("/healthz", get(healthz))
+        .merge(protected)
+        .layer(
+            // ServiceBuilder: first layer is outermost. Sensitive-headers must
+            // wrap TraceLayer so the Authorization value never reaches logs.
+            ServiceBuilder::new()
+                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+                .layer(SetSensitiveRequestHeadersLayer::new(once(
+                    header::AUTHORIZATION,
+                )))
+                .layer(TraceLayer::new_for_http())
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::REQUEST_TIMEOUT,
+                    REQUEST_TIMEOUT,
+                ))
+                .layer(PropagateRequestIdLayer::x_request_id()),
+        )
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+}
+
+async fn require_bearer(State(state): State<SharedState>, req: Request, next: Next) -> Response {
+    let authorized = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|token| state.tokens.verify(token.trim()));
+
+    if authorized {
+        next.run(req).await
+    } else {
+        let mut resp = (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthorized" })),
+        )
+            .into_response();
+        resp.headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        resp
+    }
+}
+
+async fn healthz() -> Response {
+    Json(json!({
+        "status": "ok",
+        "service": "rbpmn-server",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+    .into_response()
+}
+
+/// Lint a BPMN document without deploying it: exactly the diagnostics deploy
+/// would produce. 200 even when the model is rejected — the linting itself
+/// succeeded and the diagnostics are the payload; 400 only for input that is
+/// not a BPMN XML document at all.
+async fn lint_definitions(body: String) -> Response {
+    match rbpmn_model::check(&body) {
+        Ok(checked) => Json(json!({
+            "ok": checked.ok,
+            "diagnostics": checked.diagnostics,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_policy() {
+        assert!(Tokens::parse(["too-short"]).is_err());
+        assert!(Tokens::parse(Vec::<String>::new()).is_err());
+        assert!(Tokens::parse(["", "# comment"]).is_err());
+
+        let t = Tokens::parse([
+            "0123456789abcdef0123456789abcdef",
+            "another-token-that-is-long-enough-000",
+        ])
+        .unwrap();
+        assert_eq!(t.len(), 2);
+        assert!(t.verify("0123456789abcdef0123456789abcdef"));
+        assert!(t.verify("another-token-that-is-long-enough-000"));
+        assert!(!t.verify("0123456789abcdef0123456789abcdeX"));
+        assert!(!t.verify(""));
+    }
+
+    #[test]
+    fn bind_policy() {
+        let loopback: SocketAddr = "127.0.0.1:7420".parse().unwrap();
+        let all: SocketAddr = "0.0.0.0:7420".parse().unwrap();
+        let v6_loopback: SocketAddr = "[::1]:7420".parse().unwrap();
+        assert!(validate_bind(&loopback, false).is_ok());
+        assert!(validate_bind(&v6_loopback, false).is_ok());
+        assert!(validate_bind(&all, false).is_err());
+        assert!(validate_bind(&all, true).is_ok());
+    }
+}

@@ -276,7 +276,8 @@ enum EventDefs<'a, 'i> {
 
 fn single_event_def<'a, 'i>(c: Node<'a, 'i>) -> EventDefs<'a, 'i> {
     let mut defs = elements(c).filter(|e| {
-        e.tag_name().namespace() == Some(BPMN_NS) && e.tag_name().name().ends_with("EventDefinition")
+        e.tag_name().namespace() == Some(BPMN_NS)
+            && e.tag_name().name().ends_with("EventDefinition")
     });
     match (defs.next(), defs.next()) {
         (None, _) => EventDefs::None,

@@ -133,7 +133,9 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
         return if j + 1 == b.len() {
             Ok(())
         } else {
-            Err(format!("'W' cannot be combined with other components: '{s}'"))
+            Err(format!(
+                "'W' cannot be combined with other components: '{s}'"
+            ))
         };
     }
 
@@ -194,7 +196,7 @@ fn month_days(year: u32, month: u32) -> u32 {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         2 => {
-            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) {
                 29
             } else {
                 28
@@ -240,7 +242,14 @@ mod tests {
     #[test]
     fn valid_durations() {
         for s in [
-            "PT15M", "P14D", "P1Y2M3DT4H5M6S", "PT0.5S", "P3W", "PT36H", "P1DT12H", "PT0S",
+            "PT15M",
+            "P14D",
+            "P1Y2M3DT4H5M6S",
+            "PT0.5S",
+            "P3W",
+            "PT36H",
+            "P1DT12H",
+            "PT0S",
         ] {
             validate_duration(s).unwrap_or_else(|e| panic!("{s}: {e}"));
         }

@@ -340,12 +340,10 @@ fn lex(src: &str) -> Result<Vec<(usize, Tok)>, CondError> {
                         return err(start, "digits required in exponent");
                     }
                 }
-                let n: f64 = src[i..j]
-                    .parse()
-                    .map_err(|_| CondError {
-                        offset: start,
-                        message: format!("invalid number '{}'", &src[i..j]),
-                    })?;
+                let n: f64 = src[i..j].parse().map_err(|_| CondError {
+                    offset: start,
+                    message: format!("invalid number '{}'", &src[i..j]),
+                })?;
                 toks.push((start, Tok::Lit(Literal::Num(n))));
                 i = j;
             }

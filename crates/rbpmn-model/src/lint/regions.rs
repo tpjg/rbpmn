@@ -205,8 +205,8 @@ fn check_region(g: &Graph, s: usize, j: usize) -> RegionCheck {
 
     // Phase 2: closure and content checks over the region.
     let mut branch_exits = vec![0usize; n_branches];
-    for v in 0..n {
-        let Some(bi) = branch[v] else { continue };
+    for (v, assigned) in branch.iter().enumerate() {
+        let Some(bi) = *assigned else { continue };
         for &fi in &g.flow_in[v] {
             let u = g.src(fi);
             if u != s && !in_region(u) {
@@ -227,19 +227,19 @@ fn check_region(g: &Graph, s: usize, j: usize) -> RegionCheck {
                 branch_exits[bi] += 1;
             }
         }
-        if let NodeKind::End(kind) = &g.node(v).kind {
-            if !matches!(kind, EndKind::Terminate) {
-                errors.push(Diagnostic::error(
-                    rule::BALANCED_GATEWAYS,
-                    &g.node(v).id,
-                    format!(
-                        "end event inside the parallel block of split '{split_id}' \
+        if let NodeKind::End(kind) = &g.node(v).kind
+            && !matches!(kind, EndKind::Terminate)
+        {
+            errors.push(Diagnostic::error(
+                rule::BALANCED_GATEWAYS,
+                &g.node(v).id,
+                format!(
+                    "end event inside the parallel block of split '{split_id}' \
                          consumes a branch token, so join '{join_id}' can never fire — \
                          route the branch to the join, or use a terminate end event to \
                          cancel the whole instance"
-                    ),
-                ));
-            }
+                ),
+            ));
         }
     }
 

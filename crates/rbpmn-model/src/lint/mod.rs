@@ -293,10 +293,14 @@ fn unsupported_message(tag: &str) -> String {
         "scriptTask" => " — compute in application code (a service task handler) instead",
         "sendTask" => " — use a message intermediate throw event instead",
         "manualTask" => " — use a user task instead",
-        "businessRuleTask" => " — planned post-v1 via DMN; until then compute the \
-             decision in application code and store the result as a variable",
-        "task" => " — the abstract task has no execution semantics; use a \
-             service, user or receive task",
+        "businessRuleTask" => {
+            " — planned post-v1 via DMN; until then compute the \
+             decision in application code and store the result as a variable"
+        }
+        "task" => {
+            " — the abstract task has no execution semantics; use a \
+             service, user or receive task"
+        }
         "complexGateway" => " — model the routing explicitly with exclusive/parallel gateways",
         _ => "",
     };
@@ -433,7 +437,10 @@ fn condition_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
                 None
             }
             Some(d) => {
-                let fi = g.flow_out[v].iter().find(|&&fi| g.flow(fi).id == d).copied();
+                let fi = g.flow_out[v]
+                    .iter()
+                    .find(|&&fi| g.flow(fi).id == d)
+                    .copied();
                 if fi.is_none() {
                     out.push(Diagnostic::error(
                         rule::CONDITIONS_ARE_TRIVIAL,

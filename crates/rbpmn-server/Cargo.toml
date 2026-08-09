@@ -9,6 +9,7 @@ rust-version.workspace = true
 rbpmn-model = { path = "../rbpmn-model" }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "timeout", "sensitive-headers", "request-id", "util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
