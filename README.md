@@ -23,7 +23,7 @@ timers/messages (phase 3), the task API (phase 4).
 ## Status
 
 - [x] **Phase 0 — Parse & reject**: parser, full linter rule catalogue,
-      fixture corpus (15 accept / 31 reject), corpus runner.
+      fixture corpus (16 accept / 31 reject), corpus runner.
 - [x] Server skeleton with the security spine and `POST /v1/definitions/lint`.
 - [ ] Phase 0-B — linter playground (WASM) + bpmnlint plugin.
 - [ ] Phase 1 — pure semantic core (tokens, scopes, `step`).
@@ -44,26 +44,34 @@ graphs that pass them).
 | `no-unsupported-element` | error | Anything outside the supported subset (script/send/manual/business-rule tasks, signals, cycles, multi-instance, …). |
 | `balanced-gateways` | error | Every parallel split has a matching join; branches stay disjoint; nothing enters/escapes the region; each branch delivers exactly one token; no plain end events inside (terminate allowed). |
 | `single-start-event` | error | Exactly one start event per process and per subprocess. |
-| `conditions-are-trivial` | error | Conditions only on exclusive-split flows, matching the tiny grammar; default flow required. |
-| `timer-iso8601` | error | Timer definitions must be valid ISO-8601; dates require an explicit UTC offset. |
-| `message-has-correlation` | error | Message start/catch/throw must reference a named message and declare `rbpmn:correlationKey`. |
-| `no-foreign-implementation` | warn | Service task bound only via vendor attributes (`camunda:`, `zeebe:`, …), which rbpmn ignores. |
+| `conditions-feel-subset` | error | Conditions only on exclusive-split flows, in the strict FEEL subset (`name op literal`, `and`/`or`, parentheses); default flow required. Full-FEEL constructs (functions, arithmetic, ranges) are rejected. |
+| `timer-iso8601` | error | Timer definitions must be valid ISO-8601; dates require an explicit UTC offset; component magnitudes bounded. |
+| `message-has-correlation` | error | Message start/catch/throw must reference a *named* message. The correlation binding itself (a FEEL qualified name) is registered via `map_correlation` and checked at deploy. |
+| `no-foreign-implementation` | warn | Service task carries vendor attributes (`camunda:`, `zeebe:`, …), which rbpmn ignores — topics are bound at registration. |
+| `unresolved-topic` | error | Every service task's topic (via `map_topic`, default: element id) must have a registered handler or a declared external-worker topic. Checked at deploy against registration state — ID reserved now, enforced from phase 2. |
 | `boundary-on-supported-host` | error | Boundary events only on service/user/receive tasks and subprocesses; error boundaries only where errors can originate. |
 | `no-implicit-split` | error | Activities have at most one outgoing flow; splitting happens at explicit gateways. |
 | `implicit-merge-after-parallel` | warn | Implicit merge receiving concurrent tokens — the "task runs twice" trap (accompanies the balanced-gateways error). |
 | `bpmn-structure` ⁺ | error | Well-formedness: resolvable refs, flow cardinalities, connectivity, unique ids, error definitions. |
 | `no-mixed-gateway` ⁺ | error | A gateway either splits or joins, never both. |
 | `event-gateway-structure` ⁺ | error | Event gateway races ≥2 message/timer catches or receive tasks, each with exactly one incoming flow. |
-| `service-task-topic` ⁺ | error | Service tasks declare their work-item topic via `rbpmn:topic`. |
 
-## rbpmn extension attributes
+## XML purity: nothing rbpmn-specific in the BPMN
 
-Namespace: `https://rbpmn.dev/schema/1.0` (conventionally `xmlns:rbpmn`).
+BPMN files stay **100% standard-namespace** — no rbpmn extension attributes,
+no vendor attributes, ever. Anything that wires a model to its runtime is
+**registered in code** and **validated at deploy**, which gives the same
+class of guarantee a compiler does: a wiring gap fails loudly at deploy
+instead of "seeming to run" with stuck tokens.
 
-| Attribute | On | Meaning |
+| Wiring | Registration API | Deploy check |
 |---|---|---|
-| `rbpmn:topic` | `serviceTask` | Work-item topic that handlers/external workers subscribe to. |
-| `rbpmn:correlationKey` | message start/catch/throw events, `receiveTask` | JSON pointer into the instance variable document, e.g. `/orderId`. |
+| Service-task topic | `map_topic(definition_key, element_id, topic)`; default topic = element id; `declare_topic(name)` announces pull-mode workers | `unresolved-topic` |
+| Message correlation | `map_correlation(definition_key, element_id, "order.id")` — FEEL qualified name into the instance variables | `message-has-correlation` |
+| Filterable fields | `declare_index(definition_key, field)` — optional, performance only | — |
+
+Conditions inside the XML are pure FEEL (a strict subset), so they carry no
+rbpmn-specific syntax either.
 
 ## Fixtures
 

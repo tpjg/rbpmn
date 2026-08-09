@@ -8,11 +8,11 @@ use crate::model::*;
 use roxmltree::{Document, Node};
 
 pub const BPMN_NS: &str = "http://www.omg.org/spec/BPMN/20100524/MODEL";
-/// Namespace for rbpmn's own extension attributes (rbpmn:topic, rbpmn:correlationKey).
-pub const RBPMN_NS: &str = "https://rbpmn.dev/schema/1.0";
 
 /// Vendor namespaces whose attributes/extension elements we detect (to warn
-/// when they are the only implementation binding) but never execute.
+/// that rbpmn ignores them — wiring is bound at registration time, never in
+/// the XML) but never execute. rbpmn defines no extension namespace of its
+/// own: BPMN files stay 100% standard.
 const VENDOR_NS: &[(&str, &str)] = &[
     ("camunda", "http://camunda.org/schema/1.0/bpmn"),
     ("zeebe", "http://camunda.org/schema/zeebe/1.0"),
@@ -153,12 +153,13 @@ impl Parser {
                 cancel_activity: c.attribute("cancelActivity") != Some("false"),
                 trigger: self.boundary_trigger(c),
             }),
-            "serviceTask" => NodeKind::ServiceTask(service_binding(c)),
+            "serviceTask" => NodeKind::ServiceTask {
+                foreign: foreign_bindings(c),
+            },
             "userTask" => NodeKind::UserTask,
-            "receiveTask" => NodeKind::ReceiveTask(MessageBinding {
+            "receiveTask" => NodeKind::ReceiveTask {
                 message_ref: attr_string(c, "messageRef"),
-                correlation_key: correlation_key(c),
-            }),
+            },
             "exclusiveGateway" => NodeKind::ExclusiveGateway {
                 default_flow: attr_string(c, "default"),
             },
@@ -187,7 +188,7 @@ impl Parser {
         match single_event_def(c) {
             EventDefs::None => StartTrigger::None,
             EventDefs::One(def, "messageEventDefinition") => {
-                StartTrigger::Message(message_binding(c, def))
+                StartTrigger::Message(message_ref(def))
             }
             EventDefs::One(def, "timerEventDefinition") => StartTrigger::Timer(timer_spec(def)),
             EventDefs::One(_, tag) => StartTrigger::Unsupported {
@@ -203,9 +204,7 @@ impl Parser {
         match single_event_def(c) {
             EventDefs::None => EndKind::None,
             EventDefs::One(_, "terminateEventDefinition") => EndKind::Terminate,
-            EventDefs::One(def, "messageEventDefinition") => {
-                EndKind::Message(message_binding(c, def))
-            }
+            EventDefs::One(def, "messageEventDefinition") => EndKind::Message(message_ref(def)),
             EventDefs::One(_, tag) => EndKind::Unsupported {
                 tag: tag.to_string(),
             },
@@ -218,7 +217,7 @@ impl Parser {
     fn catch_trigger(&mut self, c: Node) -> CatchTrigger {
         match single_event_def(c) {
             EventDefs::One(def, "messageEventDefinition") => {
-                CatchTrigger::Message(message_binding(c, def))
+                CatchTrigger::Message(message_ref(def))
             }
             EventDefs::One(def, "timerEventDefinition") => CatchTrigger::Timer(timer_spec(def)),
             EventDefs::One(_, tag) => CatchTrigger::Unsupported {
@@ -236,9 +235,7 @@ impl Parser {
     fn throw_kind(&mut self, c: Node) -> ThrowKind {
         match single_event_def(c) {
             EventDefs::None => ThrowKind::None,
-            EventDefs::One(def, "messageEventDefinition") => {
-                ThrowKind::Message(message_binding(c, def))
-            }
+            EventDefs::One(def, "messageEventDefinition") => ThrowKind::Message(message_ref(def)),
             EventDefs::One(_, tag) => ThrowKind::Unsupported {
                 tag: tag.to_string(),
             },
@@ -255,7 +252,7 @@ impl Parser {
                 error_ref: attr_string(def, "errorRef"),
             },
             EventDefs::One(def, "messageEventDefinition") => {
-                BoundaryTrigger::Message(message_binding(c, def))
+                BoundaryTrigger::Message(message_ref(def))
             }
             EventDefs::One(_, tag) => BoundaryTrigger::Unsupported {
                 tag: tag.to_string(),
@@ -286,17 +283,8 @@ fn single_event_def<'a, 'i>(c: Node<'a, 'i>) -> EventDefs<'a, 'i> {
     }
 }
 
-fn message_binding(event: Node, def: Node) -> MessageBinding {
-    MessageBinding {
-        message_ref: attr_string(def, "messageRef"),
-        correlation_key: correlation_key(event),
-    }
-}
-
-fn correlation_key(event: Node) -> Option<String> {
-    event
-        .attribute((RBPMN_NS, "correlationKey"))
-        .map(str::to_string)
+fn message_ref(def: Node) -> Option<String> {
+    attr_string(def, "messageRef")
 }
 
 fn timer_spec(def: Node) -> TimerSpec {
@@ -312,7 +300,7 @@ fn timer_spec(def: Node) -> TimerSpec {
     TimerSpec::Missing
 }
 
-fn service_binding(c: Node) -> ServiceBinding {
+fn foreign_bindings(c: Node) -> Vec<String> {
     let mut foreign = Vec::new();
     for a in c.attributes() {
         if let Some(prefix) = vendor_prefix(a.namespace().unwrap_or("")) {
@@ -327,10 +315,7 @@ fn service_binding(c: Node) -> ServiceBinding {
         }
     }
     foreign.dedup();
-    ServiceBinding {
-        topic: c.attribute((RBPMN_NS, "topic")).map(str::to_string),
-        foreign,
-    }
+    foreign
 }
 
 fn vendor_prefix(ns: &str) -> Option<&'static str> {

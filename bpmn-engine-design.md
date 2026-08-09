@@ -133,10 +133,21 @@ before deploying. Initial rule set:
   cannot escape the split/join region (this is the rule that makes local counting
   correct; implement as a structural/region analysis on the flow graph)
 - `single-start-event` (per process and per subprocess, v1 simplification)
-- `conditions-are-trivial` — sequence-flow conditions must match the tiny condition
-  grammar (below); default flow required on exclusive splits
+- `conditions-feel-subset` — sequence-flow conditions must be in the FEEL subset
+  (below); default flow required on exclusive splits. Fixtures must cover both
+  directions: subset accepted; full-FEEL constructs (function call, arithmetic,
+  range) rejected with this rule id
+- `unresolved-topic` — every service task's resolved topic (see Topic binding) must
+  have a registered handler or be declared for external workers; checked at deploy
+  against registration state, so wiring gaps fail loudly instead of leaving
+  silently-stuck tokens at runtime
 - `timer-iso8601` — timer definitions must be valid ISO-8601 date/duration/cycle
-- `message-has-correlation` — every message catch/start declares its correlation key
+- `message-has-correlation` — every message start/catch/throw references a *named*
+  message in the XML; the correlation binding itself (a FEEL qualified name into
+  the instance variables, e.g. `order.id`) is registered in code
+  (`map_correlation`) and checked at deploy against registration state, exactly
+  like `unresolved-topic` — never declared in the XML (see Registration-time
+  binding)
 - `no-foreign-implementation` (warn) — service task bound only via vendor attributes
 - `boundary-on-supported-host` — boundary events only on tasks/subprocesses we support
 - `no-implicit-split` (error) — activities must have at most one outgoing sequence flow.
@@ -187,12 +198,29 @@ before deploying. Initial rule set:
   acceptable, it's the application's document.)
 - Serialization/deserialization is entirely the application's concern.
 
-### Condition grammar (deliberately tiny)
-`<json-pointer> <op> <literal>` where op ∈ {==, !=, <, <=, >, >=} plus `and`/`or` of
-those, evaluated against the instance variable document. No scripting, no FEEL, no
-user-defined functions. Checked at deploy (`conditions-are-trivial`). Rationale:
-portability, no expression-language dependency, decisions belong in application code —
-compute the decision outside, store the result, let the gateway read a flag.
+### Condition grammar: a strict FEEL subset
+Conditions are a strict subset of FEEL (DMN 1.3+) — identical syntax AND semantics,
+so every v1 condition remains a valid, identically-evaluating FEEL expression when
+dsntk lands post-v1, and models authored by FEEL-aware tooling
+(`expressionLanguage` = FEEL) parse as-is. The subset:
+- expressions: `identifier op literal`, combined with `and`/`or`, parentheses
+- ops: `=` `!=` `<` `<=` `>` `>=` (accept `==` on input, normalize to FEEL's `=`)
+- literals: numbers, double-quoted strings, `true`/`false`, `null`
+- identifiers: FEEL qualified names (`order.priority`) resolved as paths into the
+  instance's JSONB variable document; a missing path evaluates to null, and any
+  comparison with null is **false** (FEEL's ternary logic collapsed to the final
+  boolean — state this explicitly in docs; it must not change when dsntk swaps in)
+- nothing else: no functions, no arithmetic, no `in`/ranges, no date literals
+
+Additional strictness beyond FEEL (safe: a strict subset may reject more, it must
+never evaluate differently): ordering ops (`<` `<=` `>` `>=`) require a number
+literal; qualified-name segments are `[A-Za-z_][A-Za-z0-9_]*` (no spaces).
+
+Own tiny parser/evaluator in the pure core (no dsntk dependency in v1). Checked at
+deploy (`conditions-feel-subset`). Rationale unchanged: decisions belong in
+application code — compute outside, store the result, let the gateway read a flag.
+Correlation keys use the same FEEL qualified-name syntax, registered via
+`map_correlation` — the XML carries no rbpmn-specific syntax anywhere.
 
 ### Execution semantics (the correctness core)
 - Pure core: `fn step(model, state, command) -> (state', effects)` — **no IO in the
@@ -224,6 +252,10 @@ compute the decision outside, store the result, let the gateway read a flag.
 let engine = Engine::builder(pool)
     .handler("payments", HttpPostHandler::new("https://internal/payments"))
     .handler("email", my_custom_handler)          // impl ServiceTaskHandler
+    .declare_topic("fulfillment")                 // pull-mode workers will poll this
+    .map_topic("FulfillOrder", "ChargeCustomer", "payments")
+    .map_topic("Renewals",     "ChargeRenewal",  "payments")
+    .map_correlation("FulfillOrder", "AwaitPayment", "order.id")
     .build();
 
 engine.deploy(bpmn_xml).await?;                    // -> Deployment { version, diagnostics }
@@ -244,6 +276,31 @@ pub trait ServiceTaskHandler: Send + Sync {
 // Pull mode (external workers / user tasks): the task API below. Both share work_item.
 ```
 
+### Registration-time binding (topics & correlation — never in the XML)
+BPMN files stay **100% standard-namespace**: no vendor attributes, and no rbpmn
+extension attributes either. Anything that wires a model to its runtime is
+registered in code and validated at deploy — the same class of guarantee a
+compiler gives: a wiring gap fails loudly at deploy instead of "seeming to run"
+with silently-stuck tokens. (Principle, decided explicitly: resist every future
+"let's just add a hint/annotation in the XML".)
+
+A **topic** is the capability name a work item is addressed to: the routing key
+between "the engine decided this work is due" and "somebody does it". Element id
+and topic answer different questions (where in the process vs. what capability),
+and the relationship is many-to-one — several tasks across definitions can share
+one worker.
+- `map_topic(definition_key, element_id, topic)` — explicit binding, lives in code.
+- Default when unmapped: **topic = element id** (zero-config simple case; the
+  authoring style makes ids descriptive PascalCase anyway).
+- `declare_topic(name)` — announces that out-of-process workers will poll this
+  topic; the engine cannot see pull-mode consumers, so this is how they become
+  "known" to the `unresolved-topic` deploy check.
+- `map_correlation(definition_key, element_id, feel_name)` — binds a message
+  start/catch/throw element to its correlation key, a FEEL qualified name into
+  the instance variables (e.g. `order.id`). No default: every message element
+  must be mapped or deploy fails (`message-has-correlation`).
+- `work_item.topic` is denormalized at creation time from the binding in force.
+
 ### Task API (phase 3, but design the table for it now)
 - `get_task(topic, ttl) -> Option<LockedTask>` — `FOR UPDATE SKIP LOCKED`, sets
   lock_owner + lock_until = now()+ttl. **Lease model, not long locks:** base TTL is
@@ -261,10 +318,21 @@ pub trait ServiceTaskHandler: Send + Sync {
   expectations for `work_item` — heartbeats add steady row-version churn.
   The same lease applies to `kind=service` items claimed by external workers: workers
   heartbeat too, so a wedged worker's items return without waiting out a long lock.
-- `get_task_filtered(topic, filter, ttl)` — filter compiles to a JSONB expression that
-  matches a deploy-declared partial index (literal definition_id + exact expression;
-  see footguns above). Declaring filterable fields per definition at deploy time is
-  what generates the indexes.
+- `declare_index(definition_key, field)` (+ optional target: WorkItem (default) |
+  Instance) — **entirely optional performance API**; filtering and counting work
+  without it (seq scan is correct, just slower). Creates
+  `CREATE INDEX IF NOT EXISTS <deterministic-name> ON work_item
+  ((variables->>'<field>')) WHERE definition_id = '<literal id>'` — definition id
+  as a literal (planner requirement), deterministic name from (table, definition
+  key, field) so the call is idempotent and re-runnable at startup next to handler
+  registration. Use `CREATE INDEX CONCURRENTLY` (runs outside a transaction —
+  handle that). This IS the "declared filterable fields" mechanism, exposed as an
+  explicit call. JSONB stays opaque: the engine never interprets variables, it only
+  indexes fields the application names.
+- `get_task_filtered(topic, filter, ttl)` — the filter compiler MUST emit exactly
+  the indexed expression shape (`variables->>'field'` + literal definition_id) so
+  declared indexes are actually used. EXPLAIN-based integration test: index usage
+  for a declared field, correct results (via seq scan) for an undeclared one.
 - `count_tasks(topic, filter) -> u64` — dashboard indications; same index discipline.
 - `complete_task(id, owner, merge_patch)` / `fail_task(id, owner, error_code?)` —
   owner checked; completing advances the token in the same transaction.
@@ -359,7 +427,7 @@ is injected in the core from phase 1 precisely for this.
 
 **Phase 4 — User tasks & the task API**
 `kind=user` work items; get/get-filtered/count/complete with locking + TTL;
-deploy-declared filterable fields → generated partial indexes. Dashboard counting.
+declare_index API → generated partial indexes. Dashboard counting.
 
 **Phase 5 — Rounding out**
 Event ordering guarantees in `event`, retention jobs, instance migration API
@@ -383,7 +451,7 @@ Sequencing (deliberate):
    changes to semantic core or condition grammar. `dsntk-feel` / model-evaluation
    crates only, not the whole toolkit.
 2. **FEEL in sequence-flow conditions second, or never.** It deletes
-   `conditions-are-trivial` and couples control-flow correctness to an external
+   the `conditions-feel-subset` restriction and couples control-flow correctness to an external
    evaluator. If added: per-definition opt-in, tiny grammar stays the default.
 
 Integration rules (either route):
@@ -429,7 +497,7 @@ the existing subscription kinds (message, timer, later error). The clean way to 
 **v5 — Conditional events (moderate).** "Wake this token when the variable document
 satisfies a predicate." Clean hook exists: every variable write is a merge patch in a
 known transaction — re-evaluate waiting `kind=condition` subscriptions there. The
-tiny condition grammar keeps evaluation cheap and deterministic; a `subscription`
+FEEL-subset condition grammar keeps evaluation cheap and deterministic; a `subscription`
 row fits as-is. Deploy rule: conditional predicates use the same grammar as
 sequence-flow conditions.
 

@@ -13,7 +13,7 @@
     <bpmn:endEvent id="end"/>
     <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="xs"/>
     <bpmn:sequenceFlow id="f_hi" sourceRef="xs" targetRef="t_hi">
-      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">/amount &gt;= 100 and (/tier == "gold" or /vip == true)</bpmn:conditionExpression>
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">amount &gt;= 100 and (order.tier = "gold" or vip == true)</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f_lo" sourceRef="xs" targetRef="t_lo"/>
     <bpmn:sequenceFlow id="f3" sourceRef="t_hi" targetRef="xj"/>

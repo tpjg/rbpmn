@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
-  error service-task-topic @ st
   warn no-foreign-implementation @ st
 -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
                   id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <!-- Vendor attributes are ignored, never executed: the model still deploys
+       (topics are bound at registration time), but the modeler is warned that
+       the camunda binding is dead weight. -->
   <bpmn:process id="p" isExecutable="true">
     <bpmn:startEvent id="start"/>
     <bpmn:serviceTask id="st" name="Charge card" camunda:topic="payments"/>

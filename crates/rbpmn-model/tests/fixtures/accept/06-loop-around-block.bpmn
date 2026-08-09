@@ -22,7 +22,7 @@
     <bpmn:sequenceFlow id="f6" sourceRef="tb" targetRef="pj"/>
     <bpmn:sequenceFlow id="f7" sourceRef="pj" targetRef="xs_loop"/>
     <bpmn:sequenceFlow id="f_again" sourceRef="xs_loop" targetRef="xj_loop">
-      <bpmn:conditionExpression>/again == true</bpmn:conditionExpression>
+      <bpmn:conditionExpression>again = true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f_done" sourceRef="xs_loop" targetRef="end"/>
   </bpmn:process>

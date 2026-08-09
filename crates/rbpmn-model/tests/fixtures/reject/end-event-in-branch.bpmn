@@ -20,7 +20,7 @@
     <bpmn:sequenceFlow id="f3" sourceRef="ta" targetRef="pj"/>
     <bpmn:sequenceFlow id="f4" sourceRef="ps" targetRef="xs"/>
     <bpmn:sequenceFlow id="f_c" sourceRef="xs" targetRef="pj">
-      <bpmn:conditionExpression>/skip == true</bpmn:conditionExpression>
+      <bpmn:conditionExpression>skip = true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f_d" sourceRef="xs" targetRef="td"/>
     <bpmn:sequenceFlow id="f5" sourceRef="td" targetRef="e_leak"/>

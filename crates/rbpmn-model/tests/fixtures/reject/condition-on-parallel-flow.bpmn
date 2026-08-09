@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
-  error conditions-are-trivial @ f_a
+  error conditions-feel-subset @ f_a
 -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   id="defs" targetNamespace="https://rbpmn.dev/fixtures">
@@ -15,7 +15,7 @@
     <bpmn:endEvent id="end"/>
     <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
     <bpmn:sequenceFlow id="f_a" sourceRef="ps" targetRef="ta">
-      <bpmn:conditionExpression>/a == true</bpmn:conditionExpression>
+      <bpmn:conditionExpression>a = true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f_b" sourceRef="ps" targetRef="tb"/>
     <bpmn:sequenceFlow id="f2" sourceRef="ta" targetRef="pj"/>

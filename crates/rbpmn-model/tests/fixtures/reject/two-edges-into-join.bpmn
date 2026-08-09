@@ -18,7 +18,7 @@
     <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="xs"/>
     <bpmn:sequenceFlow id="f3" sourceRef="ps" targetRef="tb"/>
     <bpmn:sequenceFlow id="f_x1" sourceRef="xs" targetRef="pj">
-      <bpmn:conditionExpression>/skip == true</bpmn:conditionExpression>
+      <bpmn:conditionExpression>skip = true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f_x2" sourceRef="xs" targetRef="tx"/>
     <bpmn:sequenceFlow id="f4" sourceRef="tx" targetRef="pj"/>

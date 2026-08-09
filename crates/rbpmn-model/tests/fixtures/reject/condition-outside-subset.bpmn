@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
-  error conditions-are-trivial @ f_hi
+  error conditions-feel-subset @ f_hi
 -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   id="defs" targetNamespace="https://rbpmn.dev/fixtures">

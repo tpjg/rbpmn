@@ -22,7 +22,7 @@
     <bpmn:sequenceFlow id="f4" sourceRef="ps" targetRef="tb"/>
     <bpmn:sequenceFlow id="f5" sourceRef="tb" targetRef="xs"/>
     <bpmn:sequenceFlow id="f_cancel" sourceRef="xs" targetRef="e_term">
-      <bpmn:conditionExpression>/cancelled == true</bpmn:conditionExpression>
+      <bpmn:conditionExpression>cancelled = true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f_go" sourceRef="xs" targetRef="pj"/>
     <bpmn:sequenceFlow id="f6" sourceRef="pj" targetRef="end"/>

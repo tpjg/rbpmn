@@ -27,9 +27,15 @@ inclusive gateway, block structure, messages-only interaction, build order).
 
 ## Conventions
 
-- rbpmn extension namespace `https://rbpmn.dev/schema/1.0`: `rbpmn:topic` on
-  service tasks, `rbpmn:correlationKey` (JSON pointer) on message events and
-  receive tasks.
+- **XML purity is a principle (Timo's explicit call — resist eroding it).**
+  BPMN files are 100% standard-namespace: no rbpmn extension attributes, no
+  vendor attributes, ever. It is always tempting to "just add a hint in the
+  XML" — don't. Wiring lives in code at registration time (`map_topic`,
+  `map_correlation`, `declare_topic`, `declare_index`) and is validated at
+  deploy like a compiler validates types: fail early, never "seems to run".
+- Conditions are a **strict FEEL subset** (identical syntax and semantics, so
+  they stay valid when dsntk lands post-v1). Correlation keys use FEEL
+  qualified names too (`order.id`), registered — not in the XML.
 - Server config is env-only (`RBPMN_BIND`, `RBPMN_API_TOKEN[_FILE]`,
   `RBPMN_ALLOW_NON_LOOPBACK`); secrets never come from CLI args.
   Security posture: `docs/http-security.md`.

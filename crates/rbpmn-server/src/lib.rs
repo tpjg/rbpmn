@@ -56,9 +56,7 @@ impl Tokens {
         for entry in entries {
             let token = entry.as_ref().trim();
             if token.is_empty() {
-                return Err(
-                    "empty token entry in RBPMN_API_TOKEN (stray comma?)".to_string()
-                );
+                return Err("empty token entry in RBPMN_API_TOKEN (stray comma?)".to_string());
             }
             hashes.push(Self::hash_checked(token)?);
         }
@@ -156,7 +154,9 @@ impl Config {
 pub fn resolve_bind(raw: &str) -> Result<SocketAddr, String> {
     use std::net::ToSocketAddrs;
     raw.to_socket_addrs()
-        .map_err(|e| format!("invalid RBPMN_BIND '{raw}': {e} (expected host:port, e.g. {DEFAULT_BIND})"))?
+        .map_err(|e| {
+            format!("invalid RBPMN_BIND '{raw}': {e} (expected host:port, e.g. {DEFAULT_BIND})")
+        })?
         .next()
         .ok_or_else(|| format!("RBPMN_BIND '{raw}' resolved to no addresses"))
 }

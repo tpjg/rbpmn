@@ -14,7 +14,7 @@
     <bpmn:endEvent id="end"/>
     <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="xs"/>
     <bpmn:sequenceFlow id="f_a" sourceRef="xs" targetRef="ta">
-      <bpmn:conditionExpression>/a == true</bpmn:conditionExpression>
+      <bpmn:conditionExpression>a = true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f_b" sourceRef="xs" targetRef="tb"/>
     <bpmn:sequenceFlow id="f2" sourceRef="ta" targetRef="m"/>

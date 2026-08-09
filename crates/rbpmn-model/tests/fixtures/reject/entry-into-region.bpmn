@@ -16,7 +16,7 @@
     <bpmn:endEvent id="end"/>
     <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="x0"/>
     <bpmn:sequenceFlow id="f_in" sourceRef="x0" targetRef="ta">
-      <bpmn:conditionExpression>/rush == true</bpmn:conditionExpression>
+      <bpmn:conditionExpression>rush = true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f_norm" sourceRef="x0" targetRef="ps"/>
     <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="ta"/>

@@ -3,14 +3,13 @@
   error event-gateway-structure @ ut
 -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                  xmlns:rbpmn="https://rbpmn.dev/schema/1.0"
                   id="defs" targetNamespace="https://rbpmn.dev/fixtures">
   <bpmn:message id="m1" name="PaymentReceived"/>
   <bpmn:process id="p" isExecutable="true">
     <bpmn:startEvent id="start"/>
     <bpmn:eventBasedGateway id="ebg"/>
     <bpmn:userTask id="ut" name="Not an event"/>
-    <bpmn:intermediateCatchEvent id="c" rbpmn:correlationKey="/orderId">
+    <bpmn:intermediateCatchEvent id="c">
       <bpmn:messageEventDefinition messageRef="m1"/>
     </bpmn:intermediateCatchEvent>
     <bpmn:endEvent id="e_a"/>

@@ -3,11 +3,10 @@
   error bpmn-structure @ be
 -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                  xmlns:rbpmn="https://rbpmn.dev/schema/1.0"
                   id="defs" targetNamespace="https://rbpmn.dev/fixtures">
   <bpmn:process id="p" isExecutable="true">
     <bpmn:startEvent id="start"/>
-    <bpmn:serviceTask id="st" name="Charge card" rbpmn:topic="payments"/>
+    <bpmn:serviceTask id="st" name="Charge card"/>
     <bpmn:boundaryEvent id="be" attachedToRef="st">
       <bpmn:errorEventDefinition/>
     </bpmn:boundaryEvent>

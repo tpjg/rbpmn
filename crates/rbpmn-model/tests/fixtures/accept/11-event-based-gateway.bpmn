@@ -2,17 +2,16 @@
 <!-- expect-diagnostics:
 -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                  xmlns:rbpmn="https://rbpmn.dev/schema/1.0"
                   id="defs" targetNamespace="https://rbpmn.dev/fixtures">
   <bpmn:message id="m_paid" name="PaymentReceived"/>
   <bpmn:message id="m_cancel" name="OrderCancelled"/>
   <bpmn:process id="p" isExecutable="true">
     <bpmn:startEvent id="start"/>
     <bpmn:eventBasedGateway id="ebg"/>
-    <bpmn:intermediateCatchEvent id="c_paid" rbpmn:correlationKey="/orderId">
+    <bpmn:intermediateCatchEvent id="c_paid">
       <bpmn:messageEventDefinition messageRef="m_paid"/>
     </bpmn:intermediateCatchEvent>
-    <bpmn:intermediateCatchEvent id="c_cancel" rbpmn:correlationKey="/orderId">
+    <bpmn:intermediateCatchEvent id="c_cancel">
       <bpmn:messageEventDefinition messageRef="m_cancel"/>
     </bpmn:intermediateCatchEvent>
     <bpmn:intermediateCatchEvent id="c_late">

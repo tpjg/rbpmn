@@ -20,7 +20,7 @@ mod parse;
 
 pub use diagnostics::{CATALOGUE, Diagnostic, RuleInfo, Severity, has_errors, rule};
 pub use lint::lint;
-pub use parse::{BPMN_NS, ParseError, RBPMN_NS, parse};
+pub use parse::{BPMN_NS, ParseError, parse};
 
 /// Result of [`check`]: the parsed model plus all diagnostics.
 /// `ok` is false if any diagnostic has error severity — deploy must refuse.

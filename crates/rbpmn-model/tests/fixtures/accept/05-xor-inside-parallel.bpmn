@@ -16,7 +16,7 @@
     <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
     <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="xs"/>
     <bpmn:sequenceFlow id="f_f" sourceRef="xs" targetRef="tf">
-      <bpmn:conditionExpression>/fast == true</bpmn:conditionExpression>
+      <bpmn:conditionExpression>fast = true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
     <bpmn:sequenceFlow id="f_s" sourceRef="xs" targetRef="ts"/>
     <bpmn:sequenceFlow id="f3" sourceRef="tf" targetRef="xj"/>

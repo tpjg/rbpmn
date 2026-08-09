@@ -4,7 +4,9 @@
 -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   id="defs" targetNamespace="https://rbpmn.dev/fixtures">
-  <bpmn:message id="m1" name="PaymentReceived"/>
+  <!-- The message name is what correlate() addresses; a nameless message can
+       never receive anything. -->
+  <bpmn:message id="m1"/>
   <bpmn:process id="p" isExecutable="true">
     <bpmn:startEvent id="start"/>
     <bpmn:intermediateCatchEvent id="c">

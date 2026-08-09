@@ -71,10 +71,14 @@ pub mod rule {
     pub const NO_UNSUPPORTED_ELEMENT: &str = "no-unsupported-element";
     pub const BALANCED_GATEWAYS: &str = "balanced-gateways";
     pub const SINGLE_START_EVENT: &str = "single-start-event";
-    pub const CONDITIONS_ARE_TRIVIAL: &str = "conditions-are-trivial";
+    pub const CONDITIONS_FEEL_SUBSET: &str = "conditions-feel-subset";
     pub const TIMER_ISO8601: &str = "timer-iso8601";
     pub const MESSAGE_HAS_CORRELATION: &str = "message-has-correlation";
     pub const NO_FOREIGN_IMPLEMENTATION: &str = "no-foreign-implementation";
+    /// Deploy-time rule checked against *registration state* (map_topic /
+    /// declare_topic), so it cannot fire from pure lint(xml); the id is
+    /// reserved here, enforcement lands with the engine (phase 2).
+    pub const UNRESOLVED_TOPIC: &str = "unresolved-topic";
     pub const BOUNDARY_ON_SUPPORTED_HOST: &str = "boundary-on-supported-host";
     pub const NO_IMPLICIT_SPLIT: &str = "no-implicit-split";
     pub const IMPLICIT_MERGE_AFTER_PARALLEL: &str = "implicit-merge-after-parallel";
@@ -83,7 +87,6 @@ pub mod rule {
     pub const BPMN_STRUCTURE: &str = "bpmn-structure";
     pub const NO_MIXED_GATEWAY: &str = "no-mixed-gateway";
     pub const EVENT_GATEWAY_STRUCTURE: &str = "event-gateway-structure";
-    pub const SERVICE_TASK_TOPIC: &str = "service-task-topic";
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -120,9 +123,9 @@ pub const CATALOGUE: &[RuleInfo] = &[
         summary: "Exactly one start event per process and per subprocess (v1 simplification).",
     },
     RuleInfo {
-        id: rule::CONDITIONS_ARE_TRIVIAL,
+        id: rule::CONDITIONS_FEEL_SUBSET,
         severity: Severity::Error,
-        summary: "Sequence-flow conditions must match the tiny condition grammar; exclusive splits need a default flow.",
+        summary: "Sequence-flow conditions must be in the strict FEEL subset (name op literal, and/or, parentheses); exclusive splits need a default flow.",
     },
     RuleInfo {
         id: rule::TIMER_ISO8601,
@@ -132,12 +135,17 @@ pub const CATALOGUE: &[RuleInfo] = &[
     RuleInfo {
         id: rule::MESSAGE_HAS_CORRELATION,
         severity: Severity::Error,
-        summary: "Every message start/catch/throw declares a named message and an rbpmn:correlationKey JSON pointer.",
+        summary: "Every message start/catch/throw references a named message; correlation bindings (FEEL qualified names) are registered in code and checked at deploy.",
     },
     RuleInfo {
         id: rule::NO_FOREIGN_IMPLEMENTATION,
         severity: Severity::Warn,
-        summary: "Service task bound only via vendor-namespace attributes, which rbpmn ignores.",
+        summary: "Service task carries vendor implementation attributes (camunda/zeebe/flowable), which rbpmn ignores — topics are bound at registration.",
+    },
+    RuleInfo {
+        id: rule::UNRESOLVED_TOPIC,
+        severity: Severity::Error,
+        summary: "Every service task's topic (map_topic, default: element id) must have a registered handler or a declared external-worker topic — checked at deploy against registration state.",
     },
     RuleInfo {
         id: rule::BOUNDARY_ON_SUPPORTED_HOST,
@@ -168,10 +176,5 @@ pub const CATALOGUE: &[RuleInfo] = &[
         id: rule::EVENT_GATEWAY_STRUCTURE,
         severity: Severity::Error,
         summary: "Event-based gateways race message/timer catch events or receive tasks, each with exactly one incoming flow.",
-    },
-    RuleInfo {
-        id: rule::SERVICE_TASK_TOPIC,
-        severity: Severity::Error,
-        summary: "Service tasks must declare their work-item topic via rbpmn:topic.",
     },
 ];

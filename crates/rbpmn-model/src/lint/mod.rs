@@ -13,7 +13,6 @@ use crate::condition;
 use crate::diagnostics::{Diagnostic, Severity, rule};
 use crate::iso8601;
 use crate::model::*;
-use crate::parse::RBPMN_NS;
 use std::collections::BTreeMap;
 use structure::Graph;
 
@@ -161,38 +160,26 @@ fn element_rules(
                     ));
                 }
             }
-            NodeKind::ServiceTask(binding) => {
-                if binding.topic.as_deref().is_none_or(str::is_empty) {
-                    let mut msg = format!(
-                        "service task must declare its work-item topic: \
-                         rbpmn:topic=\"...\" (xmlns:rbpmn=\"{RBPMN_NS}\")"
-                    );
-                    if !binding.foreign.is_empty() {
-                        msg.push_str(&format!(
-                            " — found vendor binding(s) {} which rbpmn ignores",
-                            binding.foreign.join(", ")
-                        ));
-                    }
-                    out.push(Diagnostic::error(rule::SERVICE_TASK_TOPIC, id, msg));
-                    if !binding.foreign.is_empty() {
-                        out.push(Diagnostic::warn(
-                            rule::NO_FOREIGN_IMPLEMENTATION,
-                            id,
-                            format!(
-                                "service task is bound only via vendor extension(s) \
-                                 {} — rbpmn ignores foreign namespaces; declare \
-                                 rbpmn:topic instead",
-                                binding.foreign.join(", ")
-                            ),
-                        ));
-                    }
+            NodeKind::ServiceTask { foreign } => {
+                if !foreign.is_empty() {
+                    out.push(Diagnostic::warn(
+                        rule::NO_FOREIGN_IMPLEMENTATION,
+                        id,
+                        format!(
+                            "service task carries vendor implementation attribute(s) \
+                             {} which rbpmn ignores — topics are bound at registration \
+                             time (map_topic; default topic = the element id), never \
+                             in the XML",
+                            foreign.join(", ")
+                        ),
+                    ));
                 }
             }
             NodeKind::Start(trigger) => match trigger {
                 StartTrigger::None => {}
-                StartTrigger::Message(binding) => {
+                StartTrigger::Message(message_ref) => {
                     if is_process {
-                        check_message_binding(defs, id, binding, out);
+                        check_message(defs, id, message_ref.as_deref(), out);
                     } else {
                         out.push(Diagnostic::error(
                             rule::NO_UNSUPPORTED_ELEMENT,
@@ -217,7 +204,9 @@ fn element_rules(
             },
             NodeKind::End(kind) => match kind {
                 EndKind::None | EndKind::Terminate => {}
-                EndKind::Message(binding) => check_message_binding(defs, id, binding, out),
+                EndKind::Message(message_ref) => {
+                    check_message(defs, id, message_ref.as_deref(), out)
+                }
                 EndKind::Unsupported { tag } => out.push(Diagnostic::error(
                     rule::NO_UNSUPPORTED_ELEMENT,
                     id,
@@ -225,7 +214,9 @@ fn element_rules(
                 )),
             },
             NodeKind::Catch(trigger) => match trigger {
-                CatchTrigger::Message(binding) => check_message_binding(defs, id, binding, out),
+                CatchTrigger::Message(message_ref) => {
+                    check_message(defs, id, message_ref.as_deref(), out)
+                }
                 CatchTrigger::Timer(spec) => check_timer(id, spec, out),
                 CatchTrigger::Unsupported { tag } => out.push(Diagnostic::error(
                     rule::NO_UNSUPPORTED_ELEMENT,
@@ -237,7 +228,9 @@ fn element_rules(
                 )),
             },
             NodeKind::Throw(kind) => match kind {
-                ThrowKind::Message(binding) => check_message_binding(defs, id, binding, out),
+                ThrowKind::Message(message_ref) => {
+                    check_message(defs, id, message_ref.as_deref(), out)
+                }
                 ThrowKind::None => out.push(Diagnostic::error(
                     rule::NO_UNSUPPORTED_ELEMENT,
                     id,
@@ -279,7 +272,9 @@ fn element_rules(
                     )),
                 }
             }
-            NodeKind::ReceiveTask(binding) => check_message_binding(defs, id, binding, out),
+            NodeKind::ReceiveTask { message_ref } => {
+                check_message(defs, id, message_ref.as_deref(), out)
+            }
             NodeKind::UserTask
             | NodeKind::ExclusiveGateway { .. }
             | NodeKind::ParallelGateway
@@ -341,13 +336,17 @@ fn check_timer(id: &str, spec: &TimerSpec, out: &mut Vec<Diagnostic>) {
     }
 }
 
-fn check_message_binding(
+/// The XML side of `message-has-correlation`: the element must reference a
+/// *named* message. The correlation binding itself (a FEEL qualified name
+/// into the instance variables) is registered in code (`map_correlation`)
+/// and checked at deploy against registration state — never in the XML.
+fn check_message(
     defs: &Definitions,
     id: &str,
-    binding: &MessageBinding,
+    message_ref: Option<&str>,
     out: &mut Vec<Diagnostic>,
 ) {
-    match binding.message_ref.as_deref() {
+    match message_ref {
         None => out.push(Diagnostic::error(
             rule::MESSAGE_HAS_CORRELATION,
             id,
@@ -373,26 +372,6 @@ fn check_message_binding(
             }
         },
     }
-
-    match binding.correlation_key.as_deref() {
-        None | Some("") => out.push(Diagnostic::error(
-            rule::MESSAGE_HAS_CORRELATION,
-            id,
-            format!(
-                "declare rbpmn:correlationKey (xmlns:rbpmn=\"{RBPMN_NS}\"): a JSON \
-                 pointer into the instance variables, e.g. /orderId"
-            ),
-        )),
-        Some(key) => {
-            if let Err(msg) = condition::validate_pointer(key) {
-                out.push(Diagnostic::error(
-                    rule::MESSAGE_HAS_CORRELATION,
-                    id,
-                    format!("invalid rbpmn:correlationKey: {msg}"),
-                ));
-            }
-        }
-    }
 }
 
 fn condition_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
@@ -406,7 +385,7 @@ fn condition_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
         let flow = g.flow(fi);
         if flow.condition.is_some() && !is_exclusive_split(*src) {
             out.push(Diagnostic::error(
-                rule::CONDITIONS_ARE_TRIVIAL,
+                rule::CONDITIONS_FEEL_SUBSET,
                 &flow.id,
                 format!(
                     "conditions are only supported on the outgoing flows of an \
@@ -429,7 +408,7 @@ fn condition_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
         let default_fi = match default_flow.as_deref() {
             None => {
                 out.push(Diagnostic::error(
-                    rule::CONDITIONS_ARE_TRIVIAL,
+                    rule::CONDITIONS_FEEL_SUBSET,
                     gateway_id,
                     "exclusive split needs a default flow (the `default` attribute) \
                      so no token can get stuck when every condition is false",
@@ -443,7 +422,7 @@ fn condition_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
                     .copied();
                 if fi.is_none() {
                     out.push(Diagnostic::error(
-                        rule::CONDITIONS_ARE_TRIVIAL,
+                        rule::CONDITIONS_FEEL_SUBSET,
                         gateway_id,
                         format!("default flow '{d}' is not an outgoing flow of this gateway"),
                     ));
@@ -457,7 +436,7 @@ fn condition_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
             if Some(fi) == default_fi {
                 if flow.condition.is_some() {
                     out.push(Diagnostic::error(
-                        rule::CONDITIONS_ARE_TRIVIAL,
+                        rule::CONDITIONS_FEEL_SUBSET,
                         &flow.id,
                         "the default flow must not carry a condition",
                     ));
@@ -466,7 +445,7 @@ fn condition_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
             }
             match &flow.condition {
                 None => out.push(Diagnostic::error(
-                    rule::CONDITIONS_ARE_TRIVIAL,
+                    rule::CONDITIONS_FEEL_SUBSET,
                     &flow.id,
                     "flow out of an exclusive split needs a condition \
                      (or mark it as the gateway's default flow)",
@@ -474,7 +453,7 @@ fn condition_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
                 Some(src) => {
                     if let Err(e) = condition::parse(src) {
                         out.push(Diagnostic::error(
-                            rule::CONDITIONS_ARE_TRIVIAL,
+                            rule::CONDITIONS_FEEL_SUBSET,
                             &flow.id,
                             format!(
                                 "condition does not match the grammar \
@@ -507,7 +486,7 @@ fn event_gateway_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
                 target.kind,
                 NodeKind::Catch(CatchTrigger::Message(_))
                     | NodeKind::Catch(CatchTrigger::Timer(_))
-                    | NodeKind::ReceiveTask(_)
+                    | NodeKind::ReceiveTask { .. }
             );
             if !supported_target {
                 out.push(Diagnostic::error(
@@ -577,7 +556,7 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
         if let BoundaryTrigger::Error { error_ref } = &b.trigger {
             if !matches!(
                 host_kind,
-                NodeKind::ServiceTask(_) | NodeKind::SubProcess(_)
+                NodeKind::ServiceTask { .. } | NodeKind::SubProcess(_)
             ) {
                 out.push(Diagnostic::error(
                     rule::BOUNDARY_ON_SUPPORTED_HOST,

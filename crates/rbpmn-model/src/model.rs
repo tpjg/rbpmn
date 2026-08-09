@@ -76,16 +76,27 @@ pub enum NodeKind {
     Catch(CatchTrigger),
     Throw(ThrowKind),
     Boundary(BoundaryData),
-    ServiceTask(ServiceBinding),
+    /// The XML carries no binding: the work-item topic is bound at engine
+    /// registration time (`map_topic`, default: element id). `foreign` lists
+    /// vendor-namespace bindings we detected but ignore (e.g. "camunda:topic").
+    ServiceTask {
+        foreign: Vec<String>,
+    },
     UserTask,
-    ReceiveTask(MessageBinding),
-    ExclusiveGateway { default_flow: Option<Id> },
+    ReceiveTask {
+        message_ref: Option<Id>,
+    },
+    ExclusiveGateway {
+        default_flow: Option<Id>,
+    },
     ParallelGateway,
     EventBasedGateway,
     InclusiveGateway,
     CallActivity,
     SubProcess(SubProcessData),
-    Unsupported { tag: String },
+    Unsupported {
+        tag: String,
+    },
 }
 
 impl NodeKind {
@@ -96,9 +107,9 @@ impl NodeKind {
             NodeKind::Catch(_) => "intermediate catch event",
             NodeKind::Throw(_) => "intermediate throw event",
             NodeKind::Boundary(_) => "boundary event",
-            NodeKind::ServiceTask(_) => "service task",
+            NodeKind::ServiceTask { .. } => "service task",
             NodeKind::UserTask => "user task",
-            NodeKind::ReceiveTask(_) => "receive task",
+            NodeKind::ReceiveTask { .. } => "receive task",
             NodeKind::ExclusiveGateway { .. } => "exclusive gateway",
             NodeKind::ParallelGateway => "parallel gateway",
             NodeKind::EventBasedGateway => "event-based gateway",
@@ -123,18 +134,21 @@ impl NodeKind {
     pub fn is_supported_boundary_host(&self) -> bool {
         matches!(
             self,
-            NodeKind::ServiceTask(_)
+            NodeKind::ServiceTask { .. }
                 | NodeKind::UserTask
-                | NodeKind::ReceiveTask(_)
+                | NodeKind::ReceiveTask { .. }
                 | NodeKind::SubProcess(_)
         )
     }
 }
 
+/// Message events carry only the `messageRef`. Correlation bindings are
+/// registered in code (`map_correlation`, FEEL qualified names) and checked
+/// at deploy — never declared in the XML.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StartTrigger {
     None,
-    Message(MessageBinding),
+    Message(Option<Id>),
     Timer(TimerSpec),
     Unsupported { tag: String },
 }
@@ -143,13 +157,13 @@ pub enum StartTrigger {
 pub enum EndKind {
     None,
     Terminate,
-    Message(MessageBinding),
+    Message(Option<Id>),
     Unsupported { tag: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CatchTrigger {
-    Message(MessageBinding),
+    Message(Option<Id>),
     Timer(TimerSpec),
     Unsupported { tag: String },
 }
@@ -157,7 +171,7 @@ pub enum CatchTrigger {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ThrowKind {
     None,
-    Message(MessageBinding),
+    Message(Option<Id>),
     Unsupported { tag: String },
 }
 
@@ -172,18 +186,9 @@ pub struct BoundaryData {
 pub enum BoundaryTrigger {
     Timer(TimerSpec),
     Error { error_ref: Option<Id> },
-    Message(MessageBinding),
+    Message(Option<Id>),
     None,
     Unsupported { tag: String },
-}
-
-/// How a message start/catch/throw binds to a message and its correlation key.
-/// The correlation key is an rbpmn:correlationKey attribute holding a JSON
-/// pointer into the instance variable document.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MessageBinding {
-    pub message_ref: Option<Id>,
-    pub correlation_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -192,14 +197,6 @@ pub enum TimerSpec {
     Duration(String),
     Cycle(String),
     Missing,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ServiceBinding {
-    /// rbpmn:topic — which work-item topic handlers/workers subscribe to.
-    pub topic: Option<String>,
-    /// Vendor-namespace bindings we detected but ignore (e.g. "camunda:topic").
-    pub foreign: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

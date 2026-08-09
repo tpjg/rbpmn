@@ -1,18 +1,29 @@
-//! The deliberately tiny sequence-flow condition grammar:
+//! Sequence-flow conditions: a **strict subset of FEEL** (DMN 1.3+) with
+//! identical syntax and semantics, so every v1 condition remains a valid,
+//! identically-evaluating FEEL expression when dsntk lands post-v1, and
+//! models authored by FEEL-aware tooling parse as-is.
 //!
 //! ```text
 //! expr    := or
 //! or      := and ("or" and)*
 //! and     := atom ("and" atom)*
-//! atom    := "(" expr ")" | pointer op literal
-//! op      := == | != | < | <= | > | >=
-//! pointer := RFC 6901 JSON pointer, e.g. /order/amount
+//! atom    := "(" expr ")" | name op literal
+//! op      := = | != | < | <= | > | >=     ("==" accepted, normalized to "=")
+//! name    := ident ("." ident)*           (FEEL qualified name)
 //! literal := number | "string" | true | false | null
 //! ```
 //!
-//! No scripting, no FEEL, no functions. Ordering operators require a number
-//! literal. Decisions belong in application code — compute the decision
-//! outside, store the result, let the gateway read a flag.
+//! Nothing else: no functions, no arithmetic, no `in`/ranges, no date
+//! literals — those are rejected with targeted messages. Two deliberate
+//! strictness points beyond FEEL (a strict subset may reject more, it must
+//! never evaluate differently):
+//!   * ordering ops (`<` `<=` `>` `>=`) require a number literal
+//!   * qualified-name segments are `[A-Za-z_][A-Za-z0-9_]*` (no spaces)
+//!
+//! Evaluation semantics (the phase-1 evaluator must implement exactly this):
+//! a name resolves as a path into the instance's JSONB variable document; a
+//! missing path evaluates to null, and any comparison with null is **false**
+//! (FEEL's ternary logic collapsed to the final boolean).
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -44,7 +55,8 @@ pub enum Literal {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
     Cmp {
-        pointer: String,
+        /// FEEL qualified name as path segments: `order.priority` -> ["order", "priority"].
+        path: Vec<String>,
         op: CmpOp,
         value: Literal,
     },
@@ -73,34 +85,8 @@ fn err<T>(offset: usize, message: impl Into<String>) -> Result<T, CondError> {
     })
 }
 
-/// Validate an RFC 6901 JSON pointer as used by conditions and correlation keys.
-/// The empty pointer (whole document) is rejected: keys and conditions must
-/// address a location.
-pub fn validate_pointer(p: &str) -> Result<(), String> {
-    if p.is_empty() {
-        return Err("JSON pointer must not be empty".to_string());
-    }
-    if !p.starts_with('/') {
-        return Err(format!("JSON pointer must start with '/': '{p}'"));
-    }
-    let bytes = p.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'~' {
-            match bytes.get(i + 1) {
-                Some(b'0') | Some(b'1') => i += 2,
-                _ => {
-                    return Err(format!(
-                        "invalid '~' escape in JSON pointer '{p}' (only ~0 and ~1 are allowed)"
-                    ));
-                }
-            }
-        } else {
-            i += 1;
-        }
-    }
-    Ok(())
-}
+const SUBSET_HINT: &str = "not in the rbpmn FEEL subset — compute the value in \
+                           application code and store the result as a variable";
 
 pub fn parse(src: &str) -> Result<Expr, CondError> {
     let toks = lex(src)?;
@@ -123,7 +109,7 @@ enum Tok {
     And,
     Or,
     Op(CmpOp),
-    Ptr(String),
+    Name(Vec<String>),
     Lit(Literal),
 }
 
@@ -166,7 +152,7 @@ impl P {
     fn atom(&mut self) -> Result<Expr, CondError> {
         let Some(&(offset, ref tok)) = self.toks.get(self.pos) else {
             let end = self.toks.last().map(|(o, _)| *o).unwrap_or(0);
-            return err(end, "expected '(' or a JSON pointer, found end of input");
+            return err(end, "expected '(' or a variable name, found end of input");
         };
         match tok.clone() {
             Tok::LParen => {
@@ -178,13 +164,18 @@ impl P {
                 self.pos += 1;
                 Ok(inner)
             }
-            Tok::Ptr(pointer) => {
+            Tok::Name(path) => {
                 self.pos += 1;
-                validate_pointer(&pointer).map_err(|m| CondError { offset, message: m })?;
+                if let Some(&(paren_offset, Tok::LParen)) = self.toks.get(self.pos) {
+                    return err(paren_offset, format!("function calls are {SUBSET_HINT}"));
+                }
                 let Some((op_offset, Tok::Op(op))) = self.toks.get(self.pos).cloned() else {
                     return err(
                         offset,
-                        "expected a comparison operator (==, !=, <, <=, >, >=) after the JSON pointer",
+                        format!(
+                            "expected a comparison operator (=, !=, <, <=, >, >=) after '{}'",
+                            path.join(".")
+                        ),
                     );
                 };
                 self.pos += 1;
@@ -201,11 +192,12 @@ impl P {
                         "ordering comparisons (<, <=, >, >=) require a number literal",
                     );
                 }
-                Ok(Expr::Cmp { pointer, op, value })
+                Ok(Expr::Cmp { path, op, value })
             }
             _ => err(
                 offset,
-                "expected '(' or a JSON pointer (conditions look like: /amount >= 100)",
+                "expected '(' or a variable name (conditions look like: \
+                 amount >= 100 or order.tier = \"gold\")",
             ),
         }
     }
@@ -228,12 +220,13 @@ fn lex(src: &str) -> Result<Vec<(usize, Tok)>, CondError> {
                 i += 1;
             }
             b'=' => {
-                if bytes.get(i + 1) == Some(&b'=') {
-                    toks.push((start, Tok::Op(CmpOp::Eq)));
-                    i += 2;
+                // FEEL equality is '='; '==' is accepted and normalized.
+                i += if bytes.get(i + 1) == Some(&b'=') {
+                    2
                 } else {
-                    return err(start, "single '=' is not an operator; use '=='");
-                }
+                    1
+                };
+                toks.push((start, Tok::Op(CmpOp::Eq)));
             }
             b'!' => {
                 if bytes.get(i + 1) == Some(&b'=') {
@@ -260,6 +253,12 @@ fn lex(src: &str) -> Result<Vec<(usize, Tok)>, CondError> {
                     toks.push((start, Tok::Op(CmpOp::Gt)));
                     i += 1;
                 }
+            }
+            b'+' | b'*' | b'/' | b'%' => {
+                return err(start, format!("arithmetic is {SUBSET_HINT}"));
+            }
+            b'[' | b']' => {
+                return err(start, format!("range tests (in [1..10]) are {SUBSET_HINT}"));
             }
             b'"' => {
                 let mut s = String::new();
@@ -293,29 +292,16 @@ fn lex(src: &str) -> Result<Vec<(usize, Tok)>, CondError> {
                 }
                 toks.push((start, Tok::Lit(Literal::Str(s))));
             }
-            b'/' => {
-                let mut j = i;
-                while j < bytes.len() {
-                    let c = bytes[j] as char;
-                    if c.is_whitespace() || "()<>=!\"".contains(c) {
-                        break;
-                    }
-                    j += 1;
-                }
-                toks.push((start, Tok::Ptr(src[i..j].to_string())));
-                i = j;
-            }
             b'-' | b'0'..=b'9' => {
+                if bytes[i] == b'-' && !bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                    return err(start, format!("arithmetic is {SUBSET_HINT}"));
+                }
                 let mut j = i;
                 if bytes[j] == b'-' {
                     j += 1;
                 }
-                let int_start = j;
                 while j < bytes.len() && bytes[j].is_ascii_digit() {
                     j += 1;
-                }
-                if j == int_start {
-                    return err(start, "'-' must be followed by digits");
                 }
                 if bytes.get(j) == Some(&b'.') {
                     j += 1;
@@ -347,29 +333,32 @@ fn lex(src: &str) -> Result<Vec<(usize, Tok)>, CondError> {
                 toks.push((start, Tok::Lit(Literal::Num(n))));
                 i = j;
             }
-            b if (b as char).is_ascii_alphabetic() => {
-                let mut j = i;
-                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-                    j += 1;
-                }
-                let word = &src[i..j];
-                let tok = match word {
-                    "and" => Tok::And,
-                    "or" => Tok::Or,
-                    "true" => Tok::Lit(Literal::Bool(true)),
-                    "false" => Tok::Lit(Literal::Bool(false)),
-                    "null" => Tok::Lit(Literal::Null),
-                    _ => {
-                        return err(
-                            start,
-                            format!(
-                                "unknown word '{word}' — variables are addressed with JSON pointers (/{word})"
-                            ),
-                        );
+            b if (b as char).is_ascii_alphabetic() || b == b'_' => {
+                let mut segments = vec![read_segment(src, &mut i)];
+                while bytes.get(i) == Some(&b'.') {
+                    let next = bytes.get(i + 1).copied();
+                    if !next.is_some_and(|c| (c as char).is_ascii_alphabetic() || c == b'_') {
+                        return err(i, "expected a name after '.'");
                     }
+                    i += 1;
+                    segments.push(read_segment(src, &mut i));
+                }
+                let tok = if segments.len() == 1 {
+                    match segments[0].as_str() {
+                        "and" => Tok::And,
+                        "or" => Tok::Or,
+                        "true" => Tok::Lit(Literal::Bool(true)),
+                        "false" => Tok::Lit(Literal::Bool(false)),
+                        "null" => Tok::Lit(Literal::Null),
+                        "in" | "between" | "not" | "instance" | "some" | "every" | "if" => {
+                            return err(start, format!("'{}' is {SUBSET_HINT}", segments[0]));
+                        }
+                        _ => Tok::Name(segments),
+                    }
+                } else {
+                    Tok::Name(segments)
                 };
                 toks.push((start, tok));
-                i = j;
             }
             _ => {
                 let ch = src[i..].chars().next().unwrap();
@@ -378,6 +367,15 @@ fn lex(src: &str) -> Result<Vec<(usize, Tok)>, CondError> {
         }
     }
     Ok(toks)
+}
+
+fn read_segment(src: &str, i: &mut usize) -> String {
+    let bytes = src.as_bytes();
+    let start = *i;
+    while *i < bytes.len() && (bytes[*i].is_ascii_alphanumeric() || bytes[*i] == b'_') {
+        *i += 1;
+    }
+    src[start..*i].to_string()
 }
 
 #[cfg(test)]
@@ -398,39 +396,56 @@ mod tests {
     #[test]
     fn simple_comparisons() {
         assert_eq!(
-            ok("/approved == true"),
+            ok("approved = true"),
             Expr::Cmp {
-                pointer: "/approved".into(),
+                path: vec!["approved".into()],
                 op: CmpOp::Eq,
                 value: Literal::Bool(true)
             }
         );
-        ok("/amount >= 100");
-        ok("/amount < -1.5e3");
-        ok("/status != \"open\"");
-        ok("/parent/child~0x == null");
+        // '==' is accepted on input and normalized to FEEL's '='.
+        assert_eq!(ok("approved == true"), ok("approved = true"));
+        ok("amount >= 100");
+        ok("amount < -1.5e3");
+        ok("status != \"open\"");
+        ok("status = null");
+    }
+
+    #[test]
+    fn qualified_names() {
+        assert_eq!(
+            ok("order.priority = \"high\""),
+            Expr::Cmp {
+                path: vec!["order".into(), "priority".into()],
+                op: CmpOp::Eq,
+                value: Literal::Str("high".into())
+            }
+        );
+        ok("a.b.c_2 > 0");
+        bad("a. = 1");
+        bad("a.1 = 1");
     }
 
     #[test]
     fn boolean_combinations() {
-        ok("/a == 1 and /b == 2");
-        ok("/a == 1 or /b == 2 and /c == 3");
-        ok("(/a == 1 or /b == 2) and /c == 3");
+        ok("a = 1 and b = 2");
+        ok("a = 1 or b = 2 and c = 3");
+        ok("(a = 1 or b = 2) and c = 3");
         assert_eq!(
-            ok("/a == 1 and /b == 2 and /c == 3"),
+            ok("a = 1 and b = 2 and c = 3"),
             Expr::And(vec![
                 Expr::Cmp {
-                    pointer: "/a".into(),
+                    path: vec!["a".into()],
                     op: CmpOp::Eq,
                     value: Literal::Num(1.0)
                 },
                 Expr::Cmp {
-                    pointer: "/b".into(),
+                    path: vec!["b".into()],
                     op: CmpOp::Eq,
                     value: Literal::Num(2.0)
                 },
                 Expr::Cmp {
-                    pointer: "/c".into(),
+                    path: vec!["c".into()],
                     op: CmpOp::Eq,
                     value: Literal::Num(3.0)
                 },
@@ -439,16 +454,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_scripting_and_sloppiness() {
+    fn full_feel_constructs_are_rejected() {
+        assert!(bad("sum(items) > 3").message.contains("function calls"));
+        assert!(bad("amount + fee > 100").message.contains("arithmetic"));
+        assert!(bad("amount in [1..100]").message.contains("'in'"));
+        assert!(bad("x between 1 and 3").message.contains("'between'"));
+        assert!(bad("not approved").message.contains("'not'"));
+        assert!(bad("if a then b else c").message.contains("'if'"));
+        assert!(bad("amount - fee > 0").message.contains("arithmetic"));
+    }
+
+    #[test]
+    fn rejects_sloppiness() {
         bad("");
-        bad("amount > 100");
-        bad("/a = 1");
-        bad("/a && /b");
-        bad("/amount > \"high\"");
-        bad("/a == 1 extra");
+        bad("/approved == true");
+        bad("amount > \"high\"");
+        bad("a = 1 extra");
         bad("${amount > 100}");
-        bad("/a == ");
-        bad("(/a == 1");
-        bad("/a~2b == 1");
+        bad("a = ");
+        bad("(a = 1");
+        bad("a && b");
     }
 }
