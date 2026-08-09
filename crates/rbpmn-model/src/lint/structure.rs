@@ -256,19 +256,7 @@ pub fn check(g: &Graph, owner: &str, out: &mut Vec<Diagnostic>) {
     // Connectivity. Skipped when there is no start (mass noise) — the
     // single-start-event error already tells the modeler what to fix.
     if !starts.is_empty() {
-        let mut reachable = vec![false; g.scope.nodes.len()];
-        let mut queue: Vec<usize> = starts.clone();
-        for &s in &starts {
-            reachable[s] = true;
-        }
-        while let Some(v) = queue.pop() {
-            for s in g.succs(v) {
-                if !reachable[s] {
-                    reachable[s] = true;
-                    queue.push(s);
-                }
-            }
-        }
+        let reachable = reach(g.scope.nodes.len(), &starts, |v| g.succs(v));
         for (i, &reached) in reachable.iter().enumerate() {
             // Nodes with zero incoming flows already got a cardinality error.
             if !reached
@@ -291,19 +279,7 @@ pub fn check(g: &Graph, owner: &str, out: &mut Vec<Diagnostic>) {
             "scope has no end event",
         ));
     } else {
-        let mut reaches_end = vec![false; g.scope.nodes.len()];
-        let mut queue: Vec<usize> = ends.clone();
-        for &e in &ends {
-            reaches_end[e] = true;
-        }
-        while let Some(v) = queue.pop() {
-            for p in g.preds(v) {
-                if !reaches_end[p] {
-                    reaches_end[p] = true;
-                    queue.push(p);
-                }
-            }
-        }
+        let reaches_end = reach(g.scope.nodes.len(), &ends, |v| g.preds(v));
         for (i, &reaches) in reaches_end.iter().enumerate() {
             // Dead ends (zero outgoing) already got a cardinality error.
             if !reaches
@@ -318,6 +294,26 @@ pub fn check(g: &Graph, owner: &str, out: &mut Vec<Diagnostic>) {
             }
         }
     }
+}
+
+/// Set of nodes reachable from `seeds` under `neighbors` (mark-before-push,
+/// seeds pre-marked). Shared by forward and backward connectivity so the two
+/// checks can never disagree about traversal semantics.
+fn reach(n: usize, seeds: &[usize], neighbors: impl Fn(usize) -> Vec<usize>) -> Vec<bool> {
+    let mut visited = vec![false; n];
+    let mut queue: Vec<usize> = seeds.to_vec();
+    for &s in seeds {
+        visited[s] = true;
+    }
+    while let Some(v) = queue.pop() {
+        for w in neighbors(v) {
+            if !visited[w] {
+                visited[w] = true;
+                queue.push(w);
+            }
+        }
+    }
+    visited
 }
 
 fn implicit_split(node: &FlowNode) -> Diagnostic {

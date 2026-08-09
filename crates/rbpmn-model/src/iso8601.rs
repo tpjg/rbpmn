@@ -100,7 +100,10 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
     }
 
     // Scans digits with an optional fraction; whether a fraction is legal
-    // depends on the unit that follows, so the caller checks that.
+    // depends on the unit that follows, so the caller checks that. Component
+    // magnitude is capped so a syntactically-valid duration can never overflow
+    // the engine's later conversion to an actual deadline — lint must catch at
+    // deploy what would fail at runtime.
     let number = |i: &mut usize| -> Result<Option<bool>, String> {
         let start = *i;
         while *i < b.len() && b[*i].is_ascii_digit() {
@@ -108,6 +111,9 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
         }
         if *i == start {
             return Ok(None);
+        }
+        if *i - start > MAX_COMPONENT_DIGITS {
+            return Err(component_too_large(s));
         }
         let mut has_fraction = false;
         if *i < b.len() && b[*i] == b'.' {
@@ -118,6 +124,9 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
             }
             if *i == frac_start {
                 return Err(format!("digits required after '.' in '{s}'"));
+            }
+            if *i - frac_start > MAX_COMPONENT_DIGITS {
+                return Err(component_too_large(s));
             }
             has_fraction = true;
         }
@@ -130,6 +139,9 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
         j += 1;
     }
     if j > 1 && b.get(j) == Some(&b'W') {
+        if j - 1 > MAX_COMPONENT_DIGITS {
+            return Err(component_too_large(s));
+        }
         return if j + 1 == b.len() {
             Ok(())
         } else {
@@ -189,6 +201,14 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
         return Err(format!("unexpected characters in duration: '{s}'"));
     }
     Ok(())
+}
+
+/// 9 digits keeps every component comfortably inside i64/u64 second math
+/// (999,999,999 days ≈ 2.7M years) while rejecting absurd inputs at lint time.
+const MAX_COMPONENT_DIGITS: usize = 9;
+
+fn component_too_large(s: &str) -> String {
+    format!("duration component too large (max {MAX_COMPONENT_DIGITS} digits): '{s}'")
 }
 
 fn month_days(year: u32, month: u32) -> u32 {
@@ -262,5 +282,14 @@ mod tests {
         ] {
             assert!(validate_duration(s).is_err(), "{s} should be rejected");
         }
+    }
+
+    #[test]
+    fn duration_magnitude_is_bounded() {
+        assert!(validate_duration("P999999999D").is_ok());
+        assert!(validate_duration("P9999999999D").is_err());
+        assert!(validate_duration("PT9999999999H").is_err());
+        assert!(validate_duration("P9999999999W").is_err());
+        assert!(validate_duration("PT1.9999999999S").is_err());
     }
 }

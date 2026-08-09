@@ -5,8 +5,12 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "test-token-0123456789abcdef-0123456789abcdef";
 
+// The lint corpus is the single source of truth for BPMN test inputs.
+const INCLUSIVE_XML: &str =
+    include_str!("../../rbpmn-model/tests/fixtures/reject/inclusive-gateway.bpmn");
+
 fn test_app() -> axum::Router {
-    app(Tokens::parse([TOKEN]).unwrap())
+    app(Tokens::from_list([TOKEN]).unwrap())
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -16,20 +20,8 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-const INCLUSIVE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                  id="defs" targetNamespace="urn:test">
-  <bpmn:process id="p" isExecutable="true">
-    <bpmn:startEvent id="start"/>
-    <bpmn:inclusiveGateway id="ig"/>
-    <bpmn:endEvent id="end"/>
-    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ig"/>
-    <bpmn:sequenceFlow id="f2" sourceRef="ig" targetRef="end"/>
-  </bpmn:process>
-</bpmn:definitions>"#;
-
 #[tokio::test]
-async fn healthz_is_public() {
+async fn healthz_is_public_and_static() {
     let resp = test_app()
         .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
         .await
@@ -37,6 +29,10 @@ async fn healthz_is_public() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["status"], "ok");
+    assert!(
+        json.get("version").is_none(),
+        "healthz must not disclose the version to unauthenticated callers"
+    );
 }
 
 #[tokio::test]
@@ -57,6 +53,32 @@ async fn v1_requires_bearer_token() {
 }
 
 #[tokio::test]
+async fn unknown_v1_paths_cannot_be_probed_without_auth() {
+    // Uniform 401: unauthenticated callers cannot distinguish existing
+    // routes from non-existent ones.
+    let resp = test_app()
+        .oneshot(
+            Request::post("/v1/definitely/not/a/route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = test_app()
+        .oneshot(
+            Request::post("/v1/definitely/not/a/route")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn wrong_token_is_rejected() {
     let resp = test_app()
         .oneshot(
@@ -71,6 +93,20 @@ async fn wrong_token_is_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn lowercase_bearer_scheme_is_accepted() {
+    let resp = test_app()
+        .oneshot(
+            Request::post("/v1/definitions/lint")
+                .header(header::AUTHORIZATION, format!("bearer {TOKEN}"))
+                .body(Body::from(INCLUSIVE_XML))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]

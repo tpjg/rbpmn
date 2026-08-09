@@ -44,9 +44,14 @@ deliberately not the default posture.
 - 30 s request timeout (408 on expiry).
 - `Authorization` is marked sensitive so tracing/logging never records it.
 - `x-request-id` is generated (UUID) and propagated for audit correlation.
-- Errors return generic JSON (`{"error": "..."}`) — no stack traces, no
-  internal paths. Lint diagnostics are data, not error leakage: they describe
-  the caller's own document.
+- Application-level errors return generic JSON (`{"error": "..."}`) — no stack
+  traces, no internal paths. Framework-enforced limits (413 body too large,
+  408 timeout, 400 invalid UTF-8) return plain-text or empty bodies: clients
+  must switch on status code, never on body shape. Lint diagnostics are data,
+  not error leakage: they describe the caller's own document.
+- Unauthenticated `/healthz` returns a static status only — no version, no
+  build info. Everything under `/v1` — including unknown paths — answers 401
+  before 404, so anonymous callers cannot probe which routes exist.
 
 ## Controls (committed for later phases)
 
