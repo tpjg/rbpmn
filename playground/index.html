@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>rbpmn linter playground</title>
+  </head>
+  <body>
+    <header id="topbar">
+      <h1>rbpmn <span>linter playground</span></h1>
+      <p id="tagline">exactly the diagnostics deploy would produce — same rules, same WASM</p>
+    </header>
+    <main id="layout">
+      <aside id="fixtures">
+        <h2>Fixtures</h2>
+        <div id="fixture-list"></div>
+      </aside>
+      <section id="canvas-wrap">
+        <div id="canvas"></div>
+        <div id="canvas-note" hidden></div>
+      </section>
+      <aside id="side">
+        <section id="diagnostics">
+          <h2>Diagnostics <span id="verdict"></span></h2>
+          <ul id="diagnostic-list"></ul>
+        </section>
+        <section id="editor-wrap">
+          <h2>BPMN XML <span id="editor-hint">edits re-lint live</span></h2>
+          <textarea id="editor" spellcheck="false"></textarea>
+        </section>
+      </aside>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

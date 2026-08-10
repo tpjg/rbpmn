@@ -1,3 +1,8 @@
 /target
 **/*.rs.bk
 .DS_Store
+node_modules/
+playground/dist/
+playground/src/wasm/
+playground/src/fixtures.generated.js
+bpmnlint-plugin-rbpmn/wasm/

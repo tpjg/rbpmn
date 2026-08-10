@@ -3,20 +3,85 @@
   error no-inclusive-gateway @ is
   error no-inclusive-gateway @ ij
 -->
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
   <bpmn:process id="p" isExecutable="true">
-    <bpmn:startEvent id="start"/>
-    <bpmn:inclusiveGateway id="is"/>
-    <bpmn:userTask id="ta" name="A"/>
-    <bpmn:userTask id="tb" name="B"/>
-    <bpmn:inclusiveGateway id="ij"/>
-    <bpmn:endEvent id="end"/>
-    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="is"/>
-    <bpmn:sequenceFlow id="f2" sourceRef="is" targetRef="ta"/>
-    <bpmn:sequenceFlow id="f3" sourceRef="is" targetRef="tb"/>
-    <bpmn:sequenceFlow id="f4" sourceRef="ta" targetRef="ij"/>
-    <bpmn:sequenceFlow id="f5" sourceRef="tb" targetRef="ij"/>
-    <bpmn:sequenceFlow id="f6" sourceRef="ij" targetRef="end"/>
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:inclusiveGateway id="is">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:inclusiveGateway>
+    <bpmn:userTask id="ta" name="A">
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="tb" name="B">
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f5</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:inclusiveGateway id="ij">
+      <bpmn:incoming>f4</bpmn:incoming>
+      <bpmn:incoming>f5</bpmn:incoming>
+      <bpmn:outgoing>f6</bpmn:outgoing>
+    </bpmn:inclusiveGateway>
+    <bpmn:endEvent id="end">
+      <bpmn:incoming>f6</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="is" />
+    <bpmn:sequenceFlow id="f2" sourceRef="is" targetRef="ta" />
+    <bpmn:sequenceFlow id="f3" sourceRef="is" targetRef="tb" />
+    <bpmn:sequenceFlow id="f4" sourceRef="ta" targetRef="ij" />
+    <bpmn:sequenceFlow id="f5" sourceRef="tb" targetRef="ij" />
+    <bpmn:sequenceFlow id="f6" sourceRef="ij" targetRef="end" />
   </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_p">
+    <bpmndi:BPMNPlane id="BPMNPlane_p" bpmnElement="p">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="is_di" bpmnElement="is">
+        <dc:Bounds x="200" y="45" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ta_di" bpmnElement="ta">
+        <dc:Bounds x="325" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ij_di" bpmnElement="ij">
+        <dc:Bounds x="500" y="45" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+        <dc:Bounds x="657" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="tb_di" bpmnElement="tb">
+        <dc:Bounds x="325" y="170" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="200" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="250" y="70" />
+        <di:waypoint x="325" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
+        <di:waypoint x="225" y="95" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="325" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4">
+        <di:waypoint x="425" y="70" />
+        <di:waypoint x="500" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f6_di" bpmnElement="f6">
+        <di:waypoint x="550" y="70" />
+        <di:waypoint x="657" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f5_di" bpmnElement="f5">
+        <di:waypoint x="425" y="210" />
+        <di:waypoint x="525" y="210" />
+        <di:waypoint x="525" y="95" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
 </bpmn:definitions>

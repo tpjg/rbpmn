@@ -1,0 +1,14 @@
+[package]
+name = "rbpmn-wasm"
+description = "WASM bindings for rbpmn-model: the exact deploy-time linter, callable from the playground and the bpmnlint plugin."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rbpmn-model = { path = "../rbpmn-model" }
+wasm-bindgen = "0.2"
+serde_json.workspace = true

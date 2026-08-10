@@ -24,6 +24,13 @@ inclusive gateway, block structure, messages-only interaction, build order).
 - `cargo test` — everything including the fixture corpus.
 - `just lint` — clippy `-D warnings` + fmt check (keep it at zero warnings).
 - `just serve` — run the HTTP server with a throwaway token.
+- `just playground` — linter playground (builds WASM, needs node + wasm-pack).
+- `just parity` — MUST stay green: byte-parity of native Rust vs WASM lint
+  output over the corpus, plus the bpmnlint plugin's pipeline test.
+- `just fixtures-di` — fixtures carry baked-in BPMN DI so they render
+  everywhere; new fixtures without a `bpmndi:BPMNDiagram` section get theirs
+  from this (idempotent; two reject fixtures have hand-written DI — see the
+  comments in them).
 
 ## Conventions
 

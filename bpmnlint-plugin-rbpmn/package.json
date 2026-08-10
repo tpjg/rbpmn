@@ -1,0 +1,23 @@
+{
+  "name": "bpmnlint-plugin-rbpmn",
+  "version": "0.1.0",
+  "description": "rbpmn's deploy-time rules for bpmnlint — backed by the engine's own linter compiled to WASM, so modelers see exactly the diagnostics deploy will produce.",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "lib/",
+    "rules/",
+    "wasm/"
+  ],
+  "scripts": {
+    "test": "node test/plugin.test.mjs"
+  },
+  "dependencies": {
+    "bpmn-moddle": "^10.1.0",
+    "moddle-xml": "^12.1.0"
+  },
+  "devDependencies": {
+    "bpmnlint": "^11.12.1"
+  }
+}

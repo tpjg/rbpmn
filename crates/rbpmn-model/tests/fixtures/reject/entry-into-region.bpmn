@@ -2,27 +2,108 @@
 <!-- expect-diagnostics:
   error balanced-gateways @ f_in
 -->
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
-  <!-- A token sneaking into a parallel branch from outside the block breaks
-       local token counting at the join. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
   <bpmn:process id="p" isExecutable="true">
-    <bpmn:startEvent id="start"/>
-    <bpmn:exclusiveGateway id="x0" default="f_norm"/>
-    <bpmn:parallelGateway id="ps"/>
-    <bpmn:userTask id="ta" name="A"/>
-    <bpmn:userTask id="tb" name="B"/>
-    <bpmn:parallelGateway id="pj"/>
-    <bpmn:endEvent id="end"/>
-    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="x0"/>
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:exclusiveGateway id="x0" default="f_norm">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f_in</bpmn:outgoing>
+      <bpmn:outgoing>f_norm</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:parallelGateway id="ps">
+      <bpmn:incoming>f_norm</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:userTask id="ta" name="A">
+      <bpmn:incoming>f_in</bpmn:incoming>
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="tb" name="B">
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f5</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:parallelGateway id="pj">
+      <bpmn:incoming>f4</bpmn:incoming>
+      <bpmn:incoming>f5</bpmn:incoming>
+      <bpmn:outgoing>f6</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:endEvent id="end">
+      <bpmn:incoming>f6</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="x0" />
     <bpmn:sequenceFlow id="f_in" sourceRef="x0" targetRef="ta">
       <bpmn:conditionExpression>rush = true</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
-    <bpmn:sequenceFlow id="f_norm" sourceRef="x0" targetRef="ps"/>
-    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="ta"/>
-    <bpmn:sequenceFlow id="f3" sourceRef="ps" targetRef="tb"/>
-    <bpmn:sequenceFlow id="f4" sourceRef="ta" targetRef="pj"/>
-    <bpmn:sequenceFlow id="f5" sourceRef="tb" targetRef="pj"/>
-    <bpmn:sequenceFlow id="f6" sourceRef="pj" targetRef="end"/>
+    <bpmn:sequenceFlow id="f_norm" sourceRef="x0" targetRef="ps" />
+    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="ta" />
+    <bpmn:sequenceFlow id="f3" sourceRef="ps" targetRef="tb" />
+    <bpmn:sequenceFlow id="f4" sourceRef="ta" targetRef="pj" />
+    <bpmn:sequenceFlow id="f5" sourceRef="tb" targetRef="pj" />
+    <bpmn:sequenceFlow id="f6" sourceRef="pj" targetRef="end" />
   </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_p">
+    <bpmndi:BPMNPlane id="BPMNPlane_p" bpmnElement="p">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="x0_di" bpmnElement="x0" isMarkerVisible="true">
+        <dc:Bounds x="200" y="45" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ta_di" bpmnElement="ta">
+        <dc:Bounds x="475" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="pj_di" bpmnElement="pj">
+        <dc:Bounds x="950" y="45" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+        <dc:Bounds x="1107" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ps_di" bpmnElement="ps">
+        <dc:Bounds x="650" y="185" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="tb_di" bpmnElement="tb">
+        <dc:Bounds x="775" y="170" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="200" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_in_di" bpmnElement="f_in">
+        <di:waypoint x="250" y="70" />
+        <di:waypoint x="475" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_norm_di" bpmnElement="f_norm">
+        <di:waypoint x="225" y="95" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="650" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4">
+        <di:waypoint x="575" y="70" />
+        <di:waypoint x="950" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f6_di" bpmnElement="f6">
+        <di:waypoint x="1000" y="70" />
+        <di:waypoint x="1107" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="675" y="235" />
+        <di:waypoint x="675" y="280" />
+        <di:waypoint x="525" y="280" />
+        <di:waypoint x="525" y="110" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
+        <di:waypoint x="700" y="210" />
+        <di:waypoint x="775" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f5_di" bpmnElement="f5">
+        <di:waypoint x="875" y="210" />
+        <di:waypoint x="975" y="210" />
+        <di:waypoint x="975" y="95" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
 </bpmn:definitions>

@@ -21,8 +21,12 @@ const VENDOR_NS: &[(&str, &str)] = &[
 ];
 
 /// Non-executable content we silently ignore inside a flow scope (diagram-only
-/// or spec baggage per the design brief).
+/// or spec baggage per the design brief). `incoming`/`outgoing` appear here
+/// because a subProcess is both a flow node (carrying them as children) and a
+/// scope container — connectivity is derived from sequence flows instead.
 const IGNORED_SCOPE_CHILDREN: &[&str] = &[
+    "incoming",
+    "outgoing",
     "documentation",
     "extensionElements",
     "laneSet",

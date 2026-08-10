@@ -1,0 +1,236 @@
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  color: #1a1a2e;
+  background: #fafafa;
+}
+#topbar {
+  padding: 10px 16px;
+  border-bottom: 1px solid #ddd;
+  background: #fff;
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+}
+#topbar h1 {
+  margin: 0;
+  font-size: 18px;
+}
+#topbar h1 span {
+  font-weight: 400;
+  color: #666;
+}
+#tagline {
+  margin: 0;
+  font-size: 12px;
+  color: #999;
+}
+#layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 230px 1fr 380px;
+  min-height: 0;
+}
+#fixtures {
+  border-right: 1px solid #ddd;
+  overflow-y: auto;
+  background: #fff;
+  padding: 8px;
+}
+#fixtures h2,
+#side h2 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #888;
+  margin: 8px 4px 6px;
+}
+.fixture-group {
+  margin-bottom: 4px;
+}
+.fixture-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: none;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
+  cursor: pointer;
+  border-radius: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fixture-item:hover {
+  background: #f0f0f5;
+}
+.fixture-item.active {
+  background: #e6e9f8;
+  font-weight: 600;
+}
+.fixture-item .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+.dot-accept {
+  background: #2da44e;
+}
+.dot-reject {
+  background: #cf222e;
+}
+#canvas-wrap {
+  position: relative;
+  min-width: 0;
+}
+#canvas {
+  position: absolute;
+  inset: 0;
+}
+#canvas-note {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  background: #fff8e6;
+  border: 1px solid #e0c060;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  max-width: 70%;
+}
+#side {
+  border-left: 1px solid #ddd;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #fff;
+}
+#diagnostics {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+  min-height: 120px;
+}
+#verdict {
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+}
+#verdict.ok {
+  color: #2da44e;
+}
+#verdict.rejected {
+  color: #cf222e;
+}
+#diagnostic-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+#diagnostic-list li {
+  padding: 6px 8px;
+  border-radius: 6px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  border-left: 3px solid transparent;
+  background: #f6f8fa;
+}
+#diagnostic-list li:hover {
+  background: #eef1f5;
+}
+#diagnostic-list li.severity-error {
+  border-left-color: #cf222e;
+}
+#diagnostic-list li.severity-warn {
+  border-left-color: #d4a72c;
+}
+#diagnostic-list .rule {
+  font-family: ui-monospace, monospace;
+  font-weight: 600;
+}
+#diagnostic-list .element {
+  font-family: ui-monospace, monospace;
+  color: #555;
+}
+#diagnostic-list .message {
+  margin-top: 2px;
+  color: #444;
+}
+#diagnostic-list .none {
+  color: #2da44e;
+  background: none;
+  cursor: default;
+}
+#editor-wrap {
+  border-top: 1px solid #ddd;
+  display: flex;
+  flex-direction: column;
+  height: 40%;
+  min-height: 140px;
+}
+#editor-hint {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+#editor {
+  flex: 1;
+  width: 100%;
+  border: 0;
+  resize: none;
+  padding: 8px;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  outline: none;
+  background: #fcfcfd;
+}
+
+/* Annotation layer: kind -> marker/badge classes (generic, open set). */
+.rbpmn-badge {
+  min-width: 18px;
+  height: 18px;
+  border-radius: 9px;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 5px;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.35);
+}
+.rbpmn-badge-error {
+  background: #cf222e;
+}
+.rbpmn-badge-warn {
+  background: #d4a72c;
+}
+.rbpmn-mark-error:not(.djs-connection) .djs-visual > :nth-child(1) {
+  stroke: #cf222e !important;
+  stroke-width: 2px !important;
+}
+.rbpmn-mark-error.djs-connection .djs-visual > path {
+  stroke: #cf222e !important;
+}
+.rbpmn-mark-warn:not(.djs-connection) .djs-visual > :nth-child(1) {
+  stroke: #d4a72c !important;
+  stroke-width: 2px !important;
+}
+.rbpmn-mark-warn.djs-connection .djs-visual > path {
+  stroke: #d4a72c !important;
+}
+.rbpmn-mark-selected .djs-visual > :nth-child(1) {
+  stroke: #316dca !important;
+  stroke-width: 3px !important;
+}

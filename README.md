@@ -11,10 +11,13 @@ Read it before touching the semantics.
 
 ## Workspace
 
-| Crate | Purpose |
+| Crate / package | Purpose |
 |---|---|
 | `crates/rbpmn-model` | BPMN XML → internal model + the linter. Dependency-light (no IO, no async, no DB) so it compiles to WASM for the linter playground and the bpmnlint plugin. |
+| `crates/rbpmn-wasm` | Thin wasm-bindgen surface over rbpmn-model: `lint(xml) -> JSON`, `catalogue()`. |
 | `crates/rbpmn-server` | Small standalone HTTP server wrapping the engine. Bearer-token auth, loopback-only by default. See [docs/http-security.md](docs/http-security.md). |
+| `playground/` | Local linter playground (bpmn-js + WASM): fixture browser, live re-lint, diagnostics as diagram overlays. `just playground`. |
+| `bpmnlint-plugin-rbpmn/` | bpmnlint plugin backed by the same WASM — rbpmn's rules inside bpmn-io tooling, zero JS reimplementation. |
 
 Planned (per the design brief's build order): `rbpmn-core` (pure semantic
 `step` function, phase 1), the PostgreSQL projection + `Engine` API (phase 2),
@@ -25,7 +28,8 @@ timers/messages (phase 3), the task API (phase 4).
 - [x] **Phase 0 — Parse & reject**: parser, full linter rule catalogue,
       fixture corpus (16 accept / 31 reject), corpus runner.
 - [x] Server skeleton with the security spine and `POST /v1/definitions/lint`.
-- [ ] Phase 0-B — linter playground (WASM) + bpmnlint plugin.
+- [x] **Phase 0-B — linter playground (WASM) + bpmnlint plugin**, with a
+      byte-parity check between native Rust and WASM over the whole corpus.
 - [ ] Phase 1 — pure semantic core (tokens, scopes, `step`).
 - [ ] Phase 2 — PostgreSQL projection, `Engine` builder, work items.
 - [ ] Phase 3 — timers & messages. Phase 4 — task API. Phase 5 — rounding out.
@@ -88,12 +92,38 @@ One runner (`tests/fixtures.rs`) executes the corpus and compares exact
 (severity, rule, element) sets. Start every phase by writing its fixtures
 first.
 
+## Playground & bpmnlint plugin
+
+`just playground` opens a local page (no server-side component) with the whole
+fixture corpus: accepted fixtures render clean, rejected ones show the rule
+that kills them as badges on the offending elements, with a clickable
+diagnostics panel. Editing the XML re-lints live through the **same WASM
+build of `rbpmn-model` that deploy uses** — no JS reimplementation of any
+rule. Hand-typed models without DI get an automatic layout, making the
+playground the fastest way to author new fixtures (`just fixtures-di` bakes
+the layout in).
+
+`just parity` is the guarantee the playground never lies: it lints every
+fixture through native Rust and through the WASM build and requires
+byte-identical output, then runs the corpus through bpmnlint's own pipeline
+via `bpmnlint-plugin-rbpmn`. One documented blind spot: bpmn-moddle silently
+repairs duplicate ids, so `rbpmn/bpmn-structure` cannot flag them inside
+moddle-based tooling — deploy (raw XML) remains the authority.
+
+To use the rules in your own bpmn-io tooling:
+
+```json
+{ "extends": ["bpmnlint:recommended", "plugin:rbpmn/recommended"] }
+```
+
 ## Developing
 
 ```sh
 cargo test            # everything, including the fixture corpus
 just lint             # clippy -D warnings + fmt --check
 just serve            # run the HTTP server with a throwaway token
+just playground       # linter playground (builds WASM first)
+just parity           # Rust-vs-WASM byte parity + bpmnlint plugin test
 ```
 
 ## HTTP server (optional)

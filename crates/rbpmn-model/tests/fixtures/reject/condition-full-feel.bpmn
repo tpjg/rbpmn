@@ -4,23 +4,47 @@
   error conditions-feel-subset @ f_arith
   error conditions-feel-subset @ f_range
 -->
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                  id="defs" targetNamespace="https://rbpmn.dev/fixtures">
-  <!-- Valid FEEL, but outside the strict rbpmn subset: function calls,
-       arithmetic and range tests are rejected at deploy. Compute the value in
-       application code, store it as a variable, compare the flag. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
   <bpmn:process id="p" isExecutable="true">
-    <bpmn:startEvent id="start"/>
-    <bpmn:exclusiveGateway id="xs" default="f_def"/>
-    <bpmn:userTask id="ta" name="A"/>
-    <bpmn:userTask id="tb" name="B"/>
-    <bpmn:userTask id="tc" name="C"/>
-    <bpmn:userTask id="td" name="D"/>
-    <bpmn:endEvent id="e_a"/>
-    <bpmn:endEvent id="e_b"/>
-    <bpmn:endEvent id="e_c"/>
-    <bpmn:endEvent id="e_d"/>
-    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="xs"/>
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:exclusiveGateway id="xs" default="f_def">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f_fn</bpmn:outgoing>
+      <bpmn:outgoing>f_arith</bpmn:outgoing>
+      <bpmn:outgoing>f_range</bpmn:outgoing>
+      <bpmn:outgoing>f_def</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:userTask id="ta" name="A">
+      <bpmn:incoming>f_fn</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="tb" name="B">
+      <bpmn:incoming>f_arith</bpmn:incoming>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="tc" name="C">
+      <bpmn:incoming>f_range</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="td" name="D">
+      <bpmn:incoming>f_def</bpmn:incoming>
+      <bpmn:outgoing>f5</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:endEvent id="e_a">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="e_b">
+      <bpmn:incoming>f3</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="e_c">
+      <bpmn:incoming>f4</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="e_d">
+      <bpmn:incoming>f5</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="xs" />
     <bpmn:sequenceFlow id="f_fn" sourceRef="xs" targetRef="ta">
       <bpmn:conditionExpression>sum(items) &gt; 3</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
@@ -30,10 +54,83 @@
     <bpmn:sequenceFlow id="f_range" sourceRef="xs" targetRef="tc">
       <bpmn:conditionExpression>amount in [1..100]</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
-    <bpmn:sequenceFlow id="f_def" sourceRef="xs" targetRef="td"/>
-    <bpmn:sequenceFlow id="f2" sourceRef="ta" targetRef="e_a"/>
-    <bpmn:sequenceFlow id="f3" sourceRef="tb" targetRef="e_b"/>
-    <bpmn:sequenceFlow id="f4" sourceRef="tc" targetRef="e_c"/>
-    <bpmn:sequenceFlow id="f5" sourceRef="td" targetRef="e_d"/>
+    <bpmn:sequenceFlow id="f_def" sourceRef="xs" targetRef="td" />
+    <bpmn:sequenceFlow id="f2" sourceRef="ta" targetRef="e_a" />
+    <bpmn:sequenceFlow id="f3" sourceRef="tb" targetRef="e_b" />
+    <bpmn:sequenceFlow id="f4" sourceRef="tc" targetRef="e_c" />
+    <bpmn:sequenceFlow id="f5" sourceRef="td" targetRef="e_d" />
   </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_p">
+    <bpmndi:BPMNPlane id="BPMNPlane_p" bpmnElement="p">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="xs_di" bpmnElement="xs" isMarkerVisible="true">
+        <dc:Bounds x="200" y="45" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ta_di" bpmnElement="ta">
+        <dc:Bounds x="325" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="e_a_di" bpmnElement="e_a">
+        <dc:Bounds x="507" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="tb_di" bpmnElement="tb">
+        <dc:Bounds x="325" y="170" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="e_b_di" bpmnElement="e_b">
+        <dc:Bounds x="507" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="tc_di" bpmnElement="tc">
+        <dc:Bounds x="325" y="310" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="e_c_di" bpmnElement="e_c">
+        <dc:Bounds x="507" y="332" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="td_di" bpmnElement="td">
+        <dc:Bounds x="325" y="450" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="e_d_di" bpmnElement="e_d">
+        <dc:Bounds x="507" y="472" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="200" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_fn_di" bpmnElement="f_fn">
+        <di:waypoint x="250" y="70" />
+        <di:waypoint x="325" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_arith_di" bpmnElement="f_arith">
+        <di:waypoint x="225" y="95" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="325" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_range_di" bpmnElement="f_range">
+        <di:waypoint x="225" y="95" />
+        <di:waypoint x="225" y="350" />
+        <di:waypoint x="325" y="350" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_def_di" bpmnElement="f_def">
+        <di:waypoint x="225" y="95" />
+        <di:waypoint x="225" y="490" />
+        <di:waypoint x="325" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="425" y="70" />
+        <di:waypoint x="507" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
+        <di:waypoint x="425" y="210" />
+        <di:waypoint x="507" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4">
+        <di:waypoint x="425" y="350" />
+        <di:waypoint x="507" y="350" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f5_di" bpmnElement="f5">
+        <di:waypoint x="425" y="490" />
+        <di:waypoint x="507" y="490" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
 </bpmn:definitions>
