@@ -87,6 +87,7 @@ pub fn step(
 
             let mut adv = Advancer::new(proc);
             adv.events.push(Event::WorkItemCompleted {
+                id,
                 element: proc.node_id(element).to_string(),
             });
             if patch != Value::Object(serde_json::Map::new()) {
@@ -162,6 +163,7 @@ impl<'a> Advancer<'a> {
                     },
                 );
                 self.events.push(Event::WorkItemCreated {
+                    id: item,
                     element: node.id.clone(),
                     work_kind: *kind,
                     topic: topic.clone(),
@@ -230,6 +232,7 @@ impl<'a> Advancer<'a> {
                     let item = state.work_items.get_mut(&id).unwrap();
                     item.open = false;
                     self.events.push(Event::WorkItemCancelled {
+                        id,
                         element: self.proc.node_id(item.element).to_string(),
                     });
                 }

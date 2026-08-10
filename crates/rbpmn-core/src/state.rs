@@ -100,6 +100,37 @@ impl InstanceState {
         id
     }
 
+    /// Rebuild a quiescent state from projected rows (the Postgres layer's
+    /// loader). Rows are the runtime truth; this is the inverse of writing
+    /// them. Only *open* work items need to be supplied — closed ones are
+    /// answered from rows before the core is ever invoked.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rehydrate(
+        status: InstanceStatus,
+        variables: Value,
+        tokens: impl IntoIterator<Item = (TokenId, Token)>,
+        work_items: impl IntoIterator<Item = (WorkItemId, WorkItemState)>,
+        next_token: u64,
+        next_work_item: u64,
+    ) -> Self {
+        InstanceState {
+            status,
+            variables,
+            tokens: tokens.into_iter().collect(),
+            work_items: work_items.into_iter().collect(),
+            next_token,
+            next_work_item,
+        }
+    }
+
+    pub fn next_token_counter(&self) -> u64 {
+        self.next_token
+    }
+
+    pub fn next_work_item_counter(&self) -> u64 {
+        self.next_work_item
+    }
+
     pub(crate) fn alloc_work_item(&mut self, item: WorkItemState) -> WorkItemId {
         let id = WorkItemId(self.next_work_item);
         self.next_work_item += 1;

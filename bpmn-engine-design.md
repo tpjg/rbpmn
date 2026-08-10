@@ -332,6 +332,19 @@ In the library they live on the Engine builder; in the standalone server they
 are operator configuration (handler URLs never come from request data — see
 docs/http-security.md).
 
+**The environment grows monotonically.** Registration is not a one-shot
+builder ritual: more handlers and declared worker topics can be added at any
+time after build (library methods; on the standalone server an operator API /
+config reload), and a deploy validates against the environment **as it exists
+at that moment**. Both sides are **idempotent**: re-declaring a topic is a
+no-op, re-registering a handler applies the latest binding, and deploy is
+idempotent by content — same key + byte-identical XML + bindings returns the
+existing version (no new version row), changed content allocates the next
+version. Everything is safely retryable infrastructure. Future option
+(deliberately deferred): persist environment declarations in the DB so a
+restart resumes the last known environment — an availability aid; code/config
+stays the source of truth.
+
 **Ordering is deliberate: environment before definitions.** Deploy is the
 link step; `unresolved-topic` is its undefined-symbol error, so capabilities
 must be registered before a definition that uses them deploys. Both usage

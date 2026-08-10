@@ -271,4 +271,20 @@ impl ExecutableProcess {
     pub fn node_by_id(&self, id: &str) -> Option<NodeIx> {
         self.ids.get(id).copied()
     }
+
+    pub fn flow_by_id(&self, id: &str) -> Option<FlowIx> {
+        self.flows.iter().position(|f| f.id == id)
+    }
+
+    /// (element id, resolved topic) of every service task — what the
+    /// `unresolved-topic` deploy check compares against the environment.
+    pub fn service_topics(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.nodes.iter().filter_map(|n| match &n.kind {
+            ExecKind::Task {
+                kind: WorkKind::Service,
+                topic,
+            } => Some((n.id.as_str(), topic.as_str())),
+            _ => None,
+        })
+    }
 }

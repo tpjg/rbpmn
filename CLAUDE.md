@@ -28,7 +28,9 @@ inclusive gateway, block structure, messages-only interaction, build order).
 
 ## Commands
 
-- `cargo test` — everything including the fixture corpus.
+- `cargo test` — everything including the fixture corpus. The rbpmn-engine
+  integration tests need a reachable local Postgres (they create and drop
+  throwaway `rbpmn_test_*` databases; override via `RBPMN_TEST_ADMIN_URL`).
 - `just lint` — clippy `-D warnings` + fmt check (keep it at zero warnings).
 - `just serve` — run the HTTP server with a throwaway token.
 - `just playground` — linter playground (builds WASM, needs node + wasm-pack).

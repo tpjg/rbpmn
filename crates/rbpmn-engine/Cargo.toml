@@ -1,0 +1,20 @@
+[package]
+name = "rbpmn-engine"
+description = "The PostgreSQL projection of the rbpmn semantic core: transactional stepping, the Engine API, deployment with bindings manifests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rbpmn-core = { path = "../rbpmn-core" }
+rbpmn-model = { path = "../rbpmn-model" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "migrate", "macros"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

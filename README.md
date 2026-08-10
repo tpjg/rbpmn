@@ -15,13 +15,16 @@ Read it before touching the semantics.
 |---|---|
 | `crates/rbpmn-model` | BPMN XML → internal model + the linter + the FEEL-subset parser/evaluator. Dependency-light (no IO, no async, no DB) so it compiles to WASM for the linter playground and the bpmnlint plugin. |
 | `crates/rbpmn-core` | The pure semantic core: `compile` → executable model, tokens, and the `step` function. No IO — the Postgres layer projects it. |
+| `crates/rbpmn-engine` | The PostgreSQL projection: transactional stepping over the core, atomic idempotent deploys, the growing environment, incidents. |
 | `crates/rbpmn-wasm` | Thin wasm-bindgen surface over rbpmn-model: `lint(xml) -> JSON`, `catalogue()`. |
 | `crates/rbpmn-server` | Small standalone HTTP server wrapping the engine. Bearer-token auth, loopback-only by default. See [docs/http-security.md](docs/http-security.md). |
 | `playground/` | Local linter playground (bpmn-js + WASM): fixture browser, live re-lint, diagnostics as diagram overlays. `just playground`. |
 | `bpmnlint-plugin-rbpmn/` | bpmnlint plugin backed by the same WASM — rbpmn's rules inside bpmn-io tooling, zero JS reimplementation. |
 
-Planned (per the design brief's build order): the PostgreSQL projection +
-`Engine` API (phase 2), timers/messages (phase 3), the task API (phase 4).
+Planned (per the design brief's build order): the rest of phase 2 (worker
+loop, HttpPostHandler, LISTEN/NOTIFY, server deploy/start/complete endpoints,
+playground instance inspection), then timers/messages (phase 3) and the task
+API (phase 4).
 
 ## Status
 
@@ -35,7 +38,16 @@ Planned (per the design brief's build order): the PostgreSQL projection +
       golden event traces, FEEL-exact condition evaluation, RFC 7386 merge
       patch; scenario corpus + property tests (interleaving confluence,
       exactly-once joins, terminate cleanliness).
-- [ ] Phase 2 — PostgreSQL projection, `Engine` builder, work items.
+- [x] **Phase 2, milestone 1 — PostgreSQL projection**: schema, transactional
+      stepping (instance-row locking; join exactly-once verified under real
+      concurrent completions), atomic content-idempotent deploys with the
+      bindings manifest, the monotonically growing environment with
+      `unresolved-topic` enforcement + startup re-validation, retries →
+      incident. Integration tests run against a local Postgres.
+- [ ] Phase 2, milestone 2 — worker loop (SKIP LOCKED + LISTEN/NOTIFY),
+      HttpPostHandler, error boundaries → incident matching, server
+      deploy/start/complete endpoints, crash tests, playground instance
+      inspection (exit criterion).
 - [ ] Phase 3 — timers & messages. Phase 4 — task API. Phase 5 — rounding out.
 
 ## Rule catalogue

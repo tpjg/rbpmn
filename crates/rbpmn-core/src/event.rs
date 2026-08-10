@@ -7,6 +7,7 @@
 //! that golden format — stable, like rule IDs.
 
 use crate::compile::WorkKind;
+use crate::state::WorkItemId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -25,14 +26,17 @@ pub enum Event {
         flow: String,
     },
     WorkItemCreated {
+        id: WorkItemId,
         element: String,
         work_kind: WorkKind,
         topic: String,
     },
     WorkItemCompleted {
+        id: WorkItemId,
         element: String,
     },
     WorkItemCancelled {
+        id: WorkItemId,
         element: String,
     },
     VariablesPatched {
@@ -53,11 +57,12 @@ impl fmt::Display for Event {
                 element,
                 work_kind,
                 topic,
+                ..
             } => {
                 write!(f, "work-item-created {element} {work_kind} {topic}")
             }
-            Event::WorkItemCompleted { element } => write!(f, "work-item-completed {element}"),
-            Event::WorkItemCancelled { element } => write!(f, "work-item-cancelled {element}"),
+            Event::WorkItemCompleted { element, .. } => write!(f, "work-item-completed {element}"),
+            Event::WorkItemCancelled { element, .. } => write!(f, "work-item-cancelled {element}"),
             Event::VariablesPatched { .. } => write!(f, "variables-patched"),
             Event::InstanceCompleted => write!(f, "instance-completed"),
             Event::InstanceTerminated => write!(f, "instance-terminated"),
