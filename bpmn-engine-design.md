@@ -110,6 +110,19 @@ not positional indexes).
   a linter rule if they are semantically load-bearing, e.g. a service task whose only
   implementation binding is a foreign attribute).
 
+### 10. Topology: any number of engine processes, one Postgres
+Active-active by construction — there is no singleton component and no leader
+election anywhere. Postgres is the only coordination point: steps serialize on
+the instance row lock (`FOR UPDATE`), work/timer acquisition is
+`FOR UPDATE SKIP LOCKED` (competing consumers, no double delivery, no
+contention), deploys are advisory-locked per key and idempotent by content,
+and `LISTEN/NOTIFY` wakes every node while `SKIP LOCKED` arbitrates who wins.
+Run as many engine binaries as needed for HA and throughput. Replicas must
+run identical environment config; startup re-validation flags a drifted
+replica loudly (and is the standing argument for eventually persisting
+environment declarations in the DB). The scaling ceiling remains one
+Postgres — deliberately (see Non-goals).
+
 ## Supported subset (v1 target across all phases)
 
 | Category | Supported | Explicitly rejected (linter rule) |
@@ -360,8 +373,17 @@ current registration state** and fails loudly with the same rule id
 (phase 2, alongside the deploy check).
 
 ### Task API (phase 3, but design the table for it now)
-- `get_task(topic, ttl) -> Option<LockedTask>` — `FOR UPDATE SKIP LOCKED`, sets
-  lock_owner + lock_until = now()+ttl. **Lease model, not long locks:** base TTL is
+- `get_task(topic, order, ttl) -> Option<LockedTask>` — `FOR UPDATE SKIP LOCKED`,
+  sets lock_owner + lock_until = now()+ttl. `order` selects **FIFO** (default:
+  `created_at` ascending, tie-broken by item number — a fair queue) or
+  **LIFO** (descending — freshest-first triage), applied in the same
+  acquisition query; the per-definition partial indexes serve both directions
+  (btree scans backwards for free) and `created_at` is database time, so
+  ordering is consistent across nodes. Honesty note: under concurrent
+  consumers FIFO is fair-but-not-strict — `SKIP LOCKED` skips rows a peer is
+  claiming; strict global FIFO would serialize all consumers, the wrong trade
+  for a work queue. The same `order` parameter applies to
+  `get_task_filtered`. **Lease model, not long locks:** base TTL is
   short (~10 min), and holders renew it while actively working. Expired locks make
   the item available again (no reaper needed — availability predicate is
   `state='available' OR lock_until < now()`).
@@ -483,6 +505,22 @@ is exactly when it pays.
 optional axum ingress). Timer boundary events (interrupting first). Event-based
 gateway. Fixtures incl. "years-long sleep" simulated via clock injection — the clock
 is injected in the core from phase 1 precisely for this.
+
+Timer mechanics (decided): a timer catch inserts its `timer` row in the same
+transaction that parks the token, with `due_at` computed from **database
+time** (`now() + duration`) — node clocks never decide anything. Firing is
+one timer per transaction: claim via `DELETE ... WHERE id IN (SELECT id FROM
+timer WHERE due_at <= now() ORDER BY due_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+RETURNING ...`, then step the instance in that same transaction — timer-row
+deletion committing together with the step is what makes firing exactly-once;
+a crashed claimant's lock releases automatically. Draining = repeat until
+nothing is due; every node runs the same loop (competing consumers). There is
+**never** a per-timer in-process wait — a sleeping timer is a passive row.
+After draining, each scheduler sleeps until `SELECT min(due_at)` (cheap on
+the index), capped by a fallback poll interval (~30s, configurable), and a
+`NOTIFY` on timer insert wakes sleepers when an earlier timer appears —
+polling is the safety net, not the mechanism. Nothing fires before `due_at`;
+no "due soon" prefetching.
 
 **Phase 4 — User tasks & the task API**
 `kind=user` work items; get/get-filtered/count/complete with locking + TTL;
