@@ -145,6 +145,8 @@ async function loadInspection() {
   const id = document.getElementById('inspect-id').value.trim();
   const noteEl = document.getElementById('inspect-note');
   if (!id) return;
+  if (token) sessionStorage.setItem('rbpmn-token', token);
+  location.hash = `instance=${id}`;
   noteEl.textContent = 'loading…';
   try {
     const resp = await fetch(`/rbpmn/v1/instances/${id}/inspect`, {
@@ -216,4 +218,17 @@ editor.addEventListener('input', () => {
 
 await init();
 buildFixtureList();
-selectFixture(Object.keys(FIXTURES)[0]);
+
+// Deep link: #instance=<uuid> opens inspection directly (the token is
+// remembered per browser session — never in the URL).
+const deepLinked = new URLSearchParams(location.hash.slice(1)).get('instance');
+const tokenInput = document.getElementById('inspect-token');
+tokenInput.value = sessionStorage.getItem('rbpmn-token') ?? '';
+if (deepLinked) {
+  document.getElementById('inspect-id').value = deepLinked;
+  if (tokenInput.value) {
+    loadInspection();
+  }
+} else {
+  selectFixture(Object.keys(FIXTURES)[0]);
+}

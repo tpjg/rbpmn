@@ -128,6 +128,19 @@ rule. Hand-typed models without DI get an automatic layout, making the
 playground the fastest way to author new fixtures (`just fixtures-di` bakes
 the layout in).
 
+**Inspecting a live instance:** run the API (`just serve`, terminal 1 — prints
+the token) and the playground (`just playground`, terminal 2 →
+http://localhost:5173). Paste the token once and an instance id into the
+Inspect panel — or open `http://localhost:5173/#instance=<uuid>` directly
+(the token is remembered per browser session, never in the URL). Tokens and
+open/failed work items render as badges on the deployed diagram; the event
+trace lists alongside. The playground proxies `/rbpmn` to the server, which
+therefore never needs CORS.
+
+`just e2e` drives all of this headlessly and drops screenshots of **every
+fixture plus the inspection views** into `e2e/screenshots/` (gitignored) —
+needs python3 with playwright installed.
+
 `just parity` is the guarantee the playground never lies: it lints every
 fixture through native Rust and through the WASM build and requires
 byte-identical output, then runs the corpus through bpmnlint's own pipeline

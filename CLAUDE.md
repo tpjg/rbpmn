@@ -35,6 +35,8 @@ inclusive gateway, block structure, messages-only interaction, build order).
 - `just serve` — run the HTTP server with a throwaway token (needs a local
   Postgres; provisions the rbpmn_dev database).
 - `just playground` — linter playground (builds WASM, needs node + wasm-pack).
+- `just e2e` — browser end-to-end with screenshots into `e2e/screenshots/`
+  (gitignored); runs the full inspection stack when Postgres is reachable.
 - `just parity` — MUST stay green: byte-parity of native Rust vs WASM lint
   output over the corpus, plus the bpmnlint plugin's pipeline test.
 - `just fixtures-di` — fixtures carry baked-in BPMN DI so they render

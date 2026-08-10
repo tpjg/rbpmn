@@ -38,3 +38,11 @@ parity: wasm
 # Bake DI into any fixture that lacks a BPMNDiagram section (idempotent).
 fixtures-di:
     cd playground && npm install && node scripts/add-di.mjs
+
+# Browser end-to-end tests with automatic screenshots (e2e/screenshots/,
+# gitignored): every fixture rendered, plus the full inspection stack when a
+# local Postgres is reachable. Needs python3 + playwright
+# (pip install playwright && playwright install chromium).
+e2e:
+    cd playground && npm install
+    python3 e2e/run.py
