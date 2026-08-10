@@ -1,0 +1,25 @@
+{
+  "fixture": "accept/16-foreign-binding-warn.bpmn",
+  "bindings": { "topics": { "st": "payments" } },
+  "variables": {},
+  "actions": [{ "complete": "st", "patch": { "charged": true } }],
+  "expect": {
+    "status": "completed",
+    "variables": { "charged": true },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started st",
+      "work-item-created st service payments",
+      "work-item-completed st",
+      "variables-patched",
+      "element-completed st",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

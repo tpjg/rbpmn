@@ -1,0 +1,41 @@
+{
+  "fixture": "accept/05-xor-inside-parallel.bpmn",
+  "variables": { "fast": true },
+  "actions": [{ "complete": "tf" }, { "complete": "tb" }],
+  "expect": {
+    "status": "completed",
+    "variables": { "fast": true },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started ps",
+      "element-completed ps",
+      "flow-taken f2",
+      "flow-taken f6",
+      "element-started xs",
+      "element-completed xs",
+      "flow-taken f_f",
+      "element-started tb",
+      "work-item-created tb user tb",
+      "element-started tf",
+      "work-item-created tf user tf",
+      "work-item-completed tf",
+      "element-completed tf",
+      "flow-taken f3",
+      "element-started xj",
+      "element-completed xj",
+      "flow-taken f5",
+      "work-item-completed tb",
+      "element-completed tb",
+      "flow-taken f7",
+      "element-started pj",
+      "element-completed pj",
+      "flow-taken f8",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

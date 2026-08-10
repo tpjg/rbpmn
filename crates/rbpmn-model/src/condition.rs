@@ -378,6 +378,97 @@ fn read_segment(src: &str, i: &mut usize) -> String {
     src[start..*i].to_string()
 }
 
+/// Evaluate a condition against the instance variable document with **FEEL's
+/// exact semantics**, so dsntk can swap in post-v1 without any behavior
+/// change. Ternary (three-valued) logic is used internally and collapsed to a
+/// boolean only at the root: `null` becomes `false`.
+///
+/// The precise rules (all FEEL, DMN 1.3):
+///   * a missing path evaluates to null
+///   * equality treats null as an ordinary value (null-safe): `x = null` is
+///     TRUE when x is null/missing (the idiomatic "is missing" test), false
+///     otherwise — and so `x != 1` is TRUE when x is missing
+///   * equality across different types (e.g. `5 = "5"`) is null -> false
+///   * ordering comparisons need a number on both sides; anything else
+///     (null, missing, non-number) is null -> false
+///   * `and`/`or` are Kleene: `false and null` = false, `true and null` =
+///     null; `true or null` = true, `false or null` = null
+pub fn eval(expr: &Expr, variables: &serde_json::Value) -> bool {
+    truth(expr, variables).unwrap_or(false)
+}
+
+fn truth(expr: &Expr, variables: &serde_json::Value) -> Option<bool> {
+    match expr {
+        Expr::And(parts) => {
+            let mut result = Some(true);
+            for part in parts {
+                result = match (result, truth(part, variables)) {
+                    (Some(false), _) | (_, Some(false)) => return Some(false),
+                    (Some(true), x) => x,
+                    (None, _) => None,
+                };
+            }
+            result
+        }
+        Expr::Or(parts) => {
+            let mut result = Some(false);
+            for part in parts {
+                result = match (result, truth(part, variables)) {
+                    (Some(true), _) | (_, Some(true)) => return Some(true),
+                    (Some(false), x) => x,
+                    (None, _) => None,
+                };
+            }
+            result
+        }
+        Expr::Cmp { path, op, value } => compare(resolve(variables, path), *op, value),
+    }
+}
+
+fn resolve<'a>(variables: &'a serde_json::Value, path: &[String]) -> &'a serde_json::Value {
+    let mut current = variables;
+    for segment in path {
+        match current.get(segment) {
+            Some(next) => current = next,
+            None => return &serde_json::Value::Null,
+        }
+    }
+    current
+}
+
+fn compare(actual: &serde_json::Value, op: CmpOp, literal: &Literal) -> Option<bool> {
+    use serde_json::Value;
+    match op {
+        CmpOp::Eq | CmpOp::Ne => {
+            let eq = match (actual, literal) {
+                (Value::Null, Literal::Null) => Some(true),
+                (Value::Null, _) | (_, Literal::Null) => Some(false),
+                (Value::Bool(a), Literal::Bool(b)) => Some(a == b),
+                (Value::Number(a), Literal::Num(b)) => Some(a.as_f64() == Some(*b)),
+                (Value::String(a), Literal::Str(b)) => Some(a == b),
+                _ => None, // incomparable types: FEEL yields null
+            };
+            match op {
+                CmpOp::Eq => eq,
+                _ => eq.map(|b| !b),
+            }
+        }
+        CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+            let (Value::Number(a), Literal::Num(b)) = (actual, literal) else {
+                return None;
+            };
+            let a = a.as_f64()?;
+            Some(match op {
+                CmpOp::Lt => a < *b,
+                CmpOp::Le => a <= *b,
+                CmpOp::Gt => a > *b,
+                CmpOp::Ge => a >= *b,
+                _ => unreachable!(),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +565,46 @@ mod tests {
         bad("a = ");
         bad("(a = 1");
         bad("a && b");
+    }
+
+    #[test]
+    fn evaluation_follows_feel() {
+        use serde_json::json;
+        let vars = json!({
+            "amount": 250,
+            "vip": false,
+            "order": { "tier": "gold" },
+            "note": "hi",
+            "gone": null
+        });
+        let t = |src: &str| eval(&ok(src), &vars);
+
+        assert!(t("amount >= 100"));
+        assert!(!t("amount < 100"));
+        assert!(t("order.tier = \"gold\""));
+        assert!(t("vip = false"));
+        assert!(t("amount >= 100 and (order.tier = \"gold\" or vip = true)"));
+
+        // Missing/null: `= null` is the "is missing" test; everything else
+        // involving null is false.
+        assert!(t("missing = null"));
+        assert!(t("gone = null"));
+        assert!(t("order.nope = null"));
+        assert!(!t("missing = 1"));
+        assert!(t("missing != 1")); // equality is null-safe: null != 1 is true
+        assert!(!t("missing > 1"));
+        assert!(t("amount != null"));
+
+        // Type mismatch is null -> false, in both directions.
+        assert!(!t("note = 5"));
+        assert!(!t("note != 5"));
+        assert!(!t("note > 1"));
+
+        // Kleene and/or.
+        assert!(t("vip = false or missing = 1")); // true or null -> true... false-or: first true wins
+        assert!(!t("missing = 1 or missing = 2"));
+        assert!(!t("amount > 100 and missing > 1")); // true and null -> null -> false
+        assert!(!t("amount < 100 and missing > 1")); // false and null -> false
+        assert!(t("amount < 100 or amount > 100"));
     }
 }

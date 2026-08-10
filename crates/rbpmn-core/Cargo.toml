@@ -1,0 +1,15 @@
+[package]
+name = "rbpmn-core"
+description = "The pure semantic core of the rbpmn engine: tokens, scopes and the step function. No IO — the Postgres layer is a projection of this."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rbpmn-model = { path = "../rbpmn-model" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1"

@@ -1,0 +1,30 @@
+{
+  "fixture": "accept/02-exclusive-gateway.bpmn",
+  "variables": { "amount": 250, "order": { "tier": "gold" } },
+  "actions": [{ "complete": "t_hi", "patch": { "approved": true } }],
+  "expect": {
+    "status": "completed",
+    "variables": { "amount": 250, "order": { "tier": "gold" }, "approved": true },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started xs",
+      "element-completed xs",
+      "flow-taken f_hi",
+      "element-started t_hi",
+      "work-item-created t_hi user t_hi",
+      "work-item-completed t_hi",
+      "variables-patched",
+      "element-completed t_hi",
+      "flow-taken f3",
+      "element-started xj",
+      "element-completed xj",
+      "flow-taken f5",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

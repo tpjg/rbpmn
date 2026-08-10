@@ -1,0 +1,30 @@
+{
+  "fixture": "accept/15-parallel-empty-branch.bpmn",
+  "variables": {},
+  "actions": [{ "complete": "t" }],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started ps",
+      "element-completed ps",
+      "flow-taken f_direct",
+      "flow-taken f_t",
+      "element-started t",
+      "work-item-created t user t",
+      "work-item-completed t",
+      "element-completed t",
+      "flow-taken f2",
+      "element-started pj",
+      "element-completed pj",
+      "flow-taken f3",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

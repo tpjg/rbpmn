@@ -1,0 +1,31 @@
+{
+  "fixture": "accept/14-implicit-merge.bpmn",
+  "variables": { "a": true },
+  "actions": [{ "complete": "ta" }, { "complete": "m" }],
+  "expect": {
+    "status": "completed",
+    "variables": { "a": true },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started xs",
+      "element-completed xs",
+      "flow-taken f_a",
+      "element-started ta",
+      "work-item-created ta user ta",
+      "work-item-completed ta",
+      "element-completed ta",
+      "flow-taken f2",
+      "element-started m",
+      "work-item-created m user m",
+      "work-item-completed m",
+      "element-completed m",
+      "flow-taken f4",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

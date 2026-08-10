@@ -1,0 +1,29 @@
+{
+  "fixture": "accept/02-exclusive-gateway.bpmn",
+  "variables": { "amount": 50 },
+  "actions": [{ "complete": "t_lo" }],
+  "expect": {
+    "status": "completed",
+    "variables": { "amount": 50 },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started xs",
+      "element-completed xs",
+      "flow-taken f_lo",
+      "element-started t_lo",
+      "work-item-created t_lo user t_lo",
+      "work-item-completed t_lo",
+      "element-completed t_lo",
+      "flow-taken f4",
+      "element-started xj",
+      "element-completed xj",
+      "flow-taken f5",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

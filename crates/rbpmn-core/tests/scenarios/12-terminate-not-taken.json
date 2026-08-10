@@ -1,0 +1,42 @@
+{
+  "fixture": "accept/12-terminate-race.bpmn",
+  "variables": {},
+  "actions": [
+    { "complete": "tb", "patch": { "cancelled": false } },
+    { "complete": "ta" }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": { "cancelled": false },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started ps",
+      "element-completed ps",
+      "flow-taken f2",
+      "flow-taken f4",
+      "element-started ta",
+      "work-item-created ta user ta",
+      "element-started tb",
+      "work-item-created tb user tb",
+      "work-item-completed tb",
+      "variables-patched",
+      "element-completed tb",
+      "flow-taken f5",
+      "element-started xs",
+      "element-completed xs",
+      "flow-taken f_go",
+      "work-item-completed ta",
+      "element-completed ta",
+      "flow-taken f3",
+      "element-started pj",
+      "element-completed pj",
+      "flow-taken f6",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

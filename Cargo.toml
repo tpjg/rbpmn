@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rbpmn-model", "crates/rbpmn-server", "crates/rbpmn-wasm"]
+members = ["crates/rbpmn-core", "crates/rbpmn-model", "crates/rbpmn-server", "crates/rbpmn-wasm"]
 
 [workspace.package]
 version = "0.1.0"

@@ -13,15 +13,15 @@ Read it before touching the semantics.
 
 | Crate / package | Purpose |
 |---|---|
-| `crates/rbpmn-model` | BPMN XML → internal model + the linter. Dependency-light (no IO, no async, no DB) so it compiles to WASM for the linter playground and the bpmnlint plugin. |
+| `crates/rbpmn-model` | BPMN XML → internal model + the linter + the FEEL-subset parser/evaluator. Dependency-light (no IO, no async, no DB) so it compiles to WASM for the linter playground and the bpmnlint plugin. |
+| `crates/rbpmn-core` | The pure semantic core: `compile` → executable model, tokens, and the `step` function. No IO — the Postgres layer projects it. |
 | `crates/rbpmn-wasm` | Thin wasm-bindgen surface over rbpmn-model: `lint(xml) -> JSON`, `catalogue()`. |
 | `crates/rbpmn-server` | Small standalone HTTP server wrapping the engine. Bearer-token auth, loopback-only by default. See [docs/http-security.md](docs/http-security.md). |
 | `playground/` | Local linter playground (bpmn-js + WASM): fixture browser, live re-lint, diagnostics as diagram overlays. `just playground`. |
 | `bpmnlint-plugin-rbpmn/` | bpmnlint plugin backed by the same WASM — rbpmn's rules inside bpmn-io tooling, zero JS reimplementation. |
 
-Planned (per the design brief's build order): `rbpmn-core` (pure semantic
-`step` function, phase 1), the PostgreSQL projection + `Engine` API (phase 2),
-timers/messages (phase 3), the task API (phase 4).
+Planned (per the design brief's build order): the PostgreSQL projection +
+`Engine` API (phase 2), timers/messages (phase 3), the task API (phase 4).
 
 ## Status
 
@@ -30,7 +30,11 @@ timers/messages (phase 3), the task API (phase 4).
 - [x] Server skeleton with the security spine and `POST /v1/definitions/lint`.
 - [x] **Phase 0-B — linter playground (WASM) + bpmnlint plugin**, with a
       byte-parity check between native Rust and WASM over the whole corpus.
-- [ ] Phase 1 — pure semantic core (tokens, scopes, `step`).
+- [x] **Phase 1 — pure semantic core**: `compile` (re-lints + gates
+      later-phase elements), tokens, the deterministic `step` function with
+      golden event traces, FEEL-exact condition evaluation, RFC 7386 merge
+      patch; scenario corpus + property tests (interleaving confluence,
+      exactly-once joins, terminate cleanliness).
 - [ ] Phase 2 — PostgreSQL projection, `Engine` builder, work items.
 - [ ] Phase 3 — timers & messages. Phase 4 — task API. Phase 5 — rounding out.
 

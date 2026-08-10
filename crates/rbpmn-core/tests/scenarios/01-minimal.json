@@ -1,0 +1,23 @@
+{
+  "fixture": "accept/01-minimal.bpmn",
+  "variables": {},
+  "actions": [{ "complete": "review" }],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started review",
+      "work-item-created review user review",
+      "work-item-completed review",
+      "element-completed review",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

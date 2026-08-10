@@ -13,11 +13,18 @@ inclusive gateway, block structure, messages-only interaction, build order).
 - **Fixtures first.** Every phase starts with fixtures in
   `crates/rbpmn-model/tests/fixtures/{accept,reject}/`. Expected diagnostics
   are embedded in each `.bpmn` as an `expect-diagnostics:` comment; the runner
-  is `tests/fixtures.rs`.
+  is `tests/fixtures.rs`. Execution scenarios (golden event traces) live in
+  `crates/rbpmn-core/tests/scenarios/*.json` — the `Display` format of
+  `Event` is stable API, like rule IDs.
 - `rbpmn-model` stays dependency-light (no IO/async/DB) — it must compile to
   WASM for the phase 0-B playground and the bpmnlint plugin.
 - The engine advances tokens inside the caller's DB transaction; wait states
-  are the transaction boundaries. Keep the pure `step` core IO-free (phase 1).
+  are the transaction boundaries. The pure `step` core (rbpmn-core) is
+  IO-free and deterministic — keep it that way; time enters as command data
+  when timers land (phase 3), never from a clock.
+- FEEL null semantics in `condition::eval` are FEEL-exact (null-safe
+  equality, ternary and/or, root collapse) — they must not change when dsntk
+  swaps in post-v1.
 
 ## Commands
 

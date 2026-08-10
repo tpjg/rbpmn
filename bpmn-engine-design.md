@@ -207,9 +207,13 @@ dsntk lands post-v1, and models authored by FEEL-aware tooling
 - ops: `=` `!=` `<` `<=` `>` `>=` (accept `==` on input, normalize to FEEL's `=`)
 - literals: numbers, double-quoted strings, `true`/`false`, `null`
 - identifiers: FEEL qualified names (`order.priority`) resolved as paths into the
-  instance's JSONB variable document; a missing path evaluates to null, and any
-  comparison with null is **false** (FEEL's ternary logic collapsed to the final
-  boolean — state this explicitly in docs; it must not change when dsntk swaps in)
+  instance's JSONB variable document; a missing path evaluates to null. Null
+  semantics are **exactly FEEL's** (they must not change when dsntk swaps in):
+  equality is null-safe (`x = null` is the idiomatic "is missing" test — true
+  iff x is null/missing; hence `x != 1` is true when x is missing), equality
+  across different types yields null, ordering comparisons with anything but a
+  number yield null, `and`/`or` are Kleene; the ternary result collapses to a
+  boolean only at the root: null → false
 - nothing else: no functions, no arithmetic, no `in`/ranges, no date literals
 
 Additional strictness beyond FEEL (safe: a strict subset may reject more, it must
