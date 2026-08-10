@@ -134,6 +134,72 @@ def screenshot_inspection(page, server_proc_env):
     )
 
 
+def load_and_shot(page, instance, name, expect_token_badges=None):
+    """Reload the inspection for `instance` and capture one flow frame."""
+    page.fill("#inspect-id", instance)
+    page.click("#inspect-load")
+    page.wait_for_timeout(1200)
+    page.screenshot(path=str(SHOTS / f"{name}.png"))
+    if expect_token_badges is not None:
+        got = page.locator(".rbpmn-badge-token").count()
+        check(got == expect_token_badges, f"{name}: {got} token badge(s), expected {expect_token_badges}")
+
+
+def open_item(instance, element=None):
+    inspection = api(f"/v1/instances/{instance}/inspect", method="GET")
+    for w in inspection["workItems"]:
+        if w["state"] in ("available", "locked") and (element is None or w["elementId"] == element):
+            return w["id"]
+    raise AssertionError(f"no open work item at {element} in {instance}")
+
+
+def screenshot_token_flow(page):
+    """Flip-book sequences: watch tokens move through a whole lifecycle."""
+    page.goto(PREVIEW)
+    page.wait_for_load_state("networkidle")
+    page.fill("#inspect-token", TOKEN)
+
+    # Flow A — parallel block with an XOR inside (05): the fast lane.
+    xml = (
+        REPO / "crates/rbpmn-model/tests/fixtures/accept/05-xor-inside-parallel.bpmn"
+    ).read_text()
+    api("/v1/definitions", {"bpmn": xml})
+    instance = api(
+        "/v1/instances", {"definitionKey": "p", "variables": {"fast": True}}
+    )["instanceId"]
+    load_and_shot(page, instance, "flow_a_1_two_branches", expect_token_badges=2)
+    api(f"/v1/work-items/{open_item(instance, 'tf')}/complete", {})
+    load_and_shot(page, instance, "flow_a_2_fast_lane_done_token_at_join", expect_token_badges=2)
+    api(f"/v1/work-items/{open_item(instance, 'tb')}/complete", {})
+    load_and_shot(page, instance, "flow_a_3_completed", expect_token_badges=0)
+    check(
+        "completed" in page.inner_text("#inspect-note"),
+        "flow A should end completed",
+    )
+
+    # Flow B — error boundary (10): three failures walk into the boundary path.
+    xml = (
+        REPO / "crates/rbpmn-model/tests/fixtures/accept/10-error-boundary.bpmn"
+    ).read_text()
+    api("/v1/topics", {"name": "st"})
+    api("/v1/definitions", {"bpmn": xml})
+    instance = api("/v1/instances", {"definitionKey": "p"})["instanceId"]
+    load_and_shot(page, instance, "flow_b_1_service_task_pending", expect_token_badges=1)
+    for _ in range(3):
+        api(
+            f"/v1/work-items/{open_item(instance, 'st')}/fail",
+            {"errorCode": "PAYMENT_FAILED"},
+        )
+    load_and_shot(page, instance, "flow_b_2_boundary_taken_repair_task", expect_token_badges=1)
+    inspection = api(f"/v1/instances/{instance}/inspect", method="GET")
+    check(
+        inspection["tokens"][0]["elementId"] == "t_fix",
+        "token should sit at the repair task after the boundary",
+    )
+    api(f"/v1/work-items/{open_item(instance, 't_fix')}/complete", {})
+    load_and_shot(page, instance, "flow_b_3_completed_via_error_path", expect_token_badges=0)
+
+
 def main():
     SHOTS.mkdir(parents=True, exist_ok=True)
     for old in SHOTS.glob("*.png"):
@@ -187,6 +253,7 @@ def main():
             screenshot_fixtures(page)
             if with_stack:
                 screenshot_inspection(page, None)
+                screenshot_token_flow(page)
             browser.close()
     finally:
         for proc in procs:
