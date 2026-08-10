@@ -59,9 +59,19 @@ pub enum ExecKind {
     Start,
     End,
     TerminateEnd,
-    Task { kind: WorkKind, topic: String },
-    ExclusiveGateway { default_flow: Option<FlowIx> },
+    Task {
+        kind: WorkKind,
+        topic: String,
+    },
+    ExclusiveGateway {
+        default_flow: Option<FlowIx>,
+    },
     ParallelGateway,
+    /// Interrupting error boundary: entered only when its host's work item
+    /// raises a matching error code — never via a sequence flow.
+    ErrorBoundary {
+        code: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +96,8 @@ pub struct ExecutableProcess {
     nodes: Vec<ExecNode>,
     flows: Vec<ExecFlow>,
     ids: BTreeMap<String, NodeIx>,
+    /// host node -> (error code, boundary node)
+    error_boundaries: BTreeMap<NodeIx, Vec<(String, NodeIx)>>,
     start: NodeIx,
 }
 
@@ -136,6 +148,7 @@ impl ExecutableProcess {
 
         let mut nodes = Vec::with_capacity(scope.nodes.len());
         let mut node_ix: BTreeMap<&str, NodeIx> = BTreeMap::new();
+        let mut boundary_hosts: Vec<(NodeIx, String)> = Vec::new();
         for (ix, node) in scope.nodes.iter().enumerate() {
             let kind = match &node.kind {
                 NodeKind::Start(StartTrigger::None) => ExecKind::Start,
@@ -171,12 +184,25 @@ impl ExecutableProcess {
                 NodeKind::ReceiveTask { .. } => {
                     return Err(not_yet(node, "messages arrive in phase 3"));
                 }
-                NodeKind::Boundary(_) => {
-                    return Err(not_yet(
-                        node,
-                        "error boundaries arrive in phase 2, timer boundaries in phase 3",
-                    ));
-                }
+                NodeKind::Boundary(b) => match &b.trigger {
+                    BoundaryTrigger::Error { error_ref } => {
+                        let code = error_ref
+                            .as_deref()
+                            .and_then(|r| defs.errors.iter().find(|e| e.id == r))
+                            .and_then(|e| e.code.clone())
+                            .ok_or_else(|| {
+                                CompileError::Internal(format!(
+                                    "error boundary '{}' without a coded error survived lint",
+                                    node.id
+                                ))
+                            })?;
+                        boundary_hosts.push((ix, b.attached_to.clone().unwrap_or_default()));
+                        ExecKind::ErrorBoundary { code }
+                    }
+                    _ => {
+                        return Err(not_yet(node, "timer boundaries arrive in phase 3"));
+                    }
+                },
                 NodeKind::SubProcess(_) => {
                     return Err(not_yet(node, "embedded subprocesses arrive in v2"));
                 }
@@ -233,6 +259,35 @@ impl ExecutableProcess {
             }
         }
 
+        let mut error_boundaries: BTreeMap<NodeIx, Vec<(String, NodeIx)>> = BTreeMap::new();
+        for (boundary_ix, host_id) in boundary_hosts {
+            let host = *node_ix.get(host_id.as_str()).ok_or_else(|| {
+                CompileError::Internal(format!("boundary host '{host_id}' missing"))
+            })?;
+            // v1: errors originate from failing service tasks; a boundary on
+            // anything else (subprocesses are v2) is not executable yet.
+            if !matches!(
+                nodes[host].kind,
+                ExecKind::Task {
+                    kind: WorkKind::Service,
+                    ..
+                }
+            ) {
+                return Err(CompileError::NotYetExecutable {
+                    element: nodes[boundary_ix].id.clone(),
+                    what: "error boundary event".to_string(),
+                    phase: "error boundaries on subprocesses arrive in v2",
+                });
+            }
+            let ExecKind::ErrorBoundary { code } = &nodes[boundary_ix].kind else {
+                unreachable!()
+            };
+            error_boundaries
+                .entry(host)
+                .or_default()
+                .push((code.clone(), boundary_ix));
+        }
+
         let start = nodes
             .iter()
             .position(|n| n.kind == ExecKind::Start)
@@ -248,6 +303,7 @@ impl ExecutableProcess {
             nodes,
             flows,
             ids,
+            error_boundaries,
             start,
         })
     }
@@ -270,6 +326,15 @@ impl ExecutableProcess {
 
     pub fn node_by_id(&self, id: &str) -> Option<NodeIx> {
         self.ids.get(id).copied()
+    }
+
+    /// The error boundary on `host` matching `code` exactly, if any.
+    pub fn error_boundary(&self, host: NodeIx, code: &str) -> Option<NodeIx> {
+        self.error_boundaries
+            .get(&host)?
+            .iter()
+            .find(|(c, _)| c == code)
+            .map(|(_, b)| *b)
     }
 
     pub fn flow_by_id(&self, id: &str) -> Option<FlowIx> {

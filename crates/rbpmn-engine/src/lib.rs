@@ -17,12 +17,28 @@
 
 mod deploy;
 mod error;
+#[cfg(feature = "http")]
+mod http_handler;
+mod inspect;
 mod runtime;
+#[cfg(feature = "test-util")]
+pub mod testing;
+mod worker;
 
 pub use error::{Completion, DeployError, Deployment, EngineError, FailOutcome, StartedInstance};
+#[cfg(feature = "http")]
+pub use http_handler::HttpPostHandler;
+pub use inspect::{EventView, InstanceInspection, TokenView, WorkItemView};
 pub use rbpmn_core::{Bindings, Event};
+pub use sqlx::PgPool;
+pub use worker::WorkerOptions;
 
-use sqlx::PgPool;
+/// Convenience: connect a pool for the engine (the URL comes from operator
+/// config — never from request data).
+pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
+    PgPool::connect(database_url).await
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -39,15 +55,23 @@ pub struct WorkItem {
     pub variables: serde_json::Value,
 }
 
-/// Push-mode service task handler. Delivery is at-least-once; the engine
-/// guarantees exactly-once *state transition* — handlers must be idempotent.
-/// (The worker loop that invokes these lands in the phase-2 follow-up
-/// milestone; the registry and the `unresolved-topic` check are live now.)
+/// A handler failure; `code` feeds error-boundary matching once the retry
+/// budget is exhausted (no code, or no matching boundary, means incident).
+#[derive(Debug, Clone)]
+pub struct HandlerFailure {
+    pub code: Option<String>,
+    pub message: String,
+}
+
+/// Push-mode service task handler, driven by the worker loop. Delivery is
+/// at-least-once; the engine guarantees exactly-once *state transition* —
+/// handlers must be idempotent. The returned value is an RFC 7386 merge
+/// patch applied to the instance variables.
 pub trait ServiceTaskHandler: Send + Sync {
     fn execute(
         &self,
         item: WorkItem,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, HandlerFailure>> + Send + '_>>;
 }
 
 #[derive(Default)]
@@ -132,6 +156,21 @@ impl Engine {
             .unwrap()
             .handlers
             .insert(topic.into(), handler);
+    }
+
+    pub(crate) fn handled_topics(&self) -> Vec<String> {
+        self.inner
+            .env
+            .read()
+            .unwrap()
+            .handlers
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn handler_for(&self, topic: &str) -> Option<Arc<dyn ServiceTaskHandler>> {
+        self.inner.env.read().unwrap().handlers.get(topic).cloned()
     }
 
     fn covered_topics(&self) -> BTreeSet<String> {

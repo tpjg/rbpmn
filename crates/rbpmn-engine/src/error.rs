@@ -21,6 +21,8 @@ pub enum EngineError {
     UnknownDefinition(String),
     #[error("no work item {0}")]
     UnknownWorkItem(Uuid),
+    #[error("no instance {0}")]
+    UnknownInstance(Uuid),
     #[error("instance {0} is not active (status: {1})")]
     InstanceNotActive(Uuid, String),
     #[error("instance {0} has an open incident; resolve it first")]
@@ -59,12 +61,14 @@ pub enum Completion {
     AlreadyClosed { state: String },
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum FailOutcome {
     /// The item went back to `available` with one fewer retry.
     Retrying { retries_left: i32 },
-    /// Retry budget exhausted: the work item is failed and the instance is in
-    /// the incident state (no error boundary matched — none are executable
-    /// yet; boundary matching lands with the phase-2 follow-up milestone).
+    /// Budget exhausted and a matching error boundary caught the raised
+    /// error: the boundary path was taken (events included).
+    ErrorCaught(Vec<rbpmn_core::Event>),
+    /// Budget exhausted, no boundary matched: the work item is failed and
+    /// the instance is frozen in the incident state.
     IncidentRaised,
 }

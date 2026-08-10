@@ -39,6 +39,15 @@ pub enum Event {
         id: WorkItemId,
         element: String,
     },
+    WorkItemFailed {
+        id: WorkItemId,
+        element: String,
+        code: Option<String>,
+    },
+    IncidentRaised {
+        element: String,
+        code: Option<String>,
+    },
     VariablesPatched {
         patch: Value,
     },
@@ -63,6 +72,14 @@ impl fmt::Display for Event {
             }
             Event::WorkItemCompleted { element, .. } => write!(f, "work-item-completed {element}"),
             Event::WorkItemCancelled { element, .. } => write!(f, "work-item-cancelled {element}"),
+            Event::WorkItemFailed { element, code, .. } => match code {
+                Some(code) => write!(f, "work-item-failed {element} {code}"),
+                None => write!(f, "work-item-failed {element}"),
+            },
+            Event::IncidentRaised { element, code } => match code {
+                Some(code) => write!(f, "incident-raised {element} {code}"),
+                None => write!(f, "incident-raised {element}"),
+            },
             Event::VariablesPatched { .. } => write!(f, "variables-patched"),
             Event::InstanceCompleted => write!(f, "instance-completed"),
             Event::InstanceTerminated => write!(f, "instance-terminated"),

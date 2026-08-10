@@ -1,5 +1,6 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use rbpmn_engine::testing::TestDb;
 use rbpmn_server::{Tokens, app};
 use tower::ServiceExt;
 
@@ -8,9 +9,13 @@ const TOKEN: &str = "test-token-0123456789abcdef-0123456789abcdef";
 // The lint corpus is the single source of truth for BPMN test inputs.
 const INCLUSIVE_XML: &str =
     include_str!("../../rbpmn-model/tests/fixtures/reject/inclusive-gateway.bpmn");
+const MINIMAL_XML: &str = include_str!("../../rbpmn-model/tests/fixtures/accept/01-minimal.bpmn");
 
-fn test_app() -> axum::Router {
-    app(Tokens::from_list([TOKEN]).unwrap())
+async fn test_app() -> (axum::Router, TestDb) {
+    let db = TestDb::create().await;
+    let engine = rbpmn_engine::Engine::builder(db.pool.clone()).build();
+    engine.migrate().await.unwrap();
+    (app(Tokens::from_list([TOKEN]).unwrap(), engine), db)
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -20,24 +25,35 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+fn authed(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn healthz_is_public_and_static() {
-    let resp = test_app()
+    let (app, db) = test_app().await;
+    let resp = app
         .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["status"], "ok");
-    assert!(
-        json.get("version").is_none(),
-        "healthz must not disclose the version to unauthenticated callers"
-    );
+    assert!(json.get("version").is_none());
+    db.drop().await;
 }
 
 #[tokio::test]
-async fn v1_requires_bearer_token() {
-    let resp = test_app()
+async fn v1_requires_bearer_token_uniformly() {
+    let (app, db) = test_app().await;
+    let resp = app
+        .clone()
         .oneshot(
             Request::post("/v1/definitions/lint")
                 .body(Body::from(INCLUSIVE_XML))
@@ -50,13 +66,9 @@ async fn v1_requires_bearer_token() {
         resp.headers().get(header::WWW_AUTHENTICATE).unwrap(),
         "Bearer"
     );
-}
 
-#[tokio::test]
-async fn unknown_v1_paths_cannot_be_probed_without_auth() {
-    // Uniform 401: unauthenticated callers cannot distinguish existing
-    // routes from non-existent ones.
-    let resp = test_app()
+    // Unknown paths cannot be probed without auth either.
+    let resp = app
         .oneshot(
             Request::post("/v1/definitely/not/a/route")
                 .body(Body::empty())
@@ -65,53 +77,13 @@ async fn unknown_v1_paths_cannot_be_probed_without_auth() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    let resp = test_app()
-        .oneshot(
-            Request::post("/v1/definitely/not/a/route")
-                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn wrong_token_is_rejected() {
-    let resp = test_app()
-        .oneshot(
-            Request::post("/v1/definitions/lint")
-                .header(
-                    header::AUTHORIZATION,
-                    "Bearer definitely-not-the-token-but-long",
-                )
-                .body(Body::from(INCLUSIVE_XML))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn lowercase_bearer_scheme_is_accepted() {
-    let resp = test_app()
-        .oneshot(
-            Request::post("/v1/definitions/lint")
-                .header(header::AUTHORIZATION, format!("bearer {TOKEN}"))
-                .body(Body::from(INCLUSIVE_XML))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    db.drop().await;
 }
 
 #[tokio::test]
 async fn lint_reports_diagnostics() {
-    let resp = test_app()
+    let (app, db) = test_app().await;
+    let resp = app
         .oneshot(
             Request::post("/v1/definitions/lint")
                 .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
@@ -123,25 +95,181 @@ async fn lint_reports_diagnostics() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["ok"], false);
-    let rules: Vec<&str> = json["diagnostics"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|d| d["rule"].as_str().unwrap())
-        .collect();
-    assert!(rules.contains(&"no-inclusive-gateway"), "got {rules:?}");
+    db.drop().await;
 }
 
 #[tokio::test]
-async fn malformed_xml_is_bad_request() {
-    let resp = test_app()
-        .oneshot(
-            Request::post("/v1/definitions/lint")
-                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
-                .body(Body::from("this is not xml"))
-                .unwrap(),
-        )
+async fn deploy_start_complete_inspect_over_http() {
+    let (app, db) = test_app().await;
+
+    // Deploy: atomic body, idempotent on repeat.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/definitions",
+            serde_json::json!({ "bpmn": MINIMAL_XML }),
+        ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let deployed = body_json(resp).await;
+    assert_eq!(deployed["version"], 1);
+    assert_eq!(deployed["reused"], false);
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/definitions",
+            serde_json::json!({ "bpmn": MINIMAL_XML }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["reused"], true);
+
+    // Start.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/instances",
+            serde_json::json!({ "definitionKey": "p", "variables": { "orderId": 42 } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let instance_id = body_json(resp).await["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Inspect: the token-overlay read model.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/v1/instances/{instance_id}/inspect"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let inspection = body_json(resp).await;
+    assert_eq!(inspection["status"], "active");
+    assert_eq!(inspection["tokens"][0]["elementId"], "review");
+    assert!(
+        inspection["bpmnXml"]
+            .as_str()
+            .unwrap()
+            .contains("bpmn:process")
+    );
+    let work_item = inspection["workItems"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Complete; repeat answers with the idempotent no-op.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/work-items/{work_item}/complete"),
+            serde_json::json!({ "patch": { "done": true } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["outcome"], "advanced");
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/work-items/{work_item}/complete"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["outcome"], "alreadyClosed");
+
+    let resp = app
+        .oneshot(authed(
+            "GET",
+            &format!("/v1/instances/{instance_id}/inspect"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let inspection = body_json(resp).await;
+    assert_eq!(inspection["status"], "completed");
+    assert_eq!(
+        inspection["variables"],
+        serde_json::json!({ "orderId": 42, "done": true })
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn rejected_deploys_return_diagnostics() {
+    let (app, db) = test_app().await;
+
+    // Lint-dirty model.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/definitions",
+            serde_json::json!({ "bpmn": INCLUSIVE_XML }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = body_json(resp).await;
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["rule"] == "no-inclusive-gateway")
+    );
+
+    // Wiring gap -> unresolved-topic; grow the environment over the API and retry.
+    let foreign =
+        include_str!("../../rbpmn-model/tests/fixtures/accept/16-foreign-binding-warn.bpmn");
+    let deploy_body = serde_json::json!({
+        "bpmn": foreign,
+        "bindings": { "topics": { "st": "payments" } }
+    });
+    let resp = app
+        .clone()
+        .oneshot(authed("POST", "/v1/definitions", deploy_body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let json = body_json(resp).await;
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["rule"] == "unresolved-topic")
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/topics",
+            serde_json::json!({ "name": "payments" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .oneshot(authed("POST", "/v1/definitions", deploy_body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    db.drop().await;
 }

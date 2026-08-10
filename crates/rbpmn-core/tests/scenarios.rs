@@ -26,10 +26,18 @@ struct Scenario {
 }
 
 #[derive(Deserialize)]
-struct Action {
-    complete: String,
-    #[serde(default)]
-    patch: Option<Value>,
+#[serde(untagged)]
+enum Action {
+    Complete {
+        complete: String,
+        #[serde(default)]
+        patch: Option<Value>,
+    },
+    Fail {
+        fail: String,
+        #[serde(default)]
+        code: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -68,18 +76,35 @@ fn run_scenario(path: &Path, failures: &mut String) {
     trace.extend(events.iter().map(|e| e.to_string()));
 
     for action in &scenario.actions {
-        let node = proc
-            .node_by_id(&action.complete)
-            .unwrap_or_else(|| panic!("{name}: no element '{}'", action.complete));
-        let id = state
-            .open_work_item_at(node)
-            .unwrap_or_else(|| panic!("{name}: no open work item at '{}'", action.complete));
-        let patch = action
-            .patch
-            .clone()
-            .unwrap_or_else(|| serde_json::json!({}));
-        let events = step(&proc, &mut state, Command::CompleteWorkItem { id, patch })
-            .unwrap_or_else(|e| panic!("{name}: complete '{}' failed: {e}", action.complete));
+        let (element, command) = match action {
+            Action::Complete { complete, patch } => {
+                let node = proc
+                    .node_by_id(complete)
+                    .unwrap_or_else(|| panic!("{name}: no element '{complete}'"));
+                let id = state
+                    .open_work_item_at(node)
+                    .unwrap_or_else(|| panic!("{name}: no open work item at '{complete}'"));
+                let patch = patch.clone().unwrap_or_else(|| serde_json::json!({}));
+                (complete, Command::CompleteWorkItem { id, patch })
+            }
+            Action::Fail { fail, code } => {
+                let node = proc
+                    .node_by_id(fail)
+                    .unwrap_or_else(|| panic!("{name}: no element '{fail}'"));
+                let id = state
+                    .open_work_item_at(node)
+                    .unwrap_or_else(|| panic!("{name}: no open work item at '{fail}'"));
+                (
+                    fail,
+                    Command::RaiseError {
+                        id,
+                        code: code.clone(),
+                    },
+                )
+            }
+        };
+        let events = step(&proc, &mut state, command)
+            .unwrap_or_else(|e| panic!("{name}: action on '{element}' failed: {e}"));
         trace.extend(events.iter().map(|e| e.to_string()));
     }
 
@@ -88,6 +113,7 @@ fn run_scenario(path: &Path, failures: &mut String) {
         InstanceStatus::Active => "active",
         InstanceStatus::Completed => "completed",
         InstanceStatus::Terminated => "terminated",
+        InstanceStatus::Failed => "failed",
     };
 
     let mut problems = Vec::new();

@@ -1,0 +1,19 @@
+{
+  "fixture": "accept/10-error-boundary.bpmn",
+  "variables": {},
+  "actions": [{ "fail": "st", "code": "UNKNOWN_CODE" }],
+  "expect": {
+    "status": "failed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started st",
+      "work-item-created st service st",
+      "work-item-failed st UNKNOWN_CODE",
+      "incident-raised st UNKNOWN_CODE"
+    ]
+  }
+}

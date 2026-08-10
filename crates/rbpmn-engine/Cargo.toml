@@ -12,9 +12,16 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "migrate", "macros"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+
+[features]
+http = ["dep:reqwest"]
+test-util = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+axum = "0.8"
+rbpmn-engine = { path = ".", features = ["http", "test-util"] }

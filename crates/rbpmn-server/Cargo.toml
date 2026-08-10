@@ -7,6 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 rbpmn-model = { path = "../rbpmn-model" }
+rbpmn-engine = { path = "../rbpmn-engine", features = ["http"] }
+uuid = { version = "1", features = ["serde"] }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
 tower = "0.5"
@@ -20,3 +22,4 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+rbpmn-engine = { path = "../rbpmn-engine", features = ["http", "test-util"] }

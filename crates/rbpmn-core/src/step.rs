@@ -27,6 +27,13 @@ pub enum Command {
     /// Complete an open work item, applying an RFC 7386 merge patch to the
     /// variables in the same step that advances the token.
     CompleteWorkItem { id: WorkItemId, patch: Value },
+    /// A work item's retry budget is exhausted: raise the named error. A
+    /// matching error boundary on the host interrupts the task and takes the
+    /// boundary path; no match freezes the instance in the incident state.
+    RaiseError {
+        id: WorkItemId,
+        code: Option<String>,
+    },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -99,6 +106,55 @@ pub fn step(
             });
             adv.leave_single(state, token_id, element)?;
             adv.run(state)
+        }
+        Command::RaiseError { id, code } => {
+            if state.status != InstanceStatus::Active {
+                return Err(StepError::InstanceNotActive(state.status));
+            }
+            let item = state
+                .work_items
+                .get(&id)
+                .ok_or(StepError::UnknownWorkItem(id))?;
+            if !item.open {
+                return Err(StepError::WorkItemNotOpen(id));
+            }
+            let (element, token_id) = (item.element, item.token);
+
+            state.work_items.get_mut(&id).unwrap().open = false;
+            let mut adv = Advancer::new(proc);
+            adv.events.push(Event::WorkItemFailed {
+                id,
+                element: proc.node_id(element).to_string(),
+                code: code.clone(),
+            });
+
+            let boundary = code
+                .as_deref()
+                .and_then(|c| proc.error_boundary(element, c));
+            match boundary {
+                Some(boundary_ix) => {
+                    // Interrupting: the task's token continues on the
+                    // boundary path.
+                    if state.tokens.remove(&token_id).is_none() {
+                        return Err(StepError::Invariant(format!(
+                            "work item {id:?} referenced token {token_id:?} which does not exist"
+                        )));
+                    }
+                    adv.element_started(boundary_ix);
+                    adv.element_completed(boundary_ix);
+                    adv.leave_single(state, token_id, boundary_ix)?;
+                    adv.run(state)
+                }
+                None => {
+                    // Incident: freeze everything as-is for repair.
+                    state.status = InstanceStatus::Failed;
+                    adv.events.push(Event::IncidentRaised {
+                        element: proc.node_id(element).to_string(),
+                        code,
+                    });
+                    Ok(adv.events)
+                }
+            }
         }
     }
 }
@@ -213,6 +269,10 @@ impl<'a> Advancer<'a> {
                     Ok(())
                 }
             }
+            ExecKind::ErrorBoundary { .. } => Err(StepError::Invariant(format!(
+                "error boundary '{}' entered via a sequence flow",
+                node.id
+            ))),
             ExecKind::End => {
                 self.element_started(node_ix);
                 self.element_completed(node_ix);

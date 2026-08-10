@@ -23,6 +23,10 @@ pub enum InstanceStatus {
     Active,
     Completed,
     Terminated,
+    /// Incident: a raised error matched no boundary. The instance is frozen
+    /// as-is (tokens and closed items stay put) for later repair — nothing
+    /// is torn down, unlike terminate.
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

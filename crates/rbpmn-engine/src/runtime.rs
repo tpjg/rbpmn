@@ -81,8 +81,8 @@ impl Engine {
         let item_no: i64 = item.get("item_no");
 
         // Lock the instance first: every step on an instance serializes here.
-        let (definition, proc, mut state, raw_status) = load_instance(&mut tx, instance_id).await?;
-        if raw_status == "failed" {
+        let (definition, proc, mut state) = load_instance(&mut tx, instance_id).await?;
+        if state.status == InstanceStatus::Failed {
             return Err(EngineError::IncidentOpen(instance_id));
         }
 
@@ -119,9 +119,13 @@ impl Engine {
     }
 
     /// Handler failure: spend one retry and re-offer, or — budget exhausted —
-    /// raise an incident (work item failed, instance in the incident state).
-    /// Error-boundary matching joins in the phase-2 follow-up milestone.
-    pub async fn fail_work_item(&self, work_item: Uuid) -> Result<FailOutcome, EngineError> {
+    /// raise the named error into the core: a matching error boundary takes
+    /// its path; no match freezes the instance in the incident state.
+    pub async fn fail_work_item(
+        &self,
+        work_item: Uuid,
+        error_code: Option<&str>,
+    ) -> Result<FailOutcome, EngineError> {
         let mut tx = self.pool().begin().await?;
         let item = sqlx::query("select instance_id, item_no from work_item where id = $1")
             .bind(work_item)
@@ -131,8 +135,8 @@ impl Engine {
         let instance_id: Uuid = item.get("instance_id");
         let item_no: i64 = item.get("item_no");
 
-        let (definition, _proc, state, raw_status) = load_instance(&mut tx, instance_id).await?;
-        if raw_status == "failed" {
+        let (definition, proc, mut state) = load_instance(&mut tx, instance_id).await?;
+        if state.status == InstanceStatus::Failed {
             return Err(EngineError::IncidentOpen(instance_id));
         }
         if state.status != InstanceStatus::Active {
@@ -143,10 +147,11 @@ impl Engine {
         }
 
         let row = sqlx::query(
-            "update work_item set retries = retries - 1 \
+            "update work_item set retries = retries - 1, state = 'available', \
+             lock_owner = null, lock_until = null \
              where instance_id = $1 and item_no = $2 \
                and state in ('available', 'locked') \
-             returning retries, element_id",
+             returning retries, element_id, topic",
         )
         .bind(instance_id)
         .bind(item_no)
@@ -155,42 +160,40 @@ impl Engine {
         .ok_or(EngineError::UnknownWorkItem(work_item))?;
         let retries: i32 = row.get("retries");
         let element_id: String = row.get("element_id");
+        let topic: String = row.get("topic");
 
         let outcome = if retries > 0 {
             insert_engine_event(
                 &mut tx,
                 &definition,
                 instance_id,
-                "work-item-failed",
+                "work-item-retrying",
                 &element_id,
-                serde_json::json!({ "kind": "work-item-failed", "element": element_id, "retriesLeft": retries }),
+                serde_json::json!({ "kind": "work-item-retrying", "element": element_id, "retriesLeft": retries }),
             )
             .await?;
+            notify_work(&mut tx, &topic).await?;
             FailOutcome::Retrying {
                 retries_left: retries,
             }
         } else {
-            sqlx::query(
-                "update work_item set state = 'failed' where instance_id = $1 and item_no = $2",
-            )
-            .bind(instance_id)
-            .bind(item_no)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query("update instance set status = 'failed' where id = $1")
-                .bind(instance_id)
-                .execute(&mut *tx)
-                .await?;
-            insert_engine_event(
-                &mut tx,
-                &definition,
-                instance_id,
-                "incident-raised",
-                &element_id,
-                serde_json::json!({ "kind": "incident-raised", "element": element_id }),
-            )
-            .await?;
-            FailOutcome::IncidentRaised
+            let events = step(
+                &proc,
+                &mut state,
+                Command::RaiseError {
+                    id: WorkItemId(item_no as u64),
+                    code: error_code.map(str::to_string),
+                },
+            )?;
+            persist_step(&mut tx, &proc, &definition, instance_id, &state, &events).await?;
+            if events
+                .iter()
+                .any(|e| matches!(e, Event::IncidentRaised { .. }))
+            {
+                FailOutcome::IncidentRaised
+            } else {
+                FailOutcome::ErrorCaught(events)
+            }
         };
         tx.commit().await?;
         Ok(outcome)
@@ -210,7 +213,7 @@ fn compile_row(row: &PgRow, key: &str) -> Result<ExecutableProcess, EngineError>
 async fn load_instance(
     tx: &mut PgConnection,
     instance_id: Uuid,
-) -> Result<(DefinitionRef, ExecutableProcess, InstanceState, String), EngineError> {
+) -> Result<(DefinitionRef, ExecutableProcess, InstanceState), EngineError> {
     let inst = sqlx::query(
         "select i.definition_id, i.definition_key, i.status, i.variables, \
                 i.next_token, i.next_work_item, d.bpmn_xml, d.bindings \
@@ -228,14 +231,11 @@ async fn load_instance(
     };
     let proc = compile_row(&inst, &key)?;
 
-    let raw_status: String = inst.get("status");
-    let status = match raw_status.as_str() {
+    let status = match inst.get::<String, _>("status").as_str() {
         "active" => InstanceStatus::Active,
         "completed" => InstanceStatus::Completed,
         "terminated" => InstanceStatus::Terminated,
-        // 'failed' (incident) is a projection-level refinement of Active;
-        // callers gate on the raw status before invoking the core.
-        _ => InstanceStatus::Active,
+        _ => InstanceStatus::Failed,
     };
 
     let tokens = sqlx::query(
@@ -300,7 +300,7 @@ async fn load_instance(
         inst.get::<i64, _>("next_token") as u64,
         inst.get::<i64, _>("next_work_item") as u64,
     );
-    Ok((definition, proc, state, raw_status))
+    Ok((definition, proc, state))
 }
 
 /// Projects a completed step: instance columns, token snapshot, work-item
@@ -318,6 +318,7 @@ async fn persist_step(
         InstanceStatus::Active => "active",
         InstanceStatus::Completed => "completed",
         InstanceStatus::Terminated => "terminated",
+        InstanceStatus::Failed => "failed",
     };
     sqlx::query(
         "update instance set status = $2, variables = $3, next_token = $4, \
@@ -388,12 +389,18 @@ async fn persist_step(
                 .bind(element)
                 .execute(&mut *tx)
                 .await?;
+                if *work_kind == WorkKind::Service {
+                    notify_work(tx, topic).await?;
+                }
             }
             Event::WorkItemCompleted { id, .. } => {
                 set_work_item_state(tx, instance_id, id.0 as i64, "completed").await?;
             }
             Event::WorkItemCancelled { id, .. } => {
                 set_work_item_state(tx, instance_id, id.0 as i64, "cancelled").await?;
+            }
+            Event::WorkItemFailed { id, .. } => {
+                set_work_item_state(tx, instance_id, id.0 as i64, "failed").await?;
             }
             _ => {}
         }
@@ -420,6 +427,15 @@ async fn persist_step(
         .execute(&mut *tx)
         .await?;
     }
+    Ok(())
+}
+
+/// Wakes worker loops (delivered on commit; SKIP LOCKED arbitrates who wins).
+async fn notify_work(tx: &mut PgConnection, topic: &str) -> Result<(), EngineError> {
+    sqlx::query("select pg_notify('rbpmn_work', $1)")
+        .bind(topic)
+        .execute(&mut *tx)
+        .await?;
     Ok(())
 }
 

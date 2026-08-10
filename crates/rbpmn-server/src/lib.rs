@@ -12,6 +12,8 @@
 //!
 //! Endpoints grow with the engine phases; today only the linter is exposed.
 
+mod api;
+
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -179,13 +181,13 @@ pub fn validate_bind(addr: &SocketAddr, allow_non_loopback: bool) -> Result<(), 
 /// Validates the bind policy, binds, and serves until Ctrl-C/SIGTERM.
 /// The only way this crate starts a listener — the loopback check cannot be
 /// forgotten by a caller because it is not a separate step.
-pub async fn serve(config: Config) -> Result<(), String> {
+pub async fn serve(config: Config, engine: rbpmn_engine::Engine) -> Result<(), String> {
     validate_bind(&config.bind, config.allow_non_loopback)?;
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .map_err(|e| format!("cannot bind {}: {e}", config.bind))?;
     tracing::info!(bind = %config.bind, tokens = config.tokens.token_count(), "rbpmn-server listening");
-    axum::serve(listener, app(config.tokens))
+    axum::serve(listener, app(config.tokens, engine))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| format!("server error: {e}"))
@@ -220,7 +222,7 @@ struct AppState {
 
 type SharedState = Arc<AppState>;
 
-pub fn app(tokens: Tokens) -> Router {
+pub fn app(tokens: Tokens, engine: rbpmn_engine::Engine) -> Router {
     let state: SharedState = Arc::new(AppState { tokens });
 
     // Auth is structural, not conventional: the layer wraps the whole nested
@@ -229,6 +231,13 @@ pub fn app(tokens: Tokens) -> Router {
     // get a uniform 401 and cannot probe which routes exist.
     let v1 = Router::new()
         .route("/definitions/lint", post(lint_definitions))
+        .route("/definitions", post(api::deploy))
+        .route("/instances", post(api::start))
+        .route("/instances/{id}/inspect", get(api::inspect))
+        .route("/work-items/{id}/complete", post(api::complete))
+        .route("/work-items/{id}/fail", post(api::fail))
+        .route("/topics", post(api::declare_topic))
+        .with_state(engine)
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(state, require_bearer));
 

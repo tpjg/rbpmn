@@ -1,0 +1,32 @@
+{
+  "fixture": "accept/10-error-boundary.bpmn",
+  "variables": {},
+  "actions": [
+    { "fail": "st", "code": "PAYMENT_FAILED" },
+    { "complete": "t_fix" }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started st",
+      "work-item-created st service st",
+      "work-item-failed st PAYMENT_FAILED",
+      "element-started be",
+      "element-completed be",
+      "flow-taken f3",
+      "element-started t_fix",
+      "work-item-created t_fix user t_fix",
+      "work-item-completed t_fix",
+      "element-completed t_fix",
+      "flow-taken f4",
+      "element-started e_fail",
+      "element-completed e_fail",
+      "instance-completed"
+    ]
+  }
+}
