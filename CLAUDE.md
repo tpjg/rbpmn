@@ -32,7 +32,8 @@ inclusive gateway, block structure, messages-only interaction, build order).
   integration tests need a reachable local Postgres (they create and drop
   throwaway `rbpmn_test_*` databases; override via `RBPMN_TEST_ADMIN_URL`).
 - `just lint` — clippy `-D warnings` + fmt check (keep it at zero warnings).
-- `just serve` — run the HTTP server with a throwaway token.
+- `just serve` — run the HTTP server with a throwaway token (needs a local
+  Postgres; provisions the rbpmn_dev database).
 - `just playground` — linter playground (builds WASM, needs node + wasm-pack).
 - `just parity` — MUST stay green: byte-parity of native Rust vs WASM lint
   output over the corpus, plus the bpmnlint plugin's pipeline test.

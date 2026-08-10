@@ -14,6 +14,8 @@ fmt:
 serve:
     #!/usr/bin/env bash
     set -euo pipefail
+    psql -h localhost postgres -tc "select 1 from pg_database where datname = 'rbpmn_dev'" | grep -q 1 || psql -h localhost postgres -c "create database rbpmn_dev"
+    export RBPMN_DATABASE_URL="postgres://$USER@localhost:5432/rbpmn_dev"
     export RBPMN_API_TOKEN=$(openssl rand -hex 32)
     echo "token: $RBPMN_API_TOKEN"
     cargo run -p rbpmn-server

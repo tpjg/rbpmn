@@ -138,6 +138,76 @@ function selectFixture(name) {
   setXml(FIXTURES[name]);
 }
 
+// --- Instance inspection: live tokens/work items on the diagram, through
+// the same generic annotation layer the diagnostics use.
+async function loadInspection() {
+  const token = document.getElementById('inspect-token').value.trim();
+  const id = document.getElementById('inspect-id').value.trim();
+  const noteEl = document.getElementById('inspect-note');
+  if (!id) return;
+  noteEl.textContent = 'loading…';
+  try {
+    const resp = await fetch(`/rbpmn/v1/instances/${id}/inspect`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!resp.ok) {
+      noteEl.textContent = `server answered ${resp.status}`;
+      return;
+    }
+    const inspection = await resp.json();
+    activeFixture = null;
+    for (const el of fixtureList.querySelectorAll('.fixture-item')) {
+      el.classList.remove('active');
+    }
+    editor.value = inspection.bpmnXml;
+    verdict.textContent = inspection.status;
+    verdict.className = inspection.status === 'active' ? 'ok' : 'rejected';
+
+    diagnosticList.replaceChildren();
+    for (const event of inspection.events.slice(-30)) {
+      const li = document.createElement('li');
+      li.textContent = event.display;
+      if (event.elementId) {
+        li.addEventListener('click', () => focus(viewer, event.elementId));
+      }
+      diagnosticList.append(li);
+    }
+
+    const seq = ++importSeq;
+    const renderable = await ensureDi(inspection.bpmnXml);
+    if (seq !== importSeq) return;
+    await viewer.importXML(renderable);
+    viewer.get('canvas').zoom('fit-viewport');
+    const annotations = [
+      ...inspection.tokens.map((t) => ({
+        elementId: t.elementId,
+        kind: 'token',
+        payload: { title: `token (${t.waitKind})` },
+      })),
+      ...inspection.workItems
+        .filter((w) => w.state === 'available' || w.state === 'locked')
+        .map((w) => ({
+          elementId: w.elementId,
+          kind: 'work',
+          payload: { title: `work item ${w.state} (${w.kind} / ${w.topic})` },
+        })),
+      ...inspection.workItems
+        .filter((w) => w.state === 'failed')
+        .map((w) => ({
+          elementId: w.elementId,
+          kind: 'error',
+          payload: { title: `work item failed (${w.topic})` },
+        })),
+    ];
+    annotate(viewer, annotations);
+    noteEl.textContent = `${inspection.definitionKey} · ${inspection.status} · ` +
+      `${inspection.tokens.length} token(s)`;
+  } catch (e) {
+    noteEl.textContent = `cannot reach rbpmn-server: ${e.message}`;
+  }
+}
+document.getElementById('inspect-load').addEventListener('click', loadInspection);
+
 let debounce;
 editor.addEventListener('input', () => {
   clearTimeout(debounce);

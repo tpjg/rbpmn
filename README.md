@@ -44,10 +44,12 @@ API (phase 4).
       bindings manifest, the monotonically growing environment with
       `unresolved-topic` enforcement + startup re-validation, retries →
       incident. Integration tests run against a local Postgres.
-- [ ] Phase 2, milestone 2 — worker loop (SKIP LOCKED + LISTEN/NOTIFY),
-      HttpPostHandler, error boundaries → incident matching, server
-      deploy/start/complete endpoints, crash tests, playground instance
-      inspection (exit criterion).
+- [x] **Phase 2, milestone 2** — worker loop (SKIP LOCKED leases +
+      LISTEN/NOTIFY), HttpPostHandler, error boundaries (matched → boundary
+      path, unmatched → incident), the server's full engine API
+      (deploy/start/complete/fail/topics/inspect), and the playground's
+      live token-overlay instance inspection (exit criterion, verified
+      end-to-end in a browser).
 - [ ] Phase 3 — timers & messages. Phase 4 — task API. Phase 5 — rounding out.
 
 ## Rule catalogue
@@ -160,5 +162,9 @@ curl -s -X POST localhost:7420/v1/definitions/lint \
 ```
 
 Configuration is env-only: `RBPMN_BIND` (default `127.0.0.1:7420`),
-`RBPMN_API_TOKEN` / `RBPMN_API_TOKEN_FILE`, `RBPMN_ALLOW_NON_LOOPBACK`.
+`RBPMN_API_TOKEN` / `RBPMN_API_TOKEN_FILE`, `RBPMN_ALLOW_NON_LOOPBACK`,
+`RBPMN_DATABASE_URL` (required), `RBPMN_TOPICS` (comma-separated declared
+worker topics), `RBPMN_HTTP_HANDLERS` (`topic=url;...`), `RBPMN_WORKERS`.
+Startup re-validates persisted definitions against the configured
+environment and refuses to start on drift.
 Security posture and roadmap: [docs/http-security.md](docs/http-security.md).

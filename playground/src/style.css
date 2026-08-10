@@ -234,3 +234,48 @@ body {
   stroke: #316dca !important;
   stroke-width: 3px !important;
 }
+
+#inspect {
+  border-top: 1px solid #ddd;
+  margin-top: 12px;
+  padding-top: 4px;
+}
+#inspect input {
+  width: 100%;
+  margin: 3px 0;
+  padding: 5px 8px;
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+#inspect button {
+  width: 100%;
+  margin-top: 4px;
+  padding: 5px;
+  border: 1px solid #316dca;
+  background: #316dca;
+  color: #fff;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+#inspect-note {
+  font-size: 11px;
+  color: #888;
+  margin: 6px 2px;
+}
+.rbpmn-badge-token {
+  background: #316dca;
+}
+.rbpmn-badge-work {
+  background: #6639ba;
+}
+.rbpmn-mark-token:not(.djs-connection) .djs-visual > :nth-child(1) {
+  stroke: #316dca !important;
+  stroke-width: 2px !important;
+}
+.rbpmn-mark-work:not(.djs-connection) .djs-visual > :nth-child(1) {
+  stroke: #6639ba !important;
+  stroke-width: 2px !important;
+}

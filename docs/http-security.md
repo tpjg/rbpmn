@@ -21,6 +21,11 @@ emitted, so browsers cannot call it cross-origin.
 ## Controls (implemented)
 
 **Authentication** — every `/v1` route requires `Authorization: Bearer <token>`.
+The surface now includes the full engine API (deploy, start, complete/fail,
+topic declaration, instance inspection) — all privileged; deploy remains the
+most privileged of all (deploy = code). The playground's inspection view
+reaches the server through its own dev proxy, so the server still never emits
+CORS headers.
 
 - Tokens come from `RBPMN_API_TOKEN` (comma-separated, enabling rotation:
   accept old+new, flip clients, drop old) or `RBPMN_API_TOKEN_FILE` (one per
