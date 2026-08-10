@@ -332,6 +332,20 @@ In the library they live on the Engine builder; in the standalone server they
 are operator configuration (handler URLs never come from request data — see
 docs/http-security.md).
 
+**Ordering is deliberate: environment before definitions.** Deploy is the
+link step; `unresolved-topic` is its undefined-symbol error, so capabilities
+must be registered before a definition that uses them deploys. Both usage
+modes make this structural (the Rust builder produces the engine `deploy`
+hangs off; server config is read before HTTP traffic). The ordering binds the
+*declaration*, never worker liveness — `declare_topic` is a recorded promise
+that pull-mode workers exist in this environment; the engine cannot and does
+not verify they are running. Because definitions persist across restarts but
+the environment is rebuilt from code/config at every startup, deploy-time
+checking alone would miss drift (a handler removed after deploy): therefore
+**startup re-validates every active definition version's topics against the
+current registration state** and fails loudly with the same rule id
+(phase 2, alongside the deploy check).
+
 ### Task API (phase 3, but design the table for it now)
 - `get_task(topic, ttl) -> Option<LockedTask>` — `FOR UPDATE SKIP LOCKED`, sets
   lock_owner + lock_until = now()+ttl. **Lease model, not long locks:** base TTL is
