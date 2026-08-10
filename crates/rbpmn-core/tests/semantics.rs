@@ -282,3 +282,34 @@ fn topic_binding_defaults_to_element_id() {
         Event::WorkItemCreated { element, topic, .. } if element == "st" && topic == "st"
     )));
 }
+
+#[test]
+fn manifest_builder_and_json_agree() {
+    // The Rust builder and the server's JSON deploy body are two syntaxes
+    // for one manifest: identical structs, identical compile result.
+    let built = Bindings::new().topic("st", "payments");
+    let parsed: Bindings = serde_json::from_str(r#"{ "topics": { "st": "payments" } }"#).unwrap();
+    assert_eq!(built, parsed);
+
+    let defs = load("accept/16-foreign-binding-warn.bpmn");
+    for bindings in [&built, &parsed] {
+        let proc = ExecutableProcess::compile(&defs, "p", bindings).unwrap();
+        let mut state = InstanceState::new();
+        let events = step(
+            &proc,
+            &mut state,
+            Command::Start {
+                variables: json!({}),
+            },
+        )
+        .unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::WorkItemCreated { topic, .. } if topic == "payments"
+        )));
+    }
+
+    // An empty/omitted bindings object is valid and falls back to defaults.
+    let empty: Bindings = serde_json::from_str("{}").unwrap();
+    assert_eq!(empty, Bindings::default());
+}

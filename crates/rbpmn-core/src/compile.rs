@@ -20,7 +20,22 @@ pub type FlowIx = usize;
 /// id. (Correlations join in phase 3.)
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Bindings {
+    #[serde(default)]
     pub topics: BTreeMap<String, String>,
+}
+
+impl Bindings {
+    /// Fluent construction for the Rust library path. The standalone server
+    /// deserializes the same struct from the deploy body's `bindings` JSON —
+    /// two syntaxes, one manifest, one validation path.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn topic(mut self, element_id: impl Into<String>, topic: impl Into<String>) -> Self {
+        self.topics.insert(element_id.into(), topic.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
