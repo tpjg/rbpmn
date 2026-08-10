@@ -253,12 +253,17 @@ let engine = Engine::builder(pool)
     .handler("payments", HttpPostHandler::new("https://internal/payments"))
     .handler("email", my_custom_handler)          // impl ServiceTaskHandler
     .declare_topic("fulfillment")                 // pull-mode workers will poll this
-    .map_topic("FulfillOrder", "ChargeCustomer", "payments")
-    .map_topic("Renewals",     "ChargeRenewal",  "payments")
-    .map_correlation("FulfillOrder", "AwaitPayment", "order.id")
     .build();
 
-engine.deploy(bpmn_xml).await?;                    // -> Deployment { version, diagnostics }
+// One atomic deploy: the definition plus its bindings manifest, validated
+// together (the manifest needs no definition key — it rides along with the
+// definition it describes). Serializes 1:1 to the server's JSON deploy body.
+let bindings = Bindings::new()
+    .topic("ChargeCustomer", "payments")
+    .topic("ChargeRenewal", "payments")
+    .correlation("AwaitPayment", "order.id")
+    .index("status");                              // optional, performance only
+engine.deploy(bpmn_xml, bindings).await?;          // -> Deployment { version, diagnostics }
                                                    //    Err(Rejected{diagnostics}) on lint failure
 let id = engine.start("order-process", business_key, initial_vars_json).await?;
 engine.correlate("PaymentConfirmed", "order-84231", patch_json).await?; // messages, callable directly
@@ -301,6 +306,28 @@ one worker.
   must be mapped or deploy fails (`message-has-correlation`).
 - `work_item.topic` is denormalized at creation time from the binding in force.
 
+**The deployment manifest — one atomic deploy.** Per-definition wiring
+(topics, correlations, optional index declarations) is *declarative data about
+one definition* and is versioned with it: instances pin the definition version,
+so they must pin the wiring that was in force too. Therefore deploy is a single
+atomic operation carrying both — `deploy(bpmn_xml, bindings)` in the library,
+`POST /v1/definitions { "bpmn": ..., "bindings": ... }` on the server — and the
+deploy-time checks (`unresolved-topic`, `message-has-correlation`) run against
+exactly that pair. Never a multi-call registration dance: partially-wired
+intermediate states are the "seems to run" failure mode this design exists to
+kill. The Rust builder API and the HTTP endpoint converge on one
+`DeploymentManifest` struct internally — a single validation path, so library
+and server cannot drift. The manifest is a small JSON document that lives in
+git next to its `.bpmn`: this is the same information other engines smear into
+vendor XML annotations — separated cleanly from the process definition and
+versioned with it.
+
+Distinct from the manifest: **environment capabilities** (handler targets,
+`declare_topic` for external workers) describe the runtime, not a definition.
+In the library they live on the Engine builder; in the standalone server they
+are operator configuration (handler URLs never come from request data — see
+docs/http-security.md).
+
 ### Task API (phase 3, but design the table for it now)
 - `get_task(topic, ttl) -> Option<LockedTask>` — `FOR UPDATE SKIP LOCKED`, sets
   lock_owner + lock_until = now()+ttl. **Lease model, not long locks:** base TTL is
@@ -327,8 +354,9 @@ one worker.
   key, field) so the call is idempotent and re-runnable at startup next to handler
   registration. Use `CREATE INDEX CONCURRENTLY` (runs outside a transaction —
   handle that). This IS the "declared filterable fields" mechanism, exposed as an
-  explicit call. JSONB stays opaque: the engine never interprets variables, it only
-  indexes fields the application names.
+  explicit call; the same declaration can ride in the deploy manifest's `index`
+  entries (see The deployment manifest). JSONB stays opaque: the engine never
+  interprets variables, it only indexes fields the application names.
 - `get_task_filtered(topic, filter, ttl)` — the filter compiler MUST emit exactly
   the indexed expression shape (`variables->>'field'` + literal definition_id) so
   declared indexes are actually used. EXPLAIN-based integration test: index usage

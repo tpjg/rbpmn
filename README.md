@@ -74,6 +74,13 @@ instead of "seeming to run" with stuck tokens.
 | Message correlation | `map_correlation(definition_key, element_id, "order.id")` — FEEL qualified name into the instance variables | `message-has-correlation` |
 | Filterable fields | `declare_index(definition_key, field)` — optional, performance only | — |
 
+Per-definition wiring deploys **atomically with the definition** as a small
+JSON bindings manifest (`deploy(bpmn_xml, bindings)` in the library, one
+`POST /v1/definitions` body on the server) and is versioned with it — the same
+information other engines smear into vendor XML annotations, separated cleanly
+and reviewable in git next to the `.bpmn`. Environment capabilities (handler
+targets, `declare_topic`) are engine/server configuration, not manifest content.
+
 Conditions inside the XML are pure FEEL (a strict subset), so they carry no
 rbpmn-specific syntax either.
 
