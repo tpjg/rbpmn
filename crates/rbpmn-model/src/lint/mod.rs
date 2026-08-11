@@ -468,6 +468,17 @@ fn condition_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
 }
 
 fn event_gateway_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
+    // host element id -> its boundary events, built once for the scope
+    // (the alternative is rescanning every node per gateway alternative).
+    let mut boundaries: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for v in 0..g.scope.nodes.len() {
+        if let NodeKind::Boundary(data) = &g.node(v).kind
+            && let Some(host) = data.attached_to.as_deref()
+        {
+            boundaries.entry(host).or_default().push(&g.node(v).id);
+        }
+    }
+
     for v in 0..g.scope.nodes.len() {
         if !matches!(g.node(v).kind, NodeKind::EventBasedGateway) {
             continue;
@@ -498,25 +509,26 @@ fn event_gateway_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
                         target.kind.describe()
                     ),
                 ));
-            } else if g.in_deg(t) != 1 {
-                out.push(Diagnostic::error(
-                    rule::EVENT_GATEWAY_STRUCTURE,
-                    &target.id,
-                    "an event-based gateway's target must have exactly one incoming \
-                     flow (from the gateway) — it is armed only by the gateway",
-                ));
-            }
-            // A boundary event on a gateway target could never arm: the
-            // gateway holds the token, the target is never *entered*, so
-            // the boundary would silently not exist at runtime — the
-            // "seems to run" failure mode this linter exists to kill.
-            for b in 0..g.scope.nodes.len() {
-                if let NodeKind::Boundary(data) = &g.node(b).kind
-                    && data.attached_to.as_deref() == Some(target.id.as_str())
-                {
+            } else {
+                if g.in_deg(t) != 1 {
                     out.push(Diagnostic::error(
                         rule::EVENT_GATEWAY_STRUCTURE,
-                        &g.node(b).id,
+                        &target.id,
+                        "an event-based gateway's target must have exactly one incoming \
+                         flow (from the gateway) — it is armed only by the gateway",
+                    ));
+                }
+                // A boundary event on a gateway target could never arm: the
+                // gateway holds the token, the target is never *entered*, so
+                // the boundary would silently not exist at runtime — the
+                // "seems to run" failure mode this linter exists to kill.
+                // Only reported for otherwise-valid targets: an unsupported
+                // target already has its own diagnostic, and a second one
+                // would point the modeller at the wrong fix.
+                for boundary in boundaries.get(target.id.as_str()).into_iter().flatten() {
+                    out.push(Diagnostic::error(
+                        rule::EVENT_GATEWAY_STRUCTURE,
+                        *boundary,
                         "boundary events cannot attach to an event-based gateway's \
                          alternative — the gateway itself is the race; model the \
                          timeout as a timer alternative of the gateway instead",

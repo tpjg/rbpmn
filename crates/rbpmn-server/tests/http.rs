@@ -633,3 +633,98 @@ async fn topic_undeclare_over_http() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     db.drop().await;
 }
+
+/// The event stream over HTTP: auth, the camelCase cursor params, the
+/// envelope shape, and loud rejection of a malformed cursor.
+#[tokio::test]
+async fn event_stream_over_http() {
+    let (app, db) = test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/definitions",
+            serde_json::json!({ "bpmn": MINIMAL_XML }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/instances",
+            serde_json::json!({ "definitionKey": "p" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Unauthenticated reads are refused like every other /v1 path.
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/v1/events").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // The horizon is cluster-wide, so a concurrent test's transaction can
+    // briefly hold events back — poll for the first batch.
+    let mut events = serde_json::Value::Null;
+    for _ in 0..100 {
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", "/v1/events", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        events = body_json(resp).await["events"].clone();
+        if !events.as_array().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let first = &events.as_array().unwrap()[0];
+    assert_eq!(first["kind"], "instance-started");
+    assert!(first["txid"].is_i64() && first["id"].is_i64());
+    assert!(first["instanceId"].is_string());
+
+    // The cursor params are camelCase, and paging past the last id is empty.
+    let last = events.as_array().unwrap().last().unwrap();
+    let uri = format!(
+        "/v1/events?afterTxid={}&afterId={}",
+        last["txid"].as_i64().unwrap(),
+        last["id"].as_i64().unwrap()
+    );
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &uri, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        body_json(resp).await["events"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // A malformed cursor is a 400, not a 500 or a silently dead stream.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            "/v1/events?afterTxid=-1",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", "/v1/events?limit=0", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    db.drop().await;
+}

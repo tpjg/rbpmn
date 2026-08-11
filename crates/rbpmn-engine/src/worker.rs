@@ -18,6 +18,17 @@ use crate::{Engine, EngineError, WorkItem};
 use sqlx::Row;
 use std::time::Duration;
 
+/// A spawned task that is cancelled when its handle goes out of scope —
+/// `tokio::spawn` otherwise detaches, so dropping the handle would leave
+/// the work running unsupervised.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerOptions {
     /// Lease holder identity, recorded in `lock_owner`.
@@ -124,13 +135,18 @@ impl Engine {
         // with the lease renewed underneath it while it works. It runs in
         // its OWN task so a panicking handler surfaces as a JoinError and
         // becomes a recorded failure — never an invisibly dead worker loop
-        // in a process that still answers HTTP.
+        // in a process that still answers HTTP. The task is aborted if this
+        // future is dropped (worker abort, shutdown), which keeps the
+        // pre-spawn cancellation semantics: a handler must not keep running
+        // — and keep causing side effects — after nobody is left to record
+        // its result.
         let work_item_id = item.id;
-        let mut handler_task = tokio::spawn(async move { handler.execute(item).await });
+        let mut handler_task =
+            AbortOnDrop(tokio::spawn(async move { handler.execute(item).await }));
         let renew_every = (options.lease / 3).max(Duration::from_millis(200));
         let result = loop {
             tokio::select! {
-                joined = &mut handler_task => break match joined {
+                joined = &mut handler_task.0 => break match joined {
                     Ok(result) => result,
                     Err(e) if e.is_panic() => {
                         let detail = match e.into_panic().downcast::<String>() {

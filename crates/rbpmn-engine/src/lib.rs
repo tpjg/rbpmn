@@ -158,7 +158,7 @@ impl EngineBuilder {
                 pool: self.pool,
                 env: RwLock::new(self.env),
                 retry_backoff: self.retry_backoff,
-                timer_error_backoff: std::sync::Mutex::new(BTreeMap::new()),
+                deferrals: std::sync::Mutex::new(BTreeMap::new()),
                 compiled: RwLock::new(BTreeMap::new()),
             }),
         }
@@ -169,9 +169,10 @@ struct Inner {
     pool: PgPool,
     env: RwLock<Environment>,
     retry_backoff: std::time::Duration,
-    /// Instances whose timer firing recently errored, backed off so one
-    /// poisoned instance cannot head-of-line-block the scheduler.
-    timer_error_backoff: std::sync::Mutex<BTreeMap<uuid::Uuid, std::time::Instant>>,
+    /// Instances the scheduler is currently holding off on — see
+    /// [`Deferral`]. Shared by the candidate query and the sleep
+    /// computation, which is what keeps the two in agreement.
+    deferrals: std::sync::Mutex<BTreeMap<uuid::Uuid, Deferral>>,
     /// Compiled definitions by definition id — immutable rows, cached
     /// forever; definitions are few, growth is bounded by deploys.
     compiled: RwLock<BTreeMap<uuid::Uuid, Arc<rbpmn_core::ExecutableProcess>>>,
@@ -185,10 +186,44 @@ pub(crate) const CLAIMABLE: &str = "(w.state = 'available' \
      or (w.state = 'locked' and w.lock_until < now())) \
      and (w.retry_at is null or w.retry_at <= now()) and i.status = 'active'";
 
-/// How long a timer-erroring instance is skipped by the scheduler before
-/// being retried. In-process only: another replica (or a restart) retries
-/// sooner, which is exactly the right failover.
-const TIMER_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+/// Why (and until when) the scheduler is skipping an instance. Two very
+/// different situations share one map because both must be excluded from
+/// the candidate query *and* the sleep computation — a skip reason known to
+/// one but not the other is exactly the disagreement that produced this
+/// file's recurring busy-spin bugs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Deferral {
+    until: std::time::Instant,
+    /// Transient unavailability (a peer replica holds the advisory lock, a
+    /// caller holds the instance row). Escalates gently: a long-held lock
+    /// should cost a handful of wake-ups, not thousands.
+    skips: u32,
+    /// Hard failures (rehydration/step errors). Escalates steeply and is
+    /// what the persisted `timer-fire-failed` events count.
+    failures: u32,
+}
+
+/// Transient skip backoff: `200ms * 2^(skips-1)`, capped.
+const SKIP_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+const SKIP_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+/// Hard-failure backoff: `30s * 2^(failures-1)`, capped at an hour. In
+/// process memory only: another replica (or a restart) retries sooner,
+/// which is exactly the right failover.
+const FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+const FAILURE_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+/// How long a lapsed deferral's history is remembered. Bounds the map while
+/// letting consecutive failures escalate across their own backoff windows.
+const DEFERRAL_FORGET: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Failures whose `timer-fire-failed` event is persisted. Beyond this the
+/// backoff keeps growing but the stream stops being flooded by one stuck
+/// instance (the warning log continues).
+pub(crate) const MAX_RECORDED_TIMER_FAILURES: u32 = 5;
+
+/// `base * 2^(n-1)`, saturating at `max`.
+fn backoff(base: std::time::Duration, max: std::time::Duration, n: u32) -> std::time::Duration {
+    base.saturating_mul(1u32.checked_shl(n.saturating_sub(1)).unwrap_or(u32::MAX))
+        .min(max)
+}
 
 #[derive(Clone)]
 pub struct Engine {
@@ -427,20 +462,79 @@ impl Engine {
     /// Currently backed-off instances plus the time until the earliest
     /// backoff expires — the scheduler excludes the former from its queries
     /// and bounds its sleep by the latter.
-    pub(crate) fn timer_backoff_snapshot(&self) -> (Vec<uuid::Uuid>, Option<std::time::Duration>) {
-        let mut map = self.inner.timer_error_backoff.lock().unwrap();
+    /// Instances currently deferred, plus the time until the earliest one
+    /// becomes eligible again. Both the candidate query and the sleep
+    /// computation read this, so they cannot disagree about what is
+    /// actionable.
+    pub(crate) fn deferral_snapshot(&self) -> (Vec<uuid::Uuid>, Option<std::time::Duration>) {
+        let mut map = self.inner.deferrals.lock().unwrap();
         let now = std::time::Instant::now();
-        map.retain(|_, until| *until > now);
-        let earliest = map.values().min().map(|until| *until - now);
-        (map.keys().copied().collect(), earliest)
+        // Expired entries are kept (only their *deferral* lapsed, not their
+        // history) and forgotten later: dropping them at expiry would reset
+        // the consecutive-failure count on every cycle, so the backoff could
+        // never escalate and every retry would re-record the same failure.
+        // Real progress calls `clear_deferral`, which is the honest reset.
+        map.retain(|_, d| d.until + DEFERRAL_FORGET > now);
+        let deferred: Vec<uuid::Uuid> = map
+            .iter()
+            .filter(|(_, d)| d.until > now)
+            .map(|(id, _)| *id)
+            .collect();
+        let earliest = map
+            .values()
+            .map(|d| d.until)
+            .filter(|until| *until > now)
+            .min()
+            .map(|until| until - now);
+        (deferred, earliest)
     }
 
-    pub(crate) fn set_timer_error_backoff(&self, instance: uuid::Uuid) {
-        self.inner
-            .timer_error_backoff
-            .lock()
-            .unwrap()
-            .insert(instance, std::time::Instant::now() + TIMER_ERROR_BACKOFF);
+    /// A transient skip: someone else is working on this instance, or a
+    /// caller holds its row. Escalates so a long-held lock costs few
+    /// wake-ups.
+    pub(crate) fn defer_transient(&self, instance: uuid::Uuid) {
+        let mut map = self.inner.deferrals.lock().unwrap();
+        let entry = map.entry(instance).or_insert(Deferral {
+            until: std::time::Instant::now(),
+            skips: 0,
+            failures: 0,
+        });
+        entry.skips = entry.skips.saturating_add(1);
+        entry.until =
+            std::time::Instant::now() + backoff(SKIP_BACKOFF, SKIP_BACKOFF_MAX, entry.skips);
+    }
+
+    /// A hard failure. Returns the consecutive-failure count, which decides
+    /// whether the failure is also persisted as an event.
+    pub(crate) fn defer_failed(&self, instance: uuid::Uuid) -> u32 {
+        let mut map = self.inner.deferrals.lock().unwrap();
+        let entry = map.entry(instance).or_insert(Deferral {
+            until: std::time::Instant::now(),
+            skips: 0,
+            failures: 0,
+        });
+        entry.failures = entry.failures.saturating_add(1);
+        entry.until = std::time::Instant::now()
+            + backoff(FAILURE_BACKOFF, FAILURE_BACKOFF_MAX, entry.failures);
+        entry.failures
+    }
+
+    /// Progress on an instance clears its history: the next hiccup starts
+    /// from the shortest backoff again.
+    pub(crate) fn clear_deferral(&self, instance: uuid::Uuid) {
+        self.inner.deferrals.lock().unwrap().remove(&instance);
+    }
+
+    /// Test-only: make a deferred instance eligible again *without*
+    /// forgetting why it was deferred — the escalating backoff would
+    /// otherwise make failure cycles take minutes to observe. Distinct from
+    /// [`Engine::clear_deferral`], which is what real progress does and
+    /// deliberately resets the failure history.
+    #[cfg(feature = "test-util")]
+    pub fn expire_deferral_for_test(&self, instance: uuid::Uuid) {
+        if let Some(entry) = self.inner.deferrals.lock().unwrap().get_mut(&instance) {
+            entry.until = std::time::Instant::now();
+        }
     }
 
     fn pool(&self) -> &PgPool {

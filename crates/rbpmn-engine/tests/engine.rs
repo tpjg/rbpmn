@@ -2771,9 +2771,311 @@ async fn scheduler_skips_instances_locked_by_a_caller() {
     assert!(fired);
     wait_for_status(&db.pool, free.id, "completed").await;
 
-    // Once the caller commits, the skipped timer fires normally.
+    // Once the caller commits, the skipped timer fires — after its short
+    // transient deferral expires (the skip is remembered on purpose, so the
+    // next pass looks at other instances first).
     held.commit().await.unwrap();
-    assert!(engine.fire_due_timer().await.unwrap());
+    let mut fired = false;
+    for _ in 0..50 {
+        if engine.fire_due_timer().await.unwrap() {
+            fired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        fired,
+        "the deferred timer never fired after the lock released"
+    );
     wait_for_status(&db.pool, blocked.id, "completed").await;
+    db.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Second post-phase-5 review round
+// ---------------------------------------------------------------------------
+
+async fn transaction_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "select xact_commit + xact_rollback from pg_stat_database \
+         where datname = current_database()",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The liveness invariant, measured rather than argued: while a caller holds
+/// an instance's row lock, the scheduler must NOT hot-spin. Every previous
+/// incarnation of this bug produced thousands of transactions per second;
+/// the drain now reports "deferred" and the loop sleeps on that.
+#[tokio::test]
+async fn scheduler_does_not_spin_while_a_caller_holds_a_lock() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT0S</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let held_instance = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // A business transaction holds the row of the ONLY instance with a due
+    // timer — the exact shape that used to spin.
+    let mut held = db.pool.begin().await.unwrap();
+    sqlx::query("select id from rbpmn_instance where id = $1 for update")
+        .bind(held_instance.id)
+        .fetch_one(&mut *held)
+        .await
+        .unwrap();
+
+    let before = transaction_count(&db.pool).await;
+    let scheduler = tokio::spawn({
+        let engine = engine.clone();
+        async move {
+            engine
+                .run_scheduler(rbpmn_engine::SchedulerOptions::default())
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    scheduler.abort();
+    let spent = transaction_count(&db.pool).await - before;
+    assert!(
+        spent < 100,
+        "scheduler burned {spent} transactions in 1s against a locked instance — spinning"
+    );
+
+    // And it is not merely asleep: releasing the lock lets the timer fire.
+    held.commit().await.unwrap();
+    for _ in 0..50 {
+        if engine.fire_due_timer().await.unwrap() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    wait_for_status(&db.pool, held_instance.id, "completed").await;
+    db.drop().await;
+}
+
+/// Per-instance semantic order is `id`, and the stream's (txid, id) order is
+/// a DIFFERENT key: an `*_in_tx` caller that took its xid before locking the
+/// instance delivers its later events earlier in the stream. Both halves of
+/// that contract are asserted here — on a single instance, which the
+/// cross-instance test could not see.
+#[tokio::test]
+async fn per_instance_order_is_id_not_stream_position() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    sqlx::query("create table audit_marks (n int)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    engine
+        .deploy(
+            &fixture("accept/03-parallel-gateway.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let items = open_items(&db.pool, started.id).await;
+    let ta = items.iter().find(|(_, el)| el == "ta").unwrap().0;
+    let tb = items.iter().find(|(_, el)| el == "tb").unwrap().0;
+
+    // H takes its xid FIRST, before touching the instance at all.
+    let mut held = db.pool.begin().await.unwrap();
+    sqlx::query("insert into audit_marks values (1)")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+
+    // A younger autocommit transaction steps the instance first (higher
+    // txid, lower ids)...
+    engine
+        .complete_work_item(ta, serde_json::json!({}))
+        .await
+        .unwrap();
+    // ...then H steps it (lower txid, higher ids) and commits.
+    engine
+        .complete_work_item_in_tx(&mut held, tb, None, serde_json::json!({}))
+        .await
+        .unwrap();
+    held.commit().await.unwrap();
+
+    let mut all = Vec::new();
+    for _ in 0..100 {
+        all = engine
+            .read_events(rbpmn_engine::EventCursor::default(), 200)
+            .await
+            .unwrap();
+        if all.iter().any(|e| e.kind == "instance-completed") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mine: Vec<_> = all.iter().filter(|e| e.instance_id == started.id).collect();
+    assert!(!mine.is_empty());
+
+    // Guarantee: ids ascend in semantic order — ta's completion precedes
+    // tb's, which precedes the join and the instance completing.
+    let id_of = |kind: &str, element: Option<&str>| -> i64 {
+        mine.iter()
+            .find(|e| e.kind == kind && e.element_id.as_deref() == element)
+            .unwrap_or_else(|| panic!("no {kind} {element:?} in {mine:?}"))
+            .id
+    };
+    assert!(id_of("work-item-completed", Some("ta")) < id_of("work-item-completed", Some("tb")));
+    assert!(id_of("work-item-completed", Some("tb")) < id_of("instance-completed", None));
+
+    // Caveat: stream position is NOT that order — H's later events carry the
+    // lower txid and therefore arrive first.
+    let stream_pos = |kind: &str, element: Option<&str>| -> usize {
+        mine.iter()
+            .position(|e| e.kind == kind && e.element_id.as_deref() == element)
+            .unwrap()
+    };
+    assert!(
+        stream_pos("work-item-completed", Some("tb"))
+            < stream_pos("work-item-completed", Some("ta")),
+        "the documented caveat did not reproduce; the test no longer proves it"
+    );
+    db.drop().await;
+}
+
+/// Aborting a worker cancels its in-flight handler: `tokio::spawn` detaches
+/// by default, which would leave the handler running (and re-firing side
+/// effects) with nobody left to record its result.
+#[tokio::test]
+async fn aborting_a_worker_cancels_the_running_handler() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+
+    struct SlowHandler {
+        started: Arc<AtomicUsize>,
+        finished: Arc<AtomicUsize>,
+    }
+    impl ServiceTaskHandler for SlowHandler {
+        fn execute(
+            &self,
+            _item: WorkItem,
+        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, HandlerFailure>> + Send + '_>>
+        {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let finished = self.finished.clone();
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                finished.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({}))
+            })
+        }
+    }
+    let started_count = Arc::new(AtomicUsize::new(0));
+    let finished_count = Arc::new(AtomicUsize::new(0));
+    engine.register_handler(
+        "payments",
+        Arc::new(SlowHandler {
+            started: started_count.clone(),
+            finished: finished_count.clone(),
+        }),
+    );
+    engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new().topic("st", "payments"),
+        )
+        .await
+        .unwrap();
+
+    let worker = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.run_worker(worker_options()).await }
+    });
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    // Let it claim and enter the handler, then pull the rug.
+    for _ in 0..50 {
+        if started_count.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(started_count.load(Ordering::SeqCst), 1, "handler never ran");
+    worker.abort();
+
+    // Well past the handler's own duration: it must never have finished.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        finished_count.load(Ordering::SeqCst),
+        0,
+        "the handler kept running after its worker was aborted"
+    );
+    db.drop().await;
+}
+
+/// Repeated timer failures escalate their backoff and stop being persisted
+/// after a handful — one stuck instance must not flood the event stream
+/// forever.
+#[tokio::test]
+async fn repeated_timer_failures_are_bounded_in_the_stream() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT0S</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    sqlx::query("update rbpmn_token set element_id = 'ghost' where instance_id = $1")
+        .bind(started.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Drive many failure cycles, clearing the deferral each time so the
+    // instance is re-attempted immediately (the escalating backoff would
+    // otherwise make this test minutes long).
+    for _ in 0..12 {
+        assert!(!engine.fire_due_timer().await.unwrap());
+        engine.expire_deferral_for_test(started.id);
+    }
+    let recorded = event_count(&db.pool, started.id, "timer-fire-failed").await;
+    assert!(
+        (1..=5).contains(&recorded),
+        "expected the first few failures only, got {recorded}"
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn event_cursor_inputs_are_validated() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bad_cursor = rbpmn_engine::EventCursor { txid: -1, id: 0 };
+    assert!(matches!(
+        engine.read_events(bad_cursor, 10).await,
+        Err(rbpmn_engine::EngineError::InvalidVariables(_))
+    ));
+    assert!(matches!(
+        engine
+            .read_events(rbpmn_engine::EventCursor::default(), 0)
+            .await,
+        Err(rbpmn_engine::EngineError::InvalidVariables(_))
+    ));
     db.drop().await;
 }

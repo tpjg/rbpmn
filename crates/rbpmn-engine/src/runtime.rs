@@ -385,7 +385,7 @@ impl Engine {
                 &definition,
                 instance_id,
                 "work-item-retrying",
-                &element_id,
+                Some(element_id.as_str()),
                 serde_json::json!({
                     "kind": "work-item-retrying",
                     "element": element_id,
@@ -590,10 +590,12 @@ pub(crate) async fn load_instance(
     ),
     EngineError,
 > {
-    match load_instance_nowait(engine, tx, instance_id, false).await? {
-        Some(loaded) => Ok(loaded),
-        None => unreachable!("blocking load never reports lock-busy"),
-    }
+    load_instance_nowait(engine, tx, instance_id, false)
+        .await?
+        // Only the NOWAIT variant can report lock-busy; a blocking load
+        // waits instead. Surfaced as an error rather than a panic: this is
+        // the hot step path, inside a held transaction.
+        .ok_or_else(|| internal("blocking instance load reported lock-busy".to_string()))
 }
 
 /// [`load_instance`] with an optional `FOR UPDATE NOWAIT`: `Ok(None)` when
@@ -1069,12 +1071,15 @@ async fn set_work_item_state(
     Ok(())
 }
 
+/// Append an engine-generated event (one the pure core did not emit).
+/// `element` is `None` for instance-level events — a stored NULL, not an
+/// empty string, so consumers can tell "no element" from "some element".
 pub(crate) async fn insert_engine_event(
     tx: &mut PgConnection,
     definition: &DefinitionRef,
     instance_id: Uuid,
     kind: &str,
-    element: &str,
+    element: Option<&str>,
     payload: serde_json::Value,
 ) -> Result<(), EngineError> {
     sqlx::query(

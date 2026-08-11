@@ -362,12 +362,16 @@ pub fn declared_index_name(definition_key: &str, field: &str) -> String {
     hasher.update([0]);
     hasher.update(field.as_bytes());
     let digest = format!("{:x}", hasher.finalize());
-    let clean: String = definition_key
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
+    // Both halves are sanitized to ASCII before truncation: this function
+    // is public, so it must not panic on a multi-byte char landing across
+    // the cut (nor emit a non-identifier).
+    let ascii = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect()
+    };
     // Postgres identifiers cap at 63 bytes; the hash always survives.
-    let mut readable = format!("rbpmn_vix_{clean}_{field}");
+    let mut readable = format!("rbpmn_vix_{}_{}", ascii(definition_key), ascii(field));
     readable.truncate(63 - 9);
     format!("{readable}_{}", &digest[..8])
 }

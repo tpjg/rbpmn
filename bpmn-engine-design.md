@@ -613,11 +613,13 @@ head of the post-v1 roadmap (v2, below) — the first release after v1, as
 hierarchical BPMN is the modeling style this engine exists to serve.
 
 Event ordering (decided and shipped; cursor shape corrected in the
-post-phase-5 review): two guarantees. Per instance, stream order **is** the
-semantic order — an instance's steps serialize on its row lock and xids are
-allocated monotonically, so a later step always carries a higher `txid`,
-and within one transaction ascending `id` is the emission order. Across
-instances, the stream is ordered and cursored by **`(txid, id)`**, stopping
+post-phase-5 review, twice): two guarantees and one caveat. Per instance,
+ascending **`id`** is the semantic order — an instance's steps serialize on
+its row lock, so each step's rows are inserted after the previous step
+committed. (The first correction claimed per-instance *txid* monotonicity;
+that is false, because a transaction's xid is taken at its first write,
+which may precede acquiring the row lock.) The stream itself is ordered and
+cursored by **`(txid, id)`**, stopping
 at the **safe horizon**: only rows whose `txid` is older than every
 in-progress transaction are released, so nothing can ever appear behind a
 returned frontier. Neither key alone works, and the first shipped version
@@ -626,8 +628,13 @@ but transactions commit out of order, *and* a transaction's `txid` is
 assigned at its **first write** — so a business transaction around an
 `*_in_tx` call holds an old txid while inserting late, high-id events, and
 an id-only cursor advances straight past them. Ordering by the pair is what
-makes "below the horizon" mean "finished, nothing can precede this". The
-horizon is cluster-wide (xids are global to the PostgreSQL cluster) — a
+makes "below the horizon" mean "finished, nothing can precede this".
+**The caveat:** cursor safety and per-instance order are different sort
+keys and cannot both drive one pass, so an instance's events can *arrive*
+out of `id` order when a long-lived caller transaction is involved —
+consumers reassembling an instance's history sort by `id` rather than
+trusting arrival. Autocommit callers (everything over HTTP) never trigger
+it. The horizon is cluster-wide (xids are global to the PostgreSQL cluster) — a
 long-running transaction anywhere, including a business transaction around
 an `*_in_tx` call, delays the stream (late, never lost), which is one more
 reason the "commit promptly" rule is a rule. External API callers cannot

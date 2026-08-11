@@ -1,12 +1,13 @@
 //! The event-stream tailing contract (phase 5).
 //!
-//! Two guarantees, stated and kept:
+//! Two guarantees, stated and kept — and one caveat, stated because it is
+//! real rather than because it is comfortable:
 //!
-//! 1. **Per instance, stream order is the semantic order.** Every event of
-//!    an instance is written under its instance row lock, so its steps'
-//!    transactions serialize — and because xids are allocated monotonically,
-//!    a later step always carries a higher `txid`. Within one transaction,
-//!    ascending `id` is the emission order.
+//! 1. **Per instance, ascending `id` is the semantic order.** An instance's
+//!    steps serialize on its row lock, so each step's event rows are
+//!    inserted (and their ids allocated) strictly after the previous step
+//!    committed. Sort an instance's events by `id` and you have exactly the
+//!    order the core emitted them, always.
 //! 2. **A [`Engine::read_events`] cursor never misses an event.** Neither
 //!    `id` nor `txid` alone is commit order: ids are assigned at insert but
 //!    transactions commit out of order, and a transaction's `txid` is
@@ -17,6 +18,19 @@
 //!    every transaction still in progress are returned. Every transaction
 //!    below the horizon has terminated, so nothing can ever appear behind a
 //!    released `(txid, id)` frontier.
+//!
+//! **Caveat: stream order is not per-instance order.** Those two are
+//! different sort keys and cannot be reconciled in one pass — the cursor
+//! must lead with `txid` to be safe, while per-instance semantics live in
+//! `id`. So when a long-lived caller transaction takes its xid *before*
+//! acquiring an instance's row lock, its (semantically later) events carry
+//! a lower txid and arrive *earlier* in the stream than events of a step
+//! that really happened first. Consumers that care about per-instance
+//! ordering must sort each instance's events by `id` rather than trusting
+//! arrival order (a projection keyed by instance is the normal shape, and
+//! `id` is carried on every record for exactly this). Autocommit callers —
+//! everything over HTTP — never trigger it: their xid and their lock are
+//! taken in the same statement.
 //!
 //! The horizon is **cluster-wide** (transaction ids are global to the
 //! PostgreSQL cluster, not per database): one long-running transaction —
@@ -43,7 +57,9 @@ pub struct EventCursor {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventRecord {
-    /// Unique per event; ascending per instance within one transaction.
+    /// Unique per event, and **ascending in semantic order within one
+    /// instance** — the key to sort by when reassembling an instance's
+    /// history (see the module docs' caveat).
     pub id: i64,
     /// The writing transaction's id — the stream's major sort key.
     pub txid: i64,
@@ -77,6 +93,20 @@ impl Engine {
         after: EventCursor,
         limit: u32,
     ) -> Result<Vec<EventRecord>, EngineError> {
+        // Validate at the boundary: a negative cursor would reach Postgres
+        // as an invalid xid8 (a 500 on 16+, a silently dead cursor before
+        // that), and limit 0 would page forever through empty results that
+        // the contract tells the caller to read as "nothing final yet".
+        if after.txid < 0 || after.id < 0 {
+            return Err(EngineError::InvalidVariables(
+                "event cursor components must not be negative".to_string(),
+            ));
+        }
+        if limit == 0 {
+            return Err(EngineError::InvalidVariables(
+                "event page limit must be at least 1".to_string(),
+            ));
+        }
         let rows = sqlx::query(
             "select id, txid::text::bigint as txid, instance_id, definition_key, \
              kind, element_id, payload, \
