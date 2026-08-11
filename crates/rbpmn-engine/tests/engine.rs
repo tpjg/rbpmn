@@ -2329,9 +2329,9 @@ async fn declared_indexes_serve_the_filter_queries() {
     let mut scans = 0i64;
     for _ in 0..20 {
         scans = sqlx::query_scalar::<_, Option<i64>>(
-            "select idx_scan::bigint from pg_stat_user_indexes \
-             where indexrelname = 'rbpmn_vix_p_region'",
+            "select idx_scan::bigint from pg_stat_user_indexes where indexrelname = $1",
         )
+        .bind(rbpmn_engine::declared_index_name("p", "region"))
         .fetch_one(&db.pool)
         .await
         .unwrap()
@@ -2378,15 +2378,22 @@ async fn manifest_index_declarations_apply_at_deploy() {
         )
         .await
         .unwrap();
-    let exists: bool = sqlx::query_scalar(
-        "select exists (select 1 from pg_class where relname = 'rbpmn_vix_p_region')",
-    )
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
+    let exists: bool =
+        sqlx::query_scalar("select exists (select 1 from pg_class where relname = $1)")
+            .bind(rbpmn_engine::declared_index_name("p", "region"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
     assert!(
         exists,
         "the manifest's declared index must exist after deploy"
+    );
+
+    // The collision pair: ("a.b","c") and ("a","b_c") flatten identically
+    // but must get distinct indexes.
+    assert_ne!(
+        rbpmn_engine::declared_index_name("a.b", "c"),
+        rbpmn_engine::declared_index_name("a", "b_c")
     );
     db.drop().await;
 }
@@ -2496,60 +2503,76 @@ async fn undeclare_protects_versions_with_active_instances() {
 // Phase 5: the event-stream tailing contract
 // ---------------------------------------------------------------------------
 
-/// The safe horizon under out-of-order commits: an open transaction that
-/// wrote lower event ids holds later-committed higher ids back, so a
-/// tailing cursor can never skip past a gap that later fills in.
+/// The safe horizon under out-of-order commits — including the txid
+/// inversion: a business transaction takes its xid at its FIRST write, so
+/// an `*_in_tx` caller can hold an OLD txid while inserting LATE, high-id
+/// events. An id-only cursor provably loses events here; the (txid, id)
+/// cursor must not.
 #[tokio::test]
 async fn event_stream_never_misses_out_of_order_commits() {
     let db = TestDb::create().await;
     let engine = engine(&db).await;
+    sqlx::query("create table audit_marks (n int)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
     engine
         .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
         .await
         .unwrap();
+    assert!(
+        engine
+            .read_events(rbpmn_engine::EventCursor::default(), 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
-    // Drain everything already final (nothing yet).
-    assert!(engine.read_events(0, 100).await.unwrap().is_empty());
-
-    // An open transaction writes the FIRST instance's events (lower ids)
-    // but does not commit...
+    // The inversion: tx H writes a business row FIRST (assigning it an old
+    // xid), stays open...
     let mut held = db.pool.begin().await.unwrap();
-    let early = engine
-        .start_in_tx(&mut held, "p", None, serde_json::json!({}))
+    sqlx::query("insert into audit_marks values (1)")
+        .execute(&mut *held)
         .await
         .unwrap();
 
-    // ...while a second instance's events (higher ids) commit immediately.
-    let late = engine
+    // ...while a younger transaction (higher xid) inserts LOWER event ids
+    // and commits immediately.
+    let young = engine
         .start("p", None, serde_json::json!({}))
         .await
         .unwrap();
 
-    // The committed higher ids are visible to plain SQL but must be held
-    // back by the horizon: returning them would fix the cursor past the
-    // open transaction's lower ids.
-    let visible: i64 = sqlx::query("select count(*) from rbpmn_event where instance_id = $1")
-        .bind(late.id)
-        .fetch_one(&db.pool)
+    // Now H (old xid) inserts HIGHER event ids and stays open.
+    let old_tx = engine
+        .start_in_tx(&mut held, "p", None, serde_json::json!({}))
         .await
-        .unwrap()
-        .get(0);
-    assert!(visible > 0, "the second instance's events are committed");
+        .unwrap();
+
+    // Nothing may be released: H (the oldest in-progress tx) pins the
+    // horizon below BOTH transactions' rows. An id-only horizon would have
+    // released young's rows here — and later H's lower-txid rows would sort
+    // before a cursor that already passed them.
     assert!(
-        engine.read_events(0, 100).await.unwrap().is_empty(),
+        engine
+            .read_events(rbpmn_engine::EventCursor::default(), 100)
+            .await
+            .unwrap()
+            .is_empty(),
         "events past an in-flight transaction must not be released"
     );
 
-    // Commit the held transaction: everything becomes final, in id order,
-    // with each instance's events contiguous in their semantic order. The
-    // horizon is CLUSTER-wide (xids are global), so concurrent tests'
-    // transactions in sibling databases can briefly hold it back — poll.
+    // Commit H; poll until the horizon releases both (it is CLUSTER-wide,
+    // so concurrent tests' transactions can briefly hold it back).
     held.commit().await.unwrap();
     let mut all = Vec::new();
     for _ in 0..100 {
-        all = engine.read_events(0, 100).await.unwrap();
-        let complete = all.iter().any(|e| e.instance_id == early.id)
-            && all.iter().any(|e| e.instance_id == late.id);
+        all = engine
+            .read_events(rbpmn_engine::EventCursor::default(), 100)
+            .await
+            .unwrap();
+        let complete = all.iter().any(|e| e.instance_id == young.id)
+            && all.iter().any(|e| e.instance_id == old_tx.id);
         if complete {
             break;
         }
@@ -2559,19 +2582,198 @@ async fn event_stream_never_misses_out_of_order_commits() {
         !all.is_empty(),
         "horizon never released the committed events"
     );
-    let ids: Vec<i64> = all.iter().map(|e| e.id).collect();
-    let mut sorted = ids.clone();
-    sorted.sort();
-    assert_eq!(ids, sorted, "stream is in id order");
-    let early_kinds: Vec<&str> = all
-        .iter()
-        .filter(|e| e.instance_id == early.id)
-        .map(|e| e.kind.as_str())
-        .collect();
-    assert_eq!(early_kinds.first(), Some(&"instance-started"));
 
-    // Cursor resumption: reading after the last id yields nothing new.
-    let cursor = *ids.last().unwrap();
-    assert!(engine.read_events(cursor, 100).await.unwrap().is_empty());
+    // Stream order is (txid, id): H's events (older txid, HIGHER ids) come
+    // first — the id-only ordering would have lost them.
+    let cursors: Vec<(i64, i64)> = all.iter().map(|e| (e.txid, e.id)).collect();
+    let mut sorted = cursors.clone();
+    sorted.sort();
+    assert_eq!(cursors, sorted, "stream is in (txid, id) order");
+    assert_eq!(
+        all.first().unwrap().instance_id,
+        old_tx.id,
+        "the old-txid transaction's events sort first despite higher ids"
+    );
+    // Per instance, the stream preserves semantic (id) order.
+    for inst in [young.id, old_tx.id] {
+        let ids: Vec<i64> = all
+            .iter()
+            .filter(|e| e.instance_id == inst)
+            .map(|e| e.id)
+            .collect();
+        let mut s = ids.clone();
+        s.sort();
+        assert_eq!(ids, s, "per-instance id order broken for {inst}");
+    }
+
+    // Cursor walk: paging with limit 3 yields exactly the same stream,
+    // no misses, no duplicates.
+    let mut walked = Vec::new();
+    let mut cursor = rbpmn_engine::EventCursor::default();
+    loop {
+        let page = engine.read_events(cursor, 3).await.unwrap();
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().unwrap().cursor();
+        walked.extend(page.into_iter().map(|e| (e.txid, e.id)));
+    }
+    assert_eq!(walked, cursors, "paged walk must equal the full stream");
+    db.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Post-phase-5 review round
+// ---------------------------------------------------------------------------
+
+/// A panicking handler must not kill the worker loop: the panic becomes a
+/// recorded failure and the loop keeps serving other work. Before this, the
+/// spawned task died silently while the process kept answering HTTP.
+#[tokio::test]
+async fn panicking_handler_is_contained_as_a_failure() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:process id="pp" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:serviceTask id="boom"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="boom"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="boom" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    engine.register_handler(
+        "boom",
+        Arc::new(FnHandler(
+            |_item| -> Result<serde_json::Value, HandlerFailure> {
+                panic!("handler exploded");
+            },
+        )),
+    );
+    engine.deploy(xml, &Bindings::default()).await.unwrap();
+
+    let worker = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.run_worker(worker_options()).await }
+    });
+    let started = engine
+        .start("pp", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // Retries are exhausted by repeated panics and the instance freezes —
+    // the loop survived every one of them.
+    wait_for_status(&db.pool, started.id, "failed").await;
+    let last: String =
+        sqlx::query("select last_failure from rbpmn_work_item where instance_id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .get("last_failure");
+    assert!(last.contains("panicked"), "{last}");
+    assert!(last.contains("handler exploded"), "{last}");
+
+    // And the same worker still processes a fresh instance of other work.
+    let done = Arc::new(AtomicUsize::new(0));
+    let counter = done.clone();
+    engine.register_handler(
+        "boom",
+        Arc::new(FnHandler(move |_item| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({}))
+        })),
+    );
+    let second = engine
+        .start("pp", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, second.id, "completed").await;
+    assert_eq!(done.load(Ordering::SeqCst), 1);
+    worker.abort();
+    db.drop().await;
+}
+
+/// A repeatedly-failing timer records a `timer-fire-failed` event: the
+/// in-process backoff must never be the only trace ("do NOT silently
+/// swallow").
+#[tokio::test]
+async fn timer_firing_failures_are_recorded_not_swallowed() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT0S</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    // Poison rehydration so every firing attempt errors.
+    sqlx::query("update rbpmn_token set element_id = 'ghost' where instance_id = $1")
+        .bind(started.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    assert!(!engine.fire_due_timer().await.unwrap());
+    assert_eq!(
+        event_count(&db.pool, started.id, "timer-fire-failed").await,
+        1,
+        "the backoff must leave a persisted trace"
+    );
+    db.drop().await;
+}
+
+/// The scheduler must not park its whole drain behind an `*_in_tx` caller
+/// holding an instance row lock: NOWAIT lets it fire other instances' due
+/// timers immediately.
+#[tokio::test]
+async fn scheduler_skips_instances_locked_by_a_caller() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT0S</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let blocked = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await; // strictly later due_at
+    let free = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // Hold the first instance's row lock, as a business transaction would.
+    let mut held = db.pool.begin().await.unwrap();
+    sqlx::query("select id from rbpmn_instance where id = $1 for update")
+        .bind(blocked.id)
+        .fetch_one(&mut *held)
+        .await
+        .unwrap();
+
+    // The blocked instance owns the EARLIEST due timer, so a blocking load
+    // would stall here; NOWAIT moves on and fires the free one.
+    let fired = tokio::time::timeout(Duration::from_secs(5), engine.fire_due_timer())
+        .await
+        .expect("scheduler must not block on a caller-held lock")
+        .unwrap();
+    assert!(fired);
+    wait_for_status(&db.pool, free.id, "completed").await;
+
+    // Once the caller commits, the skipped timer fires normally.
+    held.commit().await.unwrap();
+    assert!(engine.fire_due_timer().await.unwrap());
+    wait_for_status(&db.pool, blocked.id, "completed").await;
     db.drop().await;
 }

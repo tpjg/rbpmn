@@ -349,27 +349,27 @@ impl Engine {
     }
 }
 
-/// Deterministic index name from (definition key, field) — the same call is
-/// idempotent and re-runnable at startup. Hash-based when the readable form
-/// would overflow Postgres's 63-byte identifier limit.
-fn index_name(definition_key: &str, field: &str) -> String {
-    let clean: String = definition_key
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let name = format!("rbpmn_vix_{clean}_{field}");
-    if name.len() <= 63 {
-        return name;
-    }
+/// Deterministic, collision-proof index name from (definition key, field):
+/// idempotent, re-runnable at startup, and always carrying a short hash of
+/// the exact pair — sanitization alone is ambiguous (("a.b","c") and
+/// ("a","b_c") both flatten to a_b_c, and IF NOT EXISTS would silently keep
+/// whichever index got there first while the validity probe vouched for
+/// it). Public so operators and tests can locate the index.
+pub fn declared_index_name(definition_key: &str, field: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(definition_key.as_bytes());
     hasher.update([0]);
     hasher.update(field.as_bytes());
     let digest = format!("{:x}", hasher.finalize());
-    let mut name = format!("rbpmn_vix_{}_{field}", &digest[..16]);
-    name.truncate(63);
-    name
+    let clean: String = definition_key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    // Postgres identifiers cap at 63 bytes; the hash always survives.
+    let mut readable = format!("rbpmn_vix_{clean}_{field}");
+    readable.truncate(63 - 9);
+    format!("{readable}_{}", &digest[..8])
 }
 
 impl Engine {
@@ -393,7 +393,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         validate_definition_key(definition_key)?;
         validate_field(field)?;
-        let name = index_name(definition_key, field);
+        let name = declared_index_name(definition_key, field);
         sqlx::query(&format!(
             "create index concurrently if not exists {name} on rbpmn_instance \
              ((variables->>'{field}')) where definition_key = '{definition_key}'"

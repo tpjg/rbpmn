@@ -547,7 +547,10 @@ is injected in the core from phase 1 precisely for this.
 
 Timer mechanics (decided; claim ordering refined during phase 3): a timer
 catch inserts its `rbpmn_timer` row in the same transaction that parks the
-token, with `due_at` computed from **database time** (`now() + duration`) —
+token, with `due_at` computed from **database time** (`clock_timestamp() +
+duration` — statement time, not `now()`: `now()` is *transaction-start*
+time, so a timer armed late inside a long caller transaction would be due
+too early by the age of that transaction) —
 node clocks never decide anything. Firing is one timer per transaction, and
 the timer row's deletion commits together with the step — that is what makes
 firing exactly-once. The originally sketched claim (`DELETE ... FOR UPDATE
@@ -609,18 +612,27 @@ Event ordering guarantees in `event`, retention jobs, instance migration API
 head of the post-v1 roadmap (v2, below) — the first release after v1, as
 hierarchical BPMN is the modeling style this engine exists to serve.
 
-Event ordering (decided and shipped): two guarantees. Per instance,
-ascending `id` **is** the semantic order (all of an instance's events are
-written under its row lock). Across instances, a naive `id > cursor` tail
-can skip events — bigserial ids are assigned at insert but transactions
-commit out of order — so `rbpmn_event` carries the writing transaction's
-64-bit `txid` (xid8, never wraps) and `read_events` / `GET /v1/events`
-stops at the **safe horizon**: only rows whose txid is older than every
+Event ordering (decided and shipped; cursor shape corrected in the
+post-phase-5 review): two guarantees. Per instance, stream order **is** the
+semantic order — an instance's steps serialize on its row lock and xids are
+allocated monotonically, so a later step always carries a higher `txid`,
+and within one transaction ascending `id` is the emission order. Across
+instances, the stream is ordered and cursored by **`(txid, id)`**, stopping
+at the **safe horizon**: only rows whose `txid` is older than every
 in-progress transaction are released, so nothing can ever appear behind a
-returned cursor. The horizon is cluster-wide (xids are global to the
-PostgreSQL cluster) — a long-running transaction anywhere, including a
-business transaction around an `*_in_tx` call, delays the stream, which is
-one more reason the "commit promptly" rule is a rule.
+returned frontier. Neither key alone works, and the first shipped version
+(id-ordered, txid-gated) was wrong: bigserial ids are assigned at insert
+but transactions commit out of order, *and* a transaction's `txid` is
+assigned at its **first write** — so a business transaction around an
+`*_in_tx` call holds an old txid while inserting late, high-id events, and
+an id-only cursor advances straight past them. Ordering by the pair is what
+makes "below the horizon" mean "finished, nothing can precede this". The
+horizon is cluster-wide (xids are global to the PostgreSQL cluster) — a
+long-running transaction anywhere, including a business transaction around
+an `*_in_tx` call, delays the stream (late, never lost), which is one more
+reason the "commit promptly" rule is a rule. External API callers cannot
+delay it at all: a claimed task is a *lease* (a row value), never an open
+transaction.
 Retention jobs, the instance migration API, cross-definition messaging and
 the upgrade escape hatch remain open — each needs a design round first.
 *(bpmnlint plugin packaging and the token-overlay debug view were pulled forward:

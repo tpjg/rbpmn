@@ -29,8 +29,8 @@ lint clean but refuse to compile.
 ## Status
 
 - [x] **Phase 0 — Parse & reject**: parser, full linter rule catalogue,
-      fixture corpus (18 accept / 32 reject, grown by later phases), corpus
-      runner.
+      fixture corpus (19 accept / 34 reject today — every phase adds its
+      own before its code), corpus runner.
 - [x] Server skeleton with the security spine and `POST /v1/definitions/lint`.
 - [x] **Phase 0-B — linter playground (WASM) + bpmnlint plugin**, with a
       byte-parity check between native Rust and WASM over the whole corpus.
@@ -94,7 +94,7 @@ graphs that pass them).
 | `implicit-merge-after-parallel` | warn | Implicit merge receiving concurrent tokens — the "task runs twice" trap (accompanies the balanced-gateways error). |
 | `bpmn-structure` ⁺ | error | Well-formedness: resolvable refs, flow cardinalities, connectivity, unique ids, error definitions. |
 | `no-mixed-gateway` ⁺ | error | A gateway either splits or joins, never both. |
-| `event-gateway-structure` ⁺ | error | Event gateway races ≥2 message/timer catches or receive tasks, each with exactly one incoming flow. |
+| `event-gateway-structure` ⁺ | error | Event gateway races ≥2 message/timer catches or receive tasks, each with exactly one incoming flow and no boundary events (the gateway itself is the race). |
 
 ## XML purity: nothing rbpmn-specific in the BPMN
 

@@ -40,6 +40,11 @@ pub fn validate_datetime(s: &str) -> Result<(), String> {
     expect(&mut i, b':')?;
     let second = digits(&mut i, 2, "second")?;
 
+    if year == 0 {
+        // Postgres timestamptz has no year zero: 0000-… would pass lint
+        // and then abort the arming transaction at runtime.
+        return Err(format!("year 0000 does not exist: '{s}'"));
+    }
     if !(1..=12).contains(&month) {
         return Err(format!("month {month} out of range in '{s}'"));
     }
@@ -276,6 +281,12 @@ fn month_days(year: u32, month: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn year_zero_is_rejected() {
+        assert!(validate_datetime("0000-02-29T00:00:00Z").is_err());
+        assert!(validate_datetime("0001-01-01T00:00:00Z").is_ok());
+    }
 
     #[test]
     fn valid_datetimes() {

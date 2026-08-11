@@ -121,14 +121,35 @@ impl Engine {
         };
 
         // Handler runs outside any transaction (at-least-once delivery),
-        // with the lease renewed underneath it while it works.
+        // with the lease renewed underneath it while it works. It runs in
+        // its OWN task so a panicking handler surfaces as a JoinError and
+        // becomes a recorded failure — never an invisibly dead worker loop
+        // in a process that still answers HTTP.
         let work_item_id = item.id;
-        let handler_future = handler.execute(item);
-        tokio::pin!(handler_future);
+        let mut handler_task = tokio::spawn(async move { handler.execute(item).await });
         let renew_every = (options.lease / 3).max(Duration::from_millis(200));
         let result = loop {
             tokio::select! {
-                result = &mut handler_future => break result,
+                joined = &mut handler_task => break match joined {
+                    Ok(result) => result,
+                    Err(e) if e.is_panic() => {
+                        let detail = match e.into_panic().downcast::<String>() {
+                            Ok(msg) => *msg,
+                            Err(payload) => payload
+                                .downcast::<&str>()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|_| "non-string panic payload".to_string()),
+                        };
+                        Err(crate::HandlerFailure {
+                            code: None,
+                            message: format!("handler panicked: {detail}"),
+                        })
+                    }
+                    Err(e) => Err(crate::HandlerFailure {
+                        code: None,
+                        message: format!("handler task failed: {e}"),
+                    }),
+                },
                 _ = tokio::time::sleep(renew_every) => {
                     match self.extend_lock(work_item_id, &options.owner, options.lease).await {
                         Ok(crate::LockExtension::Extended { .. }) => {}

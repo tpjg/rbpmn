@@ -13,7 +13,7 @@
 //! exactly-once: whoever loses the re-check simply moves on.
 
 use crate::listen::Wakeup;
-use crate::runtime::{load_instance, persist_step};
+use crate::runtime::{DefinitionRef, insert_engine_event, load_instance_nowait, persist_step};
 use crate::{Engine, EngineError};
 use rbpmn_core::{Command, InstanceStatus, TimerId, step};
 use sqlx::Row;
@@ -108,6 +108,15 @@ impl Engine {
                         "firing timer failed; backing the instance off"
                     );
                     self.set_timer_error_backoff(instance_id);
+                    // Never a silent in-memory loop: the failure is
+                    // recorded in the instance's event history, where
+                    // inspection can see it.
+                    if let Err(record_err) = self.record_timer_failure(instance_id, &e).await {
+                        tracing::warn!(
+                            instance = %instance_id, error = %record_err,
+                            "could not record the timer failure event"
+                        );
+                    }
                     continue;
                 }
             }
@@ -131,7 +140,14 @@ impl Engine {
         if !claimed {
             return Ok(false);
         }
-        let (definition, proc, mut state) = load_instance(self, &mut tx, instance_id).await?;
+        // NOWAIT: a caller transaction (an *_in_tx embedder) may hold this
+        // instance's row lock for a while — the sequential drain loop must
+        // move on to other instances' timers, not park behind it.
+        let Some((definition, proc, mut state)) =
+            load_instance_nowait(self, &mut tx, instance_id, true).await?
+        else {
+            return Ok(false);
+        };
         if state.status != InstanceStatus::Active {
             return Ok(false); // resolved between candidate pick and lock
         }
@@ -159,6 +175,38 @@ impl Engine {
         persist_step(&mut tx, &proc, &definition, instance_id, &state, &events).await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// A `timer-fire-failed` event row for a firing that keeps erroring —
+    /// the persisted, inspectable trace of what would otherwise be an
+    /// invisible in-process backoff loop.
+    async fn record_timer_failure(
+        &self,
+        instance_id: Uuid,
+        error: &EngineError,
+    ) -> Result<(), EngineError> {
+        let Some(row) =
+            sqlx::query("select definition_id, definition_key from rbpmn_instance where id = $1")
+                .bind(instance_id)
+                .fetch_optional(self.pool())
+                .await?
+        else {
+            return Ok(()); // instance gone; nothing to attach the event to
+        };
+        let definition = DefinitionRef::new(row.get("definition_id"), row.get("definition_key"));
+        let mut conn = self.pool().acquire().await?;
+        insert_engine_event(
+            &mut conn,
+            &definition,
+            instance_id,
+            "timer-fire-failed",
+            "",
+            serde_json::json!({
+                "kind": "timer-fire-failed",
+                "error": error.to_string(),
+            }),
+        )
+        .await
     }
 
     /// Time until the earliest live timer is due, from database time (cheap

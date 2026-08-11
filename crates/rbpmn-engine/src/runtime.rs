@@ -28,6 +28,12 @@ pub(crate) struct DefinitionRef {
     key: String,
 }
 
+impl DefinitionRef {
+    pub(crate) fn new(id: Uuid, key: String) -> Self {
+        DefinitionRef { id, key }
+    }
+}
+
 /// Work-item lifecycle states as stored in `rbpmn_work_item.state` (and
 /// mirrored by its CHECK constraint). Rust-side comparisons go through
 /// these; SQL text spells them out where the planner needs literals.
@@ -355,7 +361,8 @@ impl Engine {
         let row = sqlx::query(
             "update rbpmn_work_item set retries = retries - 1, failures = failures + 1, \
              state = 'available', lock_owner = null, lock_until = null, \
-             retry_at = now() + make_interval(secs => $3 * power(3, failures)), \
+             retry_at = clock_timestamp() + \
+               make_interval(secs => $3 * power(3, least(failures, 20))), \
              last_failure = coalesce($4, last_failure) \
              where instance_id = $1 and item_no = $2 \
                and state in ('available', 'locked') \
@@ -583,14 +590,47 @@ pub(crate) async fn load_instance(
     ),
     EngineError,
 > {
-    let inst = sqlx::query(
+    match load_instance_nowait(engine, tx, instance_id, false).await? {
+        Some(loaded) => Ok(loaded),
+        None => unreachable!("blocking load never reports lock-busy"),
+    }
+}
+
+/// [`load_instance`] with an optional `FOR UPDATE NOWAIT`: `Ok(None)` when
+/// someone else holds the instance row lock — for callers with other work
+/// to do (the scheduler must not park its whole drain loop behind one
+/// long-running caller transaction).
+pub(crate) async fn load_instance_nowait(
+    engine: &Engine,
+    tx: &mut PgConnection,
+    instance_id: Uuid,
+    nowait: bool,
+) -> Result<
+    Option<(
+        DefinitionRef,
+        std::sync::Arc<ExecutableProcess>,
+        InstanceState,
+    )>,
+    EngineError,
+> {
+    let sql = format!(
         "select i.definition_id, i.definition_key, i.status, i.variables, \
                 i.next_token, i.next_work_item, i.next_timer, i.next_subscription \
-         from rbpmn_instance i where i.id = $1 for update",
-    )
-    .bind(instance_id)
-    .fetch_one(&mut *tx)
-    .await?;
+         from rbpmn_instance i where i.id = $1 for update{}",
+        if nowait { " nowait" } else { "" }
+    );
+    let inst = match sqlx::query(&sql)
+        .bind(instance_id)
+        .fetch_one(&mut *tx)
+        .await
+    {
+        Ok(row) => row,
+        // 55P03 lock_not_available: the NOWAIT caller moves on.
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("55P03") => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     let key: String = inst.get("definition_key");
     let definition = DefinitionRef {
@@ -748,7 +788,7 @@ pub(crate) async fn load_instance(
             next_subscription: inst.get::<i64, _>("next_subscription") as u64,
         },
     );
-    Ok((definition, proc, state))
+    Ok(Some((definition, proc, state)))
 }
 
 /// Projects a completed step: instance columns, token snapshot, work-item
@@ -833,6 +873,7 @@ pub(crate) async fn persist_step(
     let mut event_kinds: Vec<String> = Vec::new();
     let mut event_elements: Vec<Option<String>> = Vec::new();
     let mut event_payloads: Vec<serde_json::Value> = Vec::new();
+    let mut armed_timer = false;
     for event in events {
         match event {
             Event::WorkItemCreated {
@@ -892,7 +933,7 @@ pub(crate) async fn persist_step(
                     "insert into rbpmn_timer \
                      (instance_id, timer_no, token_no, element_id, due_kind, due_spec, due_at) \
                      values ($1, $2, $3, $4, $5, $6, case when $5 = 'duration' \
-                     then now() + $6::interval else $6::timestamptz end)",
+                     then clock_timestamp() + $6::interval else $6::timestamptz end)",
                 )
                 .bind(instance_id)
                 .bind(id.0 as i64)
@@ -902,11 +943,7 @@ pub(crate) async fn persist_step(
                 .bind(spec)
                 .execute(&mut *tx)
                 .await?;
-                // Wake sleeping schedulers: the new timer may be due sooner
-                // than the min(due_at) they went to sleep on.
-                sqlx::query("select pg_notify('rbpmn_timer', '')")
-                    .execute(&mut *tx)
-                    .await?;
+                armed_timer = true;
             }
             Event::TimerFired { id, .. } | Event::TimerCancelled { id, .. } => {
                 // Fired: the delete commits with the step — exactly-once.
@@ -978,6 +1015,14 @@ pub(crate) async fn persist_step(
         event_elements.push(element);
         event_payloads.push(payload);
     }
+    if armed_timer {
+        // Wake sleeping schedulers once per step: a new timer may be due
+        // sooner than the min(due_at) they went to sleep on (delivered on
+        // commit).
+        sqlx::query("select pg_notify('rbpmn_timer', '')")
+            .execute(&mut *tx)
+            .await?;
+    }
     if !event_kinds.is_empty() {
         // One append for the whole step. unnest preserves array order and
         // bigserial ids are assigned row by row within the statement, so
@@ -1024,7 +1069,7 @@ async fn set_work_item_state(
     Ok(())
 }
 
-async fn insert_engine_event(
+pub(crate) async fn insert_engine_event(
     tx: &mut PgConnection,
     definition: &DefinitionRef,
     instance_id: Uuid,

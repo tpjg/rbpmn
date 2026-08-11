@@ -32,7 +32,7 @@ mod worker;
 pub use error::{
     Completion, Correlation, DeployError, Deployment, EngineError, FailOutcome, StartedInstance,
 };
-pub use events::EventRecord;
+pub use events::{EventCursor, EventRecord};
 #[cfg(feature = "http")]
 pub use http_handler::HttpPostHandler;
 pub use inspect::{
@@ -42,7 +42,9 @@ pub use rbpmn_core::{Bindings, Event};
 pub use runtime::FailOptions;
 pub use scheduler::SchedulerOptions;
 pub use sqlx::PgPool;
-pub use tasks::{GetTaskOptions, LockExtension, LockedTask, TaskFilter, TaskOrder};
+pub use tasks::{
+    GetTaskOptions, LockExtension, LockedTask, TaskFilter, TaskOrder, declared_index_name,
+};
 pub use worker::WorkerOptions;
 
 /// Convenience: connect a pool for the engine (the URL comes from operator
@@ -253,9 +255,12 @@ impl Engine {
     }
 
     /// Announce that out-of-process workers poll this topic. Idempotent;
-    /// callable at any time — the environment grows monotonically. The
-    /// declaration is **persisted**: the deploys it unblocks persist, so a
-    /// restart or a replica resumes the same environment.
+    /// callable at any time **after `migrate`** (the declaration is
+    /// persisted to `rbpmn_environment_topic`, so a restart or a replica
+    /// resumes the same environment — and so the table must exist; for
+    /// pre-migrate wiring use `EngineBuilder::declare_topic` +
+    /// `sync_environment`). The environment grows freely; the one guarded
+    /// inverse is [`Engine::undeclare_topic`].
     pub async fn declare_topic(&self, topic: impl Into<String>) -> Result<(), EngineError> {
         let topic = topic.into();
         crate::runtime::reject_nul_text(&topic, "topic name")?;

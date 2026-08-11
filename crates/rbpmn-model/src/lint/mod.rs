@@ -506,6 +506,23 @@ fn event_gateway_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
                      flow (from the gateway) — it is armed only by the gateway",
                 ));
             }
+            // A boundary event on a gateway target could never arm: the
+            // gateway holds the token, the target is never *entered*, so
+            // the boundary would silently not exist at runtime — the
+            // "seems to run" failure mode this linter exists to kill.
+            for b in 0..g.scope.nodes.len() {
+                if let NodeKind::Boundary(data) = &g.node(b).kind
+                    && data.attached_to.as_deref() == Some(target.id.as_str())
+                {
+                    out.push(Diagnostic::error(
+                        rule::EVENT_GATEWAY_STRUCTURE,
+                        &g.node(b).id,
+                        "boundary events cannot attach to an event-based gateway's \
+                         alternative — the gateway itself is the race; model the \
+                         timeout as a timer alternative of the gateway instead",
+                    ));
+                }
+            }
         }
     }
 }
