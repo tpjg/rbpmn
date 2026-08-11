@@ -20,10 +20,15 @@
 //!   * ordering ops (`<` `<=` `>` `>=`) require a number literal
 //!   * qualified-name segments are `[A-Za-z_][A-Za-z0-9_]*` (no spaces)
 //!
-//! Evaluation semantics (the phase-1 evaluator must implement exactly this):
-//! a name resolves as a path into the instance's JSONB variable document; a
-//! missing path evaluates to null, and any comparison with null is **false**
-//! (FEEL's ternary logic collapsed to the final boolean).
+//! Evaluation semantics — FEEL's ternary logic, collapsed to a boolean only
+//! at the root (null -> false). A name resolves as a path into the instance's
+//! JSONB variable document; a missing path is null. Two independent null
+//! rules, verified against dsntk by `feel-parity`:
+//!   * against the `null` literal: the null-check idiom, always a boolean
+//!     (`x = null` is true iff x is missing/null; `x != null` its inverse)
+//!   * against any other literal: a type mismatch, so null — **including
+//!     under `!=`**. `x != 1` is null (-> false), not true, when x is
+//!     missing: a missing variable must never satisfy a negative condition.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -482,13 +487,22 @@ fn compare(actual: &serde_json::Value, op: CmpOp, literal: &Literal) -> Option<b
     use serde_json::Value;
     match op {
         CmpOp::Eq | CmpOp::Ne => {
+            // Two independent FEEL rules, deliberately separate arms — folding
+            // them into one is what made `x != 1` true for a missing x.
             let eq = match (actual, literal) {
+                // (A) Comparison against the `null` literal is the null-check
+                // idiom: always a boolean, never null.
                 (Value::Null, Literal::Null) => Some(true),
-                (Value::Null, _) | (_, Literal::Null) => Some(false),
+                (_, Literal::Null) => Some(false),
+                // (B) Otherwise a type mismatch yields null — and null is a
+                // type, so a missing value against any non-null literal is
+                // null too (hence `x != 1` is null, not true, when x is
+                // missing).
+                (Value::Null, _) => None,
                 (Value::Bool(a), Literal::Bool(b)) => Some(a == b),
                 (Value::Number(a), Literal::Num(b)) => Some(a.as_f64() == Some(*b)),
                 (Value::String(a), Literal::Str(b)) => Some(a == b),
-                _ => None, // incomparable types: FEEL yields null
+                _ => None,
             };
             match op {
                 CmpOp::Eq => eq,
@@ -627,17 +641,27 @@ mod tests {
         assert!(t("vip = false"));
         assert!(t("amount >= 100 and (order.tier = \"gold\" or vip = true)"));
 
-        // Missing/null: `= null` is the "is missing" test; everything else
-        // involving null is false.
+        // Rule A — comparison against the `null` literal is the null-check
+        // idiom: a boolean, both directions, whether missing or explicitly null.
         assert!(t("missing = null"));
         assert!(t("gone = null"));
         assert!(t("order.nope = null"));
-        assert!(!t("missing = 1"));
-        assert!(t("missing != 1")); // equality is null-safe: null != 1 is true
-        assert!(!t("missing > 1"));
+        assert!(!t("missing != null"));
         assert!(t("amount != null"));
+        assert!(!t("amount = null"));
 
-        // Type mismatch is null -> false, in both directions.
+        // Rule B — anything else against a null/missing value is a type
+        // mismatch, so it is null (-> false at the root). Crucially `!=` too:
+        // negating null is null, NOT true. A missing variable must never
+        // affirmatively satisfy a negative condition.
+        assert!(!t("missing = 1"));
+        assert!(!t("missing != 1"));
+        assert!(!t("gone = 1"));
+        assert!(!t("gone != 1"));
+        assert!(!t("missing > 1"));
+
+        // Rule B applies identically to non-null type mismatches — null is
+        // just another type, which is the whole point of keeping them one rule.
         assert!(!t("note = 5"));
         assert!(!t("note != 5"));
         assert!(!t("note > 1"));

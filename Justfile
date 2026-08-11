@@ -35,6 +35,12 @@ parity: wasm
     cd playground && npm install && npm run parity
     cd bpmnlint-plugin-rbpmn && npm install && npm test
 
+# Differential the FEEL subset against dsntk (the DMN-TCK-verified reference):
+# every condition we accept must evaluate identically there. Outside the
+# workspace and not part of `test` — dsntk pulls ~170 crates and a C library.
+feel-parity:
+    cd feel-parity && cargo test
+
 # Bake DI into any fixture that lacks a BPMNDiagram section (idempotent).
 fixtures-di:
     cd playground && npm install && node scripts/add-di.mjs

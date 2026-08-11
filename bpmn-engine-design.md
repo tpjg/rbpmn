@@ -230,18 +230,34 @@ dsntk lands post-v1, and models authored by FEEL-aware tooling
 - ops: `=` `!=` `<` `<=` `>` `>=` (accept `==` on input, normalize to FEEL's `=`)
 - literals: numbers, double-quoted strings, `true`/`false`, `null`
 - identifiers: FEEL qualified names (`order.priority`) resolved as paths into the
-  instance's JSONB variable document; a missing path evaluates to null. Null
-  semantics are **exactly FEEL's** (they must not change when dsntk swaps in):
-  equality is null-safe (`x = null` is the idiomatic "is missing" test — true
-  iff x is null/missing; hence `x != 1` is true when x is missing), equality
-  across different types yields null, ordering comparisons with anything but a
-  number yield null, `and`/`or` are Kleene; the ternary result collapses to a
-  boolean only at the root: null → false
+  instance's JSONB variable document; a missing path evaluates to null
 - nothing else: no functions, no arithmetic, no `in`/ranges, no date literals
+
+Null semantics are **exactly FEEL's** (they must not change when dsntk swaps
+in). Two *independent* rules — conflating them is what made `x != 1` true for
+a missing x until the dsntk differential caught it:
+
+1. **Against the `null` literal**: the null-check idiom, always a boolean.
+   `x = null` is true iff x is missing/null; `x != null` its inverse.
+2. **Against any other literal**: a type mismatch, which yields null — and
+   null is a type, so a missing value is null against every non-null literal,
+   **`!=` included**. `x != 1` is null (→ false), *not* true, when x is
+   missing. A missing variable must never satisfy a negative condition;
+   the required default flow is where such a token belongs.
+
+Ordering comparisons with anything but a number yield null, `and`/`or` are
+Kleene, and the ternary result collapses to a boolean only at the root:
+null → false.
 
 Additional strictness beyond FEEL (safe: a strict subset may reject more, it must
 never evaluate differently): ordering ops (`<` `<=` `>` `>=`) require a number
 literal; qualified-name segments are `[A-Za-z_][A-Za-z0-9_]*` (no spaces).
+
+Verified, not asserted: `just feel-parity` differentials the whole subset
+against dsntk over ~8k expression/document pairs. dsntk itself stays out of
+the workspace — `dsntk-feel-number` binds Intel's decimal C library through
+`dfp-number-sys`, so the stack cannot reach wasm32 and cannot enter
+`rbpmn-model` (see "Post-v1: decisions").
 
 Own tiny parser/evaluator in the pure core (no dsntk dependency in v1). Checked at
 deploy (`conditions-feel-subset`). Rationale unchanged: decisions belong in
@@ -651,16 +667,35 @@ Unlike BPMN, **DMN has a real TCK** — and dsntk submits: 3374/3391 passed, 0 f
 16 not-supported (April 2026 submission). Independently verified correctness fits this
 project; effectively single-maintainer, so pin versions.
 
+**Surveyed at 0.3.0 (August 2026) — the constraint that shapes both routes.**
+`dsntk-feel-number` binds Intel's decimal C library via `dfp-number-sys`
+(cc-rs), and it sits under `dsntk-feel`, so *every* dsntk crate carries it.
+Consequences, measured: no wasm32 (`sys/signal.h` not found — even the parser
+alone fails), C FFI and `unsafe` in a tree whose core is
+`#![forbid(unsafe_code)]`, 91 transitive crates for the parser and 173 for the
+evaluator against `rbpmn-model`'s 4, and `dsntk-feel-evaluator` carries an
+unconditional `reqwest::blocking` for FEEL's external-Java bridge (the crate
+declares no features, so there is nothing to gate). **dsntk can therefore
+never enter `rbpmn-model`** — it would take the linter playground and the
+bpmnlint plugin with it. Native-only crates are unaffected.
+
 Sequencing (deliberate):
 1. **Business-rule task first** (clean, additive): task evaluates a deployed DMN
    artifact against the instance JSONB, result written back as merge patch; gateways
    still read flags via the tiny grammar. Preserves "decisions computed outside
    control flow, control flow reads results". New task kind + artifact type; zero
    changes to semantic core or condition grammar. `dsntk-feel` / model-evaluation
-   crates only, not the whole toolkit.
+   crates only, not the whole toolkit. Unblocked: this lives in a native crate,
+   so the wasm32 constraint does not bite.
 2. **FEEL in sequence-flow conditions second, or never.** It deletes
    the `conditions-feel-subset` restriction and couples control-flow correctness to an external
    evaluator. If added: per-definition opt-in, tiny grammar stays the default.
+   Now known to be harder than sketched: conditions are validated at deploy,
+   deploy validation lives in `rbpmn-model`, and `rbpmn-model` is the WASM
+   crate. So this route forces a choice — a native-only validation path
+   (breaking "the playground never lies"), or keeping our parser for
+   validation and using dsntk only for evaluation (two grammars, forever).
+   Decide that before, not during.
 
 Integration rules (either route):
 - Parse/validate all DMN + FEEL at deploy time — new linter rules `dmn-validates`,

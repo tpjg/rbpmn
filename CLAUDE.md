@@ -22,9 +22,15 @@ inclusive gateway, block structure, messages-only interaction, build order).
   are the transaction boundaries. The pure `step` core (rbpmn-core) is
   IO-free and deterministic — keep it that way; time enters as command data
   when timers land (phase 3), never from a clock.
-- FEEL null semantics in `condition::eval` are FEEL-exact (null-safe
-  equality, ternary and/or, root collapse) — they must not change when dsntk
-  swaps in post-v1.
+- FEEL null semantics in `condition::eval` are FEEL-exact and **verified**, not
+  asserted: `just feel-parity` differentials the subset against dsntk. Two
+  separate rules — `= null`/`!= null` are the null-check idiom (boolean);
+  everything else against a missing value is a type mismatch, so null, `!=`
+  included. Don't re-merge those match arms; that was the bug.
+- dsntk must never become a dependency of `rbpmn-model`: its number crate
+  binds a C library (`dfp-number-sys`), which kills wasm32 and the whole
+  playground/bpmnlint chain. `feel-parity` is outside the workspace for this
+  reason.
 
 ## Commands
 

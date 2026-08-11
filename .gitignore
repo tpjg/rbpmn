@@ -1,4 +1,6 @@
 /target
+# feel-parity is its own cargo project (outside the workspace), own target dir.
+/feel-parity/target
 **/*.rs.bk
 .DS_Store
 node_modules/

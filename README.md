@@ -118,7 +118,11 @@ and reviewable in git next to the `.bpmn`. Environment capabilities (handler
 targets, `declare_topic`) are engine/server configuration, not manifest content.
 
 Conditions inside the XML are pure FEEL (a strict subset), so they carry no
-rbpmn-specific syntax either.
+rbpmn-specific syntax either. Null follows FEEL exactly: `x = null` is the
+"is it set?" test, while `x = 1` **and** `x != 1` are both false when `x` is
+missing — a type mismatch is null in either direction, so an unset variable
+never satisfies a negative condition. `just feel-parity` differentials the
+whole subset against dsntk (DMN-TCK-verified) to keep that honest.
 
 ## Fixtures
 
@@ -180,6 +184,7 @@ just lint             # clippy -D warnings + fmt --check
 just serve            # run the HTTP server with a throwaway token
 just playground       # linter playground (builds WASM first)
 just parity           # Rust-vs-WASM byte parity + bpmnlint plugin test
+just feel-parity      # FEEL subset differentialled against dsntk (own lockfile)
 ```
 
 ## HTTP server (optional)

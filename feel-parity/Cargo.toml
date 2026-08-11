@@ -1,0 +1,19 @@
+[package]
+name = "rbpmn-feel-parity"
+description = "Differential check: rbpmn's FEEL-subset condition evaluator against dsntk's FEEL. Deliberately outside the workspace — dsntk pulls ~170 crates plus a C library, none of which may reach rbpmn-model."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+rbpmn-model = { path = "../crates/rbpmn-model" }
+serde_json = "1"
+
+# Pinned: dsntk is effectively single-maintainer (design brief, "Post-v1").
+dsntk-feel = "=0.3.0"
+dsntk-feel-parser = "=0.3.0"
+dsntk-feel-evaluator = "=0.3.0"
+
+[workspace]
