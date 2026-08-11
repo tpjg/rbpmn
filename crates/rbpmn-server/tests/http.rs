@@ -328,3 +328,128 @@ async fn rejected_deploys_return_diagnostics() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     db.drop().await;
 }
+
+/// Message ingress: the full deploy -> start -> correlate flow over HTTP,
+/// plus the loud no-match (404) and ambiguity (409) contracts.
+#[tokio::test]
+async fn message_ingress_delivers_and_is_loud_about_misses() {
+    let (app, db) = test_app().await;
+    let message_catch =
+        include_str!("../../rbpmn-model/tests/fixtures/accept/17-message-catch.bpmn");
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/definitions",
+            serde_json::json!({
+                "bpmn": message_catch,
+                "bindings": { "correlations": { "c": "order.id" } },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // No subscription yet: 404, never dropped silently.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/messages",
+            serde_json::json!({ "name": "WarehouseAck", "correlationKey": "o-1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/instances",
+            serde_json::json!({
+                "definitionKey": "p",
+                "variables": { "order": { "id": "o-1" } },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let instance = body_json(resp).await["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Second instance with the same key makes delivery ambiguous: 409.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/instances",
+            serde_json::json!({
+                "definitionKey": "p",
+                "variables": { "order": { "id": "o-1" } },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/messages",
+            serde_json::json!({ "name": "WarehouseAck", "correlationKey": "o-1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // A unique key delivers, patches, and reports the receiving instance.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/instances",
+            serde_json::json!({
+                "definitionKey": "p",
+                "variables": { "order": { "id": "o-unique" } },
+            }),
+        ))
+        .await
+        .unwrap();
+    let unique = body_json(resp).await["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/messages",
+            serde_json::json!({
+                "name": "WarehouseAck",
+                "correlationKey": "o-unique",
+                "patch": { "shipped": true },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["instanceId"], unique.as_str());
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/v1/instances/{unique}/inspect"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let inspection = body_json(resp).await;
+    assert_eq!(inspection["status"], "completed");
+    assert_eq!(inspection["variables"]["shipped"], true);
+    let _ = instance;
+    db.drop().await;
+}

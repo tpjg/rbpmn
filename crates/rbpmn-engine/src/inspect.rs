@@ -15,7 +15,27 @@ pub struct InstanceInspection {
     pub bpmn_xml: String,
     pub tokens: Vec<TokenView>,
     pub work_items: Vec<WorkItemView>,
+    pub timers: Vec<TimerView>,
+    pub subscriptions: Vec<SubscriptionView>,
     pub events: Vec<EventView>,
+}
+
+/// An armed timer: what is sleeping where, and until when (`due_at` in
+/// RFC 3339, from database time).
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimerView {
+    pub element_id: String,
+    pub due_spec: String,
+    pub due_at: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionView {
+    pub element_id: String,
+    pub message_name: String,
+    pub correlation_key: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -88,6 +108,37 @@ impl Engine {
         })
         .collect();
 
+        let timers = sqlx::query(
+            "select element_id, due_spec, \
+             to_char(due_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as due_at \
+             from rbpmn_timer where instance_id = $1 order by timer_no",
+        )
+        .bind(id)
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .map(|r| TimerView {
+            element_id: r.get("element_id"),
+            due_spec: r.get("due_spec"),
+            due_at: r.get("due_at"),
+        })
+        .collect();
+
+        let subscriptions = sqlx::query(
+            "select element_id, message_name, correlation_key \
+             from rbpmn_subscription where instance_id = $1 order by subscription_no",
+        )
+        .bind(id)
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .map(|r| SubscriptionView {
+            element_id: r.get("element_id"),
+            message_name: r.get("message_name"),
+            correlation_key: r.get("correlation_key"),
+        })
+        .collect();
+
         let events = sqlx::query(
             "select kind, element_id, payload from rbpmn_event where instance_id = $1 order by id",
         )
@@ -120,6 +171,8 @@ impl Engine {
             bpmn_xml: inst.get("bpmn_xml"),
             tokens,
             work_items,
+            timers,
+            subscriptions,
             events,
         })
     }

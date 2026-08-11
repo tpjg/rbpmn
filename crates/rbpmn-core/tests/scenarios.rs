@@ -43,11 +43,31 @@ struct FailAction {
     code: Option<String>,
 }
 
+/// Fire the armed timer sitting on this element — time as command data:
+/// scenarios "advance the clock" by simply saying so, which is what makes
+/// the years-long-sleep fixture run without any clock existing.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FireAction {
+    fire: String,
+}
+
+/// Deliver a message to the open subscription on this element.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliverAction {
+    deliver: String,
+    #[serde(default)]
+    patch: Option<Value>,
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum Action {
     Complete(CompleteAction),
     Fail(FailAction),
+    Fire(FireAction),
+    Deliver(DeliverAction),
 }
 
 #[derive(Deserialize)]
@@ -111,6 +131,25 @@ fn run_scenario(path: &Path, failures: &mut String) {
                         code: code.clone(),
                     },
                 )
+            }
+            Action::Fire(FireAction { fire }) => {
+                let node = proc
+                    .node_by_id(fire)
+                    .unwrap_or_else(|| panic!("{name}: no element '{fire}'"));
+                let id = state
+                    .armed_timer_at(node)
+                    .unwrap_or_else(|| panic!("{name}: no armed timer at '{fire}'"));
+                (fire, Command::FireTimer { id })
+            }
+            Action::Deliver(DeliverAction { deliver, patch }) => {
+                let node = proc
+                    .node_by_id(deliver)
+                    .unwrap_or_else(|| panic!("{name}: no element '{deliver}'"));
+                let id = state
+                    .armed_subscription_at(node)
+                    .unwrap_or_else(|| panic!("{name}: no open subscription at '{deliver}'"));
+                let patch = patch.clone().unwrap_or_else(|| serde_json::json!({}));
+                (deliver, Command::DeliverMessage { id, patch })
             }
         };
         let events = step(&proc, &mut state, command)

@@ -397,6 +397,48 @@ pub fn eval(expr: &Expr, variables: &serde_json::Value) -> bool {
     truth(expr, variables).unwrap_or(false)
 }
 
+/// Parse a bare FEEL qualified name (`order.id`) into its path segments —
+/// the shared syntax between conditions and correlation-key bindings
+/// (`map_correlation` registers these; the XML never carries them). Same
+/// strictness as the condition grammar: segments are
+/// `[A-Za-z_][A-Za-z0-9_]*`, joined by single dots, no spaces.
+pub fn parse_qname(src: &str) -> Result<Vec<String>, CondError> {
+    let mut path = Vec::new();
+    let mut offset = 0;
+    for segment in src.split('.') {
+        let valid = !segment.is_empty()
+            && segment
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return err(
+                offset,
+                format!(
+                    "'{src}' is not a FEEL qualified name \
+                     (segments are [A-Za-z_][A-Za-z0-9_]*, joined by dots)"
+                ),
+            );
+        }
+        path.push(segment.to_string());
+        offset += segment.len() + 1;
+    }
+    Ok(path)
+}
+
+/// Resolve a qualified-name path against the variable document. Missing
+/// segments resolve to null — FEEL semantics, identical to how conditions
+/// read variables.
+pub fn resolve_path<'a>(
+    variables: &'a serde_json::Value,
+    path: &[String],
+) -> &'a serde_json::Value {
+    resolve(variables, path)
+}
+
 fn truth(expr: &Expr, variables: &serde_json::Value) -> Option<bool> {
     match expr {
         Expr::And(parts) => {

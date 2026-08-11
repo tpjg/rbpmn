@@ -221,15 +221,17 @@ fn quiescent_state_is_consistent_after_every_step() {
 
 #[test]
 fn compile_gates_later_phase_elements() {
-    let receive = ExecutableProcess::compile(
-        &load("accept/07-task-kinds.bpmn"),
+    // Message start/throw events lint clean (in the v1 model surface) but
+    // stay un-executable until cross-definition messaging lands.
+    let throwing = ExecutableProcess::compile(
+        &load("accept/08-message-events.bpmn"),
         "p",
         &Bindings::default(),
     );
-    match receive {
+    match throwing {
         Err(CompileError::NotYetExecutable { element, phase, .. }) => {
-            assert_eq!(element, "rt");
-            assert!(phase.contains("phase 3"), "{phase}");
+            assert_eq!(element, "s_msg");
+            assert!(phase.contains("correlate"), "{phase}");
         }
         other => panic!("expected NotYetExecutable, got {other:?}"),
     }
@@ -243,6 +245,33 @@ fn compile_gates_later_phase_elements() {
         subprocess,
         Err(CompileError::NotYetExecutable { .. })
     ));
+}
+
+#[test]
+fn compile_requires_correlation_bindings() {
+    // `message-has-correlation`: no binding, no compile — never a default.
+    let unmapped = ExecutableProcess::compile(
+        &load("accept/17-message-catch.bpmn"),
+        "p",
+        &Bindings::default(),
+    );
+    match unmapped {
+        Err(CompileError::MissingCorrelation(elements)) => {
+            assert_eq!(elements, vec!["c".to_string()]);
+        }
+        other => panic!("expected MissingCorrelation, got {other:?}"),
+    }
+
+    // The binding must be a FEEL qualified name, not arbitrary text.
+    let invalid = ExecutableProcess::compile(
+        &load("accept/17-message-catch.bpmn"),
+        "p",
+        &Bindings::new().correlation("c", "order..id"),
+    );
+    match invalid {
+        Err(CompileError::InvalidCorrelation { element, .. }) => assert_eq!(element, "c"),
+        other => panic!("expected InvalidCorrelation, got {other:?}"),
+    }
 }
 
 #[test]

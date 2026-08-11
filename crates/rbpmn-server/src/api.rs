@@ -146,6 +146,30 @@ pub async fn fail(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageBody {
+    pub name: String,
+    pub correlation_key: String,
+    #[serde(default)]
+    pub patch: Option<serde_json::Value>,
+}
+
+/// Message ingress: deliver to the single open subscription matching
+/// (name, correlation key). No match is 404 — the message had nowhere to go,
+/// said loudly, never dropped; more than one match is 409 (delivering to
+/// "one of them" would be a guess).
+pub async fn message(State(engine): State<Engine>, Json(body): Json<MessageBody>) -> Response {
+    let patch = body.patch.unwrap_or_else(|| json!({}));
+    match engine
+        .correlate(&body.name, &body.correlation_key, patch)
+        .await
+    {
+        Ok(correlation) => Json(json!({ "instanceId": correlation.instance_id })).into_response(),
+        Err(e) => engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
 pub struct TopicBody {
     pub name: String,
 }
@@ -169,6 +193,8 @@ fn engine_error(e: EngineError) -> Response {
             (StatusCode::CONFLICT, e.to_string())
         }
         EngineError::ItemLeased(_) => (StatusCode::CONFLICT, e.to_string()),
+        EngineError::NoSubscription { .. } => (StatusCode::NOT_FOUND, e.to_string()),
+        EngineError::AmbiguousCorrelation { .. } => (StatusCode::CONFLICT, e.to_string()),
         EngineError::InvalidVariables(_) => (StatusCode::BAD_REQUEST, e.to_string()),
         EngineError::Compile(_) | EngineError::Step(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())

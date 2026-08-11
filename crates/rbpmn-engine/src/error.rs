@@ -25,6 +25,13 @@ pub enum EngineError {
     UnknownInstance(Uuid),
     #[error("work item {0} is leased by another worker; failing it requires the lease owner")]
     ItemLeased(Uuid),
+    #[error("no open subscription for message '{message}' with correlation key '{key}'")]
+    NoSubscription { message: String, key: String },
+    #[error(
+        "message '{message}' with correlation key '{key}' matches more than one open \
+         subscription — delivery would be a guess; make correlation keys unique"
+    )]
+    AmbiguousCorrelation { message: String, key: String },
     #[error("variables rejected: {0}")]
     InvalidVariables(String),
     #[error("instance {0} is not active (status: {1})")]
@@ -59,6 +66,13 @@ pub struct Deployment {
 #[derive(Debug)]
 pub struct StartedInstance {
     pub id: Uuid,
+    pub events: Vec<rbpmn_core::Event>,
+}
+
+/// A delivered message: which instance received it and what happened next.
+#[derive(Debug)]
+pub struct Correlation {
+    pub instance_id: Uuid,
     pub events: Vec<rbpmn_core::Event>,
 }
 

@@ -21,16 +21,22 @@ mod error;
 mod http_handler;
 mod inspect;
 mod runtime;
+mod scheduler;
 #[cfg(feature = "test-util")]
 pub mod testing;
 mod worker;
 
-pub use error::{Completion, DeployError, Deployment, EngineError, FailOutcome, StartedInstance};
+pub use error::{
+    Completion, Correlation, DeployError, Deployment, EngineError, FailOutcome, StartedInstance,
+};
 #[cfg(feature = "http")]
 pub use http_handler::HttpPostHandler;
-pub use inspect::{EventView, InstanceInspection, TokenView, WorkItemView};
+pub use inspect::{
+    EventView, InstanceInspection, SubscriptionView, TimerView, TokenView, WorkItemView,
+};
 pub use rbpmn_core::{Bindings, Event};
 pub use runtime::FailOptions;
+pub use scheduler::SchedulerOptions;
 pub use sqlx::PgPool;
 pub use worker::WorkerOptions;
 
@@ -52,6 +58,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         2,
         "environment",
         include_str!("../migrations/0002_environment.sql"),
+    ),
+    (
+        3,
+        "timers_messages",
+        include_str!("../migrations/0003_timers_messages.sql"),
     ),
 ];
 

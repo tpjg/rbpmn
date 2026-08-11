@@ -24,10 +24,32 @@ impl Engine {
         }
         let warnings = diagnostics;
 
-        // Phase gating + condition/topic resolution — a definition that
-        // deploys is guaranteed executable.
+        // Phase gating + condition/topic/correlation resolution — a
+        // definition that deploys is guaranteed executable and fully wired.
         let proc = match ExecutableProcess::compile(&defs, &key, bindings) {
             Ok(proc) => proc,
+            Err(rbpmn_core::CompileError::MissingCorrelation(elements)) => {
+                return Err(DeployError::Rejected(
+                    elements
+                        .iter()
+                        .map(|el| {
+                            Diagnostic::error(
+                                rule::MESSAGE_HAS_CORRELATION,
+                                el,
+                                "message element has no correlation binding — bind it \
+                                 with Bindings::correlation(element_id, feel_qualified_name)",
+                            )
+                        })
+                        .collect(),
+                ));
+            }
+            Err(rbpmn_core::CompileError::InvalidCorrelation { element, reason }) => {
+                return Err(DeployError::Rejected(vec![Diagnostic::error(
+                    rule::MESSAGE_HAS_CORRELATION,
+                    element,
+                    format!("correlation binding is not a FEEL qualified name: {reason}"),
+                )]));
+            }
             Err(e) => {
                 return Err(DeployError::Rejected(vec![Diagnostic::error(
                     rule::NO_UNSUPPORTED_ELEMENT,

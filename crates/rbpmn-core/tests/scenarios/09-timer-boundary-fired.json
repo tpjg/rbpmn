@@ -1,0 +1,30 @@
+{
+  "fixture": "accept/09-timer-boundary.bpmn",
+  "actions": [{ "fire": "bt" }, { "complete": "t_esc" }],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started ut",
+      "work-item-created ut user ut",
+      "timer-armed bt PT1H",
+      "timer-fired bt",
+      "work-item-cancelled ut",
+      "element-started bt",
+      "element-completed bt",
+      "flow-taken f3",
+      "element-started t_esc",
+      "work-item-created t_esc user t_esc",
+      "work-item-completed t_esc",
+      "element-completed t_esc",
+      "flow-taken f4",
+      "element-started e_esc",
+      "element-completed e_esc",
+      "instance-completed"
+    ]
+  }
+}

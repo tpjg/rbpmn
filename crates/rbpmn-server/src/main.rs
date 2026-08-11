@@ -38,6 +38,17 @@ async fn main() -> ExitCode {
         });
     }
 
+    // One timer scheduler per process; replicas compete safely (the timer
+    // row's delete commits with the step — exactly-once by construction).
+    {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .run_scheduler(rbpmn_engine::SchedulerOptions::default())
+                .await
+        });
+    }
+
     match rbpmn_server::serve(config, engine).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {

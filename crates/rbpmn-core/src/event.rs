@@ -6,8 +6,8 @@
 //! trace the scenario fixtures assert line by line. The `Display` format is
 //! that golden format — stable, like rule IDs.
 
-use crate::compile::WorkKind;
-use crate::state::WorkItemId;
+use crate::compile::{TimerDue, WorkKind};
+use crate::state::{SubscriptionId, TimerId, WorkItemId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -51,6 +51,52 @@ pub enum Event {
     VariablesPatched {
         patch: Value,
     },
+    /// A timer was armed on `element` (a catch or boundary event) for
+    /// `token`. The projection turns `due` into an absolute `due_at` using
+    /// database time. Self-contained on purpose: a timer armed and torn
+    /// down in the same step (a racing terminate) is gone from the state by
+    /// the time the projection reads the events.
+    TimerArmed {
+        id: TimerId,
+        element: String,
+        due: TimerDue,
+        token: crate::state::TokenId,
+    },
+    TimerFired {
+        id: TimerId,
+        element: String,
+    },
+    TimerCancelled {
+        id: TimerId,
+        element: String,
+    },
+    /// A message subscription opened on `element`; `key` is the correlation
+    /// key value evaluated from the variables at arm time. Carries `token`
+    /// for the same reason as [`Event::TimerArmed`].
+    MessageSubscribed {
+        id: SubscriptionId,
+        element: String,
+        message: String,
+        key: String,
+        token: crate::state::TokenId,
+    },
+    MessageReceived {
+        id: SubscriptionId,
+        element: String,
+        message: String,
+    },
+    SubscriptionCancelled {
+        id: SubscriptionId,
+        element: String,
+        message: String,
+    },
+    /// The correlation key did not evaluate to a string or number — the
+    /// subscription could never match, so the instance freezes as an
+    /// incident instead of waiting forever ("seems to run" is the enemy).
+    CorrelationFailed {
+        element: String,
+        name: String,
+    },
     InstanceCompleted,
     InstanceTerminated,
 }
@@ -81,6 +127,26 @@ impl fmt::Display for Event {
                 None => write!(f, "incident-raised {element}"),
             },
             Event::VariablesPatched { .. } => write!(f, "variables-patched"),
+            Event::TimerArmed { element, due, .. } => {
+                write!(f, "timer-armed {element} {due}")
+            }
+            Event::TimerFired { element, .. } => write!(f, "timer-fired {element}"),
+            Event::TimerCancelled { element, .. } => write!(f, "timer-cancelled {element}"),
+            Event::MessageSubscribed {
+                element,
+                message,
+                key,
+                ..
+            } => write!(f, "message-subscribed {element} {message} {key}"),
+            Event::MessageReceived {
+                element, message, ..
+            } => write!(f, "message-received {element} {message}"),
+            Event::SubscriptionCancelled {
+                element, message, ..
+            } => write!(f, "subscription-cancelled {element} {message}"),
+            Event::CorrelationFailed { element, name } => {
+                write!(f, "correlation-failed {element} {name}")
+            }
             Event::InstanceCompleted => write!(f, "instance-completed"),
             Event::InstanceTerminated => write!(f, "instance-terminated"),
         }

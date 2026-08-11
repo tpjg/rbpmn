@@ -21,15 +21,16 @@ Read it before touching the semantics.
 | `playground/` | Local linter playground (bpmn-js + WASM): fixture browser, live re-lint, diagnostics as diagram overlays. `just playground`. |
 | `bpmnlint-plugin-rbpmn/` | bpmnlint plugin backed by the same WASM — rbpmn's rules inside bpmn-io tooling, zero JS reimplementation. |
 
-Planned (per the design brief's build order): the rest of phase 2 (worker
-loop, HttpPostHandler, LISTEN/NOTIFY, server deploy/start/complete endpoints,
-playground instance inspection), then timers/messages (phase 3) and the task
-API (phase 4).
+Planned (per the design brief's build order): the task API (phase 4), then
+rounding out (phase 5). Cross-definition messaging (message start/throw
+routing between definitions) is designed after that; until then message
+start/throw events lint clean but refuse to compile.
 
 ## Status
 
 - [x] **Phase 0 — Parse & reject**: parser, full linter rule catalogue,
-      fixture corpus (16 accept / 31 reject), corpus runner.
+      fixture corpus (18 accept / 32 reject, grown by later phases), corpus
+      runner.
 - [x] Server skeleton with the security spine and `POST /v1/definitions/lint`.
 - [x] **Phase 0-B — linter playground (WASM) + bpmnlint plugin**, with a
       byte-parity check between native Rust and WASM over the whole corpus.
@@ -50,7 +51,15 @@ API (phase 4).
       (deploy/start/complete/fail/topics/inspect), and the playground's
       live token-overlay instance inspection (exit criterion, verified
       end-to-end in a browser).
-- [ ] Phase 3 — timers & messages. Phase 4 — task API. Phase 5 — rounding out.
+- [x] **Phase 3 — timers & messages**: timer intermediate catch (duration +
+      date, years-long sleeps as passive rows), interrupting timer boundaries,
+      message catch/receive task with registered correlations
+      (`Bindings::correlation`, FEEL qualified names — never in the XML),
+      the event-based gateway race, `correlate()` (+ `POST /v1/messages`:
+      exactly-one delivery, loud 404/409), and the deadlock-free scheduler
+      (instance-lock-first claim, `min(due_at)` sleep, `NOTIFY rbpmn_timer`,
+      poll fallback; exactly-once verified under competing schedulers).
+- [ ] Phase 4 — task API. Phase 5 — rounding out.
 
 ## Rule catalogue
 

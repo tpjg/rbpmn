@@ -236,6 +236,7 @@ pub fn app(tokens: Tokens, engine: rbpmn_engine::Engine) -> Router {
         .route("/instances/{id}/inspect", get(api::inspect))
         .route("/work-items/{id}/complete", post(api::complete))
         .route("/work-items/{id}/fail", post(api::fail))
+        .route("/messages", post(api::message))
         .route("/topics", post(api::declare_topic))
         .with_state(engine)
         .fallback(api_not_found)

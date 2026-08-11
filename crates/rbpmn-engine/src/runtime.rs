@@ -13,16 +13,17 @@
 //! until then). Remote (HTTP) callers cannot share a transaction by nature;
 //! their contract is per-call atomicity plus idempotent retries.
 
-use crate::{Completion, Engine, EngineError, FailOutcome, StartedInstance};
+use crate::{Completion, Correlation, Engine, EngineError, FailOutcome, StartedInstance};
 use rbpmn_core::{
-    Bindings, Command, Event, ExecutableProcess, InstanceState, InstanceStatus, Token, TokenId,
-    WaitKind, WorkItemId, WorkItemState, WorkKind, step,
+    Bindings, Command, Counters, Event, ExecutableProcess, InstanceState, InstanceStatus,
+    SubscriptionId, SubscriptionState, TimerDue, TimerId, TimerState, Token, TokenId, WaitKind,
+    WorkItemId, WorkItemState, WorkKind, step,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
-struct DefinitionRef {
+pub(crate) struct DefinitionRef {
     id: Uuid,
     key: String,
 }
@@ -169,6 +170,94 @@ impl Engine {
         )?;
         persist_step(tx, &proc, &definition, instance_id, &state, &events).await?;
         Ok(Completion::Advanced(events))
+    }
+
+    /// Deliver a message to the single open subscription matching
+    /// `(message, correlation key value)`, applying the merge patch in the
+    /// same step that advances the token. Exactly one subscription must
+    /// match: none is [`EngineError::NoSubscription`] (the message has
+    /// nowhere to go — loudly, never dropped), several is
+    /// [`EngineError::AmbiguousCorrelation`] (delivering to "one of them"
+    /// would be a guess).
+    pub async fn correlate(
+        &self,
+        message: &str,
+        key: &str,
+        patch: serde_json::Value,
+    ) -> Result<Correlation, EngineError> {
+        let mut tx = self.pool().begin().await?;
+        let correlation = self.correlate_in_tx(&mut tx, message, key, patch).await?;
+        tx.commit().await?;
+        Ok(correlation)
+    }
+
+    /// [`Engine::correlate`] inside the caller's transaction.
+    pub async fn correlate_in_tx(
+        &self,
+        tx: &mut PgConnection,
+        message: &str,
+        key: &str,
+        patch: serde_json::Value,
+    ) -> Result<Correlation, EngineError> {
+        reject_nul(&patch)?;
+        // Resolve without a lock, then lock the instance (the same order as
+        // every step path) and re-check the subscription under it.
+        let matches = sqlx::query(
+            "select instance_id, subscription_no from rbpmn_subscription \
+             where message_name = $1 and correlation_key = $2 limit 2",
+        )
+        .bind(message)
+        .bind(key)
+        .fetch_all(&mut *tx)
+        .await?;
+        let row = match matches.as_slice() {
+            [] => {
+                return Err(EngineError::NoSubscription {
+                    message: message.to_string(),
+                    key: key.to_string(),
+                });
+            }
+            [row] => row,
+            _ => {
+                return Err(EngineError::AmbiguousCorrelation {
+                    message: message.to_string(),
+                    key: key.to_string(),
+                });
+            }
+        };
+        let instance_id: Uuid = row.get("instance_id");
+        let subscription_no: i64 = row.get("subscription_no");
+
+        let (definition, proc, mut state) = load_instance(&mut *tx, instance_id).await?;
+        if state.status == InstanceStatus::Failed {
+            return Err(EngineError::IncidentOpen(instance_id));
+        }
+        if state.status != InstanceStatus::Active {
+            return Err(EngineError::InstanceNotActive(
+                instance_id,
+                status_to_db(state.status).to_string(),
+            ));
+        }
+        // A concurrent step (boundary timer, terminate, another delivery)
+        // may have withdrawn it between resolve and lock.
+        let sub_id = SubscriptionId(subscription_no as u64);
+        if !state.subscriptions().any(|(id, _)| id == sub_id) {
+            return Err(EngineError::NoSubscription {
+                message: message.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        let events = step(
+            &proc,
+            &mut state,
+            Command::DeliverMessage { id: sub_id, patch },
+        )?;
+        persist_step(tx, &proc, &definition, instance_id, &state, &events).await?;
+        Ok(Correlation {
+            instance_id,
+            events,
+        })
     }
 
     /// Handler failure: spend one retry (with exponential backoff before the
@@ -368,13 +457,14 @@ fn compile_row(row: &PgRow, key: &str) -> Result<ExecutableProcess, EngineError>
 /// Locks the instance row and rebuilds the quiescent core state from rows —
 /// rows are the runtime truth, this is their inverse. Every mapping is
 /// exhaustive: an unknown status/kind/wait is an error, never a guess.
-async fn load_instance(
+pub(crate) async fn load_instance(
     tx: &mut PgConnection,
     instance_id: Uuid,
 ) -> Result<(DefinitionRef, ExecutableProcess, InstanceState), EngineError> {
     let inst = sqlx::query(
         "select i.definition_id, i.definition_key, i.status, i.variables, \
-                i.next_token, i.next_work_item, d.bpmn_xml, d.bindings \
+                i.next_token, i.next_work_item, i.next_timer, i.next_subscription, \
+                d.bpmn_xml, d.bindings \
          from rbpmn_instance i join rbpmn_definition d on d.id = i.definition_id \
          where i.id = $1 for update of i",
     )
@@ -390,6 +480,59 @@ async fn load_instance(
     let proc = compile_row(&inst, &key)?;
     let status = status_from_db(&inst.get::<String, _>("status"))?;
 
+    let mut timers = Vec::new();
+    for row in sqlx::query(
+        "select timer_no, token_no, element_id, due_kind, due_spec \
+         from rbpmn_timer where instance_id = $1 order by timer_no",
+    )
+    .bind(instance_id)
+    .fetch_all(&mut *tx)
+    .await?
+    {
+        let element_id: String = row.get("element_id");
+        let spec: String = row.get("due_spec");
+        let due = match row.get::<String, _>("due_kind").as_str() {
+            "duration" => TimerDue::Duration(spec),
+            "date" => TimerDue::Date(spec),
+            other => return Err(internal(format!("unknown timer due kind '{other}'"))),
+        };
+        timers.push((
+            TimerId(row.get::<i64, _>("timer_no") as u64),
+            TimerState {
+                element: proc.node_by_id(&element_id).ok_or_else(|| {
+                    internal(format!("timer references unknown element '{element_id}'"))
+                })?,
+                token: TokenId(row.get::<i64, _>("token_no") as u64),
+                due,
+            },
+        ));
+    }
+
+    let mut subscriptions = Vec::new();
+    for row in sqlx::query(
+        "select subscription_no, token_no, element_id, message_name, correlation_key \
+         from rbpmn_subscription where instance_id = $1 order by subscription_no",
+    )
+    .bind(instance_id)
+    .fetch_all(&mut *tx)
+    .await?
+    {
+        let element_id: String = row.get("element_id");
+        subscriptions.push((
+            SubscriptionId(row.get::<i64, _>("subscription_no") as u64),
+            SubscriptionState {
+                element: proc.node_by_id(&element_id).ok_or_else(|| {
+                    internal(format!(
+                        "subscription references unknown element '{element_id}'"
+                    ))
+                })?,
+                token: TokenId(row.get::<i64, _>("token_no") as u64),
+                message: row.get("message_name"),
+                key: row.get("correlation_key"),
+            },
+        ));
+    }
+
     let mut tokens = Vec::new();
     for row in sqlx::query(
         "select token_no, element_id, wait_kind, arrived_via, work_item_no \
@@ -403,6 +546,7 @@ async fn load_instance(
         let node = proc
             .node_by_id(&element_id)
             .ok_or_else(|| internal(format!("token references unknown element '{element_id}'")))?;
+        let token_no = TokenId(row.get::<i64, _>("token_no") as u64);
         let wait = match row.get::<String, _>("wait_kind").as_str() {
             "join" => {
                 let flow_id: String = row.get("arrived_via");
@@ -413,12 +557,34 @@ async fn load_instance(
                 }
             }
             "work_item" => WaitKind::WorkItem(WorkItemId(row.get::<i64, _>("work_item_no") as u64)),
+            // A token waiting on its own timer/subscription has exactly one,
+            // linked back via token_no — resolved here, never guessed.
+            "timer" => WaitKind::Timer(
+                timers
+                    .iter()
+                    .find(|(_, t)| t.token == token_no)
+                    .map(|(id, _)| *id)
+                    .ok_or_else(|| {
+                        internal(format!(
+                            "token {token_no:?} waits on a timer that has no row"
+                        ))
+                    })?,
+            ),
+            "message" => WaitKind::Message(
+                subscriptions
+                    .iter()
+                    .find(|(_, s)| s.token == token_no)
+                    .map(|(id, _)| *id)
+                    .ok_or_else(|| {
+                        internal(format!(
+                            "token {token_no:?} waits on a subscription that has no row"
+                        ))
+                    })?,
+            ),
+            "event_gateway" => WaitKind::EventGateway,
             other => return Err(internal(format!("unknown token wait kind '{other}'"))),
         };
-        tokens.push((
-            TokenId(row.get::<i64, _>("token_no") as u64),
-            Token { node, wait },
-        ));
+        tokens.push((token_no, Token { node, wait }));
     }
 
     let mut work_items = Vec::new();
@@ -452,15 +618,24 @@ async fn load_instance(
         inst.get("variables"),
         tokens,
         work_items,
-        inst.get::<i64, _>("next_token") as u64,
-        inst.get::<i64, _>("next_work_item") as u64,
+        timers,
+        subscriptions,
+        Counters {
+            next_token: inst.get::<i64, _>("next_token") as u64,
+            next_work_item: inst.get::<i64, _>("next_work_item") as u64,
+            next_timer: inst.get::<i64, _>("next_timer") as u64,
+            next_subscription: inst.get::<i64, _>("next_subscription") as u64,
+        },
     );
     Ok((definition, proc, state))
 }
 
 /// Projects a completed step: instance columns, token snapshot, work-item
-/// transitions from the events, and the append-only event rows.
-async fn persist_step(
+/// transitions from the events, and the append-only event rows. Timer and
+/// subscription rows follow the events too — armed rows insert (with
+/// `due_at` resolved from **database time**), fired/received/cancelled rows
+/// delete, in the same transaction as the step that decided it.
+pub(crate) async fn persist_step(
     tx: &mut PgConnection,
     proc: &ExecutableProcess,
     definition: &DefinitionRef,
@@ -469,16 +644,20 @@ async fn persist_step(
     events: &[Event],
 ) -> Result<(), EngineError> {
     let status = status_to_db(state.status);
+    let counters = state.counters();
     sqlx::query(
         "update rbpmn_instance set status = $2, variables = $3, next_token = $4, \
-         next_work_item = $5, completed_at = case when $2 in ('completed', 'terminated') \
+         next_work_item = $5, next_timer = $6, next_subscription = $7, \
+         completed_at = case when $2 in ('completed', 'terminated') \
          then now() else completed_at end where id = $1",
     )
     .bind(instance_id)
     .bind(status)
     .bind(&state.variables)
-    .bind(state.next_token_counter() as i64)
-    .bind(state.next_work_item_counter() as i64)
+    .bind(counters.next_token as i64)
+    .bind(counters.next_work_item as i64)
+    .bind(counters.next_timer as i64)
+    .bind(counters.next_subscription as i64)
     .execute(&mut *tx)
     .await?;
 
@@ -494,6 +673,9 @@ async fn persist_step(
                 ("join", Some(proc.flow(*arrived_via).id.clone()), None)
             }
             WaitKind::WorkItem(item) => ("work_item", None, Some(item.0 as i64)),
+            WaitKind::Timer(_) => ("timer", None, None),
+            WaitKind::Message(_) => ("message", None, None),
+            WaitKind::EventGateway => ("event_gateway", None, None),
         };
         sqlx::query(
             "insert into rbpmn_token (instance_id, token_no, element_id, wait_kind, arrived_via, work_item_no) \
@@ -550,6 +732,80 @@ async fn persist_step(
             }
             Event::WorkItemFailed { id, .. } => {
                 set_work_item_state(tx, instance_id, id.0 as i64, "failed").await?;
+            }
+            Event::TimerArmed {
+                id,
+                element,
+                due,
+                token,
+            } => {
+                let token_no = token.0 as i64;
+                let (due_kind, spec) = match due {
+                    TimerDue::Duration(s) => ("duration", s),
+                    TimerDue::Date(s) => ("date", s),
+                };
+                // due_at from database time — the design's clock authority.
+                // Both ISO-8601 forms cast natively in PostgreSQL.
+                sqlx::query(
+                    "insert into rbpmn_timer \
+                     (instance_id, timer_no, token_no, element_id, due_kind, due_spec, due_at) \
+                     values ($1, $2, $3, $4, $5, $6, case when $5 = 'duration' \
+                     then now() + $6::interval else $6::timestamptz end)",
+                )
+                .bind(instance_id)
+                .bind(id.0 as i64)
+                .bind(token_no)
+                .bind(element)
+                .bind(due_kind)
+                .bind(spec)
+                .execute(&mut *tx)
+                .await?;
+                // Wake sleeping schedulers: the new timer may be due sooner
+                // than the min(due_at) they went to sleep on.
+                sqlx::query("select pg_notify('rbpmn_timer', '')")
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            Event::TimerFired { id, .. } | Event::TimerCancelled { id, .. } => {
+                // Fired: the delete commits with the step — exactly-once.
+                sqlx::query("delete from rbpmn_timer where instance_id = $1 and timer_no = $2")
+                    .bind(instance_id)
+                    .bind(id.0 as i64)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            Event::MessageSubscribed {
+                id,
+                element,
+                message,
+                key,
+                token,
+            } => {
+                let token_no = token.0 as i64;
+                sqlx::query(
+                    "insert into rbpmn_subscription \
+                     (instance_id, subscription_no, token_no, element_id, \
+                      message_name, correlation_key) \
+                     values ($1, $2, $3, $4, $5, $6)",
+                )
+                .bind(instance_id)
+                .bind(id.0 as i64)
+                .bind(token_no)
+                .bind(element)
+                .bind(message)
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
+            }
+            Event::MessageReceived { id, .. } | Event::SubscriptionCancelled { id, .. } => {
+                sqlx::query(
+                    "delete from rbpmn_subscription \
+                     where instance_id = $1 and subscription_no = $2",
+                )
+                .bind(instance_id)
+                .bind(id.0 as i64)
+                .execute(&mut *tx)
+                .await?;
             }
             _ => {}
         }

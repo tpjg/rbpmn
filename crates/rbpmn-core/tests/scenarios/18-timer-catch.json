@@ -1,0 +1,22 @@
+{
+  "fixture": "accept/18-timer-catch.bpmn",
+  "actions": [{ "fire": "c" }],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started c",
+      "timer-armed c P5Y",
+      "timer-fired c",
+      "element-completed c",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

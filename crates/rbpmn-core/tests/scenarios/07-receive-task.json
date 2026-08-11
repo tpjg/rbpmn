@@ -1,0 +1,38 @@
+{
+  "fixture": "accept/07-task-kinds.bpmn",
+  "bindings": { "correlations": { "rt": "order.id" } },
+  "variables": { "order": { "id": "o-7" } },
+  "actions": [
+    { "complete": "st" },
+    { "complete": "ut" },
+    { "deliver": "rt" }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": { "order": { "id": "o-7" } },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started st",
+      "work-item-created st service st",
+      "work-item-completed st",
+      "element-completed st",
+      "flow-taken f2",
+      "element-started ut",
+      "work-item-created ut user ut",
+      "work-item-completed ut",
+      "element-completed ut",
+      "flow-taken f3",
+      "element-started rt",
+      "message-subscribed rt ShipmentConfirmed o-7",
+      "message-received rt ShipmentConfirmed",
+      "element-completed rt",
+      "flow-taken f4",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

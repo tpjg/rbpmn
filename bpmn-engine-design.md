@@ -518,21 +518,44 @@ optional axum ingress). Timer boundary events (interrupting first). Event-based
 gateway. Fixtures incl. "years-long sleep" simulated via clock injection — the clock
 is injected in the core from phase 1 precisely for this.
 
-Timer mechanics (decided): a timer catch inserts its `timer` row in the same
-transaction that parks the token, with `due_at` computed from **database
-time** (`now() + duration`) — node clocks never decide anything. Firing is
-one timer per transaction: claim via `DELETE ... WHERE id IN (SELECT id FROM
-timer WHERE due_at <= now() ORDER BY due_at LIMIT 1 FOR UPDATE SKIP LOCKED)
-RETURNING ...`, then step the instance in that same transaction — timer-row
-deletion committing together with the step is what makes firing exactly-once;
-a crashed claimant's lock releases automatically. Draining = repeat until
-nothing is due; every node runs the same loop (competing consumers). There is
-**never** a per-timer in-process wait — a sleeping timer is a passive row.
-After draining, each scheduler sleeps until `SELECT min(due_at)` (cheap on
-the index), capped by a fallback poll interval (~30s, configurable), and a
-`NOTIFY` on timer insert wakes sleepers when an earlier timer appears —
-polling is the safety net, not the mechanism. Nothing fires before `due_at`;
-no "due soon" prefetching.
+Timer mechanics (decided; claim ordering refined during phase 3): a timer
+catch inserts its `rbpmn_timer` row in the same transaction that parks the
+token, with `due_at` computed from **database time** (`now() + duration`) —
+node clocks never decide anything. Firing is one timer per transaction, and
+the timer row's deletion commits together with the step — that is what makes
+firing exactly-once. The originally sketched claim (`DELETE ... FOR UPDATE
+SKIP LOCKED` first, then lock the instance) turned out to lock in the
+opposite order from every other step path (completion locks the instance,
+*then* deletes cancelled timer rows) — a classic AB/BA deadlock, survivable
+via Postgres's detector but needless. Implemented instead with identical
+invariants and no deadlock: pick the due candidate **without any lock**
+(cheap on the `due_at` index), take the instance row lock (same order as
+every other step), re-check the timer row still exists under that lock
+(a concurrent step may have fired or cancelled it — losing the re-check just
+means moving on), then step + delete the row via the `timer-fired` event in
+that one transaction. Draining = repeat until nothing is due; every node
+runs the same loop (competing consumers). There is **never** a per-timer
+in-process wait — a sleeping timer is a passive row. After draining, each
+scheduler sleeps until `SELECT min(due_at)` (cheap on the index), capped by
+a fallback poll interval (~30s, configurable), and a `NOTIFY` on timer
+insert (`rbpmn_timer` channel) wakes sleepers when an earlier timer appears
+— polling is the safety net, not the mechanism. Nothing fires before
+`due_at`; no "due soon" prefetching.
+
+Correlation delivery contract (decided): `correlate(message, key, patch)`
+delivers to **exactly one** open subscription. No match is a loud error
+(HTTP 404) — a message with nowhere to go is never dropped silently; more
+than one match is refused (HTTP 409) — delivering to "one of them" would be
+a guess. Retrying a delivered correlate returns the no-match error (the
+subscription is consumed); unlike work items there is no closed-row no-op —
+callers that need blind retry idempotency should make keys unique per
+message occurrence. The correlation key **value** is evaluated from the
+variables when the subscription is armed; a key that evaluates to anything
+but a string or number can never match, so arming freezes the instance as an
+incident (`correlation-failed` event) instead of waiting forever. Message
+start/throw events stay compile-rejected: cross-definition message routing
+(throw → start/catch between islands) is designed post-phase-3; external
+systems deliver via `correlate()`.
 
 **Phase 4 — User tasks & the task API**
 `kind=user` work items; get/get-filtered/count/complete with locking + TTL;

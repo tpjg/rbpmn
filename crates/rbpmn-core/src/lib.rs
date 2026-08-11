@@ -8,10 +8,12 @@
 //! timers arrive (phase 3), the current time enters as command data, which is
 //! what makes "years-long sleep" fixtures trivial to simulate.
 //!
-//! Phase 1 executable subset: none start/end, sequence flow, exclusive
+//! Executable subset (phases 1–3): none start/end, sequence flow, exclusive
 //! split/join (FEEL-subset conditions + default flow), parallel split/join,
-//! service/user tasks as work-item wait states, terminate end. Everything the
-//! linter accepts but this phase cannot execute is refused at [`compile`]
+//! service/user tasks as work-item wait states, terminate end, error
+//! boundaries, timer/message intermediate catch (+ receive task),
+//! interrupting timer boundaries, and the event-based gateway. Everything
+//! the linter accepts but no phase can execute yet is refused at [`compile`]
 //! time with a phase pointer — fail early, never "seems to run".
 
 #![forbid(unsafe_code)]
@@ -22,10 +24,13 @@ mod merge_patch;
 mod state;
 mod step;
 
-pub use compile::{Bindings, CompileError, ExecKind, ExecutableProcess, FlowIx, NodeIx, WorkKind};
+pub use compile::{
+    Bindings, CompileError, ExecKind, ExecutableProcess, FlowIx, NodeIx, TimerDue, WorkKind,
+};
 pub use event::Event;
 pub use merge_patch::merge_patch;
 pub use state::{
-    InstanceState, InstanceStatus, Token, TokenId, WaitKind, WorkItemId, WorkItemState,
+    Counters, InstanceState, InstanceStatus, SubscriptionId, SubscriptionState, TimerId,
+    TimerState, Token, TokenId, WaitKind, WorkItemId, WorkItemState,
 };
 pub use step::{Command, StepError, step};

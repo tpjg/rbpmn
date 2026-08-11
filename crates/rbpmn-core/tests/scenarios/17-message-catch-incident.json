@@ -1,0 +1,19 @@
+{
+  "fixture": "accept/17-message-catch.bpmn",
+  "bindings": { "correlations": { "c": "order.id" } },
+  "variables": { "note": "no order.id anywhere" },
+  "actions": [],
+  "expect": {
+    "status": "failed",
+    "variables": { "note": "no order.id anywhere" },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started c",
+      "correlation-failed c order.id",
+      "incident-raised c"
+    ]
+  }
+}

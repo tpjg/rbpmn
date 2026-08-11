@@ -15,13 +15,17 @@ use std::collections::BTreeMap;
 pub type NodeIx = usize;
 pub type FlowIx = usize;
 
-/// The per-definition wiring from the deployment manifest that the core needs
-/// today: element -> work-item topic. Unmapped tasks default to their element
-/// id. (Correlations join in phase 3.)
+/// The per-definition wiring from the deployment manifest: element ->
+/// work-item topic, and message element -> correlation key (a FEEL qualified
+/// name into the instance variables). Unmapped tasks default to their
+/// element id; correlations have **no default** — every message catch must
+/// be mapped or compilation fails (`message-has-correlation`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Bindings {
     #[serde(default)]
     pub topics: BTreeMap<String, String>,
+    #[serde(default)]
+    pub correlations: BTreeMap<String, String>,
 }
 
 impl Bindings {
@@ -35,6 +39,38 @@ impl Bindings {
     pub fn topic(mut self, element_id: impl Into<String>, topic: impl Into<String>) -> Self {
         self.topics.insert(element_id.into(), topic.into());
         self
+    }
+
+    /// Bind a message element to its correlation key — a FEEL qualified name
+    /// (`order.id`) evaluated against the instance variables when the
+    /// subscription is armed. Registered here, never in the XML.
+    pub fn correlation(
+        mut self,
+        element_id: impl Into<String>,
+        feel_name: impl Into<String>,
+    ) -> Self {
+        self.correlations
+            .insert(element_id.into(), feel_name.into());
+        self
+    }
+}
+
+/// When an armed timer becomes due — the raw ISO-8601 text from the model
+/// (lint-validated). The core never interprets it: durations and dates are
+/// resolved to a `due_at` by the projection using **database time**; in the
+/// pure core, time only ever enters as a `FireTimer` command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimerDue {
+    Duration(String),
+    Date(String),
+}
+
+impl std::fmt::Display for TimerDue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TimerDue::Duration(s) | TimerDue::Date(s) => write!(f, "{s}"),
+        }
     }
 }
 
@@ -72,6 +108,26 @@ pub enum ExecKind {
     ErrorBoundary {
         code: String,
     },
+    /// Timer intermediate catch: parks its token behind an armed timer.
+    TimerCatch {
+        due: TimerDue,
+    },
+    /// Message catch — an `intermediateCatchEvent` or a `receiveTask` (same
+    /// semantics): parks its token behind a subscription. `key` is the
+    /// parsed correlation qualified name, `key_name` its source text.
+    MessageCatch {
+        message: String,
+        key: Vec<String>,
+        key_name: String,
+    },
+    /// Interrupting timer boundary: armed on the host's token, entered only
+    /// by its timer firing — never via a sequence flow.
+    TimerBoundary {
+        due: TimerDue,
+    },
+    /// Parks its token and arms every target catch event; the first to fire
+    /// wins and the rest are cancelled.
+    EventBasedGateway,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +154,9 @@ pub struct ExecutableProcess {
     ids: BTreeMap<String, NodeIx>,
     /// host node -> (error code, boundary node)
     error_boundaries: BTreeMap<NodeIx, Vec<(String, NodeIx)>>,
+    /// host node -> its interrupting timer boundary nodes, armed on the
+    /// host's token whenever the host starts waiting.
+    timer_boundaries: BTreeMap<NodeIx, Vec<NodeIx>>,
     start: NodeIx,
 }
 
@@ -113,6 +172,17 @@ pub enum CompileError {
         what: String,
         phase: &'static str,
     },
+    /// `message-has-correlation`: every message catch element must be bound
+    /// to a correlation key via `Bindings::correlation` — there is no
+    /// default, exactly like an unresolved topic fails a deploy.
+    #[error(
+        "message element(s) without a correlation binding: {} — bind each \
+         with Bindings::correlation(element_id, feel_qualified_name)",
+        .0.join(", ")
+    )]
+    MissingCorrelation(Vec<String>),
+    #[error("correlation binding on '{element}': {reason}")]
+    InvalidCorrelation { element: String, reason: String },
     #[error("internal: {0} (lint should have prevented this)")]
     Internal(String),
 }
@@ -146,6 +216,46 @@ impl ExecutableProcess {
             phase,
         };
 
+        // The message name lives in the XML (`messageRef` -> named message);
+        // the correlation key lives in the bindings manifest. Both resolve
+        // here, so a definition that compiles is fully wired.
+        let message_name =
+            |node: &FlowNode, message_ref: &Option<Id>| -> Result<String, CompileError> {
+                message_ref
+                    .as_deref()
+                    .and_then(|r| defs.messages.iter().find(|m| m.id == r))
+                    .and_then(|m| m.name.clone())
+                    .ok_or_else(|| {
+                        CompileError::Internal(format!(
+                            "message element '{}' without a named message survived lint",
+                            node.id
+                        ))
+                    })
+            };
+        let mut missing_correlations: Vec<String> = Vec::new();
+        let mut correlation = |node: &FlowNode| -> Result<(Vec<String>, String), CompileError> {
+            let Some(name) = bindings.correlations.get(&node.id) else {
+                missing_correlations.push(node.id.clone());
+                return Ok((Vec::new(), String::new())); // placeholder; rejected below
+            };
+            let path =
+                condition::parse_qname(name).map_err(|e| CompileError::InvalidCorrelation {
+                    element: node.id.clone(),
+                    reason: e.to_string(),
+                })?;
+            Ok((path, name.clone()))
+        };
+        let timer_due = |node: &FlowNode, spec: &TimerSpec| -> Result<TimerDue, CompileError> {
+            match spec {
+                TimerSpec::Duration(s) => Ok(TimerDue::Duration(s.clone())),
+                TimerSpec::Date(s) => Ok(TimerDue::Date(s.clone())),
+                TimerSpec::Cycle(_) | TimerSpec::Missing => Err(CompileError::Internal(format!(
+                    "timer '{}' with a cycle/missing definition survived lint",
+                    node.id
+                ))),
+            }
+        };
+
         let mut nodes = Vec::with_capacity(scope.nodes.len());
         let mut node_ix: BTreeMap<&str, NodeIx> = BTreeMap::new();
         let mut boundary_hosts: Vec<(NodeIx, String)> = Vec::new();
@@ -175,14 +285,42 @@ impl ExecutableProcess {
                     ExecKind::ExclusiveGateway { default_flow: None }
                 }
                 NodeKind::ParallelGateway => ExecKind::ParallelGateway,
-                NodeKind::Start(StartTrigger::Message(_)) | NodeKind::End(EndKind::Message(_)) => {
-                    return Err(not_yet(node, "messages arrive in phase 3"));
+                NodeKind::EventBasedGateway => ExecKind::EventBasedGateway,
+                NodeKind::Catch(CatchTrigger::Timer(spec)) => ExecKind::TimerCatch {
+                    due: timer_due(node, spec)?,
+                },
+                NodeKind::Catch(CatchTrigger::Message(message_ref)) => {
+                    let (key, key_name) = correlation(node)?;
+                    ExecKind::MessageCatch {
+                        message: message_name(node, message_ref)?,
+                        key,
+                        key_name,
+                    }
                 }
-                NodeKind::Catch(_) | NodeKind::Throw(_) | NodeKind::EventBasedGateway => {
-                    return Err(not_yet(node, "messages and timers arrive in phase 3"));
+                NodeKind::ReceiveTask { message_ref } => {
+                    // A receive task IS a message catch (identical semantics,
+                    // task-shaped notation) — it never creates a work item.
+                    let (key, key_name) = correlation(node)?;
+                    ExecKind::MessageCatch {
+                        message: message_name(node, message_ref)?,
+                        key,
+                        key_name,
+                    }
                 }
-                NodeKind::ReceiveTask { .. } => {
-                    return Err(not_yet(node, "messages arrive in phase 3"));
+                NodeKind::Start(StartTrigger::Message(_))
+                | NodeKind::End(EndKind::Message(_))
+                | NodeKind::Throw(_) => {
+                    return Err(not_yet(
+                        node,
+                        "message start/throw (cross-definition messaging) is not \
+                         part of phase 3 — external systems deliver via correlate()",
+                    ));
+                }
+                NodeKind::Catch(CatchTrigger::Unsupported { .. }) => {
+                    return Err(CompileError::Internal(format!(
+                        "unsupported catch trigger on '{}' survived lint",
+                        node.id
+                    )));
                 }
                 NodeKind::Boundary(b) => match &b.trigger {
                     BoundaryTrigger::Error { error_ref } => {
@@ -199,8 +337,17 @@ impl ExecutableProcess {
                         boundary_hosts.push((ix, b.attached_to.clone().unwrap_or_default()));
                         ExecKind::ErrorBoundary { code }
                     }
+                    BoundaryTrigger::Timer(spec) => {
+                        boundary_hosts.push((ix, b.attached_to.clone().unwrap_or_default()));
+                        ExecKind::TimerBoundary {
+                            due: timer_due(node, spec)?,
+                        }
+                    }
                     _ => {
-                        return Err(not_yet(node, "timer boundaries arrive in phase 3"));
+                        return Err(CompileError::Internal(format!(
+                            "unsupported boundary trigger on '{}' survived lint",
+                            node.id
+                        )));
                     }
                 },
                 NodeKind::SubProcess(_) => {
@@ -221,6 +368,9 @@ impl ExecutableProcess {
                 incoming: Vec::new(),
                 outgoing: Vec::new(),
             });
+        }
+        if !missing_correlations.is_empty() {
+            return Err(CompileError::MissingCorrelation(missing_correlations));
         }
 
         let mut flows = Vec::with_capacity(scope.flows.len());
@@ -260,32 +410,52 @@ impl ExecutableProcess {
         }
 
         let mut error_boundaries: BTreeMap<NodeIx, Vec<(String, NodeIx)>> = BTreeMap::new();
+        let mut timer_boundaries: BTreeMap<NodeIx, Vec<NodeIx>> = BTreeMap::new();
         for (boundary_ix, host_id) in boundary_hosts {
             let host = *node_ix.get(host_id.as_str()).ok_or_else(|| {
                 CompileError::Internal(format!("boundary host '{host_id}' missing"))
             })?;
-            // v1: errors originate from failing service tasks; a boundary on
-            // anything else (subprocesses are v2) is not executable yet.
-            if !matches!(
-                nodes[host].kind,
-                ExecKind::Task {
-                    kind: WorkKind::Service,
-                    ..
+            match &nodes[boundary_ix].kind {
+                ExecKind::ErrorBoundary { code } => {
+                    // v1: errors originate from failing service tasks; a
+                    // boundary on anything else (subprocesses are v2) is not
+                    // executable yet.
+                    if !matches!(
+                        nodes[host].kind,
+                        ExecKind::Task {
+                            kind: WorkKind::Service,
+                            ..
+                        }
+                    ) {
+                        return Err(CompileError::NotYetExecutable {
+                            element: nodes[boundary_ix].id.clone(),
+                            what: "error boundary event".to_string(),
+                            phase: "error boundaries on subprocesses arrive in v2",
+                        });
+                    }
+                    error_boundaries
+                        .entry(host)
+                        .or_default()
+                        .push((code.clone(), boundary_ix));
                 }
-            ) {
-                return Err(CompileError::NotYetExecutable {
-                    element: nodes[boundary_ix].id.clone(),
-                    what: "error boundary event".to_string(),
-                    phase: "error boundaries on subprocesses arrive in v2",
-                });
+                ExecKind::TimerBoundary { .. } => {
+                    // Timer boundaries arm on any waiting host token: tasks
+                    // (work items) and receive tasks (subscriptions).
+                    // Subprocess hosts cannot reach here — a subprocess in
+                    // the model already failed compilation above.
+                    if !matches!(
+                        nodes[host].kind,
+                        ExecKind::Task { .. } | ExecKind::MessageCatch { .. }
+                    ) {
+                        return Err(CompileError::Internal(format!(
+                            "timer boundary '{}' on unsupported host survived lint",
+                            nodes[boundary_ix].id
+                        )));
+                    }
+                    timer_boundaries.entry(host).or_default().push(boundary_ix);
+                }
+                _ => unreachable!("boundary_hosts only collects boundary nodes"),
             }
-            let ExecKind::ErrorBoundary { code } = &nodes[boundary_ix].kind else {
-                unreachable!()
-            };
-            error_boundaries
-                .entry(host)
-                .or_default()
-                .push((code.clone(), boundary_ix));
         }
 
         let start = nodes
@@ -304,6 +474,7 @@ impl ExecutableProcess {
             flows,
             ids,
             error_boundaries,
+            timer_boundaries,
             start,
         })
     }
@@ -335,6 +506,15 @@ impl ExecutableProcess {
             .iter()
             .find(|(c, _)| c == code)
             .map(|(_, b)| *b)
+    }
+
+    /// The interrupting timer boundaries armed whenever `host` starts
+    /// waiting (declaration order).
+    pub fn timer_boundaries(&self, host: NodeIx) -> &[NodeIx] {
+        self.timer_boundaries
+            .get(&host)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     pub fn flow_by_id(&self, id: &str) -> Option<FlowIx> {

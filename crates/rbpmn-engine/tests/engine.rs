@@ -1013,3 +1013,579 @@ async fn event_trace(pool: &PgPool, instance: uuid::Uuid) -> Vec<String> {
         })
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: timers & messages
+// ---------------------------------------------------------------------------
+
+/// start -> timer catch (`spec`) -> end.
+fn timer_catch_xml(spec: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:process id="pt" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:intermediateCatchEvent id="c">
+      <bpmn:timerEventDefinition>{spec}</bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="c"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="c" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>"#
+    )
+}
+
+async fn timer_rows(pool: &PgPool, instance: uuid::Uuid) -> i64 {
+    sqlx::query("select count(*) from rbpmn_timer where instance_id = $1")
+        .bind(instance)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get::<i64, _>(0)
+}
+
+async fn subscription_rows(pool: &PgPool, instance: uuid::Uuid) -> i64 {
+    sqlx::query("select count(*) from rbpmn_subscription where instance_id = $1")
+        .bind(instance)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get::<i64, _>(0)
+}
+
+async fn event_count(pool: &PgPool, instance: uuid::Uuid, kind: &str) -> i64 {
+    sqlx::query("select count(*) from rbpmn_event where instance_id = $1 and kind = $2")
+        .bind(instance)
+        .bind(kind)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get::<i64, _>(0)
+}
+
+#[tokio::test]
+async fn timer_fires_from_database_time() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT0S</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(timer_rows(&db.pool, started.id).await, 1);
+
+    assert!(engine.fire_due_timer().await.unwrap());
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(timer_rows(&db.pool, started.id).await, 0);
+    assert_eq!(event_count(&db.pool, started.id, "timer-fired").await, 1);
+    // Nothing left to fire.
+    assert!(!engine.fire_due_timer().await.unwrap());
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn sleeping_timer_is_a_passive_row() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>P1D</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // Not due: nothing fires, the row just sits there with a far due_at.
+    assert!(!engine.fire_due_timer().await.unwrap());
+    let hours: f64 = sqlx::query(
+        "select (extract(epoch from (due_at - now()))/3600)::float8 from rbpmn_timer \
+         where instance_id = $1",
+    )
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+    .get::<f64, _>(0);
+    assert!((23.9..24.1).contains(&hours), "due in {hours} hours");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn date_timer_arms_at_the_absolute_instant() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDate>2100-01-01T00:00:00Z</bpmn:timeDate>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    assert!(!engine.fire_due_timer().await.unwrap());
+    let due: String = sqlx::query(
+        "select to_char(due_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+         from rbpmn_timer where instance_id = $1",
+    )
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+    .get::<String, _>(0);
+    assert_eq!(due, "2100-01-01T00:00:00Z");
+    db.drop().await;
+}
+
+/// The scheduler sleeps until min(due_at), not the poll interval: a 1-second
+/// timer completes long before the 30-second fallback poll would tick.
+#[tokio::test]
+async fn scheduler_wakes_for_the_earliest_timer() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT1S</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let scheduler = tokio::spawn({
+        let engine = engine.clone();
+        async move {
+            engine
+                .run_scheduler(rbpmn_engine::SchedulerOptions::default())
+                .await
+        }
+    });
+    let started = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    scheduler.abort();
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn competing_schedulers_fire_each_timer_exactly_once() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT0S</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let mut instances = Vec::new();
+    for _ in 0..5 {
+        instances.push(
+            engine
+                .start("pt", None, serde_json::json!({}))
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    let schedulers: Vec<_> = (0..2)
+        .map(|_| {
+            tokio::spawn({
+                let engine = engine.clone();
+                async move {
+                    engine
+                        .run_scheduler(rbpmn_engine::SchedulerOptions {
+                            poll_interval: Duration::from_millis(100),
+                        })
+                        .await
+                }
+            })
+        })
+        .collect();
+    for id in &instances {
+        wait_for_status(&db.pool, *id, "completed").await;
+    }
+    for s in schedulers {
+        s.abort();
+    }
+    for id in &instances {
+        assert_eq!(
+            event_count(&db.pool, *id, "timer-fired").await,
+            1,
+            "a timer must fire exactly once under competing schedulers"
+        );
+    }
+    db.drop().await;
+}
+
+/// start -> user task ut (boundary timer bt `spec` -> e_esc) -> end.
+fn boundary_timer_xml(spec: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:process id="pb" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:userTask id="ut" name="Approve"/>
+    <bpmn:boundaryEvent id="bt" attachedToRef="ut">
+      <bpmn:timerEventDefinition>{spec}</bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="end"/>
+    <bpmn:endEvent id="e_esc"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ut"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ut" targetRef="end"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="bt" targetRef="e_esc"/>
+  </bpmn:process>
+</bpmn:definitions>"#
+    )
+}
+
+#[tokio::test]
+async fn boundary_timer_disarms_when_the_task_completes() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &boundary_timer_xml("<bpmn:timeDuration>PT1H</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pb", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(timer_rows(&db.pool, started.id).await, 1);
+
+    let (item, _) = open_items(&db.pool, started.id).await[0].clone();
+    engine
+        .complete_work_item(item, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(timer_rows(&db.pool, started.id).await, 0);
+    assert_eq!(
+        event_count(&db.pool, started.id, "timer-cancelled").await,
+        1
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn boundary_timer_interrupts_the_task() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &boundary_timer_xml("<bpmn:timeDuration>PT0S</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pb", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    assert!(engine.fire_due_timer().await.unwrap());
+    wait_for_status(&db.pool, started.id, "completed").await;
+    // The task never completed: its item was cancelled by the interruption.
+    let state: String = sqlx::query(
+        "select state from rbpmn_work_item where instance_id = $1 and element_id = 'ut'",
+    )
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+    .get("state");
+    assert_eq!(state, "cancelled");
+    assert_eq!(event_count(&db.pool, started.id, "timer-fired").await, 1);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn correlate_delivers_exactly_once() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bindings = Bindings::new().correlation("c", "order.id");
+    engine
+        .deploy(&fixture("accept/17-message-catch.bpmn"), &bindings)
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({"order": {"id": "o-1"}}))
+        .await
+        .unwrap();
+
+    // Wrong key: nowhere to go, said loudly.
+    let miss = engine
+        .correlate("WarehouseAck", "o-2", serde_json::json!({}))
+        .await;
+    assert!(matches!(
+        miss,
+        Err(rbpmn_engine::EngineError::NoSubscription { .. })
+    ));
+
+    let correlation = engine
+        .correlate("WarehouseAck", "o-1", serde_json::json!({"shipped": true}))
+        .await
+        .unwrap();
+    assert_eq!(correlation.instance_id, started.id);
+    wait_for_status(&db.pool, started.id, "completed").await;
+    let variables: serde_json::Value =
+        sqlx::query("select variables from rbpmn_instance where id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .get("variables");
+    assert_eq!(variables["shipped"], serde_json::json!(true));
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 0);
+
+    // The subscription is consumed: a repeat has nowhere to go.
+    let repeat = engine
+        .correlate("WarehouseAck", "o-1", serde_json::json!({}))
+        .await;
+    assert!(matches!(
+        repeat,
+        Err(rbpmn_engine::EngineError::NoSubscription { .. })
+    ));
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn ambiguous_correlation_is_refused() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bindings = Bindings::new().correlation("c", "order.id");
+    engine
+        .deploy(&fixture("accept/17-message-catch.bpmn"), &bindings)
+        .await
+        .unwrap();
+    let vars = serde_json::json!({"order": {"id": "dup"}});
+    engine.start("p", None, vars.clone()).await.unwrap();
+    engine.start("p", None, vars).await.unwrap();
+
+    let result = engine
+        .correlate("WarehouseAck", "dup", serde_json::json!({}))
+        .await;
+    assert!(matches!(
+        result,
+        Err(rbpmn_engine::EngineError::AmbiguousCorrelation { .. })
+    ));
+    db.drop().await;
+}
+
+/// The caller-transaction property extends to message delivery: a rollback
+/// takes the business write and the delivery back together.
+#[tokio::test]
+async fn correlate_in_tx_shares_business_writes() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    sqlx::query("create table shipments (order_id text primary key)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let bindings = Bindings::new().correlation("c", "order.id");
+    engine
+        .deploy(&fixture("accept/17-message-catch.bpmn"), &bindings)
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({"order": {"id": "o-9"}}))
+        .await
+        .unwrap();
+
+    let mut tx = db.pool.begin().await.unwrap();
+    sqlx::query("insert into shipments (order_id) values ('o-9')")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    engine
+        .correlate_in_tx(&mut tx, "WarehouseAck", "o-9", serde_json::json!({}))
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+
+    // Both gone: the delivery never happened, the subscription is still open.
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 1);
+    let shipments: i64 = sqlx::query("select count(*) from shipments")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(shipments, 0);
+
+    // And the retry converges.
+    engine
+        .correlate("WarehouseAck", "o-9", serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn missing_correlation_key_freezes_loudly() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bindings = Bindings::new().correlation("c", "order.id");
+    engine
+        .deploy(&fixture("accept/17-message-catch.bpmn"), &bindings)
+        .await
+        .unwrap();
+    // No order.id in the variables: the subscription could never match.
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "failed").await;
+    assert_eq!(
+        event_count(&db.pool, started.id, "correlation-failed").await,
+        1
+    );
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 0);
+    db.drop().await;
+}
+
+/// Terminate tears everything down in one transaction — including armed
+/// timers (fixture-12 shape with a timer in the surviving branch).
+#[tokio::test]
+async fn terminate_clears_armed_timers() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:process id="ptr" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:intermediateCatchEvent id="tc">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>P1D</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:userTask id="tb" name="Check"/>
+    <bpmn:exclusiveGateway id="xs" default="f_go"/>
+    <bpmn:endEvent id="e_term"><bpmn:terminateEventDefinition/></bpmn:endEvent>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="tc"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="tc" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="ps" targetRef="tb"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="tb" targetRef="xs"/>
+    <bpmn:sequenceFlow id="f_cancel" sourceRef="xs" targetRef="e_term">
+      <bpmn:conditionExpression>cancelled = true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_go" sourceRef="xs" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="pj" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    engine.deploy(xml, &Bindings::default()).await.unwrap();
+    let started = engine
+        .start("ptr", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(timer_rows(&db.pool, started.id).await, 1);
+
+    let (item, _) = open_items(&db.pool, started.id).await[0].clone();
+    engine
+        .complete_work_item(item, serde_json::json!({"cancelled": true}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "terminated").await;
+    assert_eq!(timer_rows(&db.pool, started.id).await, 0);
+    assert_eq!(
+        event_count(&db.pool, started.id, "timer-cancelled").await,
+        1
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn event_gateway_race_message_wins() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bindings = Bindings::new()
+        .correlation("c_paid", "order.id")
+        .correlation("c_cancel", "order.id");
+    engine
+        .deploy(&fixture("accept/11-event-based-gateway.bpmn"), &bindings)
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({"order": {"id": "o-e"}}))
+        .await
+        .unwrap();
+    assert_eq!(timer_rows(&db.pool, started.id).await, 1);
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 2);
+
+    engine
+        .correlate("PaymentReceived", "o-e", serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    // The losers are withdrawn with the race.
+    assert_eq!(timer_rows(&db.pool, started.id).await, 0);
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 0);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn event_gateway_race_timer_wins() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m" name="Answer"/>
+  <bpmn:process id="pe" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:eventBasedGateway id="ebg"/>
+    <bpmn:intermediateCatchEvent id="c_t">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT0S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="c_m">
+      <bpmn:messageEventDefinition messageRef="m"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="e_t"/>
+    <bpmn:endEvent id="e_m"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ebg"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ebg" targetRef="c_t"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ebg" targetRef="c_m"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="c_t" targetRef="e_t"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="c_m" targetRef="e_m"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let bindings = Bindings::new().correlation("c_m", "k");
+    engine.deploy(xml, &bindings).await.unwrap();
+    let started = engine
+        .start("pe", None, serde_json::json!({"k": "x"}))
+        .await
+        .unwrap();
+
+    assert!(engine.fire_due_timer().await.unwrap());
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 0);
+    // The losing subscription is gone: its message has nowhere to go now.
+    let late = engine.correlate("Answer", "x", serde_json::json!({})).await;
+    assert!(matches!(
+        late,
+        Err(rbpmn_engine::EngineError::NoSubscription { .. })
+    ));
+    db.drop().await;
+}

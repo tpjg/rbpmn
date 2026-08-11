@@ -1,0 +1,33 @@
+{
+  "fixture": "accept/11-event-based-gateway.bpmn",
+  "bindings": {
+    "correlations": { "c_paid": "order.id", "c_cancel": "order.id" }
+  },
+  "variables": { "order": { "id": "o-3" } },
+  "actions": [{ "fire": "c_late" }],
+  "expect": {
+    "status": "completed",
+    "variables": { "order": { "id": "o-3" } },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started ebg",
+      "message-subscribed c_paid PaymentReceived o-3",
+      "message-subscribed c_cancel OrderCancelled o-3",
+      "timer-armed c_late P3D",
+      "timer-fired c_late",
+      "subscription-cancelled c_paid PaymentReceived",
+      "subscription-cancelled c_cancel OrderCancelled",
+      "element-completed ebg",
+      "flow-taken f4",
+      "element-started c_late",
+      "element-completed c_late",
+      "flow-taken f7",
+      "element-started e_late",
+      "element-completed e_late",
+      "instance-completed"
+    ]
+  }
+}

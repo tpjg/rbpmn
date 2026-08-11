@@ -1,0 +1,25 @@
+{
+  "fixture": "accept/17-message-catch.bpmn",
+  "bindings": { "correlations": { "c": "order.id" } },
+  "variables": { "order": { "id": "order-84231" } },
+  "actions": [{ "deliver": "c", "patch": { "shipped": true } }],
+  "expect": {
+    "status": "completed",
+    "variables": { "order": { "id": "order-84231" }, "shipped": true },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started c",
+      "message-subscribed c WarehouseAck order-84231",
+      "message-received c WarehouseAck",
+      "variables-patched",
+      "element-completed c",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}
