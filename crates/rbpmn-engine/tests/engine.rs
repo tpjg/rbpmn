@@ -1906,3 +1906,145 @@ async fn frozen_instances_do_not_block_correlation() {
     ));
     db.drop().await;
 }
+
+/// The 1 MiB response cap is enforced while streaming: an oversized handler
+/// response becomes a recorded failure, not an unbounded buffer.
+#[tokio::test]
+async fn oversized_handler_response_is_refused() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new().route(
+        "/work",
+        axum::routing::post(|| async {
+            // > 1 MiB of valid JSON.
+            let huge = "x".repeat(2 * 1024 * 1024);
+            axum::Json(serde_json::json!({ "blob": huge }))
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    engine.register_handler(
+        "payments",
+        Arc::new(HttpPostHandler::new(format!("http://{addr}/work"))),
+    );
+    engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new().topic("st", "payments"),
+        )
+        .await
+        .unwrap();
+
+    let worker = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.run_worker(worker_options()).await }
+    });
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "failed").await;
+    worker.abort();
+
+    let last: String =
+        sqlx::query("select last_failure from rbpmn_work_item where instance_id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .get("last_failure");
+    assert!(last.contains("too large"), "{last}");
+    db.drop().await;
+}
+
+/// NUL bytes in text parameters are 400-class rejections, never a
+/// transaction-poisoning database error.
+#[tokio::test]
+async fn nul_in_text_parameters_is_rejected_loudly() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bindings = Bindings::new().correlation("c", "order.id");
+    engine
+        .deploy(&fixture("accept/17-message-catch.bpmn"), &bindings)
+        .await
+        .unwrap();
+
+    let bad_key = engine
+        .correlate("WarehouseAck", "a\u{0}b", serde_json::json!({}))
+        .await;
+    assert!(matches!(
+        bad_key,
+        Err(rbpmn_engine::EngineError::InvalidVariables(_))
+    ));
+    let bad_name = engine
+        .correlate("Ware\u{0}houseAck", "o-1", serde_json::json!({}))
+        .await;
+    assert!(matches!(
+        bad_name,
+        Err(rbpmn_engine::EngineError::InvalidVariables(_))
+    ));
+    let bad_bk = engine
+        .start(
+            "p",
+            Some("bk\u{0}"),
+            serde_json::json!({"order": {"id": "x"}}),
+        )
+        .await;
+    assert!(matches!(
+        bad_bk,
+        Err(rbpmn_engine::EngineError::InvalidVariables(_))
+    ));
+    db.drop().await;
+}
+
+/// The inspection view exposes armed timers and open subscriptions — the
+/// token overlay's data for phase-3 wait states.
+#[tokio::test]
+async fn inspection_shows_timers_and_subscriptions() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bindings = Bindings::new()
+        .correlation("c_paid", "order.id")
+        .correlation("c_cancel", "order.id");
+    engine
+        .deploy(&fixture("accept/11-event-based-gateway.bpmn"), &bindings)
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({"order": {"id": "o-i"}}))
+        .await
+        .unwrap();
+
+    let view = engine.inspect_instance(started.id).await.unwrap();
+    assert_eq!(view.timers.len(), 1);
+    assert_eq!(view.timers[0].element_id, "c_late");
+    assert_eq!(view.timers[0].due_spec, "P3D");
+    // RFC 3339 UTC, e.g. "2026-08-14T09:00:00Z".
+    assert!(
+        view.timers[0].due_at.ends_with('Z'),
+        "{}",
+        view.timers[0].due_at
+    );
+    let subs: Vec<(String, String, String)> = view
+        .subscriptions
+        .iter()
+        .map(|s| {
+            (
+                s.element_id.clone(),
+                s.message_name.clone(),
+                s.correlation_key.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        subs,
+        vec![
+            ("c_paid".into(), "PaymentReceived".into(), "o-i".into()),
+            ("c_cancel".into(), "OrderCancelled".into(), "o-i".into()),
+        ]
+    );
+    db.drop().await;
+}

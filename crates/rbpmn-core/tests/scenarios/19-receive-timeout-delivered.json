@@ -1,0 +1,27 @@
+{
+  "fixture": "accept/19-receive-timeout.bpmn",
+  "bindings": { "correlations": { "rt": "po.number" } },
+  "variables": { "po": { "number": "po-19" } },
+  "actions": [{ "deliver": "rt", "patch": { "acked": true } }],
+  "expect": {
+    "status": "completed",
+    "variables": { "po": { "number": "po-19" }, "acked": true },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started rt",
+      "message-subscribed rt SupplierAck po-19",
+      "timer-armed bt P2D",
+      "message-received rt SupplierAck",
+      "variables-patched",
+      "timer-cancelled bt",
+      "element-completed rt",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

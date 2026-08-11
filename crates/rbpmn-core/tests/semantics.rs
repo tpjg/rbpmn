@@ -530,3 +530,93 @@ fn error_incident_parks_the_token_at_the_failed_task() {
     assert_eq!(tokens[0].1.node, proc.node_by_id("review").unwrap());
     assert_eq!(tokens[0].1.wait, WaitKind::Incident);
 }
+
+/// Several timer boundaries on one task: the first to fire wins, interrupts
+/// the task, and withdraws its siblings — first-fires-wins, exactly one
+/// continuation.
+#[test]
+fn multiple_timer_boundaries_first_fires_wins() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:userTask id="ut"/>
+    <bpmn:boundaryEvent id="bt_warn" attachedToRef="ut">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="bt_hard" attachedToRef="ut">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>P1D</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="end"/>
+    <bpmn:endEvent id="e_warn"/>
+    <bpmn:endEvent id="e_hard"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ut"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ut" targetRef="end"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="bt_warn" targetRef="e_warn"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="bt_hard" targetRef="e_hard"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let defs = rbpmn_model::parse(xml).unwrap();
+    let proc = ExecutableProcess::compile(&defs, "p", &Bindings::default()).unwrap();
+
+    // Fire the *second* boundary: the first is withdrawn with the host.
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(state.timers().count(), 2);
+    let hard = state
+        .armed_timer_at(proc.node_by_id("bt_hard").unwrap())
+        .unwrap();
+    let events = step(&proc, &mut state, Command::FireTimer { id: hard }).unwrap();
+    let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+    assert!(
+        trace.contains(&"work-item-cancelled ut".to_string()),
+        "{trace:?}"
+    );
+    assert!(
+        trace.contains(&"timer-cancelled bt_warn".to_string()),
+        "{trace:?}"
+    );
+    assert!(trace.contains(&"element-started e_hard".to_string()));
+    assert!(!trace.contains(&"element-started e_warn".to_string()));
+    assert_eq!(state.status, InstanceStatus::Completed);
+    assert_eq!(state.timers().count(), 0);
+
+    // Completing the task disarms both.
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({}),
+        },
+    )
+    .unwrap();
+    let item = state
+        .open_work_item_at(proc.node_by_id("ut").unwrap())
+        .unwrap();
+    let events = step(
+        &proc,
+        &mut state,
+        Command::CompleteWorkItem {
+            id: item,
+            patch: json!({}),
+        },
+    )
+    .unwrap();
+    let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+    assert!(
+        trace.contains(&"timer-cancelled bt_warn".to_string()),
+        "{trace:?}"
+    );
+    assert!(trace.contains(&"timer-cancelled bt_hard".to_string()));
+    assert_eq!(state.status, InstanceStatus::Completed);
+    assert_eq!(state.timers().count(), 0);
+}
