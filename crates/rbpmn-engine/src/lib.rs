@@ -22,6 +22,7 @@ mod http_handler;
 mod inspect;
 mod runtime;
 mod scheduler;
+mod tasks;
 #[cfg(feature = "test-util")]
 pub mod testing;
 mod worker;
@@ -38,6 +39,7 @@ pub use rbpmn_core::{Bindings, Event};
 pub use runtime::FailOptions;
 pub use scheduler::SchedulerOptions;
 pub use sqlx::PgPool;
+pub use tasks::{GetTaskOptions, LockExtension, LockedTask, TaskFilter, TaskOrder};
 pub use worker::WorkerOptions;
 
 /// Convenience: connect a pool for the engine (the URL comes from operator
@@ -63,6 +65,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         3,
         "timers_messages",
         include_str!("../migrations/0003_timers_messages.sql"),
+    ),
+    (
+        4,
+        "task_api",
+        include_str!("../migrations/0004_task_api.sql"),
     ),
 ];
 

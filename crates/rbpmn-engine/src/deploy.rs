@@ -18,6 +18,14 @@ impl Engine {
         }
         let key = defs.processes[0].id.clone();
 
+        // Manifest index declarations are validated up front (fail early,
+        // before anything persists) and applied after the commit — a
+        // CONCURRENTLY build cannot run inside the deploy transaction.
+        for field in &bindings.indexes {
+            crate::tasks::validate_index_declaration(&key, field)
+                .map_err(|e| DeployError::InvalidManifest(e.to_string()))?;
+        }
+
         let diagnostics = rbpmn_model::lint(&defs);
         if rbpmn_model::has_errors(&diagnostics) {
             return Err(DeployError::Rejected(diagnostics));
@@ -107,6 +115,9 @@ impl Engine {
             && row.get::<String, _>("content_hash") == content_hash
         {
             tx.commit().await?;
+            // Idempotent re-deploy re-applies the declarations too — this
+            // is what makes deploy re-runnable at startup.
+            self.apply_manifest_indexes(&key, bindings).await?;
             return Ok(Deployment {
                 definition_id: row.get("id"),
                 key,
@@ -130,6 +141,7 @@ impl Engine {
         .await?
         .get("id");
         tx.commit().await?;
+        self.apply_manifest_indexes(&key, bindings).await?;
 
         Ok(Deployment {
             definition_id: id,
@@ -138,6 +150,23 @@ impl Engine {
             reused: false,
             warnings,
         })
+    }
+
+    /// Build the manifest's declared indexes, after the deploy commit
+    /// (CONCURRENTLY cannot run in a transaction). Everything here is
+    /// idempotent, so a failure is safely retried by re-deploying.
+    async fn apply_manifest_indexes(
+        &self,
+        key: &str,
+        bindings: &Bindings,
+    ) -> Result<(), DeployError> {
+        for field in &bindings.indexes {
+            self.declare_index(key, field).await.map_err(|e| match e {
+                crate::EngineError::Db(db) => DeployError::Db(db),
+                other => DeployError::InvalidManifest(other.to_string()),
+            })?;
+        }
+        Ok(())
     }
 
     /// Startup re-validation: definitions persist across restarts but the

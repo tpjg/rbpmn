@@ -410,18 +410,28 @@ current registration state** and fails loudly with the same rule id
   expectations for `work_item` — heartbeats add steady row-version churn.
   The same lease applies to `kind=service` items claimed by external workers: workers
   heartbeat too, so a wedged worker's items return without waiting out a long lock.
-- `declare_index(definition_key, field)` (+ optional target: WorkItem (default) |
-  Instance) — **entirely optional performance API**; filtering and counting work
-  without it (seq scan is correct, just slower). Creates
-  `CREATE INDEX IF NOT EXISTS <deterministic-name> ON rbpmn_work_item
-  ((variables->>'<field>')) WHERE definition_id = '<literal id>'` — definition id
-  as a literal (planner requirement), deterministic name from (table, definition
-  key, field) so the call is idempotent and re-runnable at startup next to handler
-  registration. Use `CREATE INDEX CONCURRENTLY` (runs outside a transaction —
-  handle that). This IS the "declared filterable fields" mechanism, exposed as an
-  explicit call; the same declaration can ride in the deploy manifest's `index`
-  entries (see The deployment manifest). JSONB stays opaque: the engine never
-  interprets variables, it only indexes fields the application names.
+- `declare_index(definition_key, field)` — **entirely optional performance
+  API**; filtering and counting work without it (seq scan is correct, just
+  slower). Two refinements decided during phase 4: filters evaluate the
+  **owning instance's live variables** — the sketched `variables_snapshot`
+  on work_item (its "?" was never resolved) is rejected, because a snapshot
+  silently diverges from the one variable document, and a filter matching
+  stale data is a "seems correct" bug; consequently the index lives on
+  `rbpmn_instance`, and its partial predicate is **`definition_key`** (a
+  literal), not the sketched `definition_id` — instances pin a definition
+  *version*, and a per-version predicate would silently exclude every
+  instance deployed after the index. Creates `CREATE INDEX CONCURRENTLY IF
+  NOT EXISTS <deterministic-name> ON rbpmn_instance ((variables->>'<field>'))
+  WHERE definition_key = '<literal>'` — deterministic name from (key,
+  field), idempotent and re-runnable at startup. CONCURRENTLY runs outside
+  a transaction and, interrupted, leaves an *invalid* index that
+  `IF NOT EXISTS` would silently accept forever — so validity is verified
+  after the build and an invalid leftover is dropped and reported loudly.
+  This IS the "declared filterable fields" mechanism, exposed as an
+  explicit call; the same declaration rides in the deploy manifest's
+  `indexes` entries, validated before anything persists and applied after
+  the commit. JSONB stays opaque: the engine never interprets variables, it
+  only indexes fields the application names.
 - `get_task_filtered(topic, filter, ttl)` — the filter compiler MUST emit exactly
   the indexed expression shape (`variables->>'field'` + literal definition_id) so
   declared indexes are actually used. EXPLAIN-based integration test: index usage

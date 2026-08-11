@@ -21,10 +21,10 @@ Read it before touching the semantics.
 | `playground/` | Local linter playground (bpmn-js + WASM): fixture browser, live re-lint, diagnostics as diagram overlays. `just playground`. |
 | `bpmnlint-plugin-rbpmn/` | bpmnlint plugin backed by the same WASM — rbpmn's rules inside bpmn-io tooling, zero JS reimplementation. |
 
-Planned (per the design brief's build order): the task API (phase 4), then
-rounding out (phase 5). Cross-definition messaging (message start/throw
-routing between definitions) is designed after that; until then message
-start/throw events lint clean but refuse to compile.
+Planned (per the design brief's build order): rounding out (phase 5).
+Cross-definition messaging (message start/throw routing between
+definitions) is designed after that; until then message start/throw events
+lint clean but refuse to compile.
 
 ## Status
 
@@ -59,7 +59,16 @@ start/throw events lint clean but refuse to compile.
       exactly-one delivery, loud 404/409), and the deadlock-free scheduler
       (instance-lock-first claim, `min(due_at)` sleep, `NOTIFY rbpmn_timer`,
       poll fallback; exactly-once verified under competing schedulers).
-- [ ] Phase 4 — task API. Phase 5 — rounding out.
+- [x] **Phase 4 — user tasks & the task API**: pull-mode `get_task` (FIFO
+      default / LIFO opt-in, `SKIP LOCKED`, renewable leases — expired locks
+      return without a reaper), `extend_lock` with the typed lock-lost
+      result, owner-checked `complete_task`/`fail_task`, equality filters
+      over the instance's **live** variables, `count_tasks`, and
+      `declare_index` (partial expression indexes, also declarable in the
+      deploy manifest; index usage verified by test against the real query
+      path). Server: `POST /v1/tasks/{get,count}` and
+      `/v1/tasks/{id}/{extend,complete,fail}`.
+- [ ] Phase 5 — rounding out.
 
 ## Rule catalogue
 

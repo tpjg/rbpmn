@@ -465,3 +465,116 @@ async fn message_ingress_delivers_and_is_loud_about_misses() {
     let _ = instance;
     db.drop().await;
 }
+
+/// The pull-mode task lifecycle over HTTP: claim (200/204), heartbeat
+/// (extended / 409 lockLost), owner-checked completion.
+#[tokio::test]
+async fn task_api_lifecycle_over_http() {
+    let (app, db) = test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/definitions",
+            serde_json::json!({ "bpmn": MINIMAL_XML }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/instances",
+            serde_json::json!({ "definitionKey": "p", "variables": { "region": "north" } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Count, then claim FIFO.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/tasks/count",
+            serde_json::json!({ "topic": "review" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["count"], 1);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/tasks/get",
+            serde_json::json!({ "topic": "review", "owner": "alice" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let task = body_json(resp).await["task"].clone();
+    assert_eq!(task["elementId"], "review");
+    assert_eq!(task["variables"]["region"], "north");
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // Nothing left to claim: 204.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/tasks/get",
+            serde_json::json!({ "topic": "review", "owner": "bob" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Heartbeat: owner extends; a stranger gets the typed 409.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/tasks/{task_id}/extend"),
+            serde_json::json!({ "owner": "alice", "ttlSeconds": 600 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["outcome"], "extended");
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/tasks/{task_id}/extend"),
+            serde_json::json!({ "owner": "bob", "ttlSeconds": 600 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(resp).await["outcome"], "lockLost");
+
+    // Completion is owner-checked: a stranger is refused, the owner lands.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/tasks/{task_id}/complete"),
+            serde_json::json!({ "owner": "bob", "patch": {} }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/tasks/{task_id}/complete"),
+            serde_json::json!({ "owner": "alice", "patch": { "approved": true } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["outcome"], "advanced");
+    db.drop().await;
+}

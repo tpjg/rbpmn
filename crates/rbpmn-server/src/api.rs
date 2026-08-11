@@ -44,7 +44,170 @@ pub async fn deploy(State(engine): State<Engine>, Json(body): Json<DeployBody>) 
         Err(DeployError::NotExactlyOneProcess(n)) => bad_request(format!(
             "a deployment must contain exactly one process, found {n}"
         )),
+        Err(e @ DeployError::InvalidManifest(_)) => bad_request(e.to_string()),
         Err(DeployError::Db(e)) => internal(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTaskBody {
+    pub topic: String,
+    pub owner: String,
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+    /// "fifo" (default) or "lifo".
+    #[serde(default)]
+    pub order: Option<String>,
+    #[serde(default)]
+    pub filter: Option<FilterBody>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterBody {
+    pub definition_key: String,
+    #[serde(default)]
+    pub fields: std::collections::BTreeMap<String, String>,
+}
+
+impl FilterBody {
+    fn into_filter(self) -> rbpmn_engine::TaskFilter {
+        let mut filter = rbpmn_engine::TaskFilter::new(self.definition_key);
+        for (field, value) in self.fields {
+            filter = filter.field(field, value);
+        }
+        filter
+    }
+}
+
+/// Claim the next task on a topic (200 with the task, 204 when none).
+pub async fn get_task(State(engine): State<Engine>, Json(body): Json<GetTaskBody>) -> Response {
+    let order = match body.order.as_deref() {
+        None | Some("fifo") => rbpmn_engine::TaskOrder::Fifo,
+        Some("lifo") => rbpmn_engine::TaskOrder::Lifo,
+        Some(other) => return bad_request(format!("unknown order '{other}' (fifo|lifo)")),
+    };
+    let mut options = rbpmn_engine::GetTaskOptions::new(body.owner);
+    if let Some(secs) = body.ttl_seconds {
+        options.ttl = std::time::Duration::from_secs(secs);
+    }
+    options.order = order;
+    options.filter = body.filter.map(FilterBody::into_filter);
+    match engine.get_task(&body.topic, &options).await {
+        Ok(Some(task)) => Json(serde_json::json!({ "task": task })).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CountTasksBody {
+    pub topic: String,
+    #[serde(default)]
+    pub filter: Option<FilterBody>,
+}
+
+pub async fn count_tasks(
+    State(engine): State<Engine>,
+    Json(body): Json<CountTasksBody>,
+) -> Response {
+    let filter = body.filter.map(FilterBody::into_filter);
+    match engine.count_tasks(&body.topic, filter.as_ref()).await {
+        Ok(count) => Json(serde_json::json!({ "count": count })).into_response(),
+        Err(e) => engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtendBody {
+    pub owner: String,
+    pub ttl_seconds: u64,
+}
+
+/// Heartbeat. A lost lease is 409 with a distinct outcome — the client's UI
+/// must be able to say "this task was reassigned", never fail silently.
+pub async fn extend_lock(
+    State(engine): State<Engine>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ExtendBody>,
+) -> Response {
+    match engine
+        .extend_lock(
+            id,
+            &body.owner,
+            std::time::Duration::from_secs(body.ttl_seconds),
+        )
+        .await
+    {
+        Ok(rbpmn_engine::LockExtension::Extended { until }) => {
+            Json(json!({ "outcome": "extended", "lockUntil": until })).into_response()
+        }
+        Ok(rbpmn_engine::LockExtension::Lost) => {
+            (StatusCode::CONFLICT, Json(json!({ "outcome": "lockLost" }))).into_response()
+        }
+        Err(e) => engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CompleteTaskBody {
+    pub owner: String,
+    #[serde(default)]
+    pub patch: Option<serde_json::Value>,
+}
+
+/// Owner-checked completion (the ownerless push-mode endpoint stays at
+/// /work-items/{id}/complete).
+pub async fn complete_task(
+    State(engine): State<Engine>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CompleteTaskBody>,
+) -> Response {
+    let patch = body.patch.unwrap_or_else(|| json!({}));
+    match engine.complete_task(id, &body.owner, patch).await {
+        Ok(Completion::Advanced(_)) => Json(json!({ "outcome": "advanced" })).into_response(),
+        Ok(Completion::AlreadyClosed { state }) => {
+            Json(json!({ "outcome": "alreadyClosed", "state": state })).into_response()
+        }
+        Err(e) => engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailTaskBody {
+    pub owner: String,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
+pub async fn fail_task(
+    State(engine): State<Engine>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<FailTaskBody>,
+) -> Response {
+    match engine
+        .fail_task(id, &body.owner, body.error_code, body.error_message)
+        .await
+    {
+        Ok(FailOutcome::Retrying { retries_left }) => {
+            Json(json!({ "outcome": "retrying", "retriesLeft": retries_left })).into_response()
+        }
+        Ok(FailOutcome::AlreadyClosed { state }) => {
+            Json(json!({ "outcome": "alreadyClosed", "state": state })).into_response()
+        }
+        Ok(FailOutcome::ErrorCaught(_)) => {
+            Json(json!({ "outcome": "errorCaught" })).into_response()
+        }
+        Ok(FailOutcome::IncidentRaised) => {
+            Json(json!({ "outcome": "incidentRaised" })).into_response()
+        }
+        Err(e) => engine_error(e),
     }
 }
 

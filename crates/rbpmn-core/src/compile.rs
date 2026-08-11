@@ -26,6 +26,11 @@ pub struct Bindings {
     pub topics: BTreeMap<String, String>,
     #[serde(default)]
     pub correlations: BTreeMap<String, String>,
+    /// Variables fields the application filters/counts tasks by — the
+    /// engine creates a partial expression index per entry at deploy
+    /// (`declare_index`). Entirely optional performance declarations.
+    #[serde(default)]
+    pub indexes: std::collections::BTreeSet<String>,
 }
 
 impl Bindings {
@@ -51,6 +56,12 @@ impl Bindings {
     ) -> Self {
         self.correlations
             .insert(element_id.into(), feel_name.into());
+        self
+    }
+
+    /// Declare a filterable variables field (optional, performance only).
+    pub fn index(mut self, field: impl Into<String>) -> Self {
+        self.indexes.insert(field.into());
         self
     }
 }

@@ -11,6 +11,8 @@ pub enum DeployError {
     Xml(#[from] rbpmn_model::ParseError),
     #[error("a deployment must contain exactly one process, found {0}")]
     NotExactlyOneProcess(usize),
+    #[error("invalid bindings manifest: {0}")]
+    InvalidManifest(String),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }

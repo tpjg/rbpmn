@@ -2048,3 +2048,337 @@ async fn inspection_shows_timers_and_subscriptions() {
     );
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4: the pull-mode task API
+// ---------------------------------------------------------------------------
+
+use rbpmn_engine::{GetTaskOptions, LockExtension, TaskFilter, TaskOrder};
+
+async fn three_review_instances(engine: &Engine) -> Vec<uuid::Uuid> {
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        ids.push(
+            engine
+                .start("p", None, serde_json::json!({ "n": n }))
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    ids
+}
+
+#[tokio::test]
+async fn tasks_are_fifo_by_default_lifo_on_request() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let ids = three_review_instances(&engine).await;
+
+    let first = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(first.instance_id, ids[0], "FIFO: oldest first");
+    assert_eq!(first.element_id, "review");
+    assert_eq!(first.variables, serde_json::json!({ "n": 0 }));
+
+    let mut lifo = GetTaskOptions::new("w2");
+    lifo.order = TaskOrder::Lifo;
+    let last = engine
+        .get_task("review", &lifo)
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(last.instance_id, ids[2], "LIFO: freshest first");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn leases_expire_and_tasks_return() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let mut short = GetTaskOptions::new("w1");
+    short.ttl = Duration::from_millis(300);
+    let task = engine.get_task("review", &short).await.unwrap().unwrap();
+
+    // Live lease: nothing for a second consumer.
+    assert!(
+        engine
+            .get_task("review", &GetTaskOptions::new("w2"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Expired: the same task is claimable again — no reaper involved.
+    let reclaimed = engine
+        .get_task("review", &GetTaskOptions::new("w2"))
+        .await
+        .unwrap()
+        .expect("expired lease is claimable");
+    assert_eq!(reclaimed.id, task.id);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn extend_lock_heartbeats_and_reports_loss() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let extended = engine
+        .extend_lock(task.id, "w1", Duration::from_secs(600))
+        .await
+        .unwrap();
+    assert!(matches!(extended, LockExtension::Extended { .. }));
+
+    // Wrong owner: typed loss, not silence.
+    assert_eq!(
+        engine
+            .extend_lock(task.id, "somebody-else", Duration::from_secs(600))
+            .await
+            .unwrap(),
+        LockExtension::Lost
+    );
+
+    engine
+        .complete_task(task.id, "w1", serde_json::json!({}))
+        .await
+        .unwrap();
+    // Closed task: the heartbeat reports loss too.
+    assert_eq!(
+        engine
+            .extend_lock(task.id, "w1", Duration::from_secs(600))
+            .await
+            .unwrap(),
+        LockExtension::Lost
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn completing_a_task_requires_its_live_owner() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let stolen = engine
+        .complete_task(task.id, "w2", serde_json::json!({}))
+        .await;
+    assert!(matches!(
+        stolen,
+        Err(rbpmn_engine::EngineError::ItemLeased(_))
+    ));
+
+    let done = engine
+        .complete_task(task.id, "w1", serde_json::json!({ "ok": true }))
+        .await
+        .unwrap();
+    assert!(matches!(done, Completion::Advanced(_)));
+    wait_for_status(&db.pool, started.id, "completed").await;
+
+    // Retried completion converges on the idempotent no-op, same contract
+    // as the push path.
+    let again = engine
+        .complete_task(task.id, "w1", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(matches!(again, Completion::AlreadyClosed { .. }));
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn filters_match_live_instance_variables() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    let north = engine
+        .start("p", None, serde_json::json!({ "region": "north" }))
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({ "region": "south" }))
+        .await
+        .unwrap();
+
+    assert_eq!(engine.count_tasks("review", None).await.unwrap(), 2);
+    let filter = TaskFilter::new("p").field("region", "north");
+    assert_eq!(
+        engine.count_tasks("review", Some(&filter)).await.unwrap(),
+        1
+    );
+
+    let mut options = GetTaskOptions::new("w1");
+    options.filter = Some(filter);
+    let task = engine.get_task("review", &options).await.unwrap().unwrap();
+    assert_eq!(task.instance_id, north.id);
+    // The other region's task is invisible through this filter.
+    assert!(engine.get_task("review", &options).await.unwrap().is_none());
+
+    // Injection-shaped field names are rejected loudly, never embedded.
+    let evil = TaskFilter::new("p").field("x') or ('1'='1", "y");
+    let mut options = GetTaskOptions::new("w1");
+    options.filter = Some(evil);
+    assert!(matches!(
+        engine.get_task("review", &options).await,
+        Err(rbpmn_engine::EngineError::InvalidVariables(_))
+    ));
+    db.drop().await;
+}
+
+/// The design-mandated index test: a declared field's filter/count queries
+/// actually use the generated partial index (asserted via
+/// pg_stat_user_indexes against the *real* query, so an expression-shape
+/// drift in the filter compiler cannot silently pass), while an undeclared
+/// field stays correct without one.
+#[tokio::test]
+async fn declared_indexes_serve_the_filter_queries() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    for i in 0..300 {
+        engine
+            .start(
+                "p",
+                None,
+                serde_json::json!({ "region": format!("r{i}"), "shade": format!("s{i}") }),
+            )
+            .await
+            .unwrap();
+    }
+    engine.declare_index("p", "region").await.unwrap();
+    engine.declare_index("p", "region").await.unwrap(); // idempotent
+    sqlx::query("analyze rbpmn_instance")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Undeclared field: correct via sequential scan.
+    let undeclared = TaskFilter::new("p").field("shade", "s7");
+    assert_eq!(
+        engine
+            .count_tasks("review", Some(&undeclared))
+            .await
+            .unwrap(),
+        1
+    );
+
+    // Declared field: correct AND index-served.
+    let declared = TaskFilter::new("p").field("region", "r250");
+    assert_eq!(
+        engine.count_tasks("review", Some(&declared)).await.unwrap(),
+        1
+    );
+    let mut options = GetTaskOptions::new("w1");
+    options.filter = Some(declared);
+    assert!(engine.get_task("review", &options).await.unwrap().is_some());
+
+    let mut scans = 0i64;
+    for _ in 0..20 {
+        scans = sqlx::query_scalar::<_, Option<i64>>(
+            "select idx_scan::bigint from pg_stat_user_indexes \
+             where indexrelname = 'rbpmn_vix_p_region'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .unwrap_or(0);
+        if scans > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await; // stats lag
+    }
+    assert!(
+        scans > 0,
+        "the declared index was never used by the filter queries"
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn manifest_index_declarations_apply_at_deploy() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+
+    // A bad field name refuses the whole deploy before anything persists.
+    let bad = engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().index("no'good"),
+        )
+        .await;
+    assert!(matches!(
+        bad,
+        Err(rbpmn_engine::DeployError::InvalidManifest(_))
+    ));
+    let defs: i64 = sqlx::query("select count(*) from rbpmn_definition")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(defs, 0, "a rejected manifest must not deploy");
+
+    engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().index("region"),
+        )
+        .await
+        .unwrap();
+    let exists: bool = sqlx::query_scalar(
+        "select exists (select 1 from pg_class where relname = 'rbpmn_vix_p_region')",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        exists,
+        "the manifest's declared index must exist after deploy"
+    );
+    db.drop().await;
+}
