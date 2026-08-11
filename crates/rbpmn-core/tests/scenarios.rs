@@ -25,19 +25,29 @@ struct Scenario {
     expect: Expect,
 }
 
+// deny_unknown_fields on each shape: a stray field (a patch on a fail, a
+// code on a complete) is a loud scenario error, never silent data loss.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompleteAction {
+    complete: String,
+    #[serde(default)]
+    patch: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FailAction {
+    fail: String,
+    #[serde(default)]
+    code: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum Action {
-    Complete {
-        complete: String,
-        #[serde(default)]
-        patch: Option<Value>,
-    },
-    Fail {
-        fail: String,
-        #[serde(default)]
-        code: Option<String>,
-    },
+    Complete(CompleteAction),
+    Fail(FailAction),
 }
 
 #[derive(Deserialize)]
@@ -77,7 +87,7 @@ fn run_scenario(path: &Path, failures: &mut String) {
 
     for action in &scenario.actions {
         let (element, command) = match action {
-            Action::Complete { complete, patch } => {
+            Action::Complete(CompleteAction { complete, patch }) => {
                 let node = proc
                     .node_by_id(complete)
                     .unwrap_or_else(|| panic!("{name}: no element '{complete}'"));
@@ -87,7 +97,7 @@ fn run_scenario(path: &Path, failures: &mut String) {
                 let patch = patch.clone().unwrap_or_else(|| serde_json::json!({}));
                 (complete, Command::CompleteWorkItem { id, patch })
             }
-            Action::Fail { fail, code } => {
+            Action::Fail(FailAction { fail, code }) => {
                 let node = proc
                     .node_by_id(fail)
                     .unwrap_or_else(|| panic!("{name}: no element '{fail}'"));

@@ -353,10 +353,12 @@ at that moment**. Both sides are **idempotent**: re-declaring a topic is a
 no-op, re-registering a handler applies the latest binding, and deploy is
 idempotent by content — same key + byte-identical XML + bindings returns the
 existing version (no new version row), changed content allocates the next
-version. Everything is safely retryable infrastructure. Future option
-(deliberately deferred): persist environment declarations in the DB so a
-restart resumes the last known environment — an availability aid; code/config
-stays the source of truth.
+version. Everything is safely retryable infrastructure. Declared worker topics are
+**persisted** (`environment_topic`): the deploys a declaration unblocks
+persist, so the declaration must too — a restart or replica resumes the same
+environment, converging config and API declarations (their union wins).
+Handlers remain code/config by nature (they are executable bindings, not
+data); handler drift is what startup re-validation still catches.
 
 **Ordering is deliberate: environment before definitions.** Deploy is the
 link step; `unresolved-topic` is its undefined-symbol error, so capabilities

@@ -39,7 +39,7 @@ impl Engine {
 
         // The link step: every service-task topic must be covered by the
         // environment as registered *right now*.
-        let covered = self.covered_topics();
+        let covered = self.covered_topics().await?;
         let gaps: Vec<Diagnostic> = proc
             .service_topics()
             .filter(|(_, topic)| !covered.contains(*topic))
@@ -134,14 +134,26 @@ impl Engine {
         .fetch_all(self.pool())
         .await?;
 
-        let covered = self.covered_topics();
+        let covered = self.covered_topics().await?;
         let mut out = Vec::new();
         for row in rows {
             let key: String = row.get("key");
             let version: i32 = row.get("version");
-            let bindings: Bindings =
-                serde_json::from_value(row.get::<serde_json::Value, _>("bindings"))
-                    .unwrap_or_default();
+            let bindings: Bindings = match serde_json::from_value(
+                row.get::<serde_json::Value, _>("bindings"),
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    out.push(Diagnostic::error(
+                            rule::BPMN_STRUCTURE,
+                            &key,
+                            format!(
+                                "stored bindings manifest of {key} v{version} does not                                  deserialize ({e}) — refusing to guess"
+                            ),
+                        ));
+                    continue;
+                }
+            };
             let Ok(defs) = rbpmn_model::parse(&row.get::<String, _>("bpmn_xml")) else {
                 out.push(Diagnostic::error(
                     rule::BPMN_STRUCTURE,
@@ -150,8 +162,18 @@ impl Engine {
                 ));
                 continue;
             };
-            let Ok(proc) = ExecutableProcess::compile(&defs, &key, &bindings) else {
-                continue; // deploy validated it; a compile change is not an env gap
+            let proc = match ExecutableProcess::compile(&defs, &key, &bindings) {
+                Ok(proc) => proc,
+                Err(e) => {
+                    // Deploy validated it once; if it stopped compiling the
+                    // engine itself changed — say so, never skip silently.
+                    out.push(Diagnostic::error(
+                        rule::BPMN_STRUCTURE,
+                        &key,
+                        format!("stored definition {key} v{version} no longer compiles: {e}"),
+                    ));
+                    continue;
+                }
             };
             for (element, topic) in proc.service_topics() {
                 if !covered.contains(topic) {

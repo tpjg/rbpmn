@@ -24,6 +24,9 @@ impl HttpPostHandler {
             url: url.into(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
+                // The operator configured THIS url; a redirect elsewhere
+                // would re-POST the instance variables to a different host.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest client"),
         }
@@ -60,13 +63,32 @@ impl ServiceTaskHandler for HttpPostHandler {
                     code: None,
                     message: format!("reading response: {e}"),
                 })?;
+                const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+                if bytes.len() > MAX_RESPONSE_BYTES {
+                    return Err(HandlerFailure {
+                        code: None,
+                        message: format!("response too large ({} bytes)", bytes.len()),
+                    });
+                }
                 if bytes.is_empty() {
                     return Ok(serde_json::json!({}));
                 }
-                serde_json::from_slice(&bytes).map_err(|e| HandlerFailure {
-                    code: None,
-                    message: format!("response is not JSON: {e}"),
-                })
+                let patch: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|e| HandlerFailure {
+                        code: None,
+                        message: format!("response is not JSON: {e}"),
+                    })?;
+                // A 200 with a non-object body was never meant as an RFC 7386
+                // whole-document replacement — refuse it here, at the
+                // ingestion boundary, before it can wipe the variables.
+                if !patch.is_object() {
+                    return Err(HandlerFailure {
+                        code: None,
+                        message: "response body must be a JSON object (an RFC 7386 merge patch)"
+                            .to_string(),
+                    });
+                }
+                Ok(patch)
             } else {
                 let code = response
                     .headers()

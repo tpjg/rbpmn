@@ -30,6 +30,7 @@ pub use error::{Completion, DeployError, Deployment, EngineError, FailOutcome, S
 pub use http_handler::HttpPostHandler;
 pub use inspect::{EventView, InstanceInspection, TokenView, WorkItemView};
 pub use rbpmn_core::{Bindings, Event};
+pub use runtime::FailOptions;
 pub use sqlx::PgPool;
 pub use worker::WorkerOptions;
 
@@ -83,6 +84,7 @@ struct Environment {
 pub struct EngineBuilder {
     pool: PgPool,
     env: Environment,
+    retry_backoff: std::time::Duration,
 }
 
 impl EngineBuilder {
@@ -100,11 +102,20 @@ impl EngineBuilder {
         self
     }
 
+    /// Base retry backoff (default 5s). A failed item becomes claimable
+    /// again after `base * 3^failures` — transient outages are ridden out
+    /// instead of burning the whole retry budget in milliseconds.
+    pub fn retry_backoff(mut self, base: std::time::Duration) -> Self {
+        self.retry_backoff = base;
+        self
+    }
+
     pub fn build(self) -> Engine {
         Engine {
             inner: Arc::new(Inner {
                 pool: self.pool,
                 env: RwLock::new(self.env),
+                retry_backoff: self.retry_backoff,
             }),
         }
     }
@@ -113,6 +124,7 @@ impl EngineBuilder {
 struct Inner {
     pool: PgPool,
     env: RwLock<Environment>,
+    retry_backoff: std::time::Duration,
 }
 
 #[derive(Clone)]
@@ -125,6 +137,7 @@ impl Engine {
         EngineBuilder {
             pool,
             env: Environment::default(),
+            retry_backoff: std::time::Duration::from_secs(5),
         }
     }
 
@@ -137,14 +150,38 @@ impl Engine {
     }
 
     /// Announce that out-of-process workers poll this topic. Idempotent;
-    /// callable at any time — the environment grows monotonically.
-    pub fn declare_topic(&self, topic: impl Into<String>) {
-        self.inner
-            .env
-            .write()
-            .unwrap()
-            .declared
-            .insert(topic.into());
+    /// callable at any time — the environment grows monotonically. The
+    /// declaration is **persisted**: the deploys it unblocks persist, so a
+    /// restart or a replica resumes the same environment.
+    pub async fn declare_topic(&self, topic: impl Into<String>) -> Result<(), sqlx::Error> {
+        let topic = topic.into();
+        sqlx::query("insert into environment_topic (name) values ($1) on conflict do nothing")
+            .bind(&topic)
+            .execute(&self.inner.pool)
+            .await?;
+        self.inner.env.write().unwrap().declared.insert(topic);
+        Ok(())
+    }
+
+    /// Converges code/config declarations with the persisted set: pushes
+    /// builder-declared topics into the DB and pulls previously persisted
+    /// ones into memory. Call at startup after `migrate`.
+    pub async fn sync_environment(&self) -> Result<(), sqlx::Error> {
+        let declared: Vec<String> = {
+            let env = self.inner.env.read().unwrap();
+            env.declared.iter().cloned().collect()
+        };
+        for topic in declared {
+            sqlx::query("insert into environment_topic (name) values ($1) on conflict do nothing")
+                .bind(&topic)
+                .execute(&self.inner.pool)
+                .await?;
+        }
+        let rows: Vec<String> = sqlx::query_scalar("select name from environment_topic")
+            .fetch_all(&self.inner.pool)
+            .await?;
+        self.inner.env.write().unwrap().declared.extend(rows);
+        Ok(())
     }
 
     /// Register (or re-register: latest binding wins) a push-mode handler.
@@ -173,13 +210,27 @@ impl Engine {
         self.inner.env.read().unwrap().handlers.get(topic).cloned()
     }
 
-    fn covered_topics(&self) -> BTreeSet<String> {
-        let env = self.inner.env.read().unwrap();
-        env.handlers
-            .keys()
-            .chain(env.declared.iter())
-            .cloned()
-            .collect()
+    /// Topics the environment covers right now: registered handlers plus
+    /// declared topics from memory *and* the persisted set (so replicas see
+    /// each other's API declarations without a restart).
+    pub(crate) async fn covered_topics(&self) -> Result<BTreeSet<String>, sqlx::Error> {
+        let mut covered: BTreeSet<String> = {
+            let env = self.inner.env.read().unwrap();
+            env.handlers
+                .keys()
+                .chain(env.declared.iter())
+                .cloned()
+                .collect()
+        };
+        let rows: Vec<String> = sqlx::query_scalar("select name from environment_topic")
+            .fetch_all(&self.inner.pool)
+            .await?;
+        covered.extend(rows);
+        Ok(covered)
+    }
+
+    pub(crate) fn retry_backoff(&self) -> std::time::Duration {
+        self.inner.retry_backoff
     }
 
     fn pool(&self) -> &PgPool {

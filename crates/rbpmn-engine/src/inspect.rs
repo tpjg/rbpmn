@@ -34,6 +34,7 @@ pub struct WorkItemView {
     pub topic: String,
     pub kind: String,
     pub retries: i32,
+    pub last_failure: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -69,7 +70,7 @@ impl Engine {
         .collect();
 
         let work_items = sqlx::query(
-            "select id, element_id, state, topic, kind, retries from work_item \
+            "select id, element_id, state, topic, kind, retries, last_failure from work_item \
              where instance_id = $1 order by item_no",
         )
         .bind(id)
@@ -83,6 +84,7 @@ impl Engine {
             topic: r.get("topic"),
             kind: r.get("kind"),
             retries: r.get("retries"),
+            last_failure: r.get("last_failure"),
         })
         .collect();
 

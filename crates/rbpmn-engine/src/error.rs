@@ -23,6 +23,10 @@ pub enum EngineError {
     UnknownWorkItem(Uuid),
     #[error("no instance {0}")]
     UnknownInstance(Uuid),
+    #[error("work item {0} is leased by another worker; failing it requires the lease owner")]
+    ItemLeased(Uuid),
+    #[error("variables rejected: {0}")]
+    InvalidVariables(String),
     #[error("instance {0} is not active (status: {1})")]
     InstanceNotActive(Uuid, String),
     #[error("instance {0} has an open incident; resolve it first")]
@@ -63,8 +67,12 @@ pub enum Completion {
 
 #[derive(Debug, PartialEq)]
 pub enum FailOutcome {
-    /// The item went back to `available` with one fewer retry.
+    /// The item went back to `available` with one fewer retry (claimable
+    /// again once its backoff `retry_at` passes).
     Retrying { retries_left: i32 },
+    /// The item was already completed/cancelled/failed: the idempotent
+    /// no-op, mirroring `Completion::AlreadyClosed`.
+    AlreadyClosed { state: String },
     /// Budget exhausted and a matching error boundary caught the raised
     /// error: the boundary path was taken (events included).
     ErrorCaught(Vec<rbpmn_core::Event>),

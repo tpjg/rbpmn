@@ -228,6 +228,11 @@ if (deepLinked) {
   document.getElementById('inspect-id').value = deepLinked;
   if (tokenInput.value) {
     loadInspection();
+  } else {
+    document.getElementById('inspect-note').textContent =
+      'enter the API token, then press Load';
+    tokenInput.focus();
+    selectFixture(Object.keys(FIXTURES)[0]);
   }
 } else {
   selectFixture(Object.keys(FIXTURES)[0]);

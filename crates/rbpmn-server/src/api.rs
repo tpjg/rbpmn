@@ -7,7 +7,9 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use rbpmn_engine::{Bindings, Completion, DeployError, Engine, EngineError, FailOutcome};
+use rbpmn_engine::{
+    Bindings, Completion, DeployError, Engine, EngineError, FailOptions, FailOutcome,
+};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -108,6 +110,10 @@ pub async fn complete(
 pub struct FailBody {
     #[serde(default)]
     pub error_code: Option<String>,
+    /// Recorded on the work item and in retry events — makes incidents
+    /// diagnosable from stored state.
+    #[serde(default)]
+    pub error_message: Option<String>,
 }
 
 pub async fn fail(
@@ -115,9 +121,19 @@ pub async fn fail(
     Path(id): Path<Uuid>,
     Json(body): Json<FailBody>,
 ) -> Response {
-    match engine.fail_work_item(id, body.error_code.as_deref()).await {
+    // HTTP callers carry no lease identity: failing a live-leased item is
+    // refused (409) so a stray call cannot yank work from a running worker.
+    let options = FailOptions {
+        error_code: body.error_code,
+        detail: body.error_message,
+        owner: None,
+    };
+    match engine.fail_work_item(id, &options).await {
         Ok(FailOutcome::Retrying { retries_left }) => {
             Json(json!({ "outcome": "retrying", "retriesLeft": retries_left })).into_response()
+        }
+        Ok(FailOutcome::AlreadyClosed { state }) => {
+            Json(json!({ "outcome": "alreadyClosed", "state": state })).into_response()
         }
         Ok(FailOutcome::ErrorCaught(_)) => {
             Json(json!({ "outcome": "errorCaught" })).into_response()
@@ -134,12 +150,14 @@ pub struct TopicBody {
     pub name: String,
 }
 
-/// Grows the environment at runtime (idempotent). In-memory: replicas must
-/// receive the same declaration, and it does not survive a restart — config
-/// remains the source of truth.
+/// Grows the environment at runtime (idempotent). The declaration is
+/// persisted, so it survives restarts and is visible to every replica —
+/// config and API declarations converge on the same set.
 pub async fn declare_topic(State(engine): State<Engine>, Json(body): Json<TopicBody>) -> Response {
-    engine.declare_topic(body.name);
-    StatusCode::NO_CONTENT.into_response()
+    match engine.declare_topic(body.name).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal(e),
+    }
 }
 
 fn engine_error(e: EngineError) -> Response {
@@ -150,13 +168,19 @@ fn engine_error(e: EngineError) -> Response {
         EngineError::IncidentOpen(_) | EngineError::InstanceNotActive(..) => {
             (StatusCode::CONFLICT, e.to_string())
         }
+        EngineError::ItemLeased(_) => (StatusCode::CONFLICT, e.to_string()),
+        EngineError::InvalidVariables(_) => (StatusCode::BAD_REQUEST, e.to_string()),
         EngineError::Compile(_) | EngineError::Step(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
         }
-        EngineError::Db(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal error".to_string(),
-        ),
+        EngineError::Db(inner) => {
+            // The generic 500 hides internals from callers, not operators.
+            tracing::error!(error = %inner, "database error serving engine API");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
+        }
     };
     (status, Json(json!({ "error": message }))).into_response()
 }

@@ -65,9 +65,18 @@ async fn build_engine() -> Result<rbpmn_engine::Engine, String> {
 
     if let Ok(topics) = std::env::var("RBPMN_TOPICS") {
         for topic in topics.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-            engine.declare_topic(topic);
+            engine
+                .declare_topic(topic)
+                .await
+                .map_err(|e| format!("cannot persist topic declaration '{topic}': {e}"))?;
         }
     }
+    // Converge config with previously persisted declarations (API-declared
+    // topics survive restarts; replicas see each other's declarations).
+    engine
+        .sync_environment()
+        .await
+        .map_err(|e| format!("cannot load persisted environment: {e}"))?;
     // RBPMN_HTTP_HANDLERS="topic=https://internal/x;other=https://internal/y"
     if let Ok(handlers) = std::env::var("RBPMN_HTTP_HANDLERS") {
         for entry in handlers.split(';').map(str::trim).filter(|e| !e.is_empty()) {

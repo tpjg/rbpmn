@@ -511,6 +511,9 @@ fn event_gateway_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
 }
 
 fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
+    // (host, error code) -> first boundary claiming it; a second boundary
+    // with the same code could never fire — ambiguity we reject loudly.
+    let mut error_claims: BTreeMap<(usize, String), String> = BTreeMap::new();
     for v in 0..g.scope.nodes.len() {
         let NodeKind::Boundary(b) = &g.node(v).kind else {
             continue;
@@ -577,8 +580,8 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
                         id,
                         format!("errorRef '{eref}' does not resolve to an error definition"),
                     )),
-                    Some(e) => {
-                        if e.code.as_deref().is_none_or(str::is_empty) {
+                    Some(e) => match e.code.as_deref() {
+                        None | Some("") => {
                             out.push(Diagnostic::error(
                                 rule::BPMN_STRUCTURE,
                                 id,
@@ -588,7 +591,22 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
                                 ),
                             ));
                         }
-                    }
+                        Some(code) => {
+                            if let Some(first) =
+                                error_claims.insert((host, code.to_string()), id.clone())
+                            {
+                                out.push(Diagnostic::error(
+                                    rule::BPMN_STRUCTURE,
+                                    id,
+                                    format!(
+                                        "'{first}' already catches error code '{code}' on \
+                                         this activity — a second boundary for the same \
+                                         code can never fire"
+                                    ),
+                                ));
+                            }
+                        }
+                    },
                 },
             }
         }

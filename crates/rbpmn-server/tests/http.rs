@@ -81,9 +81,44 @@ async fn v1_requires_bearer_token_uniformly() {
 }
 
 #[tokio::test]
+async fn wrong_token_is_rejected() {
+    let (app, db) = test_app().await;
+    let resp = app
+        .oneshot(
+            Request::post("/v1/definitions/lint")
+                .header(
+                    header::AUTHORIZATION,
+                    "Bearer definitely-not-the-token-but-long-enough",
+                )
+                .body(Body::from(INCLUSIVE_XML))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn authed_unknown_paths_are_404() {
+    let (app, db) = test_app().await;
+    let resp = app
+        .oneshot(authed(
+            "POST",
+            "/v1/definitely/not/a/route",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    db.drop().await;
+}
+
+#[tokio::test]
 async fn lint_reports_diagnostics() {
     let (app, db) = test_app().await;
     let resp = app
+        .clone()
         .oneshot(
             Request::post("/v1/definitions/lint")
                 .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
@@ -95,6 +130,26 @@ async fn lint_reports_diagnostics() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["ok"], false);
+    // The stable rule id is the contract, not just "not ok".
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["rule"] == "no-inclusive-gateway")
+    );
+
+    // Input that is not BPMN at all is a client error, not a lint result.
+    let resp = app
+        .oneshot(
+            Request::post("/v1/definitions/lint")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::from("this is not xml"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     db.drop().await;
 }
 

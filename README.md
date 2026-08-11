@@ -15,7 +15,7 @@ Read it before touching the semantics.
 |---|---|
 | `crates/rbpmn-model` | BPMN XML → internal model + the linter + the FEEL-subset parser/evaluator. Dependency-light (no IO, no async, no DB) so it compiles to WASM for the linter playground and the bpmnlint plugin. |
 | `crates/rbpmn-core` | The pure semantic core: `compile` → executable model, tokens, and the `step` function. No IO — the Postgres layer projects it. |
-| `crates/rbpmn-engine` | The PostgreSQL projection: transactional stepping over the core, atomic idempotent deploys, the growing environment, incidents. |
+| `crates/rbpmn-engine` | The PostgreSQL projection: transactional stepping over the core (with `*_in_tx` variants sharing the caller's transaction — process transitions commit atomically with business writes), atomic idempotent deploys, the growing persistent environment, leases, retries with backoff, incidents. |
 | `crates/rbpmn-wasm` | Thin wasm-bindgen surface over rbpmn-model: `lint(xml) -> JSON`, `catalogue()`. |
 | `crates/rbpmn-server` | Small standalone HTTP server wrapping the engine. Bearer-token auth, loopback-only by default. See [docs/http-security.md](docs/http-security.md). |
 | `playground/` | Local linter playground (bpmn-js + WASM): fixture browser, live re-lint, diagnostics as diagram overlays. `just playground`. |

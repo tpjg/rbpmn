@@ -205,7 +205,11 @@ def main():
     for old in SHOTS.glob("*.png"):
         old.unlink()
 
-    subprocess.run(["npm", "run", "build"], cwd=PLAYGROUND, check=True, capture_output=True)
+    build = subprocess.run(["npm", "run", "build"], cwd=PLAYGROUND, capture_output=True, text=True)
+    if build.returncode != 0:
+        print(build.stdout)
+        print(build.stderr)
+        sys.exit("playground build failed")
     procs = []
     db_name = None
     try:
@@ -233,15 +237,23 @@ def main():
                 "RBPMN_DATABASE_URL": f"postgres://{os.environ.get('USER', 'postgres')}@localhost:5432/{db_name}",
                 "RBPMN_API_TOKEN": TOKEN,
             }
-            procs.append(
-                subprocess.Popen(
-                    [REPO / "target/debug/rbpmn-server"],
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+            server_log = open(SHOTS / "server.log", "w")
+            server = subprocess.Popen(
+                [REPO / "target/debug/rbpmn-server"],
+                env=env,
+                stdout=server_log,
+                stderr=server_log,
             )
-            wait_port(7420)
+            procs.append(server)
+            try:
+                wait_port(7420)
+            except RuntimeError:
+                server_log.flush()
+                print((SHOTS / "server.log").read_text())
+                raise
+            if server.poll() is not None:
+                print((SHOTS / "server.log").read_text())
+                sys.exit("rbpmn-server exited during startup")
         else:
             print("no local Postgres — skipping the inspection stack (fixture sweep only)")
 
