@@ -71,20 +71,21 @@ impl Engine {
         if let Some(bk) = business_key {
             reject_nul_text(bk, "business key")?;
         }
-        let row = sqlx::query(
-            "select id, bpmn_xml, bindings from rbpmn_definition \
+        let definition_id: Uuid = sqlx::query(
+            "select id from rbpmn_definition \
              where key = $1 order by version desc limit 1",
         )
         .bind(key)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| EngineError::UnknownDefinition(key.to_string()))?;
+        .ok_or_else(|| EngineError::UnknownDefinition(key.to_string()))?
+        .get("id");
 
         let definition = DefinitionRef {
-            id: row.get("id"),
+            id: definition_id,
             key: key.to_string(),
         };
-        let proc = compile_row(&row, key)?;
+        let proc = compiled_process(self, &mut *tx, definition_id, key).await?;
 
         let instance_id: Uuid = sqlx::query(
             "insert into rbpmn_instance \
@@ -108,6 +109,10 @@ impl Engine {
         })
     }
 
+    /// Ownerless completion: refused while another holder's lease is live
+    /// (`ItemLeased`) — a stray call must not discard a working claimant's
+    /// result. Claimed tasks are completed through [`Engine::complete_task`]
+    /// with the lease identity.
     pub async fn complete_work_item(
         &self,
         work_item: Uuid,
@@ -115,17 +120,20 @@ impl Engine {
     ) -> Result<Completion, EngineError> {
         let mut tx = self.pool().begin().await?;
         let completion = self
-            .complete_work_item_in_tx(&mut tx, work_item, patch)
+            .complete_work_item_in_tx(&mut tx, work_item, None, patch)
             .await?;
         tx.commit().await?;
         Ok(completion)
     }
 
-    /// [`Engine::complete_work_item`] inside the caller's transaction.
+    /// [`Engine::complete_work_item`] inside the caller's transaction, with
+    /// the caller's lease identity (`None` = ownerless: only unleased items
+    /// may be completed).
     pub async fn complete_work_item_in_tx(
         &self,
         tx: &mut PgConnection,
         work_item: Uuid,
+        owner: Option<&str>,
         patch: serde_json::Value,
     ) -> Result<Completion, EngineError> {
         reject_nul(&patch)?;
@@ -138,20 +146,15 @@ impl Engine {
         let instance_id: Uuid = item.get("instance_id");
         let item_no: i64 = item.get("item_no");
 
-        // Lock the instance first: every step on an instance serializes here.
-        let (definition, proc, mut state) = load_instance(&mut *tx, instance_id).await?;
+        // Lock the instance first: every step on an instance serializes
+        // here, in the same order engine-wide (instance row, then item row
+        // — the one order that can never deadlock the scheduler or a fail).
+        let (definition, proc, mut state) = load_instance(self, &mut *tx, instance_id).await?;
+        let item_state = guard_lease(&mut *tx, instance_id, item_no, owner, work_item).await?;
 
         // The idempotent no-op comes before every other gate: a retried,
         // already-committed completion must converge even if a sibling
         // branch has since raised an incident.
-        let item_state: String = sqlx::query(
-            "select state from rbpmn_work_item where instance_id = $1 and item_no = $2",
-        )
-        .bind(instance_id)
-        .bind(item_no)
-        .fetch_one(&mut *tx)
-        .await?
-        .get("state");
         if item_state != "available" && item_state != "locked" {
             return Ok(Completion::AlreadyClosed { state: item_state });
         }
@@ -242,7 +245,7 @@ impl Engine {
         let instance_id: Uuid = row.get("instance_id");
         let subscription_no: i64 = row.get("subscription_no");
 
-        let (definition, proc, mut state) = load_instance(&mut *tx, instance_id).await?;
+        let (definition, proc, mut state) = load_instance(self, &mut *tx, instance_id).await?;
         if state.status == InstanceStatus::Failed {
             return Err(EngineError::IncidentOpen(instance_id));
         }
@@ -313,22 +316,15 @@ impl Engine {
         let instance_id: Uuid = item.get("instance_id");
         let item_no: i64 = item.get("item_no");
 
-        let (definition, proc, mut state) = load_instance(&mut *tx, instance_id).await?;
-
-        // FOR UPDATE: a worker claim locks only the work-item row (never the
-        // instance row), so without this lock a claim can land between this
-        // read and the UPDATE below and have its fresh lease silently wiped
-        // — two workers would then run the same item concurrently.
-        let row = sqlx::query(
-            "select state, lock_owner, \
-             (lock_until is not null and lock_until > now()) as lease_live \
-             from rbpmn_work_item where instance_id = $1 and item_no = $2 for update",
+        let (definition, proc, mut state) = load_instance(self, &mut *tx, instance_id).await?;
+        let item_state = guard_lease(
+            &mut *tx,
+            instance_id,
+            item_no,
+            options.owner.as_deref(),
+            work_item,
         )
-        .bind(instance_id)
-        .bind(item_no)
-        .fetch_one(&mut *tx)
         .await?;
-        let item_state: String = row.get("state");
         if item_state != "available" && item_state != "locked" {
             // The idempotent no-op, mirroring completion.
             return Ok(FailOutcome::AlreadyClosed { state: item_state });
@@ -341,12 +337,6 @@ impl Engine {
                 instance_id,
                 status_to_db(state.status).to_string(),
             ));
-        }
-        if item_state == "locked"
-            && row.get::<bool, _>("lease_live")
-            && options.owner.as_deref() != row.get::<Option<String>, _>("lock_owner").as_deref()
-        {
-            return Err(EngineError::ItemLeased(work_item));
         }
 
         // SET expressions see pre-update values: the backoff exponent uses
@@ -460,7 +450,7 @@ fn require_object(value: &serde_json::Value, what: &str) -> Result<(), EngineErr
 
 /// Text parameters bound into queries hit the same NUL limitation as jsonb;
 /// reject at the boundary so it is a 400, not a transaction-poisoning 500.
-fn reject_nul_text(value: &str, what: &str) -> Result<(), EngineError> {
+pub(crate) fn reject_nul_text(value: &str, what: &str) -> Result<(), EngineError> {
     if value.contains('\u{0}') {
         return Err(EngineError::InvalidVariables(format!(
             "{what} must not contain \\u0000 (PostgreSQL cannot store it)"
@@ -497,7 +487,7 @@ fn reject_nul(value: &serde_json::Value) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn compile_row(row: &PgRow, key: &str) -> Result<ExecutableProcess, EngineError> {
+pub(crate) fn compile_row(row: &PgRow, key: &str) -> Result<ExecutableProcess, EngineError> {
     // A manifest that stopped deserializing is corruption or an unmigrated
     // schema change — loudly reject, never silently run with empty bindings.
     let bindings: Bindings = serde_json::from_value(row.get::<serde_json::Value, _>("bindings"))
@@ -511,19 +501,81 @@ fn compile_row(row: &PgRow, key: &str) -> Result<ExecutableProcess, EngineError>
     Ok(ExecutableProcess::compile(&defs, key, &bindings)?)
 }
 
+/// The one lease gate: taken under the instance lock (every caller locks
+/// the instance first — a single lock order engine-wide), reading the item
+/// row FOR UPDATE so a concurrent claim cannot slip between check and
+/// mutation. Live foreign leases are refused; closed items pass through
+/// (the caller answers its idempotent AlreadyClosed). Returns the item's
+/// state.
+pub(crate) async fn guard_lease(
+    tx: &mut PgConnection,
+    instance_id: Uuid,
+    item_no: i64,
+    owner: Option<&str>,
+    work_item: Uuid,
+) -> Result<String, EngineError> {
+    let row = sqlx::query(
+        "select state, lock_owner, \
+         (lock_until is not null and lock_until > now()) as lease_live \
+         from rbpmn_work_item where instance_id = $1 and item_no = $2 for update",
+    )
+    .bind(instance_id)
+    .bind(item_no)
+    .fetch_one(&mut *tx)
+    .await?;
+    let state: String = row.get("state");
+    if state == "locked"
+        && row.get::<bool, _>("lease_live")
+        && owner != row.get::<Option<String>, _>("lock_owner").as_deref()
+    {
+        return Err(EngineError::ItemLeased(work_item));
+    }
+    Ok(state)
+}
+
+/// The definition compile cache: definitions are immutable (insert-only,
+/// content-hashed, unique (key, version)), so a compiled process is cached
+/// forever by definition id. On a hit the whole-XML fetch and O(model)
+/// parse+compile are skipped — this runs inside the held instance lock on
+/// every step-like operation, so it is the hottest path there is.
+pub(crate) async fn compiled_process(
+    engine: &Engine,
+    tx: &mut PgConnection,
+    definition_id: Uuid,
+    key: &str,
+) -> Result<std::sync::Arc<ExecutableProcess>, EngineError> {
+    if let Some(proc) = engine.cached_process(definition_id) {
+        return Ok(proc);
+    }
+    let row = sqlx::query("select bpmn_xml, bindings from rbpmn_definition where id = $1")
+        .bind(definition_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| internal(format!("definition {definition_id} has no row")))?;
+    let proc = std::sync::Arc::new(compile_row(&row, key)?);
+    engine.cache_process(definition_id, proc.clone());
+    Ok(proc)
+}
+
 /// Locks the instance row and rebuilds the quiescent core state from rows —
 /// rows are the runtime truth, this is their inverse. Every mapping is
 /// exhaustive: an unknown status/kind/wait is an error, never a guess.
 pub(crate) async fn load_instance(
+    engine: &Engine,
     tx: &mut PgConnection,
     instance_id: Uuid,
-) -> Result<(DefinitionRef, ExecutableProcess, InstanceState), EngineError> {
+) -> Result<
+    (
+        DefinitionRef,
+        std::sync::Arc<ExecutableProcess>,
+        InstanceState,
+    ),
+    EngineError,
+> {
     let inst = sqlx::query(
         "select i.definition_id, i.definition_key, i.status, i.variables, \
-                i.next_token, i.next_work_item, i.next_timer, i.next_subscription, \
-                d.bpmn_xml, d.bindings \
-         from rbpmn_instance i join rbpmn_definition d on d.id = i.definition_id \
-         where i.id = $1 for update of i",
+                i.next_token, i.next_work_item, i.next_timer, i.next_subscription \
+         from rbpmn_instance i where i.id = $1 for update",
     )
     .bind(instance_id)
     .fetch_one(&mut *tx)
@@ -534,7 +586,7 @@ pub(crate) async fn load_instance(
         id: inst.get("definition_id"),
         key: key.clone(),
     };
-    let proc = compile_row(&inst, &key)?;
+    let proc = compiled_process(engine, &mut *tx, definition.id, &key).await?;
     let status = status_from_db(&inst.get::<String, _>("status"))?;
 
     let mut timers = Vec::new();
@@ -866,7 +918,20 @@ pub(crate) async fn persist_step(
                 .execute(&mut *tx)
                 .await?;
             }
-            _ => {}
+            // Trace/history-only events project no row deltas. Exhaustive
+            // on purpose: a new event variant must be classified here
+            // deliberately — a wildcard would let a delta-bearing variant
+            // compile straight into silent database drift.
+            Event::InstanceStarted
+            | Event::ElementStarted { .. }
+            | Event::ElementCompleted { .. }
+            | Event::FlowTaken { .. }
+            | Event::VariablesPatched { .. }
+            | Event::IncidentRaised { .. }
+            | Event::CorrelationFailed { .. }
+            | Event::DuplicateSubscription { .. }
+            | Event::InstanceCompleted
+            | Event::InstanceTerminated => {}
         }
         let payload = serde_json::to_value(event).expect("event serializes");
         let kind = payload

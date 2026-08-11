@@ -108,6 +108,20 @@ pub enum LockExtension {
     Lost,
 }
 
+/// A lease must be plausible: zero would mint a lock expired at birth (two
+/// owners on one task moments later), and an absurd TTL turns into a
+/// Postgres interval error surfaced as a 500. Reject both at the boundary.
+fn validate_ttl(ttl: Duration) -> Result<(), EngineError> {
+    const MIN_TTL: Duration = Duration::from_millis(10);
+    const MAX_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
+    if ttl < MIN_TTL || ttl > MAX_TTL {
+        return Err(EngineError::InvalidVariables(format!(
+            "lease ttl must be between 10ms and 30 days, got {ttl:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Field names embed in SQL as literals (the planner needs the literal to
 /// match the index expression), so they are validated hard — same segment
 /// grammar as FEEL qualified names.
@@ -162,6 +176,7 @@ fn compile_filter(
     let mut sql = format!(" and i.definition_key = '{}'", filter.definition_key);
     for (field, value) in &filter.fields {
         validate_field(field)?;
+        crate::runtime::reject_nul_text(value, "filter value")?;
         write!(
             sql,
             " and i.variables->>'{field}' = ${}",
@@ -183,6 +198,9 @@ impl Engine {
         topic: &str,
         options: &GetTaskOptions,
     ) -> Result<Option<LockedTask>, EngineError> {
+        crate::runtime::reject_nul_text(topic, "topic")?;
+        crate::runtime::reject_nul_text(&options.owner, "owner")?;
+        validate_ttl(options.ttl)?;
         let direction = match options.order {
             TaskOrder::Fifo => "asc",
             TaskOrder::Lifo => "desc",
@@ -197,15 +215,15 @@ impl Engine {
              lock_until = now() + make_interval(secs => $3) \
              where id = (select w.id from rbpmn_work_item w \
                 join rbpmn_instance i on i.id = w.instance_id \
-                where w.topic = $1 \
-                  and (w.state = 'available' or (w.state = 'locked' and w.lock_until < now())) \
-                  and (w.retry_at is null or w.retry_at <= now()) \
-                  and i.status = 'active'{filter_sql} \
+                where w.topic = $1 and {claimable}{filter_sql} \
                 order by w.created_at {direction}, w.item_no {direction} \
                 limit 1 for update of w skip locked) \
              returning id, instance_id, definition_key, element_id, topic, kind, \
                to_char(lock_until at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
-                 as lock_until",
+                 as lock_until, \
+               (select variables from rbpmn_instance i2 \
+                 where i2.id = rbpmn_work_item.instance_id) as variables",
+            claimable = crate::CLAIMABLE,
         );
         let mut query = sqlx::query(&sql)
             .bind(topic)
@@ -217,13 +235,11 @@ impl Engine {
         let Some(row) = query.fetch_optional(self.pool()).await? else {
             return Ok(None);
         };
+        // Claim and variables read are ONE statement (the subquery in the
+        // RETURNING list): a step committing between two statements can no
+        // longer hand back post-claim variables — one claim, one snapshot.
         let instance_id: Uuid = row.get("instance_id");
-        let variables: serde_json::Value =
-            sqlx::query("select variables from rbpmn_instance where id = $1")
-                .bind(instance_id)
-                .fetch_one(self.pool())
-                .await?
-                .get("variables");
+        let variables: serde_json::Value = row.get("variables");
         Ok(Some(LockedTask {
             id: row.get("id"),
             instance_id,
@@ -243,6 +259,7 @@ impl Engine {
         topic: &str,
         filter: Option<&TaskFilter>,
     ) -> Result<u64, EngineError> {
+        crate::runtime::reject_nul_text(topic, "topic")?;
         let mut args: Vec<String> = Vec::new();
         let filter_sql = match filter {
             Some(filter) => compile_filter(filter, &mut args, 2)?,
@@ -251,10 +268,8 @@ impl Engine {
         let sql = format!(
             "select count(*) from rbpmn_work_item w \
              join rbpmn_instance i on i.id = w.instance_id \
-             where w.topic = $1 \
-               and (w.state = 'available' or (w.state = 'locked' and w.lock_until < now())) \
-               and (w.retry_at is null or w.retry_at <= now()) \
-               and i.status = 'active'{filter_sql}",
+             where w.topic = $1 and {claimable}{filter_sql}",
+            claimable = crate::CLAIMABLE,
         );
         let mut query = sqlx::query(&sql).bind(topic);
         for value in &args {
@@ -273,6 +288,8 @@ impl Engine {
         owner: &str,
         ttl: Duration,
     ) -> Result<LockExtension, EngineError> {
+        crate::runtime::reject_nul_text(owner, "owner")?;
+        validate_ttl(ttl)?;
         let row = sqlx::query(
             "update rbpmn_work_item set lock_until = now() + make_interval(secs => $3) \
              where id = $1 and lock_owner = $2 and state = 'locked' and lock_until > now() \
@@ -295,7 +312,9 @@ impl Engine {
     /// Owner-checked completion: refuses while another holder's lease is
     /// live (`ItemLeased`), otherwise identical to
     /// [`Engine::complete_work_item`] — including the idempotent
-    /// `AlreadyClosed` no-op, so a retried completion converges.
+    /// `AlreadyClosed` no-op, so a retried completion converges. The lease
+    /// guard runs *under the instance lock* inside `complete_work_item_in_tx`
+    /// — the one lock order engine-wide (instance row, then item row).
     pub async fn complete_task(
         &self,
         task: Uuid,
@@ -303,25 +322,9 @@ impl Engine {
         patch: serde_json::Value,
     ) -> Result<Completion, EngineError> {
         let mut tx = self.pool().begin().await?;
-        // Same guard as fail: FOR UPDATE so a concurrent claim cannot slip
-        // between the check and the completion.
-        let row = sqlx::query(
-            "select state, lock_owner, \
-             (lock_until is not null and lock_until > now()) as lease_live \
-             from rbpmn_work_item where id = $1 for update",
-        )
-        .bind(task)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(EngineError::UnknownWorkItem(task))?;
-        let state: String = row.get("state");
-        if state == "locked"
-            && row.get::<bool, _>("lease_live")
-            && row.get::<Option<String>, _>("lock_owner").as_deref() != Some(owner)
-        {
-            return Err(EngineError::ItemLeased(task));
-        }
-        let completion = self.complete_work_item_in_tx(&mut tx, task, patch).await?;
+        let completion = self
+            .complete_work_item_in_tx(&mut tx, task, Some(owner), patch)
+            .await?;
         tx.commit().await?;
         Ok(completion)
     }

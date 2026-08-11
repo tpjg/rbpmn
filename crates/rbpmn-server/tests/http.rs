@@ -578,3 +578,58 @@ async fn task_api_lifecycle_over_http() {
     assert_eq!(body_json(resp).await["outcome"], "advanced");
     db.drop().await;
 }
+
+/// Topic lifecycle over HTTP: declare, protected undeclare (409 naming the
+/// dependent definitions), successful undeclare (204).
+#[tokio::test]
+async fn topic_undeclare_over_http() {
+    let (app, db) = test_app().await;
+    for name in ["payments", "unused"] {
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                "/v1/topics",
+                serde_json::json!({ "name": name }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+    let with_service_task =
+        include_str!("../../rbpmn-model/tests/fixtures/accept/16-foreign-binding-warn.bpmn");
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/definitions",
+            serde_json::json!({
+                "bpmn": with_service_task,
+                "bindings": { "topics": { "st": "payments" } },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "DELETE",
+            "/v1/topics/payments",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert!(body["definitions"][0].as_str().unwrap().starts_with("p v1"));
+
+    let resp = app
+        .clone()
+        .oneshot(authed("DELETE", "/v1/topics/unused", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    db.drop().await;
+}

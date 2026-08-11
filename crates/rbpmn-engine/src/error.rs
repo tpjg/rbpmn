@@ -27,6 +27,15 @@ pub enum EngineError {
     UnknownInstance(Uuid),
     #[error("work item {0} is leased by another worker; failing it requires the lease owner")]
     ItemLeased(Uuid),
+    #[error(
+        "topic '{topic}' is still needed by: {} — undeclaring it would strand \
+         their service tasks",
+        .definitions.join(", ")
+    )]
+    TopicInUse {
+        topic: String,
+        definitions: Vec<String>,
+    },
     #[error("no open subscription for message '{message}' with correlation key '{key}'")]
     NoSubscription { message: String, key: String },
     #[error(

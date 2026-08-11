@@ -167,13 +167,7 @@ pub async fn complete_task(
     Json(body): Json<CompleteTaskBody>,
 ) -> Response {
     let patch = body.patch.unwrap_or_else(|| json!({}));
-    match engine.complete_task(id, &body.owner, patch).await {
-        Ok(Completion::Advanced(_)) => Json(json!({ "outcome": "advanced" })).into_response(),
-        Ok(Completion::AlreadyClosed { state }) => {
-            Json(json!({ "outcome": "alreadyClosed", "state": state })).into_response()
-        }
-        Err(e) => engine_error(e),
-    }
+    completion_response(engine.complete_task(id, &body.owner, patch).await)
 }
 
 #[derive(Deserialize)]
@@ -191,22 +185,27 @@ pub async fn fail_task(
     Path(id): Path<Uuid>,
     Json(body): Json<FailTaskBody>,
 ) -> Response {
-    match engine
-        .fail_task(id, &body.owner, body.error_code, body.error_message)
-        .await
-    {
-        Ok(FailOutcome::Retrying { retries_left }) => {
-            Json(json!({ "outcome": "retrying", "retriesLeft": retries_left })).into_response()
-        }
-        Ok(FailOutcome::AlreadyClosed { state }) => {
-            Json(json!({ "outcome": "alreadyClosed", "state": state })).into_response()
-        }
-        Ok(FailOutcome::ErrorCaught(_)) => {
-            Json(json!({ "outcome": "errorCaught" })).into_response()
-        }
-        Ok(FailOutcome::IncidentRaised) => {
-            Json(json!({ "outcome": "incidentRaised" })).into_response()
-        }
+    fail_response(
+        engine
+            .fail_task(id, &body.owner, body.error_code, body.error_message)
+            .await,
+    )
+}
+
+/// Withdraw a persisted topic declaration. Refused (409) while any relevant
+/// definition still needs the topic — you cannot undeclare what active
+/// workflows depend on.
+pub async fn undeclare_topic(State(engine): State<Engine>, Path(name): Path<String>) -> Response {
+    match engine.undeclare_topic(&name).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(EngineError::TopicInUse { topic, definitions }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("topic '{topic}' is still needed"),
+                "definitions": definitions,
+            })),
+        )
+            .into_response(),
         Err(e) => engine_error(e),
     }
 }
@@ -259,10 +258,34 @@ pub async fn complete(
     Json(body): Json<CompleteBody>,
 ) -> Response {
     let patch = body.patch.unwrap_or_else(|| json!({}));
-    match engine.complete_work_item(id, patch).await {
+    completion_response(engine.complete_work_item(id, patch).await)
+}
+
+/// The one Completion -> HTTP mapping (push and pull endpoints share it).
+fn completion_response(result: Result<Completion, EngineError>) -> Response {
+    match result {
         Ok(Completion::Advanced(_)) => Json(json!({ "outcome": "advanced" })).into_response(),
         Ok(Completion::AlreadyClosed { state }) => {
             Json(json!({ "outcome": "alreadyClosed", "state": state })).into_response()
+        }
+        Err(e) => engine_error(e),
+    }
+}
+
+/// The one FailOutcome -> HTTP mapping (push and pull endpoints share it).
+fn fail_response(result: Result<FailOutcome, EngineError>) -> Response {
+    match result {
+        Ok(FailOutcome::Retrying { retries_left }) => {
+            Json(json!({ "outcome": "retrying", "retriesLeft": retries_left })).into_response()
+        }
+        Ok(FailOutcome::AlreadyClosed { state }) => {
+            Json(json!({ "outcome": "alreadyClosed", "state": state })).into_response()
+        }
+        Ok(FailOutcome::ErrorCaught(_)) => {
+            Json(json!({ "outcome": "errorCaught" })).into_response()
+        }
+        Ok(FailOutcome::IncidentRaised) => {
+            Json(json!({ "outcome": "incidentRaised" })).into_response()
         }
         Err(e) => engine_error(e),
     }
@@ -291,21 +314,7 @@ pub async fn fail(
         detail: body.error_message,
         owner: None,
     };
-    match engine.fail_work_item(id, &options).await {
-        Ok(FailOutcome::Retrying { retries_left }) => {
-            Json(json!({ "outcome": "retrying", "retriesLeft": retries_left })).into_response()
-        }
-        Ok(FailOutcome::AlreadyClosed { state }) => {
-            Json(json!({ "outcome": "alreadyClosed", "state": state })).into_response()
-        }
-        Ok(FailOutcome::ErrorCaught(_)) => {
-            Json(json!({ "outcome": "errorCaught" })).into_response()
-        }
-        Ok(FailOutcome::IncidentRaised) => {
-            Json(json!({ "outcome": "incidentRaised" })).into_response()
-        }
-        Err(e) => engine_error(e),
-    }
+    fail_response(engine.fail_work_item(id, &options).await)
 }
 
 #[derive(Deserialize)]
@@ -343,7 +352,7 @@ pub struct TopicBody {
 pub async fn declare_topic(State(engine): State<Engine>, Json(body): Json<TopicBody>) -> Response {
     match engine.declare_topic(body.name).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => internal(e),
+        Err(e) => engine_error(e),
     }
 }
 
@@ -356,6 +365,7 @@ fn engine_error(e: EngineError) -> Response {
             (StatusCode::CONFLICT, e.to_string())
         }
         EngineError::ItemLeased(_) => (StatusCode::CONFLICT, e.to_string()),
+        EngineError::TopicInUse { .. } => (StatusCode::CONFLICT, e.to_string()),
         EngineError::NoSubscription { .. } => (StatusCode::NOT_FOUND, e.to_string()),
         EngineError::AmbiguousCorrelation { .. } => (StatusCode::CONFLICT, e.to_string()),
         EngineError::InvalidVariables(_) => (StatusCode::BAD_REQUEST, e.to_string()),

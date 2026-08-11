@@ -142,6 +142,9 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
         if !component_value_ok(&s[1..j]) {
             return Err(component_too_large(s));
         }
+        if component_value(&s[1..j]) * 7.0 > MAX_TOTAL_DAYS {
+            return Err(total_too_large(s));
+        }
         return if j + 1 == b.len() {
             Ok(())
         } else {
@@ -152,8 +155,10 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
     }
 
     let mut components = 0;
-    for unit in [b'Y', b'M', b'D'] {
+    let mut total_days = 0f64;
+    for (unit, days_per) in [(b'Y', 365.25), (b'M', 30.4375), (b'D', 1.0)] {
         let save = i;
+        let start = i;
         if let Some(has_fraction) = number(&mut i)? {
             if b.get(i) == Some(&unit) {
                 if has_fraction {
@@ -161,6 +166,7 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
                         "fractions are only allowed on the seconds component: '{s}'"
                     ));
                 }
+                total_days += component_value(&s[start..i]) * days_per;
                 i += 1;
                 components += 1;
             } else {
@@ -172,8 +178,13 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
     if b.get(i) == Some(&b'T') {
         i += 1;
         let mut time_components = 0;
-        for unit in [b'H', b'M', b'S'] {
+        for (unit, days_per) in [
+            (b'H', 1.0 / 24.0),
+            (b'M', 1.0 / 1440.0),
+            (b'S', 1.0 / 86400.0),
+        ] {
             let save = i;
+            let start = i;
             if let Some(has_fraction) = number(&mut i)? {
                 if b.get(i) == Some(&unit) {
                     if has_fraction && unit != b'S' {
@@ -181,6 +192,7 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
                             "fractions are only allowed on the seconds component: '{s}'"
                         ));
                     }
+                    total_days += component_value(&s[start..i]) * days_per;
                     i += 1;
                     time_components += 1;
                 } else {
@@ -200,6 +212,9 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
     if i != b.len() {
         return Err(format!("unexpected characters in duration: '{s}'"));
     }
+    if total_days > MAX_TOTAL_DAYS {
+        return Err(total_too_large(s));
+    }
     Ok(())
 }
 
@@ -213,6 +228,22 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
 const MAX_COMPONENT_VALUE: u64 = 1_000_000;
 /// Fraction digits carry no magnitude; bound them for sanity only.
 const MAX_COMPONENT_DIGITS: usize = 9;
+
+/// Total-magnitude bound: 10,000 years. Per-component caps alone are not
+/// enough — Postgres's timestamptz tops out at 294276 AD, so a lint-passing
+/// P500000Y would fail `now() + interval` at timer-arm time. Ten millennia
+/// is deliberately far below that ceiling and far beyond any process
+/// anybody will outlive.
+const MAX_TOTAL_DAYS: f64 = 10_000.0 * 365.25;
+
+fn total_too_large(s: &str) -> String {
+    format!("duration exceeds the 10,000-year total cap: '{s}'")
+}
+
+/// Parse a digit run already validated by `component_value_ok`.
+fn component_value(digits: &str) -> f64 {
+    digits.parse::<f64>().unwrap_or(f64::INFINITY)
+}
 
 fn component_value_ok(digits: &str) -> bool {
     digits
@@ -311,5 +342,13 @@ mod tests {
         assert!(validate_duration("P999999999W").is_err());
         assert!(validate_duration("PT9999999999H").is_err());
         assert!(validate_duration("PT1.9999999999S").is_err());
+        // The 10,000-year total cap: Postgres timestamptz ends at 294276 AD,
+        // so a per-component cap alone would let P500000Y deploy and then
+        // fail at timer-arm time.
+        assert!(validate_duration("P9999Y").is_ok());
+        assert!(validate_duration("P500000Y").is_err());
+        assert!(validate_duration("P600000W").is_err());
+        assert!(validate_duration("P9999Y11M").is_ok());
+        assert!(validate_duration("P10000Y1D").is_err());
     }
 }

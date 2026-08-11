@@ -283,7 +283,7 @@ async fn library_transaction_shares_business_writes() {
             .await
             .unwrap();
         let done = engine
-            .complete_work_item_in_tx(&mut tx, item, serde_json::json!({}))
+            .complete_work_item_in_tx(&mut tx, item, None, serde_json::json!({}))
             .await
             .unwrap();
         assert!(matches!(done, Completion::Advanced(_)));
@@ -308,7 +308,7 @@ async fn library_transaction_shares_business_writes() {
         .await
         .unwrap();
     engine
-        .complete_work_item_in_tx(&mut tx, item, serde_json::json!({}))
+        .complete_work_item_in_tx(&mut tx, item, None, serde_json::json!({}))
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -1676,7 +1676,10 @@ async fn poisoned_instance_cannot_starve_other_timers() {
         .start("pb", None, serde_json::json!({}))
         .await
         .unwrap();
-    sqlx::query("update rbpmn_definition set bindings = '\"garbage\"'::jsonb where key = 'pa'")
+    // Poison the instance's own rows (a ghost token): rehydration fails on
+    // every load, and no compile cache can paper over corrupted state.
+    sqlx::query("update rbpmn_token set element_id = 'ghost' where instance_id = $1")
+        .bind(poisoned.id)
         .execute(&db.pool)
         .await
         .unwrap();
@@ -1686,8 +1689,11 @@ async fn poisoned_instance_cannot_starve_other_timers() {
     assert!(engine.fire_due_timer().await.unwrap());
     wait_for_status(&db.pool, healthy.id, "completed").await;
 
-    // Only the poisoned one remains, and it is backed off: no livelock.
+    // Only the poisoned one remains, and it is backed off: no livelock —
+    // and nothing to sleep on either (the backed-off instance's overdue
+    // timer must not drive the scheduler's wait to zero: the busy-spin).
     assert!(!engine.fire_due_timer().await.unwrap());
+    assert_eq!(engine.next_due_in().await.unwrap(), None);
     let status: String = sqlx::query("select status from rbpmn_instance where id = $1")
         .bind(poisoned.id)
         .fetch_one(&db.pool)
@@ -1729,9 +1735,11 @@ async fn completion_error_keeps_the_lease_and_never_reruns_the_handler() {
         .start("pc", None, serde_json::json!({}))
         .await
         .unwrap();
-    // Corrupt the stored bindings *after* start: the claim still works, the
-    // handler runs, and then completion's rehydrate fails persistently.
-    sqlx::query("update rbpmn_definition set bindings = '\"garbage\"'::jsonb")
+    // Poison the instance rows *after* start (a ghost token): the claim
+    // still works, the handler runs, and then completion's rehydrate fails
+    // persistently — no compile cache can paper over corrupted state.
+    sqlx::query("update rbpmn_token set element_id = 'ghost' where instance_id = $1")
+        .bind(started.id)
         .execute(&db.pool)
         .await
         .unwrap();
@@ -2380,5 +2388,106 @@ async fn manifest_index_declarations_apply_at_deploy() {
         exists,
         "the manifest's declared index must exist after deploy"
     );
+    db.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Environment: undeclaring topics
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn undeclare_topic_is_protected_by_active_definitions() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("payments").await.unwrap();
+    engine.declare_topic("unused").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new().topic("st", "payments"),
+        )
+        .await
+        .unwrap();
+
+    // Needed by the latest version of 'p': refused, with the culprit named.
+    let refused = engine.undeclare_topic("payments").await;
+    match refused {
+        Err(rbpmn_engine::EngineError::TopicInUse { definitions, .. }) => {
+            assert!(
+                definitions.iter().any(|d| d.starts_with("p v1")),
+                "{definitions:?}"
+            );
+        }
+        other => panic!("expected TopicInUse, got {other:?}"),
+    }
+    // Still declared: a redeploy binding it keeps working.
+    engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new().topic("st", "payments"),
+        )
+        .await
+        .unwrap();
+
+    // Unused: undeclares (idempotently), and a deploy binding it now fails.
+    engine.undeclare_topic("unused").await.unwrap();
+    engine.undeclare_topic("unused").await.unwrap(); // absent = no-op
+    let gone = engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new().topic("st", "unused"),
+        )
+        .await;
+    match gone {
+        Err(DeployError::Rejected(diags)) => {
+            assert!(diags.iter().any(|d| d.rule == "unresolved-topic"));
+        }
+        other => panic!("expected unresolved-topic rejection, got {other:?}"),
+    }
+    db.drop().await;
+}
+
+/// A superseded definition version with active instances still protects its
+/// topics — instances pin the version that needs them.
+#[tokio::test]
+async fn undeclare_protects_versions_with_active_instances() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("payments").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new().topic("st", "payments"),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // Supersede with a version bound to a different topic.
+    engine.declare_topic("payments-v2").await.unwrap();
+    let v2 = fixture("accept/16-foreign-binding-warn.bpmn")
+        .replace("<bpmn:process", "<!-- v2 --><bpmn:process");
+    engine
+        .deploy(&v2, &Bindings::new().topic("st", "payments-v2"))
+        .await
+        .unwrap();
+
+    // The running v1 instance still needs 'payments': refused.
+    assert!(matches!(
+        engine.undeclare_topic("payments").await,
+        Err(rbpmn_engine::EngineError::TopicInUse { .. })
+    ));
+
+    // Finish the instance; with only quiescent history left, undeclare works.
+    let (item, _) = open_items(&db.pool, started.id).await[0].clone();
+    engine
+        .complete_work_item(item, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    engine.undeclare_topic("payments").await.unwrap();
     db.drop().await;
 }

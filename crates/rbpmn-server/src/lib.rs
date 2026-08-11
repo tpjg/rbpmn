@@ -243,6 +243,10 @@ pub fn app(tokens: Tokens, engine: rbpmn_engine::Engine) -> Router {
         .route("/tasks/{id}/complete", post(api::complete_task))
         .route("/tasks/{id}/fail", post(api::fail_task))
         .route("/topics", post(api::declare_topic))
+        .route(
+            "/topics/{name}",
+            axum::routing::delete(api::undeclare_topic),
+        )
         .with_state(engine)
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(state, require_bearer));

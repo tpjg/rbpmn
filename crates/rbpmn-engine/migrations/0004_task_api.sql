@@ -6,3 +6,7 @@
 
 create index rbpmn_work_item_pull on rbpmn_work_item (topic, created_at, item_no)
     where state in ('available', 'locked');
+
+-- The phase-0 acquire index is fully subsumed: the pull index above covers
+-- its (topic, state='available') shape and more.
+drop index rbpmn_work_item_acquire;

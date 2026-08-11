@@ -145,6 +145,7 @@ impl EngineBuilder {
                 env: RwLock::new(self.env),
                 retry_backoff: self.retry_backoff,
                 timer_error_backoff: std::sync::Mutex::new(BTreeMap::new()),
+                compiled: RwLock::new(BTreeMap::new()),
             }),
         }
     }
@@ -157,7 +158,18 @@ struct Inner {
     /// Instances whose timer firing recently errored, backed off so one
     /// poisoned instance cannot head-of-line-block the scheduler.
     timer_error_backoff: std::sync::Mutex<BTreeMap<uuid::Uuid, std::time::Instant>>,
+    /// Compiled definitions by definition id — immutable rows, cached
+    /// forever; definitions are few, growth is bounded by deploys.
+    compiled: RwLock<BTreeMap<uuid::Uuid, Arc<rbpmn_core::ExecutableProcess>>>,
 }
+
+/// The one claimability predicate, shared verbatim by the push worker's
+/// claim, the pull API's claim, and the dashboard count — aliases `w` (work
+/// item) and `i` (instance) are part of the contract. Three queries, one
+/// truth: a claimability change edited here cannot desynchronize them.
+pub(crate) const CLAIMABLE: &str = "(w.state = 'available' \
+     or (w.state = 'locked' and w.lock_until < now())) \
+     and (w.retry_at is null or w.retry_at <= now()) and i.status = 'active'";
 
 /// How long a timer-erroring instance is skipped by the scheduler before
 /// being retried. In-process only: another replica (or a restart) retries
@@ -232,8 +244,9 @@ impl Engine {
     /// callable at any time — the environment grows monotonically. The
     /// declaration is **persisted**: the deploys it unblocks persist, so a
     /// restart or a replica resumes the same environment.
-    pub async fn declare_topic(&self, topic: impl Into<String>) -> Result<(), sqlx::Error> {
+    pub async fn declare_topic(&self, topic: impl Into<String>) -> Result<(), EngineError> {
         let topic = topic.into();
+        crate::runtime::reject_nul_text(&topic, "topic name")?;
         sqlx::query(
             "insert into rbpmn_environment_topic (name) values ($1) on conflict do nothing",
         )
@@ -244,10 +257,69 @@ impl Engine {
         Ok(())
     }
 
+    /// Withdraw a persisted topic declaration — the inverse of
+    /// [`Engine::declare_topic`], with a protection: a topic still needed by
+    /// a **relevant** definition (the latest version of any key, or any
+    /// version with active instances — the same set startup re-validation
+    /// checks) is refused with [`EngineError::TopicInUse`], and so is one
+    /// whose definitions cannot be inspected — we only undeclare what we
+    /// can *prove* unneeded. Registered handlers deliberately do not count
+    /// as a substitute: they are process-local and ephemeral, and a replica
+    /// without that handler code would refuse to boot.
+    ///
+    /// Known limits, by design: a topic still named in `RBPMN_TOPICS` (or a
+    /// builder `declare_topic`) returns at the next startup via
+    /// `sync_environment` — remove it from config too; and other replicas
+    /// keep the topic in their in-memory set until they restart. Absent
+    /// topics undeclare as a no-op (idempotent, like everything else).
+    pub async fn undeclare_topic(&self, topic: &str) -> Result<(), EngineError> {
+        crate::runtime::reject_nul_text(topic, "topic name")?;
+        let mut tx = self.inner.pool.begin().await?;
+        let rows = sqlx::query(
+            "select distinct d.key, d.version, d.bpmn_xml, d.bindings from rbpmn_definition d \
+             where d.id in (select definition_id from rbpmn_instance where status = 'active') \
+                or (d.key, d.version) in \
+                   (select key, max(version) from rbpmn_definition group by key) \
+             order by d.key, d.version",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut needed_by: Vec<String> = Vec::new();
+        for row in &rows {
+            let key: String = sqlx::Row::get(row, "key");
+            let version: i32 = sqlx::Row::get(row, "version");
+            match crate::runtime::compile_row(row, &key) {
+                Ok(proc) => {
+                    if proc.service_topics().any(|(_, t)| t == topic) {
+                        needed_by.push(format!("{key} v{version}"));
+                    }
+                }
+                Err(e) => {
+                    // Cannot inspect -> cannot prove the topic unneeded ->
+                    // refuse loudly rather than guess.
+                    needed_by.push(format!("{key} v{version} (uninspectable: {e})"));
+                }
+            }
+        }
+        if !needed_by.is_empty() {
+            return Err(EngineError::TopicInUse {
+                topic: topic.to_string(),
+                definitions: needed_by,
+            });
+        }
+        sqlx::query("delete from rbpmn_environment_topic where name = $1")
+            .bind(topic)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        self.inner.env.write().unwrap().declared.remove(topic);
+        Ok(())
+    }
+
     /// Converges code/config declarations with the persisted set: pushes
     /// builder-declared topics into the DB and pulls previously persisted
     /// ones into memory. Call at startup after `migrate`.
-    pub async fn sync_environment(&self) -> Result<(), sqlx::Error> {
+    pub async fn sync_environment(&self) -> Result<(), EngineError> {
         let declared: Vec<String> = {
             let env = self.inner.env.read().unwrap();
             env.declared.iter().cloned().collect()
@@ -316,11 +388,39 @@ impl Engine {
         self.inner.retry_backoff
     }
 
-    pub(crate) fn timer_error_backoff_active(&self, instance: uuid::Uuid) -> bool {
+    pub(crate) fn cached_process(
+        &self,
+        definition_id: uuid::Uuid,
+    ) -> Option<Arc<rbpmn_core::ExecutableProcess>> {
+        self.inner
+            .compiled
+            .read()
+            .unwrap()
+            .get(&definition_id)
+            .cloned()
+    }
+
+    pub(crate) fn cache_process(
+        &self,
+        definition_id: uuid::Uuid,
+        proc: Arc<rbpmn_core::ExecutableProcess>,
+    ) {
+        self.inner
+            .compiled
+            .write()
+            .unwrap()
+            .insert(definition_id, proc);
+    }
+
+    /// Currently backed-off instances plus the time until the earliest
+    /// backoff expires — the scheduler excludes the former from its queries
+    /// and bounds its sleep by the latter.
+    pub(crate) fn timer_backoff_snapshot(&self) -> (Vec<uuid::Uuid>, Option<std::time::Duration>) {
         let mut map = self.inner.timer_error_backoff.lock().unwrap();
         let now = std::time::Instant::now();
         map.retain(|_, until| *until > now);
-        map.contains_key(&instance)
+        let earliest = map.values().min().map(|until| *until - now);
+        (map.keys().copied().collect(), earliest)
     }
 
     pub(crate) fn set_timer_error_backoff(&self, instance: uuid::Uuid) {

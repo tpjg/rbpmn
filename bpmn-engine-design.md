@@ -370,6 +370,23 @@ environment, converging config and API declarations (their union wins).
 Handlers remain code/config by nature (they are executable bindings, not
 data); handler drift is what startup re-validation still catches.
 
+Growth got one carefully protected inverse (decided post-phase-4):
+`undeclare_topic(name)` / `DELETE /v1/topics/{name}` withdraws a persisted
+declaration — but is **refused (`TopicInUse`, HTTP 409, naming the
+culprits) while any relevant definition still needs the topic**: the latest
+version of every key plus any version with active instances, the same set
+startup re-validation checks. A definition that cannot be inspected (no
+longer compiles) also blocks — we only undeclare what we can *prove*
+unneeded. Registered handlers deliberately do not substitute for the
+declaration: they are process-local and ephemeral, and a replica without
+that handler code would refuse to boot. Known, accepted limits ("we can
+only check what we know"): a topic still named in config or a builder
+declaration returns at the next `sync_environment`; other replicas keep it
+in memory until they restart; and a deploy racing an undeclare in the
+narrow window between check and delete is caught loudly by the next
+startup re-validation, never silently stuck. Undeclaring an absent topic
+is the idempotent no-op.
+
 **Ordering is deliberate: environment before definitions.** Deploy is the
 link step; `unresolved-topic` is its undefined-symbol error, so capabilities
 must be registered before a definition that uses them deploys. Both usage

@@ -620,3 +620,67 @@ fn multiple_timer_boundaries_first_fires_wins() {
     assert_eq!(state.status, InstanceStatus::Completed);
     assert_eq!(state.timers().count(), 0);
 }
+
+/// Token conservation across a mid-advance freeze: a parallel sibling still
+/// queued when the incident fires must park (Incident wait at its target),
+/// never silently vanish — a frozen instance that lost a branch could never
+/// be repaired.
+#[test]
+fn freeze_parks_in_flight_sibling_tokens() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m" name="Go"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:intermediateCatchEvent id="c">
+      <bpmn:messageEventDefinition messageRef="m"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:userTask id="ut"/>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="c"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ps" targetRef="ut"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="c" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="ut" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="pj" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let defs = rbpmn_model::parse(xml).unwrap();
+    // Branch f2 (declared first) fails its correlation while branch f3's
+    // token is still queued behind it in the same advancement.
+    let bindings = Bindings::new().correlation("c", "order.id");
+    let proc = ExecutableProcess::compile(&defs, "p", &bindings).unwrap();
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({}), // no order.id
+        },
+    )
+    .unwrap();
+
+    assert_eq!(state.status, InstanceStatus::Failed);
+    let mut tokens: Vec<(usize, WaitKind)> = state
+        .tokens()
+        .map(|(_, t)| (t.node, t.wait.clone()))
+        .collect();
+    tokens.sort_by_key(|(node, _)| *node);
+    assert_eq!(
+        tokens.len(),
+        2,
+        "both branch tokens must survive the freeze"
+    );
+    let c = proc.node_by_id("c").unwrap();
+    let ut = proc.node_by_id("ut").unwrap();
+    assert!(tokens.contains(&(c, WaitKind::Incident)), "{tokens:?}");
+    assert!(
+        tokens.contains(&(ut, WaitKind::Incident)),
+        "the in-flight sibling parks at its target: {tokens:?}"
+    );
+    // The sibling never entered its node: no work item was created for it.
+    assert_eq!(state.open_work_items().count(), 0);
+}

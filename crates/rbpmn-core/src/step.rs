@@ -151,17 +151,7 @@ pub fn step(
                 .and_then(|c| proc.error_boundary(element, c));
             match boundary {
                 Some(boundary_ix) => {
-                    // Interrupting: the task's token continues on the
-                    // boundary path; sibling boundary timers disarm.
-                    if state.tokens.remove(&token_id).is_none() {
-                        return Err(StepError::Invariant(format!(
-                            "work item {id:?} referenced token {token_id:?} which does not exist"
-                        )));
-                    }
-                    adv.cancel_attachments(state, token_id);
-                    adv.element_started(boundary_ix);
-                    adv.element_completed(boundary_ix);
-                    adv.leave_single(state, token_id, boundary_ix)?;
+                    adv.interrupt_to_boundary(state, token_id, boundary_ix)?;
                     adv.run(state)
                 }
                 None => {
@@ -214,11 +204,7 @@ pub fn step(
                         id: wid,
                         element: proc.node_id(host_element).to_string(),
                     });
-                    adv.cancel_attachments(state, timer.token);
-                    state.tokens.remove(&timer.token);
-                    adv.element_started(timer.element);
-                    adv.element_completed(timer.element);
-                    adv.leave_single(state, timer.token, timer.element)?;
+                    adv.interrupt_to_boundary(state, timer.token, timer.element)?;
                     adv.run(state)
                 }
                 // Interrupting boundary on a receive task: the open
@@ -234,11 +220,7 @@ pub fn step(
                         element: proc.node_id(sub.element).to_string(),
                         message: sub.message,
                     });
-                    adv.cancel_attachments(state, timer.token);
-                    state.tokens.remove(&timer.token);
-                    adv.element_started(timer.element);
-                    adv.element_completed(timer.element);
-                    adv.leave_single(state, timer.token, timer.element)?;
+                    adv.interrupt_to_boundary(state, timer.token, timer.element)?;
                     adv.run(state)
                 }
                 // The race at an event-based gateway: this timer won, every
@@ -373,12 +355,7 @@ impl<'a> Advancer<'a> {
             }
             ExecKind::TimerCatch { due } => {
                 self.element_started(node_ix);
-                let due = due.clone();
-                let id = state.alloc_timer(TimerState {
-                    element: node_ix,
-                    token,
-                    due: due.clone(),
-                });
+                let id = self.arm_timer(state, token, node_ix, due.clone());
                 state.tokens.insert(
                     token,
                     Token {
@@ -386,12 +363,6 @@ impl<'a> Advancer<'a> {
                         wait: WaitKind::Timer(id),
                     },
                 );
-                self.events.push(Event::TimerArmed {
-                    id,
-                    element: node.id.clone(),
-                    due,
-                    token,
-                });
                 Ok(())
             }
             ExecKind::MessageCatch { .. } => {
@@ -425,18 +396,7 @@ impl<'a> Advancer<'a> {
                     let target = self.proc.flow(flow).target;
                     match &self.proc.node(target).kind {
                         ExecKind::TimerCatch { due } => {
-                            let due = due.clone();
-                            let id = state.alloc_timer(TimerState {
-                                element: target,
-                                token,
-                                due: due.clone(),
-                            });
-                            self.events.push(Event::TimerArmed {
-                                id,
-                                element: self.proc.node_id(target).to_string(),
-                                due,
-                                token,
-                            });
+                            self.arm_timer(state, token, target, due.clone());
                         }
                         ExecKind::MessageCatch { .. } => {
                             if self.subscribe(state, token, target).is_none() {
@@ -530,23 +490,7 @@ impl<'a> Advancer<'a> {
                 }
                 // Everything of the instance goes in one transaction:
                 // tokens, work items, timers, subscriptions.
-                let timers: Vec<TimerId> = state.timers.keys().copied().collect();
-                for id in timers {
-                    let timer = state.timers.remove(&id).unwrap();
-                    self.events.push(Event::TimerCancelled {
-                        id,
-                        element: self.proc.node_id(timer.element).to_string(),
-                    });
-                }
-                let subs: Vec<SubscriptionId> = state.subscriptions.keys().copied().collect();
-                for id in subs {
-                    let sub = state.subscriptions.remove(&id).unwrap();
-                    self.events.push(Event::SubscriptionCancelled {
-                        id,
-                        element: self.proc.node_id(sub.element).to_string(),
-                        message: sub.message,
-                    });
-                }
+                self.withdraw_arms(state, None);
                 state.tokens.clear();
                 self.queue.clear();
                 state.status = InstanceStatus::Terminated;
@@ -666,18 +610,50 @@ impl<'a> Advancer<'a> {
                 unreachable!("timer_boundaries only holds timer boundary nodes");
             };
             let due = due.clone();
-            let id = state.alloc_timer(TimerState {
-                element: b,
-                token,
-                due: due.clone(),
-            });
-            self.events.push(Event::TimerArmed {
-                id,
-                element: self.proc.node_id(b).to_string(),
-                due,
-                token,
-            });
+            self.arm_timer(state, token, b, due);
         }
+    }
+
+    /// The single timer-arming chokepoint (mirror of `subscribe`): allocate,
+    /// record, emit — every armed timer goes through here.
+    fn arm_timer(
+        &mut self,
+        state: &mut InstanceState,
+        token: TokenId,
+        element: NodeIx,
+        due: crate::compile::TimerDue,
+    ) -> TimerId {
+        let id = state.alloc_timer(TimerState {
+            element,
+            token,
+            due: due.clone(),
+        });
+        self.events.push(Event::TimerArmed {
+            id,
+            element: self.proc.node_id(element).to_string(),
+            due,
+            token,
+        });
+        id
+    }
+
+    /// Interrupting boundary taken: the host's token leaves on the boundary
+    /// path, its remaining arms withdrawn first. The host never completes.
+    fn interrupt_to_boundary(
+        &mut self,
+        state: &mut InstanceState,
+        token: TokenId,
+        boundary: NodeIx,
+    ) -> Result<(), StepError> {
+        if state.tokens.remove(&token).is_none() {
+            return Err(StepError::Invariant(format!(
+                "token {token:?} vanished before its boundary interrupt"
+            )));
+        }
+        self.cancel_attachments(state, token);
+        self.element_started(boundary);
+        self.element_completed(boundary);
+        self.leave_single(state, token, boundary)
     }
 
     /// Open a subscription for the message catch at `element`, evaluating
@@ -751,8 +727,12 @@ impl<'a> Advancer<'a> {
     /// Every incident converges here: withdraw the token's in-flight arms,
     /// park it at the failing element (`WaitKind::Incident` — inspection
     /// shows *where*, and a future repair API has one shape to resume), and
-    /// freeze the instance. The cause event is pushed by the caller first;
-    /// `incident-raised` closes the sequence.
+    /// freeze the instance. Tokens still queued in this advancement (a
+    /// parallel sibling mid-transit) park at their target elements the same
+    /// way — frozen means *nothing advances and nothing vanishes*; token
+    /// conservation must survive the freeze or no repair can ever resume.
+    /// The cause event is pushed by the caller first; `incident-raised`
+    /// closes the sequence.
     fn freeze(
         &mut self,
         state: &mut InstanceState,
@@ -768,6 +748,15 @@ impl<'a> Advancer<'a> {
                 wait: WaitKind::Incident,
             },
         );
+        for (queued, node, _via) in std::mem::take(&mut self.queue) {
+            state.tokens.insert(
+                queued,
+                Token {
+                    node,
+                    wait: WaitKind::Incident,
+                },
+            );
+        }
         state.status = InstanceStatus::Failed;
         self.events.push(Event::IncidentRaised {
             element: self.proc.node_id(element).to_string(),
@@ -779,10 +768,18 @@ impl<'a> Advancer<'a> {
     /// boundary timers when their host resolves, or the losing alternatives
     /// of an event-based gateway.
     fn cancel_attachments(&mut self, state: &mut InstanceState, token: TokenId) {
+        self.withdraw_arms(state, Some(token));
+    }
+
+    /// Withdraw armed timers and open subscriptions — one token's (boundary
+    /// disarm, gateway race) or every token's (terminate). Timers first,
+    /// then subscriptions, each in id order: the deterministic cancellation
+    /// order the golden traces pin.
+    fn withdraw_arms(&mut self, state: &mut InstanceState, token: Option<TokenId>) {
         let timers: Vec<TimerId> = state
             .timers
             .iter()
-            .filter(|(_, t)| t.token == token)
+            .filter(|(_, t)| token.is_none_or(|tok| t.token == tok))
             .map(|(id, _)| *id)
             .collect();
         for id in timers {
@@ -795,7 +792,7 @@ impl<'a> Advancer<'a> {
         let subs: Vec<SubscriptionId> = state
             .subscriptions
             .iter()
-            .filter(|(_, s)| s.token == token)
+            .filter(|(_, s)| token.is_none_or(|tok| s.token == tok))
             .map(|(id, _)| *id)
             .collect();
         for id in subs {

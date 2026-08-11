@@ -51,11 +51,17 @@ impl Engine {
                             listener = None;
                         }
                     }
-                    let wait = match self.next_due_in().await {
+                    let mut wait = match self.next_due_in().await {
                         Ok(Some(until_due)) => until_due.min(options.poll_interval),
                         Ok(None) => options.poll_interval,
                         Err(_) => Duration::from_secs(1),
                     };
+                    // A backed-off instance's timer is invisible above; wake
+                    // when its backoff expires (floored so an imminent
+                    // expiry cannot degenerate into a hot loop).
+                    if let (_, Some(until_retry)) = self.timer_backoff_snapshot() {
+                        wait = wait.min(until_retry.max(Duration::from_millis(250)));
+                    }
                     match listener.as_mut() {
                         Some(l) => {
                             if tokio::time::timeout(wait, l.recv())
@@ -87,21 +93,24 @@ impl Engine {
     /// erroring goes on a short in-process backoff, so one poisoned
     /// instance can never head-of-line-block every timer engine-wide.
     pub async fn fire_due_timer(&self) -> Result<bool, EngineError> {
+        // Backed-off instances are excluded in the query itself: they must
+        // neither fill the candidate batch (head-of-line starvation) nor
+        // drive the sleep computation (busy-spin).
+        let (backed_off, _) = self.timer_backoff_snapshot();
         let candidates = sqlx::query(
             "select t.instance_id, t.timer_no from rbpmn_timer t \
              join rbpmn_instance i on i.id = t.instance_id \
              where t.due_at <= now() and i.status = 'active' \
+               and not (i.id = any($1)) \
              order by t.due_at limit 8",
         )
+        .bind(&backed_off)
         .fetch_all(self.pool())
         .await?;
 
         for candidate in candidates {
             let instance_id: Uuid = candidate.get("instance_id");
             let timer_no: i64 = candidate.get("timer_no");
-            if self.timer_error_backoff_active(instance_id) {
-                continue;
-            }
             match self.try_fire(instance_id, timer_no).await {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue, // lock busy or timer resolved meanwhile
@@ -137,7 +146,7 @@ impl Engine {
         if !claimed {
             return Ok(false);
         }
-        let (definition, proc, mut state) = load_instance(&mut tx, instance_id).await?;
+        let (definition, proc, mut state) = load_instance(self, &mut tx, instance_id).await?;
         if state.status != InstanceStatus::Active {
             return Ok(false); // resolved between candidate pick and lock
         }
@@ -175,11 +184,13 @@ impl Engine {
     /// Postgres's `GREATEST` *ignores* NULLs rather than propagating them —
     /// the clamp must happen here, not in SQL.)
     pub async fn next_due_in(&self) -> Result<Option<Duration>, EngineError> {
+        let (backed_off, _) = self.timer_backoff_snapshot();
         let secs: Option<f64> = sqlx::query_scalar(
             "select extract(epoch from (min(t.due_at) - now()))::float8 \
              from rbpmn_timer t join rbpmn_instance i on i.id = t.instance_id \
-             where i.status = 'active'",
+             where i.status = 'active' and not (i.id = any($1))",
         )
+        .bind(&backed_off)
         .fetch_one(self.pool())
         .await?;
         Ok(secs.map(|s| Duration::from_secs_f64(s.max(0.0))))

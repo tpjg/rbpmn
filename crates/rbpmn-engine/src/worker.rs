@@ -49,22 +49,36 @@ impl Engine {
                 Ok(false) => {
                     if listener.is_none() {
                         listener = PgListener::connect_with(self.pool()).await.ok();
-                        if let Some(l) = listener.as_mut()
-                            && l.listen("rbpmn_work").await.is_err()
-                        {
-                            listener = None;
+                        if let Some(l) = listener.as_mut() {
+                            if l.listen("rbpmn_work").await.is_err() {
+                                listener = None;
+                            } else {
+                                // A NOTIFY between the empty claim above and
+                                // the LISTEN just now is lost forever — claim
+                                // once more before parking on the channel.
+                                continue;
+                            }
                         }
                     }
+                    // Bound the wait by the earliest retry backoff: NOTIFY
+                    // fires when the item *fails*, not when its retry_at
+                    // elapses — without this, retries run poll_interval late.
+                    let wait = match self.next_retry_in().await {
+                        Ok(Some(until_retry)) => until_retry
+                            .max(Duration::from_millis(50))
+                            .min(options.poll_interval),
+                        _ => options.poll_interval,
+                    };
                     match listener.as_mut() {
                         Some(l) => {
-                            if tokio::time::timeout(options.poll_interval, l.recv())
+                            if tokio::time::timeout(wait, l.recv())
                                 .await
                                 .is_ok_and(|r| r.is_err())
                             {
                                 listener = None; // connection lost; rebuild next round
                             }
                         }
-                        None => tokio::time::sleep(options.poll_interval).await,
+                        None => tokio::time::sleep(wait).await,
                     }
                 }
                 Err(e) => {
@@ -87,38 +101,37 @@ impl Engine {
         // Filters: handled topics, availability (or expired lease), retry
         // backoff elapsed, and — crucially — the instance still active, so
         // an incident-frozen instance's siblings are never re-executed.
-        let Some(row) = sqlx::query(
+        let claim = format!(
             "update rbpmn_work_item set state = 'locked', lock_owner = $2, \
              lock_until = now() + make_interval(secs => $3) \
              where id = (select w.id from rbpmn_work_item w \
                 join rbpmn_instance i on i.id = w.instance_id \
-                where w.kind = 'service' and w.topic = any($1) \
-                  and (w.state = 'available' or (w.state = 'locked' and w.lock_until < now())) \
-                  and (w.retry_at is null or w.retry_at <= now()) \
-                  and i.status = 'active' \
+                where w.kind = 'service' and w.topic = any($1) and {claimable} \
                 order by w.created_at, w.item_no limit 1 for update of w skip locked) \
-             returning id, instance_id, definition_key, element_id, topic",
-        )
-        .bind(&topics)
-        .bind(&options.owner)
-        .bind(options.lease.as_secs_f64())
-        .fetch_optional(self.pool())
-        .await?
+             returning id, instance_id, definition_key, element_id, topic, \
+               (select variables from rbpmn_instance i2 \
+                 where i2.id = rbpmn_work_item.instance_id) as variables",
+            claimable = crate::CLAIMABLE,
+        );
+        let Some(row) = sqlx::query(&claim)
+            .bind(&topics)
+            .bind(&options.owner)
+            .bind(options.lease.as_secs_f64())
+            .fetch_optional(self.pool())
+            .await?
         else {
             return Ok(false);
         };
 
+        // Claim and variables read are one statement (the RETURNING
+        // subquery): one claim, one snapshot.
         let item = WorkItem {
             id: row.get("id"),
             instance_id: row.get("instance_id"),
             definition_key: row.get("definition_key"),
             element_id: row.get("element_id"),
             topic: row.get("topic"),
-            variables: sqlx::query("select variables from rbpmn_instance where id = $1")
-                .bind(row.get::<uuid::Uuid, _>("instance_id"))
-                .fetch_one(self.pool())
-                .await?
-                .get("variables"),
+            variables: row.get("variables"),
         };
 
         let Some(handler) = self.handler_for(&item.topic) else {
@@ -137,9 +150,9 @@ impl Engine {
             tokio::select! {
                 result = &mut handler_future => break result,
                 _ = tokio::time::sleep(renew_every) => {
-                    match self.renew_lease(work_item_id, &options.owner, options.lease).await {
-                        Ok(true) => {}
-                        Ok(false) => {
+                    match self.extend_lock(work_item_id, &options.owner, options.lease).await {
+                        Ok(crate::LockExtension::Extended { .. }) => {}
+                        Ok(crate::LockExtension::Lost) => {
                             tracing::warn!(item = %work_item_id, "lease lost during handler execution");
                             // Keep going: completion stays exactly-once — if a
                             // competing claim finished first we get AlreadyClosed.
@@ -158,7 +171,10 @@ impl Engine {
         };
 
         match result {
-            Ok(patch) => match self.complete_work_item(work_item_id, patch).await {
+            Ok(patch) => match self
+                .complete_task(work_item_id, &options.owner, patch)
+                .await
+            {
                 Ok(_) => {} // Advanced or the idempotent AlreadyClosed
                 Err(EngineError::InvalidVariables(message)) => {
                     // The handler already ran; its patch is unstorable.
@@ -208,24 +224,23 @@ impl Engine {
         Ok(true)
     }
 
-    /// Heartbeat: extends the lease only while this owner still holds it.
-    /// Returns false when the lease was lost (expired and reclaimed).
-    async fn renew_lease(
-        &self,
-        work_item: uuid::Uuid,
-        owner: &str,
-        lease: Duration,
-    ) -> Result<bool, EngineError> {
-        let result = sqlx::query(
-            "update rbpmn_work_item set lock_until = now() + make_interval(secs => $3) \
-             where id = $1 and lock_owner = $2 and state = 'locked' and lock_until > now()",
+    /// Time until the earliest backoff-parked retry on a handled topic —
+    /// the worker's analog of the scheduler's `next_due_in`.
+    async fn next_retry_in(&self) -> Result<Option<Duration>, EngineError> {
+        let topics = self.handled_topics();
+        if topics.is_empty() {
+            return Ok(None);
+        }
+        let secs: Option<f64> = sqlx::query_scalar(
+            "select extract(epoch from (min(w.retry_at) - now()))::float8 \
+             from rbpmn_work_item w join rbpmn_instance i on i.id = w.instance_id \
+             where w.kind = 'service' and w.topic = any($1) \
+               and w.state = 'available' and w.retry_at > now() and i.status = 'active'",
         )
-        .bind(work_item)
-        .bind(owner)
-        .bind(lease.as_secs_f64())
-        .execute(self.pool())
+        .bind(&topics)
+        .fetch_one(self.pool())
         .await?;
-        Ok(result.rows_affected() == 1)
+        Ok(secs.map(|s| Duration::from_secs_f64(s.max(0.0))))
     }
 
     async fn release_claim(&self, work_item: uuid::Uuid, owner: &str) -> Result<(), EngineError> {
