@@ -1,0 +1,4 @@
+# Migration files are embedded and sha256-checksummed into the migration
+# ledger (rbpmn_migrations); a CRLF checkout would change every checksum and
+# report false MigrationDrift. Force LF everywhere.
+crates/rbpmn-engine/migrations/*.sql text eol=lf

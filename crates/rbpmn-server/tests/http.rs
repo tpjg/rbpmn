@@ -405,6 +405,18 @@ async fn message_ingress_delivers_and_is_loud_about_misses() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 
+    // A non-object patch would replace the entire variables document: 400.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/messages",
+            serde_json::json!({ "name": "WarehouseAck", "correlationKey": "o-1", "patch": 5 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
     // A unique key delivers, patches, and reports the receiving instance.
     let resp = app
         .clone()

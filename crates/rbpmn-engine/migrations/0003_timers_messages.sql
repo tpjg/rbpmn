@@ -34,4 +34,4 @@ alter table rbpmn_instance add column next_subscription bigint not null default 
 
 alter table rbpmn_token drop constraint rbpmn_token_wait_kind_check;
 alter table rbpmn_token add constraint rbpmn_token_wait_kind_check
-    check (wait_kind in ('join', 'work_item', 'timer', 'message', 'event_gateway'));
+    check (wait_kind in ('join', 'work_item', 'timer', 'message', 'event_gateway', 'incident'));

@@ -112,7 +112,7 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
         if *i == start {
             return Ok(None);
         }
-        if *i - start > MAX_COMPONENT_DIGITS {
+        if !component_value_ok(&s[start..*i]) {
             return Err(component_too_large(s));
         }
         let mut has_fraction = false;
@@ -139,7 +139,7 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
         j += 1;
     }
     if j > 1 && b.get(j) == Some(&b'W') {
-        if j - 1 > MAX_COMPONENT_DIGITS {
+        if !component_value_ok(&s[1..j]) {
             return Err(component_too_large(s));
         }
         return if j + 1 == b.len() {
@@ -203,12 +203,28 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 9 digits keeps every component comfortably inside i64/u64 second math
-/// (999,999,999 days ≈ 2.7M years) while rejecting absurd inputs at lint time.
+/// Per-component value bound. This must reject at lint time everything the
+/// runtime's `now() + spec::interval` would reject: PostgreSQL intervals
+/// hold months and days as int32, so e.g. P999999999W (7e9 days) errors at
+/// timer-arm time with "interval field value out of range" — after deploy
+/// accepted it. One million per unit keeps every combination far inside
+/// int32 months/days and int64 microseconds while allowing multi-millennium
+/// timers nobody will outlive.
+const MAX_COMPONENT_VALUE: u64 = 1_000_000;
+/// Fraction digits carry no magnitude; bound them for sanity only.
 const MAX_COMPONENT_DIGITS: usize = 9;
 
+fn component_value_ok(digits: &str) -> bool {
+    digits
+        .parse::<u64>()
+        .is_ok_and(|v| v <= MAX_COMPONENT_VALUE)
+}
+
 fn component_too_large(s: &str) -> String {
-    format!("duration component too large (max {MAX_COMPONENT_DIGITS} digits): '{s}'")
+    format!(
+        "duration component too large (max {MAX_COMPONENT_VALUE} per unit — \
+         larger values overflow the runtime's deadline arithmetic): '{s}'"
+    )
 }
 
 fn month_days(year: u32, month: u32) -> u32 {
@@ -286,10 +302,14 @@ mod tests {
 
     #[test]
     fn duration_magnitude_is_bounded() {
-        assert!(validate_duration("P999999999D").is_ok());
-        assert!(validate_duration("P9999999999D").is_err());
+        // The bound tracks what PostgreSQL's interval type accepts at
+        // timer-arm time: P999999999W passed the old digit-count cap but
+        // overflowed int32 interval days at runtime.
+        assert!(validate_duration("P1000000D").is_ok());
+        assert!(validate_duration("P1000001D").is_err());
+        assert!(validate_duration("P999999999D").is_err());
+        assert!(validate_duration("P999999999W").is_err());
         assert!(validate_duration("PT9999999999H").is_err());
-        assert!(validate_duration("P9999999999W").is_err());
         assert!(validate_duration("PT1.9999999999S").is_err());
     }
 }

@@ -79,25 +79,67 @@ impl Engine {
     /// Fire at most one due timer. Returns whether an attempt was made (the
     /// caller drains until false); a candidate lost to a concurrent step
     /// still counts as an attempt, so the drain re-scans.
+    ///
+    /// Liveness by construction: a small *batch* of candidates is scanned,
+    /// each behind a `pg_try_advisory_xact_lock` (try = never waits = never
+    /// deadlocks) so replicas spread across instances instead of piling on
+    /// the earliest timer — and an instance whose load or step keeps
+    /// erroring goes on a short in-process backoff, so one poisoned
+    /// instance can never head-of-line-block every timer engine-wide.
     pub async fn fire_due_timer(&self) -> Result<bool, EngineError> {
-        let Some(candidate) = sqlx::query(
+        let candidates = sqlx::query(
             "select t.instance_id, t.timer_no from rbpmn_timer t \
              join rbpmn_instance i on i.id = t.instance_id \
              where t.due_at <= now() and i.status = 'active' \
-             order by t.due_at limit 1",
+             order by t.due_at limit 8",
         )
-        .fetch_optional(self.pool())
-        .await?
-        else {
-            return Ok(false);
-        };
-        let instance_id: Uuid = candidate.get("instance_id");
-        let timer_no: i64 = candidate.get("timer_no");
+        .fetch_all(self.pool())
+        .await?;
 
+        for candidate in candidates {
+            let instance_id: Uuid = candidate.get("instance_id");
+            let timer_no: i64 = candidate.get("timer_no");
+            if self.timer_error_backoff_active(instance_id) {
+                continue;
+            }
+            match self.try_fire(instance_id, timer_no).await {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue, // lock busy or timer resolved meanwhile
+                Err(e) => {
+                    // Log and back this instance off instead of returning:
+                    // returning Err would retry the same head-of-line
+                    // candidate forever while every other timer starves.
+                    tracing::warn!(
+                        instance = %instance_id, error = %e,
+                        "firing timer failed; backing the instance off"
+                    );
+                    self.set_timer_error_backoff(instance_id);
+                    continue;
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// One firing attempt inside one transaction. `Ok(false)` means someone
+    /// else holds the instance's advisory lock or the timer resolved
+    /// between candidate pick and instance lock — both mean "move on".
+    async fn try_fire(&self, instance_id: Uuid, timer_no: i64) -> Result<bool, EngineError> {
         let mut tx = self.pool().begin().await?;
+        // Advisory-first is deadlock-free: try-lock never waits, and every
+        // other path takes only the instance row lock (a one-lock cycle
+        // cannot exist).
+        let claimed: bool =
+            sqlx::query_scalar("select pg_try_advisory_xact_lock(hashtextextended($1, 8601))")
+                .bind(instance_id.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+        if !claimed {
+            return Ok(false);
+        }
         let (definition, proc, mut state) = load_instance(&mut tx, instance_id).await?;
         if state.status != InstanceStatus::Active {
-            return Ok(true); // resolved between candidate pick and lock
+            return Ok(false); // resolved between candidate pick and lock
         }
         // Re-check under the instance lock: a concurrent step may have
         // fired or cancelled it; due_at cannot move (timers never reschedule).
@@ -110,7 +152,7 @@ impl Engine {
         .fetch_optional(&mut *tx)
         .await?;
         if still_armed.is_none() {
-            return Ok(true);
+            return Ok(false);
         }
 
         let events = step(
@@ -125,15 +167,21 @@ impl Engine {
         Ok(true)
     }
 
-    /// Time until the earliest armed timer is due (clamped at zero), from
-    /// database time — cheap on the `due_at` index.
-    async fn next_due_in(&self) -> Result<Option<Duration>, EngineError> {
+    /// Time until the earliest live timer is due, from database time (cheap
+    /// on the `due_at` index) — `None` when nothing is armed. Frozen
+    /// instances' timers don't count: they cannot fire until repaired, and
+    /// counting them would make every scheduler spin on an overdue timer it
+    /// is not allowed to touch. (`min()` over zero rows is NULL, and
+    /// Postgres's `GREATEST` *ignores* NULLs rather than propagating them —
+    /// the clamp must happen here, not in SQL.)
+    pub async fn next_due_in(&self) -> Result<Option<Duration>, EngineError> {
         let secs: Option<f64> = sqlx::query_scalar(
-            "select greatest(extract(epoch from (min(due_at) - now())), 0)::float8 \
-             from rbpmn_timer",
+            "select extract(epoch from (min(t.due_at) - now()))::float8 \
+             from rbpmn_timer t join rbpmn_instance i on i.id = t.instance_id \
+             where i.status = 'active'",
         )
         .fetch_one(self.pool())
         .await?;
-        Ok(secs.map(Duration::from_secs_f64))
+        Ok(secs.map(|s| Duration::from_secs_f64(s.max(0.0))))
     }
 }

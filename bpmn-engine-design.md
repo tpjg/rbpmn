@@ -543,19 +543,34 @@ insert (`rbpmn_timer` channel) wakes sleepers when an earlier timer appears
 `due_at`; no "due soon" prefetching.
 
 Correlation delivery contract (decided): `correlate(message, key, patch)`
-delivers to **exactly one** open subscription. No match is a loud error
-(HTTP 404) — a message with nowhere to go is never dropped silently; more
-than one match is refused (HTTP 409) — delivering to "one of them" would be
-a guess. Retrying a delivered correlate returns the no-match error (the
-subscription is consumed); unlike work items there is no closed-row no-op —
-callers that need blind retry idempotency should make keys unique per
-message occurrence. The correlation key **value** is evaluated from the
-variables when the subscription is armed; a key that evaluates to anything
-but a string or number can never match, so arming freezes the instance as an
-incident (`correlation-failed` event) instead of waiting forever. Message
-start/throw events stay compile-rejected: cross-definition message routing
-(throw → start/catch between islands) is designed post-phase-3; external
-systems deliver via `correlate()`.
+delivers to **exactly one** open subscription of an **active** instance
+(frozen instances keep their subscription rows for repair, but those never
+match — a corpse must not block delivery to a live instance sharing its
+key). No match is a loud error (HTTP 404) — a message with nowhere to go is
+never dropped silently; more than one match is refused (HTTP 409) —
+delivering to "one of them" would be a guess. Retrying a delivered
+correlate returns the no-match error (the subscription is consumed); unlike
+work items there is no closed-row no-op — callers that need blind retry
+idempotency should make keys unique per message occurrence. The correlation
+key **value** is evaluated from the variables when the subscription is
+armed; valid keys are strings and **exact integers** (floats have no
+canonical spelling across a jsonb round-trip — the same logical value would
+arm two different keys). An invalid key, like a second open subscription
+for the same (message, key) in one instance (every delivery would be
+permanently ambiguous — `duplicate-subscription` event), freezes the
+instance as an incident instead of waiting forever. Message start/throw
+events stay compile-rejected: cross-definition message routing (throw →
+start/catch between islands) is designed post-phase-3; external systems
+deliver via `correlate()`.
+
+Incident freeze (uniform, decided in the post-phase-3 review round): every
+incident converges on one shape — the token parks at the failing element
+with the `incident` wait kind, that token's in-flight arms (boundary
+timers, partial event-gateway arms) are withdrawn, and the instance
+freezes. Inspection always shows *where* it failed, and a future repair API
+has exactly one state to resume from. Anything the freeze deliberately
+keeps (a sibling branch's subscription, say) is excluded from scheduler and
+correlation queries by instance status, never left to trip them.
 
 **Phase 4 — User tasks & the task API**
 `kind=user` work items; get/get-filtered/count/complete with locking + TTL;

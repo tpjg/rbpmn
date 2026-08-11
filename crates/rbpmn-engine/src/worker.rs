@@ -137,10 +137,21 @@ impl Engine {
             tokio::select! {
                 result = &mut handler_future => break result,
                 _ = tokio::time::sleep(renew_every) => {
-                    if !self.renew_lease(work_item_id, &options.owner, options.lease).await? {
-                        tracing::warn!(item = %work_item_id, "lease lost during handler execution");
-                        // Keep going: completion stays exactly-once — if a
-                        // competing claim finished first we get AlreadyClosed.
+                    match self.renew_lease(work_item_id, &options.owner, options.lease).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(item = %work_item_id, "lease lost during handler execution");
+                            // Keep going: completion stays exactly-once — if a
+                            // competing claim finished first we get AlreadyClosed.
+                        }
+                        Err(e) => {
+                            // A transient DB blip is precisely what renewal
+                            // exists to ride out — cancelling the in-flight
+                            // handler over it would re-run its side effects
+                            // later. If the DB is really gone, completion
+                            // fails loudly right after.
+                            tracing::warn!(item = %work_item_id, error = %e, "lease renewal failed; continuing");
+                        }
                     }
                 }
             }
@@ -167,8 +178,13 @@ impl Engine {
                         .await?;
                 }
                 Err(e) => {
-                    tracing::warn!(item = %work_item_id, error = %e, "completion refused; releasing claim");
-                    self.release_claim(work_item_id, &options.owner).await?;
+                    // Keep the claim: releasing would make the drain loop
+                    // re-claim instantly and re-run the handler with zero
+                    // backoff — re-firing its side effects on every lap. The
+                    // held lease *is* the backoff: nothing re-runs before
+                    // the lease TTL, which is the at-least-once contract.
+                    tracing::warn!(item = %work_item_id, error = %e, "completion failed; keeping the lease");
+                    return Err(e);
                 }
             },
             Err(failure) => {
@@ -183,8 +199,9 @@ impl Engine {
                     )
                     .await;
                 if let Err(e) = outcome {
-                    tracing::warn!(item = %work_item_id, error = %e, "failure refused; releasing claim");
-                    self.release_claim(work_item_id, &options.owner).await?;
+                    // Same reasoning as the completion arm.
+                    tracing::warn!(item = %work_item_id, error = %e, "recording the failure failed; keeping the lease");
+                    return Err(e);
                 }
             }
         }

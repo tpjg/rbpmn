@@ -59,16 +59,40 @@ impl ServiceTaskHandler for HttpPostHandler {
                 })?;
 
             if response.status().is_success() {
-                let bytes = response.bytes().await.map_err(|e| HandlerFailure {
-                    code: None,
-                    message: format!("reading response: {e}"),
-                })?;
                 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-                if bytes.len() > MAX_RESPONSE_BYTES {
+                // Enforce the cap while streaming — buffering first would
+                // let a misbehaving endpoint exhaust memory before the
+                // check ever ran.
+                if response
+                    .content_length()
+                    .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
+                {
                     return Err(HandlerFailure {
                         code: None,
-                        message: format!("response too large ({} bytes)", bytes.len()),
+                        message: "response too large (limit 1 MiB)".to_string(),
                     });
+                }
+                let mut response = response;
+                let mut bytes: Vec<u8> = Vec::new();
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(chunk)) => {
+                            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                                return Err(HandlerFailure {
+                                    code: None,
+                                    message: "response too large (limit 1 MiB)".to_string(),
+                                });
+                            }
+                            bytes.extend_from_slice(&chunk);
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            return Err(HandlerFailure {
+                                code: None,
+                                message: format!("reading response: {e}"),
+                            });
+                        }
+                    }
                 }
                 if bytes.is_empty() {
                     return Ok(serde_json::json!({}));

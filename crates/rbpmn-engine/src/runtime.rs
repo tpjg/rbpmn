@@ -67,6 +67,10 @@ impl Engine {
         variables: serde_json::Value,
     ) -> Result<StartedInstance, EngineError> {
         reject_nul(&variables)?;
+        require_object(&variables, "initial variables")?;
+        if let Some(bk) = business_key {
+            reject_nul_text(bk, "business key")?;
+        }
         let row = sqlx::query(
             "select id, bpmn_xml, bindings from rbpmn_definition \
              where key = $1 order by version desc limit 1",
@@ -125,6 +129,7 @@ impl Engine {
         patch: serde_json::Value,
     ) -> Result<Completion, EngineError> {
         reject_nul(&patch)?;
+        require_object(&patch, "completion patch")?;
         let item = sqlx::query("select instance_id, item_no from rbpmn_work_item where id = $1")
             .bind(work_item)
             .fetch_optional(&mut *tx)
@@ -200,11 +205,20 @@ impl Engine {
         patch: serde_json::Value,
     ) -> Result<Correlation, EngineError> {
         reject_nul(&patch)?;
+        require_object(&patch, "message patch")?;
+        reject_nul_text(message, "message name")?;
+        reject_nul_text(key, "correlation key")?;
         // Resolve without a lock, then lock the instance (the same order as
-        // every step path) and re-check the subscription under it.
+        // every step path) and re-check the subscription under it. Only
+        // *active* instances count: an incident-frozen instance keeps its
+        // subscription rows (frozen for repair), and those must not block
+        // delivery to a live instance sharing the key — or answer for a key
+        // that otherwise has no destination.
         let matches = sqlx::query(
-            "select instance_id, subscription_no from rbpmn_subscription \
-             where message_name = $1 and correlation_key = $2 limit 2",
+            "select s.instance_id, s.subscription_no from rbpmn_subscription s \
+             join rbpmn_instance i on i.id = s.instance_id \
+             where s.message_name = $1 and s.correlation_key = $2 \
+               and i.status = 'active' limit 2",
         )
         .bind(message)
         .bind(key)
@@ -284,6 +298,13 @@ impl Engine {
         work_item: Uuid,
         options: &FailOptions,
     ) -> Result<FailOutcome, EngineError> {
+        // Scrubbed, not rejected: a NUL in a handler's failure message must
+        // not wedge the fail path itself into an abort loop.
+        let options = &FailOptions {
+            error_code: options.error_code.as_deref().map(scrub_nul),
+            detail: options.detail.as_deref().map(scrub_nul),
+            owner: options.owner.clone(),
+        };
         let item = sqlx::query("select instance_id, item_no from rbpmn_work_item where id = $1")
             .bind(work_item)
             .fetch_optional(&mut *tx)
@@ -294,10 +315,14 @@ impl Engine {
 
         let (definition, proc, mut state) = load_instance(&mut *tx, instance_id).await?;
 
+        // FOR UPDATE: a worker claim locks only the work-item row (never the
+        // instance row), so without this lock a claim can land between this
+        // read and the UPDATE below and have its fresh lease silently wiped
+        // — two workers would then run the same item concurrently.
         let row = sqlx::query(
             "select state, lock_owner, \
              (lock_until is not null and lock_until > now()) as lease_live \
-             from rbpmn_work_item where instance_id = $1 and item_no = $2",
+             from rbpmn_work_item where instance_id = $1 and item_no = $2 for update",
         )
         .bind(instance_id)
         .bind(item_no)
@@ -417,6 +442,38 @@ fn work_kind_from_db(kind: &str) -> Result<WorkKind, EngineError> {
 
 fn internal(message: String) -> EngineError {
     EngineError::Compile(rbpmn_core::CompileError::Internal(message))
+}
+
+/// RFC 7386 replaces the whole target when the patch is not an object — for
+/// the variables document that means one stray scalar destroys every
+/// variable. Reject loudly at the boundary; the same rule guards initial
+/// variables (the document must *be* an object).
+fn require_object(value: &serde_json::Value, what: &str) -> Result<(), EngineError> {
+    if !value.is_object() {
+        return Err(EngineError::InvalidVariables(format!(
+            "{what} must be a JSON object (a non-object RFC 7386 merge patch \
+             would replace the entire variables document)"
+        )));
+    }
+    Ok(())
+}
+
+/// Text parameters bound into queries hit the same NUL limitation as jsonb;
+/// reject at the boundary so it is a 400, not a transaction-poisoning 500.
+fn reject_nul_text(value: &str, what: &str) -> Result<(), EngineError> {
+    if value.contains('\u{0}') {
+        return Err(EngineError::InvalidVariables(format!(
+            "{what} must not contain \\u0000 (PostgreSQL cannot store it)"
+        )));
+    }
+    Ok(())
+}
+
+/// Diagnostic text (failure details, error codes) is scrubbed, not rejected:
+/// refusing the *fail* path over a NUL byte would loop the failure forever —
+/// the exact wedge the fail path exists to resolve.
+fn scrub_nul(value: &str) -> String {
+    value.replace('\u{0}', "\u{fffd}")
 }
 
 /// PostgreSQL jsonb cannot represent NUL in strings; reject it loudly at the
@@ -582,6 +639,7 @@ pub(crate) async fn load_instance(
                     })?,
             ),
             "event_gateway" => WaitKind::EventGateway,
+            "incident" => WaitKind::Incident,
             other => return Err(internal(format!("unknown token wait kind '{other}'"))),
         };
         tokens.push((token_no, Token { node, wait }));
@@ -676,6 +734,7 @@ pub(crate) async fn persist_step(
             WaitKind::Timer(_) => ("timer", None, None),
             WaitKind::Message(_) => ("message", None, None),
             WaitKind::EventGateway => ("event_gateway", None, None),
+            WaitKind::Incident => ("incident", None, None),
         };
         sqlx::query(
             "insert into rbpmn_token (instance_id, token_no, element_id, wait_kind, arrived_via, work_item_no) \

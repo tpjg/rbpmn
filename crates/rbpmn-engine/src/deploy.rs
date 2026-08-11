@@ -161,21 +161,21 @@ impl Engine {
         for row in rows {
             let key: String = row.get("key");
             let version: i32 = row.get("version");
-            let bindings: Bindings = match serde_json::from_value(
-                row.get::<serde_json::Value, _>("bindings"),
-            ) {
-                Ok(b) => b,
-                Err(e) => {
-                    out.push(Diagnostic::error(
+            let bindings: Bindings =
+                match serde_json::from_value(row.get::<serde_json::Value, _>("bindings")) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        out.push(Diagnostic::error(
                             rule::BPMN_STRUCTURE,
                             &key,
                             format!(
-                                "stored bindings manifest of {key} v{version} does not                                  deserialize ({e}) — refusing to guess"
+                                "stored bindings manifest of {key} v{version} does not \
+                             deserialize ({e}) — refusing to guess"
                             ),
                         ));
-                    continue;
-                }
-            };
+                        continue;
+                    }
+                };
             let Ok(defs) = rbpmn_model::parse(&row.get::<String, _>("bpmn_xml")) else {
                 out.push(Diagnostic::error(
                     rule::BPMN_STRUCTURE,

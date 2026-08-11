@@ -165,12 +165,10 @@ pub fn step(
                     adv.run(state)
                 }
                 None => {
-                    // Incident: freeze everything as-is for repair.
-                    state.status = InstanceStatus::Failed;
-                    adv.events.push(Event::IncidentRaised {
-                        element: proc.node_id(element).to_string(),
-                        code,
-                    });
+                    // Incident: the uniform freeze (token parked at the
+                    // failed task, boundary timers withdrawn, instance
+                    // frozen for repair).
+                    adv.freeze(state, token_id, element, code);
                     Ok(adv.events)
                 }
             }
@@ -250,9 +248,11 @@ pub fn step(
                     adv.take_gateway_path(state, timer.token, token.node, timer.element)?;
                     adv.run(state)
                 }
-                WaitKind::Timer(_) | WaitKind::Join { .. } => Err(StepError::Invariant(format!(
-                    "timer {id:?} fired on a token in an unrelated wait state"
-                ))),
+                WaitKind::Timer(_) | WaitKind::Join { .. } | WaitKind::Incident => {
+                    Err(StepError::Invariant(format!(
+                        "timer {id:?} fired on a token in an unrelated wait state"
+                    )))
+                }
             }
         }
         Command::DeliverMessage { id, patch } => {
@@ -681,9 +681,13 @@ impl<'a> Advancer<'a> {
     }
 
     /// Open a subscription for the message catch at `element`, evaluating
-    /// its correlation key from the variables **now** (arm time). A key that
-    /// is not a string or number can never match — the instance freezes as
-    /// an incident instead of waiting forever.
+    /// its correlation key from the variables **now** (arm time). Keys must
+    /// be strings or exact integers (floats have no canonical spelling
+    /// across a jsonb round-trip — the same logical value would arm two
+    /// different keys); anything else can never match. Both cases, and a
+    /// duplicate open (message, key) in this instance (which would make
+    /// every delivery permanently ambiguous), freeze the instance as an
+    /// incident instead of waiting forever.
     fn subscribe(
         &mut self,
         state: &mut InstanceState,
@@ -701,39 +705,74 @@ impl<'a> Advancer<'a> {
         let value = rbpmn_model::condition::resolve_path(&state.variables, key);
         let key_value = match value {
             Value::String(s) => Some(s.clone()),
-            Value::Number(n) => Some(n.to_string()),
+            Value::Number(n) => n
+                .as_i64()
+                .map(|i| i.to_string())
+                .or_else(|| n.as_u64().map(|u| u.to_string())),
             _ => None,
         };
-        match key_value {
-            Some(key_value) => {
-                let id = state.alloc_subscription(SubscriptionState {
-                    element,
-                    token,
-                    message: message.clone(),
-                    key: key_value.clone(),
-                });
-                self.events.push(Event::MessageSubscribed {
-                    id,
-                    element: self.proc.node_id(element).to_string(),
-                    message: message.clone(),
-                    key: key_value,
-                    token,
-                });
-                Some(id)
-            }
-            None => {
-                self.events.push(Event::CorrelationFailed {
-                    element: self.proc.node_id(element).to_string(),
-                    name: key_name.clone(),
-                });
-                self.events.push(Event::IncidentRaised {
-                    element: self.proc.node_id(element).to_string(),
-                    code: None,
-                });
-                state.status = InstanceStatus::Failed;
-                None
-            }
+        let Some(key_value) = key_value else {
+            self.events.push(Event::CorrelationFailed {
+                element: self.proc.node_id(element).to_string(),
+                name: key_name.clone(),
+            });
+            self.freeze(state, token, element, None);
+            return None;
+        };
+        if state
+            .subscriptions
+            .values()
+            .any(|s| s.message == *message && s.key == key_value)
+        {
+            self.events.push(Event::DuplicateSubscription {
+                element: self.proc.node_id(element).to_string(),
+                message: message.clone(),
+                key: key_value,
+            });
+            self.freeze(state, token, element, None);
+            return None;
         }
+        let id = state.alloc_subscription(SubscriptionState {
+            element,
+            token,
+            message: message.clone(),
+            key: key_value.clone(),
+        });
+        self.events.push(Event::MessageSubscribed {
+            id,
+            element: self.proc.node_id(element).to_string(),
+            message: message.clone(),
+            key: key_value,
+            token,
+        });
+        Some(id)
+    }
+
+    /// Every incident converges here: withdraw the token's in-flight arms,
+    /// park it at the failing element (`WaitKind::Incident` — inspection
+    /// shows *where*, and a future repair API has one shape to resume), and
+    /// freeze the instance. The cause event is pushed by the caller first;
+    /// `incident-raised` closes the sequence.
+    fn freeze(
+        &mut self,
+        state: &mut InstanceState,
+        token: TokenId,
+        element: NodeIx,
+        code: Option<String>,
+    ) {
+        self.cancel_attachments(state, token);
+        state.tokens.insert(
+            token,
+            Token {
+                node: element,
+                wait: WaitKind::Incident,
+            },
+        );
+        state.status = InstanceStatus::Failed;
+        self.events.push(Event::IncidentRaised {
+            element: self.proc.node_id(element).to_string(),
+            code,
+        });
     }
 
     /// Withdraw every remaining timer/subscription attached to `token` —

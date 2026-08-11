@@ -137,6 +137,7 @@ impl EngineBuilder {
                 pool: self.pool,
                 env: RwLock::new(self.env),
                 retry_backoff: self.retry_backoff,
+                timer_error_backoff: std::sync::Mutex::new(BTreeMap::new()),
             }),
         }
     }
@@ -146,7 +147,15 @@ struct Inner {
     pool: PgPool,
     env: RwLock<Environment>,
     retry_backoff: std::time::Duration,
+    /// Instances whose timer firing recently errored, backed off so one
+    /// poisoned instance cannot head-of-line-block the scheduler.
+    timer_error_backoff: std::sync::Mutex<BTreeMap<uuid::Uuid, std::time::Instant>>,
 }
+
+/// How long a timer-erroring instance is skipped by the scheduler before
+/// being retried. In-process only: another replica (or a restart) retries
+/// sooner, which is exactly the right failover.
+const TIMER_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Engine {
@@ -298,6 +307,21 @@ impl Engine {
 
     pub(crate) fn retry_backoff(&self) -> std::time::Duration {
         self.inner.retry_backoff
+    }
+
+    pub(crate) fn timer_error_backoff_active(&self, instance: uuid::Uuid) -> bool {
+        let mut map = self.inner.timer_error_backoff.lock().unwrap();
+        let now = std::time::Instant::now();
+        map.retain(|_, until| *until > now);
+        map.contains_key(&instance)
+    }
+
+    pub(crate) fn set_timer_error_backoff(&self, instance: uuid::Uuid) {
+        self.inner
+            .timer_error_backoff
+            .lock()
+            .unwrap()
+            .insert(instance, std::time::Instant::now() + TIMER_ERROR_BACKOFF);
     }
 
     fn pool(&self) -> &PgPool {

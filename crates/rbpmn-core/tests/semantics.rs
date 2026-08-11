@@ -342,3 +342,191 @@ fn manifest_builder_and_json_agree() {
     let empty: Bindings = serde_json::from_str("{}").unwrap();
     assert_eq!(empty, Bindings::default());
 }
+
+// ---------------------------------------------------------------------------
+// Incident freeze: one uniform shape (review round after phase 3)
+// ---------------------------------------------------------------------------
+
+/// Event-based gateway with the timer armed *before* the failing message
+/// alternative: the partial arm must be withdrawn and the token parked at
+/// the failing element as `Incident` — never a Failed instance with live
+/// arms or no token at all.
+#[test]
+fn gateway_correlation_incident_withdraws_partial_arms() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m" name="Answer"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:eventBasedGateway id="ebg"/>
+    <bpmn:intermediateCatchEvent id="c_t">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>P1D</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="c_m">
+      <bpmn:messageEventDefinition messageRef="m"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="e_t"/>
+    <bpmn:endEvent id="e_m"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ebg"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ebg" targetRef="c_t"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ebg" targetRef="c_m"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="c_t" targetRef="e_t"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="c_m" targetRef="e_m"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let defs = rbpmn_model::parse(xml).unwrap();
+    let bindings = Bindings::new().correlation("c_m", "order.id");
+    let proc = ExecutableProcess::compile(&defs, "p", &bindings).unwrap();
+    let mut state = InstanceState::new();
+    let events = step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({}), // no order.id: c_m's arming fails
+        },
+    )
+    .unwrap();
+
+    let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+    assert!(
+        trace.contains(&"timer-armed c_t P1D".to_string()),
+        "{trace:?}"
+    );
+    assert!(trace.contains(&"correlation-failed c_m order.id".to_string()));
+    assert!(
+        trace.contains(&"timer-cancelled c_t".to_string()),
+        "the partial arm must be withdrawn: {trace:?}"
+    );
+    assert_eq!(*trace.last().unwrap(), "incident-raised c_m".to_string());
+
+    assert_eq!(state.status, InstanceStatus::Failed);
+    assert_eq!(state.timers().count(), 0);
+    assert_eq!(state.subscriptions().count(), 0);
+    let tokens: Vec<_> = state.tokens().collect();
+    assert_eq!(tokens.len(), 1, "the token must survive the freeze");
+    assert_eq!(tokens[0].1.node, proc.node_by_id("c_m").unwrap());
+    assert_eq!(tokens[0].1.wait, WaitKind::Incident);
+}
+
+/// Floats have no canonical spelling across a jsonb round-trip; only strings
+/// and exact integers are valid correlation keys.
+#[test]
+fn float_correlation_keys_are_rejected_loudly() {
+    let defs = load("accept/17-message-catch.bpmn");
+    let bindings = Bindings::new().correlation("c", "order.id");
+    let proc = ExecutableProcess::compile(&defs, "p", &bindings).unwrap();
+
+    // Exact integer: fine, canonical rendering.
+    let mut state = InstanceState::new();
+    let events = step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({"order": {"id": 84231}}),
+        },
+    )
+    .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.to_string() == "message-subscribed c WarehouseAck 84231")
+    );
+
+    // Float: incident, token parked at the catch.
+    let mut state = InstanceState::new();
+    let events = step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({"order": {"id": 1.5}}),
+        },
+    )
+    .unwrap();
+    assert_eq!(state.status, InstanceStatus::Failed);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.to_string() == "correlation-failed c order.id")
+    );
+    assert_eq!(state.tokens().next().unwrap().1.wait, WaitKind::Incident);
+}
+
+/// Two open subscriptions for one (message, key) would make every delivery
+/// permanently ambiguous — arming the second freezes the instance instead.
+#[test]
+fn duplicate_subscription_freezes_instead_of_arming_ambiguity() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m" name="Answer"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:intermediateCatchEvent id="c_a">
+      <bpmn:messageEventDefinition messageRef="m"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="c_b">
+      <bpmn:messageEventDefinition messageRef="m"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="c_a"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ps" targetRef="c_b"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="c_a" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="c_b" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="pj" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let defs = rbpmn_model::parse(xml).unwrap();
+    let bindings = Bindings::new()
+        .correlation("c_a", "order.id")
+        .correlation("c_b", "order.id");
+    let proc = ExecutableProcess::compile(&defs, "p", &bindings).unwrap();
+    let mut state = InstanceState::new();
+    let events = step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({"order": {"id": "o-1"}}),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(state.status, InstanceStatus::Failed);
+    let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+    assert!(
+        trace.contains(&"duplicate-subscription c_b Answer o-1".to_string()),
+        "{trace:?}"
+    );
+    // The first, legitimate subscription is withdrawn by the freeze? No —
+    // it belongs to a *different* token, which stays frozen as-is; what
+    // matters is that no deliverable ambiguity exists and the failure is
+    // attributed to the second catch.
+    assert!(trace.contains(&"message-subscribed c_a Answer o-1".to_string()));
+}
+
+/// The error-boundary incident converges on the same freeze shape: the
+/// token reparked at the failed task as `Incident`.
+#[test]
+fn error_incident_parks_the_token_at_the_failed_task() {
+    let proc = compile("accept/01-minimal.bpmn");
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({}),
+        },
+    )
+    .unwrap();
+    let id = work_item_at(&proc, &state, "review");
+    step(&proc, &mut state, Command::RaiseError { id, code: None }).unwrap();
+
+    assert_eq!(state.status, InstanceStatus::Failed);
+    let tokens: Vec<_> = state.tokens().collect();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].1.node, proc.node_by_id("review").unwrap());
+    assert_eq!(tokens[0].1.wait, WaitKind::Incident);
+}

@@ -154,6 +154,16 @@ async fn full_flow_matches_the_core_golden_trace() {
 
     wait_for_status(&db.pool, started.id, "completed").await;
 
+    // A completed instance holds zero token rows — the quiescent snapshot
+    // of an empty core state.
+    let tokens: i64 = sqlx::query("select count(*) from rbpmn_token where instance_id = $1")
+        .bind(started.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(tokens, 0);
+
     let trace = event_trace(&db.pool, started.id).await;
     let expected: Vec<String> = serde_json::from_str::<serde_json::Value>(
         &fs::read_to_string(
@@ -1585,6 +1595,313 @@ async fn event_gateway_race_timer_wins() {
     let late = engine.correlate("Answer", "x", serde_json::json!({})).await;
     assert!(matches!(
         late,
+        Err(rbpmn_engine::EngineError::NoSubscription { .. })
+    ));
+    db.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Post-phase-3 review round: scheduler liveness, worker loops, boundary guards
+// ---------------------------------------------------------------------------
+
+/// The busy-spin regression (Postgres's GREATEST ignores NULLs): with no
+/// live timers the scheduler must have nothing to sleep on — never a
+/// zero-duration "next due". Frozen instances' timers must not count either:
+/// the scheduler is not allowed to touch them, so sleeping on them spins.
+#[tokio::test]
+async fn idle_scheduler_has_nothing_due() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+
+    // Empty database: nothing armed, nothing due.
+    assert_eq!(engine.next_due_in().await.unwrap(), None);
+
+    // A far-future timer: due roughly a day out, never clamped to zero.
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>P1D</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let due_in = engine.next_due_in().await.unwrap().unwrap();
+    assert!(due_in > Duration::from_secs(23 * 3600), "{due_in:?}");
+
+    // Freeze the instance while its timer is armed (simulate an incident):
+    // the overdue timer of a frozen instance must not drive the sleep.
+    sqlx::query("update rbpmn_instance set status = 'failed'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("update rbpmn_timer set due_at = now() - interval '1 hour'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(engine.next_due_in().await.unwrap(), None);
+    assert!(!engine.fire_due_timer().await.unwrap());
+    db.drop().await;
+}
+
+/// Head-of-line regression: one instance whose definition no longer loads
+/// must not starve every other timer engine-wide.
+#[tokio::test]
+async fn poisoned_instance_cannot_starve_other_timers() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    // Two definitions; the poisoned one holds the *earliest* due timer.
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT0S</bpmn:timeDuration>").replace("pt", "pa"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT0S</bpmn:timeDuration>").replace("pt", "pb"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let poisoned = engine
+        .start("pa", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await; // strictly earlier due_at
+    let healthy = engine
+        .start("pb", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    sqlx::query("update rbpmn_definition set bindings = '\"garbage\"'::jsonb where key = 'pa'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // First pass: the poisoned candidate errors, goes on backoff, and the
+    // healthy instance fires in the same call.
+    assert!(engine.fire_due_timer().await.unwrap());
+    wait_for_status(&db.pool, healthy.id, "completed").await;
+
+    // Only the poisoned one remains, and it is backed off: no livelock.
+    assert!(!engine.fire_due_timer().await.unwrap());
+    let status: String = sqlx::query("select status from rbpmn_instance where id = $1")
+        .bind(poisoned.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .get("status");
+    assert_eq!(status, "active");
+    db.drop().await;
+}
+
+/// A persistent completion error must not re-run the handler in a hot loop:
+/// the worker keeps its lease (the lease TTL *is* the backoff).
+#[tokio::test]
+async fn completion_error_keeps_the_lease_and_never_reruns_the_handler() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let counter = invocations.clone();
+    engine.register_handler(
+        "st",
+        Arc::new(FnHandler(move |_item| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({}))
+        })),
+    );
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:process id="pc" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:serviceTask id="st"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="st"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="st" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    engine.deploy(xml, &Bindings::default()).await.unwrap();
+    let started = engine
+        .start("pc", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    // Corrupt the stored bindings *after* start: the claim still works, the
+    // handler runs, and then completion's rehydrate fails persistently.
+    sqlx::query("update rbpmn_definition set bindings = '\"garbage\"'::jsonb")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let worker = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.run_worker(worker_options()).await }
+    });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    worker.abort();
+
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "the handler must not re-run while the completion error persists"
+    );
+    let state: String = sqlx::query("select state from rbpmn_work_item where instance_id = $1")
+        .bind(started.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .get("state");
+    assert_eq!(state, "locked", "the lease is the backoff");
+    db.drop().await;
+}
+
+/// A NUL byte in a handler's failure message is scrubbed, not allowed to
+/// abort the fail transaction (which would loop the failure forever).
+#[tokio::test]
+async fn nul_in_failure_detail_is_scrubbed_not_wedged() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let (item, _) = open_items(&db.pool, started.id).await[0].clone();
+
+    let outcome = engine
+        .fail_work_item(
+            item,
+            &FailOptions {
+                detail: Some("binary\u{0}garbage".to_string()),
+                ..FailOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, FailOutcome::Retrying { .. }));
+    let last: String =
+        sqlx::query("select last_failure from rbpmn_work_item where instance_id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .get("last_failure");
+    assert_eq!(last, "binary\u{fffd}garbage");
+    db.drop().await;
+}
+
+/// A non-object RFC 7386 patch would replace the whole variables document —
+/// rejected at every boundary, including initial variables.
+#[tokio::test]
+async fn non_object_patches_are_rejected_everywhere() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bindings = Bindings::new().correlation("c", "order.id");
+    engine
+        .deploy(&fixture("accept/17-message-catch.bpmn"), &bindings)
+        .await
+        .unwrap();
+
+    let bad_start = engine.start("p", None, serde_json::json!([1, 2])).await;
+    assert!(matches!(
+        bad_start,
+        Err(rbpmn_engine::EngineError::InvalidVariables(_))
+    ));
+
+    let started = engine
+        .start("p", None, serde_json::json!({"order": {"id": "o-1"}}))
+        .await
+        .unwrap();
+    let bad_correlate = engine
+        .correlate("WarehouseAck", "o-1", serde_json::json!(5))
+        .await;
+    assert!(matches!(
+        bad_correlate,
+        Err(rbpmn_engine::EngineError::InvalidVariables(_))
+    ));
+    // The subscription is untouched by the refused delivery, and a proper
+    // object still goes through.
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 1);
+    engine
+        .correlate("WarehouseAck", "o-1", serde_json::json!({"ok": true}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    db.drop().await;
+}
+
+/// A frozen instance's leftover subscription must not block delivery to an
+/// active instance sharing the correlation key — and must answer "no
+/// subscription", not ambiguity, when it is the only holder.
+#[tokio::test]
+async fn frozen_instances_do_not_block_correlation() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m" name="Go"/>
+  <bpmn:process id="pf" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:intermediateCatchEvent id="c">
+      <bpmn:messageEventDefinition messageRef="m"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:serviceTask id="st"/>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="c"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ps" targetRef="st"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="c" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="st" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="pj" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    engine.declare_topic("st").await.unwrap();
+    let bindings = Bindings::new().correlation("c", "k");
+    engine.deploy(xml, &bindings).await.unwrap();
+    let vars = serde_json::json!({"k": "shared"});
+    let frozen = engine.start("pf", None, vars.clone()).await.unwrap();
+    let active = engine.start("pf", None, vars).await.unwrap();
+
+    // Freeze the first instance via an unmatched error on its service task;
+    // its subscription row stays (frozen for repair).
+    let item = open_items(&db.pool, frozen.id)
+        .await
+        .into_iter()
+        .find(|(_, el)| el == "st")
+        .unwrap()
+        .0;
+    for _ in 0..3 {
+        engine
+            .fail_work_item(item, &FailOptions::default())
+            .await
+            .unwrap();
+    }
+    wait_for_status(&db.pool, frozen.id, "failed").await;
+    assert_eq!(subscription_rows(&db.pool, frozen.id).await, 1);
+
+    // Delivery reaches the active instance — no ambiguity from the corpse.
+    let correlation = engine
+        .correlate("Go", "shared", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(correlation.instance_id, active.id);
+
+    // With only the frozen holder left: loud no-destination, not ambiguity
+    // and not IncidentOpen.
+    let miss = engine
+        .correlate("Go", "shared", serde_json::json!({}))
+        .await;
+    assert!(matches!(
+        miss,
         Err(rbpmn_engine::EngineError::NoSubscription { .. })
     ));
     db.drop().await;

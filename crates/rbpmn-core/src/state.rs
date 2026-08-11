@@ -54,6 +54,11 @@ pub enum WaitKind {
     /// Parked at an event-based gateway; the armed timers/subscriptions
     /// point back at this token and race — first to fire wins.
     EventGateway,
+    /// Frozen by an incident at this element. Every incident converges on
+    /// this shape — token parked where it failed, in-flight arms withdrawn —
+    /// so inspection always shows *where*, and a future repair API has one
+    /// state to resume from.
+    Incident,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

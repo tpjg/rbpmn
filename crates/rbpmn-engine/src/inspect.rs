@@ -67,12 +67,29 @@ pub struct EventView {
 
 impl Engine {
     pub async fn inspect_instance(&self, id: Uuid) -> Result<InstanceInspection, EngineError> {
+        // One repeatable-read transaction: all reads see a single snapshot,
+        // so the view can never show e.g. a completed instance with tokens
+        // still on it (torn across a concurrent step).
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("set transaction isolation level repeatable read")
+            .execute(&mut *tx)
+            .await?;
+        let inspection = self.inspect_in(&mut tx, id).await?;
+        tx.commit().await?;
+        Ok(inspection)
+    }
+
+    async fn inspect_in(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        id: Uuid,
+    ) -> Result<InstanceInspection, EngineError> {
         let inst = sqlx::query(
             "select i.definition_key, i.status, i.variables, d.bpmn_xml \
              from rbpmn_instance i join rbpmn_definition d on d.id = i.definition_id where i.id = $1",
         )
         .bind(id)
-        .fetch_optional(self.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or(EngineError::UnknownInstance(id))?;
 
@@ -80,7 +97,7 @@ impl Engine {
             "select element_id, wait_kind from rbpmn_token where instance_id = $1 order by token_no",
         )
         .bind(id)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(|r| TokenView {
@@ -94,7 +111,7 @@ impl Engine {
              where instance_id = $1 order by item_no",
         )
         .bind(id)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(|r| WorkItemView {
@@ -114,7 +131,7 @@ impl Engine {
              from rbpmn_timer where instance_id = $1 order by timer_no",
         )
         .bind(id)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(|r| TimerView {
@@ -129,7 +146,7 @@ impl Engine {
              from rbpmn_subscription where instance_id = $1 order by subscription_no",
         )
         .bind(id)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(|r| SubscriptionView {
@@ -143,7 +160,7 @@ impl Engine {
             "select kind, element_id, payload from rbpmn_event where instance_id = $1 order by id",
         )
         .bind(id)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(|r| {

@@ -90,12 +90,21 @@ pub enum Event {
         element: String,
         message: String,
     },
-    /// The correlation key did not evaluate to a string or number — the
-    /// subscription could never match, so the instance freezes as an
+    /// The correlation key did not evaluate to a string or an exact integer
+    /// — the subscription could never match (floats have no canonical
+    /// spelling across a jsonb round-trip), so the instance freezes as an
     /// incident instead of waiting forever ("seems to run" is the enemy).
     CorrelationFailed {
         element: String,
         name: String,
+    },
+    /// A second open subscription for the same (message, key) in one
+    /// instance: every delivery would be permanently ambiguous, so arming
+    /// freezes the instance as an incident.
+    DuplicateSubscription {
+        element: String,
+        message: String,
+        key: String,
     },
     InstanceCompleted,
     InstanceTerminated,
@@ -146,6 +155,13 @@ impl fmt::Display for Event {
             } => write!(f, "subscription-cancelled {element} {message}"),
             Event::CorrelationFailed { element, name } => {
                 write!(f, "correlation-failed {element} {name}")
+            }
+            Event::DuplicateSubscription {
+                element,
+                message,
+                key,
+            } => {
+                write!(f, "duplicate-subscription {element} {message} {key}")
             }
             Event::InstanceCompleted => write!(f, "instance-completed"),
             Event::InstanceTerminated => write!(f, "instance-terminated"),
