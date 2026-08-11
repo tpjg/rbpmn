@@ -45,6 +45,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
+/// Embedded schema migrations, applied in order inside one transaction.
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (1, "runtime", include_str!("../migrations/0001_runtime.sql")),
+    (
+        2,
+        "environment",
+        include_str!("../migrations/0002_environment.sql"),
+    ),
+];
+
 /// A claimed unit of service work, as handed to a push-mode handler.
 #[derive(Debug, Clone)]
 pub struct WorkItem {
@@ -142,11 +152,53 @@ impl Engine {
     }
 
     /// Run the schema migrations. Idempotent; call at startup.
-    pub async fn migrate(&self) -> Result<(), sqlx::Error> {
-        sqlx::migrate!()
-            .run(&self.inner.pool)
-            .await
-            .map_err(sqlx::Error::from)
+    ///
+    /// Hand-rolled on purpose: sqlx's migrator hardcodes its
+    /// `_sqlx_migrations` ledger, which would collide with a host
+    /// application running its own sqlx migrations in the shared schema.
+    /// Every rbpmn relation — this ledger included — is `rbpmn_`-prefixed.
+    pub async fn migrate(&self) -> Result<(), EngineError> {
+        use sha2::{Digest, Sha256};
+        let mut tx = self.inner.pool.begin().await?;
+        // Serialize concurrent migrators (replicas booting together).
+        sqlx::query("select pg_advisory_xact_lock(hashtext('rbpmn_migrations'))")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "create table if not exists rbpmn_migrations (\
+             version bigint primary key, \
+             description text not null, \
+             checksum text not null, \
+             applied_at timestamptz not null default now())",
+        )
+        .execute(&mut *tx)
+        .await?;
+        for &(version, description, sql) in MIGRATIONS {
+            let checksum = format!("{:x}", Sha256::digest(sql.as_bytes()));
+            let applied: Option<String> =
+                sqlx::query_scalar("select checksum from rbpmn_migrations where version = $1")
+                    .bind(version)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            match applied {
+                Some(existing) if existing == checksum => continue,
+                Some(_) => return Err(EngineError::MigrationDrift(version, description)),
+                None => {
+                    sqlx::raw_sql(sql).execute(&mut *tx).await?;
+                    sqlx::query(
+                        "insert into rbpmn_migrations (version, description, checksum) \
+                         values ($1, $2, $3)",
+                    )
+                    .bind(version)
+                    .bind(description)
+                    .bind(&checksum)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Announce that out-of-process workers poll this topic. Idempotent;
@@ -155,10 +207,12 @@ impl Engine {
     /// restart or a replica resumes the same environment.
     pub async fn declare_topic(&self, topic: impl Into<String>) -> Result<(), sqlx::Error> {
         let topic = topic.into();
-        sqlx::query("insert into environment_topic (name) values ($1) on conflict do nothing")
-            .bind(&topic)
-            .execute(&self.inner.pool)
-            .await?;
+        sqlx::query(
+            "insert into rbpmn_environment_topic (name) values ($1) on conflict do nothing",
+        )
+        .bind(&topic)
+        .execute(&self.inner.pool)
+        .await?;
         self.inner.env.write().unwrap().declared.insert(topic);
         Ok(())
     }
@@ -172,12 +226,14 @@ impl Engine {
             env.declared.iter().cloned().collect()
         };
         for topic in declared {
-            sqlx::query("insert into environment_topic (name) values ($1) on conflict do nothing")
-                .bind(&topic)
-                .execute(&self.inner.pool)
-                .await?;
+            sqlx::query(
+                "insert into rbpmn_environment_topic (name) values ($1) on conflict do nothing",
+            )
+            .bind(&topic)
+            .execute(&self.inner.pool)
+            .await?;
         }
-        let rows: Vec<String> = sqlx::query_scalar("select name from environment_topic")
+        let rows: Vec<String> = sqlx::query_scalar("select name from rbpmn_environment_topic")
             .fetch_all(&self.inner.pool)
             .await?;
         self.inner.env.write().unwrap().declared.extend(rows);
@@ -222,7 +278,7 @@ impl Engine {
                 .cloned()
                 .collect()
         };
-        let rows: Vec<String> = sqlx::query_scalar("select name from environment_topic")
+        let rows: Vec<String> = sqlx::query_scalar("select name from rbpmn_environment_topic")
             .fetch_all(&self.inner.pool)
             .await?;
         covered.extend(rows);

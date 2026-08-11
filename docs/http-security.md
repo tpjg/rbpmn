@@ -73,7 +73,7 @@ deliberately not the default posture.
 - **Idempotency**: completing an already-completed work item is a distinct
   no-op result in the engine contract, so retried HTTP calls cannot
   double-advance state.
-- **Audit**: the append-only `event` table is the audit log; request ids from
+- **Audit**: the append-only `rbpmn_event` table is the audit log; request ids from
   the HTTP layer land in event payloads for end-to-end correlation.
 
 ## Operator checklist

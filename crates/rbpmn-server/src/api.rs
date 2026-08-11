@@ -181,6 +181,15 @@ fn engine_error(e: EngineError) -> Response {
                 "internal error".to_string(),
             )
         }
+        // Startup-only in practice (migrate runs before serve); still mapped
+        // so nothing leaks through a wildcard.
+        EngineError::MigrationDrift(..) => {
+            tracing::error!(error = %e, "migration drift surfaced via API");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
+        }
     };
     (status, Json(json!({ "error": message }))).into_response()
 }

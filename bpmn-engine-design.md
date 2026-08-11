@@ -89,7 +89,7 @@ not positional indexes).
 - `LISTEN/NOTIFY` to wake pollers early; polling interval is the fallback, not the
   mechanism.
 - **Partial indexes** per definition on the shared tables:
-  `CREATE INDEX ... ON work_item ((variables->>'status')) WHERE definition_id = 'orders'`.
+  `CREATE INDEX ... ON rbpmn_work_item ((variables->>'status')) WHERE definition_id = 'orders'`.
   Two footguns: (a) the planner only uses a partial index when the query contains the
   **literal** predicate (`definition_id = 'orders'`, not `= $1`); (b) the indexed
   expression must match the query expression **exactly** (`->>` vs `@>` are different
@@ -181,6 +181,16 @@ before deploying. Initial rule set:
 ## Runtime model
 
 ### Tables (single shared schema)
+
+Every physical relation (tables, indexes, and the migration ledger
+`rbpmn_migrations`) carries an **`rbpmn_` prefix**: the engine shares its
+schema with the embedding application's business tables — that is the whole
+point of same-transaction stepping — so generic names like `instance` are
+not ours to claim. Prose below uses the short names; the DDL is prefixed.
+(The migration runner is hand-rolled for the same reason: sqlx's migrator
+hardcodes its `_sqlx_migrations` table, which would collide with a host
+application running its own sqlx migrations in the shared schema.)
+
 - `definition` (id, key, **version**, bpmn_xml, parsed/validated model as JSONB cache,
   deployed_at) — (key, version) unique; instances pin a definition id.
 - `instance` (id, definition_id, business_key, status[active|completed|terminated],
@@ -354,7 +364,7 @@ no-op, re-registering a handler applies the latest binding, and deploy is
 idempotent by content — same key + byte-identical XML + bindings returns the
 existing version (no new version row), changed content allocates the next
 version. Everything is safely retryable infrastructure. Declared worker topics are
-**persisted** (`environment_topic`): the deploys a declaration unblocks
+**persisted** (`rbpmn_environment_topic`): the deploys a declaration unblocks
 persist, so the declaration must too — a restart or replica resumes the same
 environment, converging config and API declarations (their union wins).
 Handlers remain code/config by nature (they are executable bindings, not
@@ -403,7 +413,7 @@ current registration state** and fails loudly with the same rule id
 - `declare_index(definition_key, field)` (+ optional target: WorkItem (default) |
   Instance) — **entirely optional performance API**; filtering and counting work
   without it (seq scan is correct, just slower). Creates
-  `CREATE INDEX IF NOT EXISTS <deterministic-name> ON work_item
+  `CREATE INDEX IF NOT EXISTS <deterministic-name> ON rbpmn_work_item
   ((variables->>'<field>')) WHERE definition_id = '<literal id>'` — definition id
   as a literal (planner requirement), deterministic name from (table, definition
   key, field) so the call is idempotent and re-runnable at startup next to handler

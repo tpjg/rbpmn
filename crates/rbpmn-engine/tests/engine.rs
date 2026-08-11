@@ -65,7 +65,7 @@ fn worker_options() -> WorkerOptions {
 
 async fn wait_for_status(pool: &PgPool, instance: uuid::Uuid, wanted: &str) {
     for _ in 0..100 {
-        let status: String = sqlx::query("select status from instance where id = $1")
+        let status: String = sqlx::query("select status from rbpmn_instance where id = $1")
             .bind(instance)
             .fetch_one(pool)
             .await
@@ -200,7 +200,7 @@ async fn join_fires_exactly_once_under_concurrent_completion() {
         assert!(matches!(rb.unwrap(), Completion::Advanced(_)));
 
         let join_fired: i64 = sqlx::query(
-            "select count(*) from event where instance_id = $1 \
+            "select count(*) from rbpmn_event where instance_id = $1 \
              and kind = 'element-started' and element_id = 'pj'",
         )
         .bind(started.id)
@@ -561,7 +561,7 @@ async fn failing_a_live_lease_requires_its_owner() {
     let id = open_items(&db.pool, started.id).await[0].0;
 
     sqlx::query(
-        "update work_item set state = 'locked', lock_owner = 'w1', \
+        "update rbpmn_work_item set state = 'locked', lock_owner = 'w1', \
          lock_until = now() + interval '10 minutes' where id = $1",
     )
     .bind(id)
@@ -644,12 +644,13 @@ async fn worker_executes_registered_handlers() {
         .unwrap();
     wait_for_status(&db.pool, started.id, "completed").await;
 
-    let variables: serde_json::Value = sqlx::query("select variables from instance where id = $1")
-        .bind(started.id)
-        .fetch_one(&db.pool)
-        .await
-        .unwrap()
-        .get("variables");
+    let variables: serde_json::Value =
+        sqlx::query("select variables from rbpmn_instance where id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .get("variables");
     assert_eq!(variables, serde_json::json!({ "charged": true }));
     worker.abort();
     db.drop().await;
@@ -796,7 +797,7 @@ async fn expired_leases_are_reclaimed() {
         .unwrap();
 
     sqlx::query(
-        "update work_item set state = 'locked', lock_owner = 'dead-worker', \
+        "update rbpmn_work_item set state = 'locked', lock_owner = 'dead-worker', \
          lock_until = now() - interval '5 seconds' where instance_id = $1",
     )
     .bind(started.id)
@@ -851,12 +852,13 @@ async fn http_post_handler_end_to_end() {
         .unwrap();
     wait_for_status(&db.pool, started.id, "completed").await;
 
-    let variables: serde_json::Value = sqlx::query("select variables from instance where id = $1")
-        .bind(started.id)
-        .fetch_one(&db.pool)
-        .await
-        .unwrap()
-        .get("variables");
+    let variables: serde_json::Value =
+        sqlx::query("select variables from rbpmn_instance where id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .get("variables");
     assert_eq!(variables, serde_json::json!({ "paid": true }));
     worker.abort();
     db.drop().await;
@@ -985,7 +987,7 @@ async fn startup_revalidation_detects_handler_drift() {
 
 async fn open_items(pool: &PgPool, instance: uuid::Uuid) -> Vec<(uuid::Uuid, String)> {
     sqlx::query(
-        "select id, element_id from work_item \
+        "select id, element_id from rbpmn_work_item \
          where instance_id = $1 and state in ('available', 'locked') order by item_no",
     )
     .bind(instance)
@@ -998,7 +1000,7 @@ async fn open_items(pool: &PgPool, instance: uuid::Uuid) -> Vec<(uuid::Uuid, Str
 }
 
 async fn event_trace(pool: &PgPool, instance: uuid::Uuid) -> Vec<String> {
-    sqlx::query("select payload from event where instance_id = $1 order by id")
+    sqlx::query("select payload from rbpmn_event where instance_id = $1 order by id")
         .bind(instance)
         .fetch_all(pool)
         .await

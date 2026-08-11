@@ -49,7 +49,7 @@ impl Engine {
     pub async fn inspect_instance(&self, id: Uuid) -> Result<InstanceInspection, EngineError> {
         let inst = sqlx::query(
             "select i.definition_key, i.status, i.variables, d.bpmn_xml \
-             from instance i join definition d on d.id = i.definition_id where i.id = $1",
+             from rbpmn_instance i join rbpmn_definition d on d.id = i.definition_id where i.id = $1",
         )
         .bind(id)
         .fetch_optional(self.pool())
@@ -57,7 +57,7 @@ impl Engine {
         .ok_or(EngineError::UnknownInstance(id))?;
 
         let tokens = sqlx::query(
-            "select element_id, wait_kind from token where instance_id = $1 order by token_no",
+            "select element_id, wait_kind from rbpmn_token where instance_id = $1 order by token_no",
         )
         .bind(id)
         .fetch_all(self.pool())
@@ -70,7 +70,7 @@ impl Engine {
         .collect();
 
         let work_items = sqlx::query(
-            "select id, element_id, state, topic, kind, retries, last_failure from work_item \
+            "select id, element_id, state, topic, kind, retries, last_failure from rbpmn_work_item \
              where instance_id = $1 order by item_no",
         )
         .bind(id)
@@ -89,7 +89,7 @@ impl Engine {
         .collect();
 
         let events = sqlx::query(
-            "select kind, element_id, payload from event where instance_id = $1 order by id",
+            "select kind, element_id, payload from rbpmn_event where instance_id = $1 order by id",
         )
         .bind(id)
         .fetch_all(self.pool())

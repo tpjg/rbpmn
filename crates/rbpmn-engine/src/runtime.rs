@@ -67,7 +67,7 @@ impl Engine {
     ) -> Result<StartedInstance, EngineError> {
         reject_nul(&variables)?;
         let row = sqlx::query(
-            "select id, bpmn_xml, bindings from definition \
+            "select id, bpmn_xml, bindings from rbpmn_definition \
              where key = $1 order by version desc limit 1",
         )
         .bind(key)
@@ -82,7 +82,7 @@ impl Engine {
         let proc = compile_row(&row, key)?;
 
         let instance_id: Uuid = sqlx::query(
-            "insert into instance \
+            "insert into rbpmn_instance \
              (definition_id, definition_key, business_key, status, variables) \
              values ($1, $2, $3, 'active', 'null'::jsonb) returning id",
         )
@@ -124,7 +124,7 @@ impl Engine {
         patch: serde_json::Value,
     ) -> Result<Completion, EngineError> {
         reject_nul(&patch)?;
-        let item = sqlx::query("select instance_id, item_no from work_item where id = $1")
+        let item = sqlx::query("select instance_id, item_no from rbpmn_work_item where id = $1")
             .bind(work_item)
             .fetch_optional(&mut *tx)
             .await?
@@ -138,13 +138,14 @@ impl Engine {
         // The idempotent no-op comes before every other gate: a retried,
         // already-committed completion must converge even if a sibling
         // branch has since raised an incident.
-        let item_state: String =
-            sqlx::query("select state from work_item where instance_id = $1 and item_no = $2")
-                .bind(instance_id)
-                .bind(item_no)
-                .fetch_one(&mut *tx)
-                .await?
-                .get("state");
+        let item_state: String = sqlx::query(
+            "select state from rbpmn_work_item where instance_id = $1 and item_no = $2",
+        )
+        .bind(instance_id)
+        .bind(item_no)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("state");
         if item_state != "available" && item_state != "locked" {
             return Ok(Completion::AlreadyClosed { state: item_state });
         }
@@ -194,7 +195,7 @@ impl Engine {
         work_item: Uuid,
         options: &FailOptions,
     ) -> Result<FailOutcome, EngineError> {
-        let item = sqlx::query("select instance_id, item_no from work_item where id = $1")
+        let item = sqlx::query("select instance_id, item_no from rbpmn_work_item where id = $1")
             .bind(work_item)
             .fetch_optional(&mut *tx)
             .await?
@@ -207,7 +208,7 @@ impl Engine {
         let row = sqlx::query(
             "select state, lock_owner, \
              (lock_until is not null and lock_until > now()) as lease_live \
-             from work_item where instance_id = $1 and item_no = $2",
+             from rbpmn_work_item where instance_id = $1 and item_no = $2",
         )
         .bind(instance_id)
         .bind(item_no)
@@ -237,7 +238,7 @@ impl Engine {
         // SET expressions see pre-update values: the backoff exponent uses
         // the failure count before this failure.
         let row = sqlx::query(
-            "update work_item set retries = retries - 1, failures = failures + 1, \
+            "update rbpmn_work_item set retries = retries - 1, failures = failures + 1, \
              state = 'available', lock_owner = null, lock_until = null, \
              retry_at = now() + make_interval(secs => $3 * power(3, failures)), \
              last_failure = coalesce($4, last_failure) \
@@ -374,7 +375,7 @@ async fn load_instance(
     let inst = sqlx::query(
         "select i.definition_id, i.definition_key, i.status, i.variables, \
                 i.next_token, i.next_work_item, d.bpmn_xml, d.bindings \
-         from instance i join definition d on d.id = i.definition_id \
+         from rbpmn_instance i join rbpmn_definition d on d.id = i.definition_id \
          where i.id = $1 for update of i",
     )
     .bind(instance_id)
@@ -392,7 +393,7 @@ async fn load_instance(
     let mut tokens = Vec::new();
     for row in sqlx::query(
         "select token_no, element_id, wait_kind, arrived_via, work_item_no \
-         from token where instance_id = $1 order by token_no",
+         from rbpmn_token where instance_id = $1 order by token_no",
     )
     .bind(instance_id)
     .fetch_all(&mut *tx)
@@ -422,7 +423,7 @@ async fn load_instance(
 
     let mut work_items = Vec::new();
     for row in sqlx::query(
-        "select item_no, token_no, element_id, kind, topic from work_item \
+        "select item_no, token_no, element_id, kind, topic from rbpmn_work_item \
          where instance_id = $1 and state in ('available', 'locked') order by item_no",
     )
     .bind(instance_id)
@@ -469,7 +470,7 @@ async fn persist_step(
 ) -> Result<(), EngineError> {
     let status = status_to_db(state.status);
     sqlx::query(
-        "update instance set status = $2, variables = $3, next_token = $4, \
+        "update rbpmn_instance set status = $2, variables = $3, next_token = $4, \
          next_work_item = $5, completed_at = case when $2 in ('completed', 'terminated') \
          then now() else completed_at end where id = $1",
     )
@@ -483,7 +484,7 @@ async fn persist_step(
 
     // Token rows are a snapshot of the quiescent state (small per instance;
     // wholesale replace keeps the projection trivially correct).
-    sqlx::query("delete from token where instance_id = $1")
+    sqlx::query("delete from rbpmn_token where instance_id = $1")
         .bind(instance_id)
         .execute(&mut *tx)
         .await?;
@@ -495,7 +496,7 @@ async fn persist_step(
             WaitKind::WorkItem(item) => ("work_item", None, Some(item.0 as i64)),
         };
         sqlx::query(
-            "insert into token (instance_id, token_no, element_id, wait_kind, arrived_via, work_item_no) \
+            "insert into rbpmn_token (instance_id, token_no, element_id, wait_kind, arrived_via, work_item_no) \
              values ($1, $2, $3, $4, $5, $6)",
         )
         .bind(instance_id)
@@ -522,7 +523,7 @@ async fn persist_step(
                     .map(|(_, w)| w.token.0 as i64)
                     .ok_or_else(|| internal("created work item missing from state".into()))?;
                 sqlx::query(
-                    "insert into work_item \
+                    "insert into rbpmn_work_item \
                      (instance_id, item_no, definition_id, definition_key, token_no, \
                       kind, topic, element_id, state) \
                      values ($1, $2, $3, $4, $5, $6, $7, $8, 'available')",
@@ -563,7 +564,7 @@ async fn persist_step(
             .and_then(|e| e.as_str())
             .map(str::to_string);
         sqlx::query(
-            "insert into event (instance_id, definition_id, definition_key, kind, element_id, payload) \
+            "insert into rbpmn_event (instance_id, definition_id, definition_key, kind, element_id, payload) \
              values ($1, $2, $3, $4, $5, $6)",
         )
         .bind(instance_id)
@@ -593,7 +594,7 @@ async fn set_work_item_state(
     item_no: i64,
     to: &str,
 ) -> Result<(), EngineError> {
-    sqlx::query("update work_item set state = $3 where instance_id = $1 and item_no = $2")
+    sqlx::query("update rbpmn_work_item set state = $3 where instance_id = $1 and item_no = $2")
         .bind(instance_id)
         .bind(item_no)
         .bind(to)
@@ -611,7 +612,7 @@ async fn insert_engine_event(
     payload: serde_json::Value,
 ) -> Result<(), EngineError> {
     sqlx::query(
-        "insert into event (instance_id, definition_id, definition_key, kind, element_id, payload) \
+        "insert into rbpmn_event (instance_id, definition_id, definition_key, kind, element_id, payload) \
          values ($1, $2, $3, $4, $5, $6)",
     )
     .bind(instance_id)

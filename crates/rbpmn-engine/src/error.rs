@@ -35,6 +35,11 @@ pub enum EngineError {
     Compile(#[from] rbpmn_core::CompileError),
     #[error("semantic core rejected the step: {0}")]
     Step(#[from] rbpmn_core::StepError),
+    #[error(
+        "migration {0} '{1}' was already applied with different content — \
+         refusing to run (this build's migration files drifted from the database)"
+    )]
+    MigrationDrift(i64, &'static str),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }

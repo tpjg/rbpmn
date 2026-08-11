@@ -74,7 +74,7 @@ impl Engine {
             .await?;
 
         let latest = sqlx::query(
-            "select id, version, content_hash from definition \
+            "select id, version, content_hash from rbpmn_definition \
              where key = $1 order by version desc limit 1",
         )
         .bind(&key)
@@ -96,7 +96,7 @@ impl Engine {
         let version: i32 = latest.map(|r| r.get::<i32, _>("version") + 1).unwrap_or(1);
 
         let id: Uuid = sqlx::query(
-            "insert into definition (key, version, content_hash, bpmn_xml, bindings) \
+            "insert into rbpmn_definition (key, version, content_hash, bpmn_xml, bindings) \
              values ($1, $2, $3, $4, $5) returning id",
         )
         .bind(&key)
@@ -125,10 +125,10 @@ impl Engine {
     /// Call after wiring the initial environment; fail loudly on diagnostics.
     pub async fn check_active_definitions(&self) -> Result<Vec<Diagnostic>, sqlx::Error> {
         let rows = sqlx::query(
-            "select distinct d.key, d.version, d.bpmn_xml, d.bindings from definition d \
-             where d.id in (select definition_id from instance where status = 'active') \
+            "select distinct d.key, d.version, d.bpmn_xml, d.bindings from rbpmn_definition d \
+             where d.id in (select definition_id from rbpmn_instance where status = 'active') \
                 or (d.key, d.version) in \
-                   (select key, max(version) from definition group by key) \
+                   (select key, max(version) from rbpmn_definition group by key) \
              order by d.key, d.version",
         )
         .fetch_all(self.pool())

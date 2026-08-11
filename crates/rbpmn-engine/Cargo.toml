@@ -11,7 +11,7 @@ rbpmn-model = { path = "../rbpmn-model" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "migrate", "macros"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["sync", "time", "macros"] }

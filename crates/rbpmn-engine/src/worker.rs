@@ -88,10 +88,10 @@ impl Engine {
         // backoff elapsed, and — crucially — the instance still active, so
         // an incident-frozen instance's siblings are never re-executed.
         let Some(row) = sqlx::query(
-            "update work_item set state = 'locked', lock_owner = $2, \
+            "update rbpmn_work_item set state = 'locked', lock_owner = $2, \
              lock_until = now() + make_interval(secs => $3) \
-             where id = (select w.id from work_item w \
-                join instance i on i.id = w.instance_id \
+             where id = (select w.id from rbpmn_work_item w \
+                join rbpmn_instance i on i.id = w.instance_id \
                 where w.kind = 'service' and w.topic = any($1) \
                   and (w.state = 'available' or (w.state = 'locked' and w.lock_until < now())) \
                   and (w.retry_at is null or w.retry_at <= now()) \
@@ -114,7 +114,7 @@ impl Engine {
             definition_key: row.get("definition_key"),
             element_id: row.get("element_id"),
             topic: row.get("topic"),
-            variables: sqlx::query("select variables from instance where id = $1")
+            variables: sqlx::query("select variables from rbpmn_instance where id = $1")
                 .bind(row.get::<uuid::Uuid, _>("instance_id"))
                 .fetch_one(self.pool())
                 .await?
@@ -200,7 +200,7 @@ impl Engine {
         lease: Duration,
     ) -> Result<bool, EngineError> {
         let result = sqlx::query(
-            "update work_item set lock_until = now() + make_interval(secs => $3) \
+            "update rbpmn_work_item set lock_until = now() + make_interval(secs => $3) \
              where id = $1 and lock_owner = $2 and state = 'locked' and lock_until > now()",
         )
         .bind(work_item)
@@ -213,7 +213,7 @@ impl Engine {
 
     async fn release_claim(&self, work_item: uuid::Uuid, owner: &str) -> Result<(), EngineError> {
         sqlx::query(
-            "update work_item set state = 'available', lock_owner = null, \
+            "update rbpmn_work_item set state = 'available', lock_owner = null, \
              lock_until = null where id = $1 and lock_owner = $2 and state = 'locked'",
         )
         .bind(work_item)
