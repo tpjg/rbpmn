@@ -4,6 +4,7 @@ description = "The pure semantic core of the rbpmn engine: tokens, scopes and th
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 rbpmn-model = { path = "../rbpmn-model" }

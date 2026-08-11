@@ -12,11 +12,11 @@
 //! row's delete commits together with the step, which is what makes firing
 //! exactly-once: whoever loses the re-check simply moves on.
 
+use crate::listen::Wakeup;
 use crate::runtime::{load_instance, persist_step};
 use crate::{Engine, EngineError};
 use rbpmn_core::{Command, InstanceStatus, TimerId, step};
 use sqlx::Row;
-use sqlx::postgres::PgListener;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -38,18 +38,13 @@ impl Engine {
     /// Runs forever (spawn it; abort to stop). Transient errors back off and
     /// continue — the loop must survive database restarts.
     pub async fn run_scheduler(&self, options: SchedulerOptions) {
-        let mut listener = None;
+        let mut wakeup = Wakeup::new("rbpmn_timer");
         loop {
             match self.fire_due_timer().await {
                 Ok(true) => continue,
                 Ok(false) => {
-                    if listener.is_none() {
-                        listener = PgListener::connect_with(self.pool()).await.ok();
-                        if let Some(l) = listener.as_mut()
-                            && l.listen("rbpmn_timer").await.is_err()
-                        {
-                            listener = None;
-                        }
+                    if wakeup.ensure(self.pool()).await {
+                        continue; // freshly listening: re-check the gap
                     }
                     let mut wait = match self.next_due_in().await {
                         Ok(Some(until_due)) => until_due.min(options.poll_interval),
@@ -62,17 +57,7 @@ impl Engine {
                     if let (_, Some(until_retry)) = self.timer_backoff_snapshot() {
                         wait = wait.min(until_retry.max(Duration::from_millis(250)));
                     }
-                    match listener.as_mut() {
-                        Some(l) => {
-                            if tokio::time::timeout(wait, l.recv())
-                                .await
-                                .is_ok_and(|r| r.is_err())
-                            {
-                                listener = None; // connection lost; rebuild next round
-                            }
-                        }
-                        None => tokio::time::sleep(wait).await,
-                    }
+                    wakeup.park(wait).await;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "scheduler iteration failed; backing off");

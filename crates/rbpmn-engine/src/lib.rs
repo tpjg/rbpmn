@@ -17,9 +17,11 @@
 
 mod deploy;
 mod error;
+mod events;
 #[cfg(feature = "http")]
 mod http_handler;
 mod inspect;
+mod listen;
 mod runtime;
 mod scheduler;
 mod tasks;
@@ -30,6 +32,7 @@ mod worker;
 pub use error::{
     Completion, Correlation, DeployError, Deployment, EngineError, FailOutcome, StartedInstance,
 };
+pub use events::EventRecord;
 #[cfg(feature = "http")]
 pub use http_handler::HttpPostHandler;
 pub use inspect::{
@@ -71,6 +74,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "task_api",
         include_str!("../migrations/0004_task_api.sql"),
     ),
+    (
+        5,
+        "event_stream",
+        include_str!("../migrations/0005_event_stream.sql"),
+    ),
 ];
 
 /// A claimed unit of service work, as handed to a push-mode handler.
@@ -106,6 +114,10 @@ pub trait ServiceTaskHandler: Send + Sync {
 #[derive(Default)]
 struct Environment {
     handlers: BTreeMap<String, Arc<dyn ServiceTaskHandler>>,
+    /// Not a redundant mirror of `rbpmn_environment_topic`: this set serves
+    /// the bootstrap window (builder declarations before `migrate`/
+    /// `sync_environment` have run, when the table may not even exist).
+    /// After sync, the DB is a superset and `covered_topics` unions both.
     declared: BTreeSet<String>,
 }
 
@@ -325,12 +337,7 @@ impl Engine {
             env.declared.iter().cloned().collect()
         };
         for topic in declared {
-            sqlx::query(
-                "insert into rbpmn_environment_topic (name) values ($1) on conflict do nothing",
-            )
-            .bind(&topic)
-            .execute(&self.inner.pool)
-            .await?;
+            self.declare_topic(topic).await?;
         }
         let rows: Vec<String> = sqlx::query_scalar("select name from rbpmn_environment_topic")
             .fetch_all(&self.inner.pool)

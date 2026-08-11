@@ -28,6 +28,17 @@ pub(crate) struct DefinitionRef {
     key: String,
 }
 
+/// Work-item lifecycle states as stored in `rbpmn_work_item.state` (and
+/// mirrored by its CHECK constraint). Rust-side comparisons go through
+/// these; SQL text spells them out where the planner needs literals.
+pub(crate) mod item_state {
+    pub const AVAILABLE: &str = "available";
+    pub const LOCKED: &str = "locked";
+    pub const COMPLETED: &str = "completed";
+    pub const CANCELLED: &str = "cancelled";
+    pub const FAILED: &str = "failed";
+}
+
 /// Options for [`Engine::fail_work_item`].
 #[derive(Debug, Clone, Default)]
 pub struct FailOptions {
@@ -155,7 +166,7 @@ impl Engine {
         // The idempotent no-op comes before every other gate: a retried,
         // already-committed completion must converge even if a sibling
         // branch has since raised an incident.
-        if item_state != "available" && item_state != "locked" {
+        if item_state != item_state::AVAILABLE && item_state != item_state::LOCKED {
             return Ok(Completion::AlreadyClosed { state: item_state });
         }
         if state.status == InstanceStatus::Failed {
@@ -325,7 +336,7 @@ impl Engine {
             work_item,
         )
         .await?;
-        if item_state != "available" && item_state != "locked" {
+        if item_state != item_state::AVAILABLE && item_state != item_state::LOCKED {
             // The idempotent no-op, mirroring completion.
             return Ok(FailOutcome::AlreadyClosed { state: item_state });
         }
@@ -524,7 +535,7 @@ pub(crate) async fn guard_lease(
     .fetch_one(&mut *tx)
     .await?;
     let state: String = row.get("state");
-    if state == "locked"
+    if state == item_state::LOCKED
         && row.get::<bool, _>("lease_live")
         && owner != row.get::<Option<String>, _>("lock_owner").as_deref()
     {
@@ -772,11 +783,18 @@ pub(crate) async fn persist_step(
     .await?;
 
     // Token rows are a snapshot of the quiescent state (small per instance;
-    // wholesale replace keeps the projection trivially correct).
+    // wholesale replace keeps the projection trivially correct). One delete
+    // plus one multi-row insert — round-trips inside the held instance lock
+    // are the cost that matters here.
     sqlx::query("delete from rbpmn_token where instance_id = $1")
         .bind(instance_id)
         .execute(&mut *tx)
         .await?;
+    let mut token_nos: Vec<i64> = Vec::new();
+    let mut token_elements: Vec<&str> = Vec::new();
+    let mut wait_kinds: Vec<&str> = Vec::new();
+    let mut arrived_vias: Vec<Option<String>> = Vec::new();
+    let mut work_item_nos: Vec<Option<i64>> = Vec::new();
     for (id, token) in state.tokens() {
         let (wait_kind, arrived_via, work_item_no) = match &token.wait {
             WaitKind::Join { arrived_via } => {
@@ -788,20 +806,33 @@ pub(crate) async fn persist_step(
             WaitKind::EventGateway => ("event_gateway", None, None),
             WaitKind::Incident => ("incident", None, None),
         };
+        token_nos.push(id.0 as i64);
+        token_elements.push(proc.node_id(token.node));
+        wait_kinds.push(wait_kind);
+        arrived_vias.push(arrived_via);
+        work_item_nos.push(work_item_no);
+    }
+    if !token_nos.is_empty() {
         sqlx::query(
-            "insert into rbpmn_token (instance_id, token_no, element_id, wait_kind, arrived_via, work_item_no) \
-             values ($1, $2, $3, $4, $5, $6)",
+            "insert into rbpmn_token \
+             (instance_id, token_no, element_id, wait_kind, arrived_via, work_item_no) \
+             select $1, t.no, t.el, t.wk, t.via, t.wi \
+             from unnest($2::bigint[], $3::text[], $4::text[], $5::text[], $6::bigint[]) \
+               as t(no, el, wk, via, wi)",
         )
         .bind(instance_id)
-        .bind(id.0 as i64)
-        .bind(proc.node_id(token.node))
-        .bind(wait_kind)
-        .bind(arrived_via)
-        .bind(work_item_no)
+        .bind(&token_nos)
+        .bind(&token_elements)
+        .bind(&wait_kinds)
+        .bind(&arrived_vias)
+        .bind(&work_item_nos)
         .execute(&mut *tx)
         .await?;
     }
 
+    let mut event_kinds: Vec<String> = Vec::new();
+    let mut event_elements: Vec<Option<String>> = Vec::new();
+    let mut event_payloads: Vec<serde_json::Value> = Vec::new();
     for event in events {
         match event {
             Event::WorkItemCreated {
@@ -836,13 +867,13 @@ pub(crate) async fn persist_step(
                 }
             }
             Event::WorkItemCompleted { id, .. } => {
-                set_work_item_state(tx, instance_id, id.0 as i64, "completed").await?;
+                set_work_item_state(tx, instance_id, id.0 as i64, item_state::COMPLETED).await?;
             }
             Event::WorkItemCancelled { id, .. } => {
-                set_work_item_state(tx, instance_id, id.0 as i64, "cancelled").await?;
+                set_work_item_state(tx, instance_id, id.0 as i64, item_state::CANCELLED).await?;
             }
             Event::WorkItemFailed { id, .. } => {
-                set_work_item_state(tx, instance_id, id.0 as i64, "failed").await?;
+                set_work_item_state(tx, instance_id, id.0 as i64, item_state::FAILED).await?;
             }
             Event::TimerArmed {
                 id,
@@ -943,16 +974,26 @@ pub(crate) async fn persist_step(
             .get("element")
             .and_then(|e| e.as_str())
             .map(str::to_string);
+        event_kinds.push(kind);
+        event_elements.push(element);
+        event_payloads.push(payload);
+    }
+    if !event_kinds.is_empty() {
+        // One append for the whole step. unnest preserves array order and
+        // bigserial ids are assigned row by row within the statement, so
+        // per-instance id order stays the emission order.
         sqlx::query(
-            "insert into rbpmn_event (instance_id, definition_id, definition_key, kind, element_id, payload) \
-             values ($1, $2, $3, $4, $5, $6)",
+            "insert into rbpmn_event \
+             (instance_id, definition_id, definition_key, kind, element_id, payload) \
+             select $1, $2, $3, e.kind, e.element, e.payload \
+             from unnest($4::text[], $5::text[], $6::jsonb[]) as e(kind, element, payload)",
         )
         .bind(instance_id)
         .bind(definition.id)
         .bind(&definition.key)
-        .bind(kind)
-        .bind(element)
-        .bind(payload)
+        .bind(&event_kinds)
+        .bind(&event_elements)
+        .bind(&event_payloads)
         .execute(&mut *tx)
         .await?;
     }

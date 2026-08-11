@@ -670,12 +670,7 @@ impl<'a> Advancer<'a> {
         token: TokenId,
         element: NodeIx,
     ) -> Option<SubscriptionId> {
-        let ExecKind::MessageCatch {
-            message,
-            key,
-            key_name,
-        } = &self.proc.node(element).kind
-        else {
+        let ExecKind::MessageCatch { message, key } = &self.proc.node(element).kind else {
             unreachable!("subscribe is only called on message catch nodes");
         };
         let value = rbpmn_model::condition::resolve_path(&state.variables, key);
@@ -690,7 +685,7 @@ impl<'a> Advancer<'a> {
         let Some(key_value) = key_value else {
             self.events.push(Event::CorrelationFailed {
                 element: self.proc.node_id(element).to_string(),
-                name: key_name.clone(),
+                name: key.join("."),
             });
             self.freeze(state, token, element, None);
             return None;

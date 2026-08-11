@@ -126,12 +126,11 @@ fn validate_ttl(ttl: Duration) -> Result<(), EngineError> {
 /// match the index expression), so they are validated hard — same segment
 /// grammar as FEEL qualified names.
 fn validate_field(field: &str) -> Result<(), EngineError> {
-    let ok = !field.is_empty()
-        && field
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    // One grammar source: a field is a single-segment FEEL qualified name.
+    let ok = matches!(
+        rbpmn_model::condition::parse_qname(field),
+        Ok(path) if path.len() == 1
+    );
     if !ok {
         return Err(EngineError::InvalidVariables(format!(
             "'{field}' is not a valid filter/index field name \

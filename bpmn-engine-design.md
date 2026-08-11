@@ -608,6 +608,21 @@ Event ordering guarantees in `event`, retention jobs, instance migration API
 (design only). Embedded subprocesses + non-interrupting boundary timers are the
 head of the post-v1 roadmap (v2, below) — the first release after v1, as
 hierarchical BPMN is the modeling style this engine exists to serve.
+
+Event ordering (decided and shipped): two guarantees. Per instance,
+ascending `id` **is** the semantic order (all of an instance's events are
+written under its row lock). Across instances, a naive `id > cursor` tail
+can skip events — bigserial ids are assigned at insert but transactions
+commit out of order — so `rbpmn_event` carries the writing transaction's
+64-bit `txid` (xid8, never wraps) and `read_events` / `GET /v1/events`
+stops at the **safe horizon**: only rows whose txid is older than every
+in-progress transaction are released, so nothing can ever appear behind a
+returned cursor. The horizon is cluster-wide (xids are global to the
+PostgreSQL cluster) — a long-running transaction anywhere, including a
+business transaction around an `*_in_tx` call, delays the stream, which is
+one more reason the "commit promptly" rule is a rule.
+Retention jobs, the instance migration API, cross-definition messaging and
+the upgrade escape hatch remain open — each needs a design round first.
 *(bpmnlint plugin packaging and the token-overlay debug view were pulled forward:
 plugin → phase 0-B, token overlay → phase 2 exit criterion.)*
 

@@ -4,6 +4,7 @@ description = "The PostgreSQL projection of the rbpmn semantic core: transaction
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 rbpmn-core = { path = "../rbpmn-core" }

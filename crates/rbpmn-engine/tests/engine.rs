@@ -2491,3 +2491,87 @@ async fn undeclare_protects_versions_with_active_instances() {
     engine.undeclare_topic("payments").await.unwrap();
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5: the event-stream tailing contract
+// ---------------------------------------------------------------------------
+
+/// The safe horizon under out-of-order commits: an open transaction that
+/// wrote lower event ids holds later-committed higher ids back, so a
+/// tailing cursor can never skip past a gap that later fills in.
+#[tokio::test]
+async fn event_stream_never_misses_out_of_order_commits() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+
+    // Drain everything already final (nothing yet).
+    assert!(engine.read_events(0, 100).await.unwrap().is_empty());
+
+    // An open transaction writes the FIRST instance's events (lower ids)
+    // but does not commit...
+    let mut held = db.pool.begin().await.unwrap();
+    let early = engine
+        .start_in_tx(&mut held, "p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // ...while a second instance's events (higher ids) commit immediately.
+    let late = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // The committed higher ids are visible to plain SQL but must be held
+    // back by the horizon: returning them would fix the cursor past the
+    // open transaction's lower ids.
+    let visible: i64 = sqlx::query("select count(*) from rbpmn_event where instance_id = $1")
+        .bind(late.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert!(visible > 0, "the second instance's events are committed");
+    assert!(
+        engine.read_events(0, 100).await.unwrap().is_empty(),
+        "events past an in-flight transaction must not be released"
+    );
+
+    // Commit the held transaction: everything becomes final, in id order,
+    // with each instance's events contiguous in their semantic order. The
+    // horizon is CLUSTER-wide (xids are global), so concurrent tests'
+    // transactions in sibling databases can briefly hold it back — poll.
+    held.commit().await.unwrap();
+    let mut all = Vec::new();
+    for _ in 0..100 {
+        all = engine.read_events(0, 100).await.unwrap();
+        let complete = all.iter().any(|e| e.instance_id == early.id)
+            && all.iter().any(|e| e.instance_id == late.id);
+        if complete {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !all.is_empty(),
+        "horizon never released the committed events"
+    );
+    let ids: Vec<i64> = all.iter().map(|e| e.id).collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted, "stream is in id order");
+    let early_kinds: Vec<&str> = all
+        .iter()
+        .filter(|e| e.instance_id == early.id)
+        .map(|e| e.kind.as_str())
+        .collect();
+    assert_eq!(early_kinds.first(), Some(&"instance-started"));
+
+    // Cursor resumption: reading after the last id yields nothing new.
+    let cursor = *ids.last().unwrap();
+    assert!(engine.read_events(cursor, 100).await.unwrap().is_empty());
+    db.drop().await;
+}

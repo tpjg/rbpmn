@@ -125,11 +125,10 @@ pub enum ExecKind {
     },
     /// Message catch — an `intermediateCatchEvent` or a `receiveTask` (same
     /// semantics): parks its token behind a subscription. `key` is the
-    /// parsed correlation qualified name, `key_name` its source text.
+    /// parsed correlation qualified name (source text = `key.join(".")`).
     MessageCatch {
         message: String,
         key: Vec<String>,
-        key_name: String,
     },
     /// Interrupting timer boundary: armed on the host's token, entered only
     /// by its timer firing — never via a sequence flow.
@@ -244,17 +243,15 @@ impl ExecutableProcess {
                     })
             };
         let mut missing_correlations: Vec<String> = Vec::new();
-        let mut correlation = |node: &FlowNode| -> Result<(Vec<String>, String), CompileError> {
+        let mut correlation = |node: &FlowNode| -> Result<Vec<String>, CompileError> {
             let Some(name) = bindings.correlations.get(&node.id) else {
                 missing_correlations.push(node.id.clone());
-                return Ok((Vec::new(), String::new())); // placeholder; rejected below
+                return Ok(Vec::new()); // placeholder; rejected below
             };
-            let path =
-                condition::parse_qname(name).map_err(|e| CompileError::InvalidCorrelation {
-                    element: node.id.clone(),
-                    reason: e.to_string(),
-                })?;
-            Ok((path, name.clone()))
+            condition::parse_qname(name).map_err(|e| CompileError::InvalidCorrelation {
+                element: node.id.clone(),
+                reason: e.to_string(),
+            })
         };
         let timer_due = |node: &FlowNode, spec: &TimerSpec| -> Result<TimerDue, CompileError> {
             match spec {
@@ -300,22 +297,16 @@ impl ExecutableProcess {
                 NodeKind::Catch(CatchTrigger::Timer(spec)) => ExecKind::TimerCatch {
                     due: timer_due(node, spec)?,
                 },
-                NodeKind::Catch(CatchTrigger::Message(message_ref)) => {
-                    let (key, key_name) = correlation(node)?;
-                    ExecKind::MessageCatch {
-                        message: message_name(node, message_ref)?,
-                        key,
-                        key_name,
-                    }
-                }
+                NodeKind::Catch(CatchTrigger::Message(message_ref)) => ExecKind::MessageCatch {
+                    message: message_name(node, message_ref)?,
+                    key: correlation(node)?,
+                },
                 NodeKind::ReceiveTask { message_ref } => {
                     // A receive task IS a message catch (identical semantics,
                     // task-shaped notation) — it never creates a work item.
-                    let (key, key_name) = correlation(node)?;
                     ExecKind::MessageCatch {
                         message: message_name(node, message_ref)?,
-                        key,
-                        key_name,
+                        key: correlation(node)?,
                     }
                 }
                 NodeKind::Start(StartTrigger::Message(_))

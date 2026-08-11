@@ -4,6 +4,7 @@ description = "WASM bindings for rbpmn-model: the exact deploy-time linter, call
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]

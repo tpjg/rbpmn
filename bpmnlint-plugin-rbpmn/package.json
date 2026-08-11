@@ -1,7 +1,7 @@
 {
   "name": "bpmnlint-plugin-rbpmn",
   "version": "0.1.0",
-  "description": "rbpmn's deploy-time rules for bpmnlint — backed by the engine's own linter compiled to WASM, so modelers see exactly the diagnostics deploy will produce.",
+  "description": "rbpmn's deploy-time rules for bpmnlint \u2014 backed by the engine's own linter compiled to WASM, so modelers see exactly the diagnostics deploy will produce.",
   "type": "module",
   "main": "index.js",
   "files": [
@@ -19,5 +19,6 @@
   },
   "devDependencies": {
     "bpmnlint": "^11.12.1"
-  }
+  },
+  "license": "(MIT OR Apache-2.0)"
 }

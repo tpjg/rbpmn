@@ -50,6 +50,31 @@ pub async fn deploy(State(engine): State<Engine>, Json(body): Json<DeployBody>) 
 }
 
 #[derive(Deserialize)]
+pub struct EventsQuery {
+    #[serde(default)]
+    pub after: i64,
+    #[serde(default = "default_events_limit")]
+    pub limit: u32,
+}
+
+fn default_events_limit() -> u32 {
+    100
+}
+
+/// Tail the append-only event stream. The cursor contract (documented on
+/// `Engine::read_events`): pass the last returned id as `after`; the batch
+/// stops at the safe horizon, so no event can ever appear behind it.
+pub async fn events(
+    State(engine): State<Engine>,
+    axum::extract::Query(query): axum::extract::Query<EventsQuery>,
+) -> Response {
+    match engine.read_events(query.after, query.limit).await {
+        Ok(events) => Json(json!({ "events": events })).into_response(),
+        Err(e) => engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTaskBody {
     pub topic: String,

@@ -12,10 +12,10 @@
 //! whole instance) whose retry backoff has elapsed. `LISTEN rbpmn_work`
 //! wakes the loop early; the poll interval is the safety net.
 
+use crate::listen::Wakeup;
 use crate::runtime::FailOptions;
 use crate::{Engine, EngineError, WorkItem};
 use sqlx::Row;
-use sqlx::postgres::PgListener;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -42,23 +42,13 @@ impl Engine {
     /// Runs forever (spawn it; abort to stop). Transient errors back off and
     /// continue — the loop must survive database restarts.
     pub async fn run_worker(&self, options: WorkerOptions) {
-        let mut listener = None;
+        let mut wakeup = Wakeup::new("rbpmn_work");
         loop {
             match self.work_once(&options).await {
                 Ok(true) => continue,
                 Ok(false) => {
-                    if listener.is_none() {
-                        listener = PgListener::connect_with(self.pool()).await.ok();
-                        if let Some(l) = listener.as_mut() {
-                            if l.listen("rbpmn_work").await.is_err() {
-                                listener = None;
-                            } else {
-                                // A NOTIFY between the empty claim above and
-                                // the LISTEN just now is lost forever — claim
-                                // once more before parking on the channel.
-                                continue;
-                            }
-                        }
+                    if wakeup.ensure(self.pool()).await {
+                        continue; // freshly listening: re-check the gap
                     }
                     // Bound the wait by the earliest retry backoff: NOTIFY
                     // fires when the item *fails*, not when its retry_at
@@ -69,17 +59,7 @@ impl Engine {
                             .min(options.poll_interval),
                         _ => options.poll_interval,
                     };
-                    match listener.as_mut() {
-                        Some(l) => {
-                            if tokio::time::timeout(wait, l.recv())
-                                .await
-                                .is_ok_and(|r| r.is_err())
-                            {
-                                listener = None; // connection lost; rebuild next round
-                            }
-                        }
-                        None => tokio::time::sleep(wait).await,
-                    }
+                    wakeup.park(wait).await;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "worker iteration failed; backing off");

@@ -4,6 +4,7 @@ description = "Small standalone HTTP server wrapping the rbpmn engine, for deplo
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 rbpmn-model = { path = "../rbpmn-model" }
