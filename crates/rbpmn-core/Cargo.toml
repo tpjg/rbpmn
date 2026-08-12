@@ -12,5 +12,14 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[features]
+# Exposes `ExecutableProcess::compile_without_lint`, which runs models the
+# linter refuses so the structural rules can be shown to prevent a real hazard
+# rather than a hypothetical one (tests/mutation.rs). Never enable in a build
+# that executes real definitions.
+unlinted-compile = []
+
 [dev-dependencies]
 proptest = "1"
+# Self-dependency to turn on the test-only feature for this crate's own tests.
+rbpmn-core = { path = ".", features = ["unlinted-compile"] }

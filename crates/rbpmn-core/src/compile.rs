@@ -212,7 +212,38 @@ impl ExecutableProcess {
                     .collect(),
             ));
         }
+        Self::compile_unlinted(defs, process_id, bindings)
+    }
 
+    /// Compile **without the deploy-time lint gate**, for models the linter
+    /// would refuse.
+    ///
+    /// This exists for exactly one purpose: proving the structural rules earn
+    /// their keep. Running a rejected model shows the concrete hazard the rule
+    /// prevents — a parallel join collecting a second token on one flow, a
+    /// starved join, a token stuck forever — instead of leaving the
+    /// restriction as an assertion nobody has tested
+    /// (`crates/rbpmn-core/tests/mutation.rs`, docs/stress-testing.md §3d).
+    ///
+    /// Never reachable from a normal build: it is behind a non-default feature
+    /// that only this crate's own tests enable. The semantic core assumes
+    /// lint-clean input, so anything here may return
+    /// [`CompileError::Internal`], hit [`crate::StepError::Invariant`], or
+    /// simply misbehave — that is the point.
+    #[cfg(feature = "unlinted-compile")]
+    pub fn compile_without_lint(
+        defs: &Definitions,
+        process_id: &str,
+        bindings: &Bindings,
+    ) -> Result<Self, CompileError> {
+        Self::compile_unlinted(defs, process_id, bindings)
+    }
+
+    fn compile_unlinted(
+        defs: &Definitions,
+        process_id: &str,
+        bindings: &Bindings,
+    ) -> Result<Self, CompileError> {
         let process = defs
             .processes
             .iter()

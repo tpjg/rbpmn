@@ -22,7 +22,7 @@ are six, and each is a distinct target:
 
 | # | Third outcome | Hunted by |
 |---|---|---|
-| 1 | Linter accepts → `StepError::Invariant` or panic | model generator + mutation fuzz (§3) |
+| 1 | Linter accepts → `StepError::Invariant` or panic | mutation fuzz (§3c) — *hunted, nothing found* |
 | 2 | Linter accepts → stuck token, no pending stimulus | state-space exploration (§2, §7) |
 | 3 | Runs, but differently in Postgres than in the core | replay verification (§4) |
 | 4 | Correct alone, wrong under concurrency | the storm (§4), chaos (§5) |
@@ -31,11 +31,13 @@ are six, and each is a distinct target:
 
 Outcome 1 is the Camunda-lineage bug class the whole design exists to
 prevent — a model that lints clean and then executes with wrong token
-semantics; it is still open, and §3c is the hunt for it. Outcome 5 had no
-test at all until the generator landed — the `reject/` fixtures prove the
-linter catches what it should, and nothing proved it *doesn't* catch what it
-shouldn't. It is now covered for everything the block grammar can express
-(§3a).
+semantics. §3c is the hunt for it, and it currently comes up empty: the
+linter refuses ~99% of structural mutations and the survivors are harmless.
+
+Outcome 5 had no test at all until the generator landed — the `reject/`
+fixtures prove the linter catches what it should, and nothing proved it
+*doesn't* catch what it shouldn't. It is now covered for everything the block
+grammar can express (§3a).
 
 Two properties of this codebase make the search unusually cheap, and both
 should be treated as load-bearing infrastructure, not conveniences:
@@ -51,12 +53,13 @@ should be treated as load-bearing infrastructure, not conveniences:
 
 ## 1. Universal invariants
 
-Every technique below checks the same invariant set. It lives today as `check`
-in `crates/rbpmn-core/tests/explore.rs`; promote it into the crate behind
-`#[cfg(any(test, feature = "invariants"))]` as soon as a second consumer needs
-it (§2's driver, or the fsck of §4). All of the below are implemented there
-except **no zombie transitions**, which inspects the result of applying
-commands rather than a single state, and so belongs to §2's driver:
+Every technique below checks the same invariant set. It lives as `check` in
+`crates/rbpmn-core/tests/explorer/mod.rs`, shared by `explore.rs` and
+`mutation.rs`; promote it into the crate behind
+`#[cfg(any(test, feature = "invariants"))]` when a consumer outside the test
+tree needs it (the fsck of §4). All of the below are implemented there except
+**no zombie transitions**, which inspects the result of applying commands
+rather than a single state, and so belongs to §2's driver:
 
 - **No deadlock.** `status == Active` ⟹ at least one pending stimulus
   (open work item, armed timer, or open subscription).
@@ -202,14 +205,57 @@ A mutant that survives the linter *and* the executor is fine — the linter is
 allowed to be permissive where semantics stay correct. A mutant that survives
 the linter and breaks the executor is outcome 1.
 
+**Landed** as `crates/rbpmn-core/tests/mutation.rs`, with seven mutations:
+retarget a flow, re-source a flow, drop a flow, give a task a second outgoing
+flow, swap a gateway's kind, turn a gateway inclusive, and starve a parallel
+join. Accepted mutants are not merely "run once" — they get the full
+explicit-state exploration of §7, so the invariant set judges them at every
+reachable state. `CompileError::Internal` counts as a hazard by its own
+wording ("lint should have prevented this"), and every rejection's rule id is
+checked against the published `CATALOGUE`, since rule ids are stable API.
+
+> **Result: zero linter holes.** Over a representative run, 567 of 572
+> applicable mutants were **rejected** and 5 executed cleanly — the linter
+> refuses ~99% of structural mutations, and the remainder are harmless.
+> Verified non-vacuous the hard way: commenting out `regions::check` in the
+> linter makes the fuzz report `LINTER HOLE via swap_gateway_kind` within a
+> single run. The hunt works; there is currently nothing to find.
+
 **(d) Prove the restriction earns its keep.** The inverse, and the most
-interesting artifact: generate deliberately *non*-block-structured graphs and
-run them through the core with the region check disabled. Demonstrate on
-demand that local token counting goes wrong — reproduce the Camunda-lineage
-deviations in this engine — then re-enable the rule and watch them become
-deploy rejections. That turns `balanced-gateways` from a restriction we
-*assert* is necessary into one with a reproducible counterexample attached.
-It belongs in the README.
+interesting artifact: run *non*-block-structured models through the core with
+the lint gate off, and see what actually goes wrong. The `reject/` fixtures
+already are those models, so there is nothing to generate — they just need
+executing. `ExecutableProcess::compile_without_lint` (feature
+`unlinted-compile`, enabled only by this crate's own tests) is the gate
+bypass.
+
+The headline counterexample is the Camunda-lineage bug itself, reproduced on
+demand by `without_block_structure_a_join_double_counts`:
+
+> `cross-branch-merge` without the gate → `StepError::Invariant: second token
+> arrived at join 'pj' via flow 'f7' — the linter's block structure guarantee
+> is broken`
+
+The full measured table, which the test pins so it cannot rot:
+
+| Fixture | Rejected by | Without the gate |
+|---|---|---|
+| `cross-branch-merge` | `balanced-gateways` | **join double-counts** (`Invariant`) |
+| `implicit-split` | `no-implicit-split` | **`Invariant`**: two outgoing flows |
+| `orphan-parallel-join` | `balanced-gateways` | **deadlock** |
+| `two-edges-into-join` | `balanced-gateways` | **deadlock** |
+| `end-event-in-branch` | `balanced-gateways` | **deadlock** |
+| `entry-into-region` | `balanced-gateways` | executes cleanly (18 states) |
+| `parallel-missing-join` | `balanced-gateways` | executes cleanly (8 states) |
+
+The last two rows are the honest result and worth stating plainly: block
+structure is a **sufficient** condition that makes local join counting
+provably correct, so an individual violation of it need not manifest a
+hazard. Those two rules are conservative rather than hazard-driven. That is
+not an argument for relaxing them — the theorem needs the whole property, not
+the cases where breaking it happens to be survivable — but it is the
+difference between a rule we can justify with a counterexample and one we
+justify by the proof it enables.
 
 **The fuzzer is a fixture factory.** Because `step` is deterministic, a
 shrunk falsifying case is a `.bpmn` file plus a command sequence — i.e.
@@ -627,17 +673,22 @@ Randomized testing **falsifies**; it does not prove. Stated precisely:
 | 3 | FEEL differential vs dsntk (§6) | 1 d | A stated must-not-change claim, verified |
 | ~~4~~ | ~~Model generator + structural oracle (§3a, §3b)~~ | done | **Landed**: `tests/modelgen/` + `tests/generator.rs` |
 | ~~5~~ | ~~Explicit-state exploration (§7)~~ | done | **Landed**: `crates/rbpmn-core/tests/explore.rs` |
-| 6 | Mutation fuzz (§3c) + restriction counterexamples (§3d) | 2 d | The linter-hole hunt |
+| ~~6~~ | ~~Mutation fuzz (§3c) + restriction counterexamples (§3d)~~ | done | **Landed**: `tests/mutation.rs` |
 | 7 | Storm + replay verification + fsck (§4) | 3–5 d | The projection claim; deadlock freedom |
 | 8 | Chaos (§5) | 2–3 d | Closes testing-strategy #5 |
 | 9 | Kani on `iso8601` + `condition` parsers (§7) | 2–3 d | Panic/overflow proofs on untrusted input |
 | 10 | TLA+ spec of the concurrency protocol (§7) | 2 d | The distributed claims |
 
-Items 3, 4 and 5 are done, and they compose: `explore.rs` now explores
-*generated* models, so §3 × §7 is live. Item 1 is cheaper than listed —
-`explore.rs` already carries the invariant set, leaving the driver plus
-promoting `check` out of the test file. **Item 6 is next and is now cheap**:
-mutation fuzz reuses the generator wholesale, and it is the hunt for outcome 1
-(a model that lints clean and then executes wrong) — the bug class this engine
-exists to prevent. Extending the generator to boundary events and event-based
-gateways (see §3's status note) is the other open half.
+Items 3, 4, 5 and 6 are done, and they compose: the generator feeds both the
+explorer and the mutation fuzz, all three sharing one invariant set. Of the
+six third outcomes, 1, 2, 5 and 6 are now hunted; **3 and 4 are not, and they
+are the ones that live in the Postgres layer** — which is also the newest and
+most concurrent code in the repo, verified by hand-written cases. That makes
+item 7 (storm + replay verification) the highest-value work remaining, with
+item 10 (the TLA+ spec) before it since it is independent of all the Rust work
+and tells the storm which interleavings to build for.
+
+Item 1 is cheaper than listed — the invariant set already exists, leaving the
+random driver and the rehydration differential. Extending the generator to
+boundary events and event-based gateways (see §3's status note) is the other
+open half of §3.

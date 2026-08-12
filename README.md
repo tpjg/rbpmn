@@ -96,6 +96,23 @@ graphs that pass them).
 | `no-mixed-gateway` ⁺ | error | A gateway either splits or joins, never both. |
 | `event-gateway-structure` ⁺ | error | Event gateway races ≥2 message/timer catches or receive tasks, each with exactly one incoming flow and no boundary events (the gateway itself is the race). |
 
+### The structural rules have counterexamples, not just rationales
+
+`cargo test -p rbpmn-core --test mutation` runs the rejected fixtures with the
+lint gate off and records what actually breaks. `cross-branch-merge` produces
+the Camunda-lineage bug in this engine, on demand:
+
+```
+StepError::Invariant: second token arrived at join 'pj' via flow 'f7'
+  — the linter's block structure guarantee is broken
+```
+
+Others deadlock; two (`entry-into-region`, `parallel-missing-join`) execute
+cleanly — block structure is a *sufficient* condition for local join counting,
+so not every violation manifests. The same file mutation-fuzzes generated
+models: ~99% of structural mutations are rejected, and no lint-clean mutant
+has yet executed wrongly. Details in `docs/stress-testing.md` §3.
+
 ## XML purity: nothing rbpmn-specific in the BPMN
 
 BPMN files stay **100% standard-namespace** — no rbpmn extension attributes,

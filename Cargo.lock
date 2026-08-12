@@ -1301,6 +1301,7 @@ name = "rbpmn-core"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "rbpmn-core",
  "rbpmn-model",
  "serde",
  "serde_json",

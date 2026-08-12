@@ -97,34 +97,38 @@ fn number(block: &Block, ids: &mut Ids) -> Node {
 
 // ------------------------------------------------------------------ emitting
 
-#[derive(Clone, Copy, PartialEq)]
-enum Kind {
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Kind {
     Start,
     End,
     UserTask,
     Exclusive,
     Parallel,
+    /// Never generated — only reachable by mutation (tests/mutation.rs).
+    Inclusive,
 }
 
-struct Element {
-    id: String,
-    kind: Kind,
+#[derive(Clone, Debug)]
+pub struct Element {
+    pub id: String,
+    pub kind: Kind,
 }
 
-struct Flow {
-    id: String,
-    source: String,
-    target: String,
-    condition: Option<String>,
+#[derive(Clone, Debug)]
+pub struct Flow {
+    pub id: String,
+    pub source: String,
+    pub target: String,
+    pub condition: Option<String>,
 }
 
 /// Elements and flows are collected separately and stitched at the end: an
 /// element's `<incoming>`/`<outgoing>` lists are *derived* from the flows, so
 /// nothing has to know its successors while being emitted.
-#[derive(Default)]
-struct Builder {
-    elements: Vec<Element>,
-    flows: Vec<Flow>,
+#[derive(Default, Clone, Debug)]
+pub struct Builder {
+    pub elements: Vec<Element>,
+    pub flows: Vec<Flow>,
 }
 
 impl Builder {
@@ -227,7 +231,7 @@ impl Builder {
             .collect()
     }
 
-    fn to_xml(&self) -> String {
+    pub fn to_xml(&self) -> String {
         let mut body = String::new();
         for e in &self.elements {
             let inc: String = self
@@ -245,6 +249,7 @@ impl Builder {
                 Kind::End => ("bpmn:endEvent", String::new()),
                 Kind::UserTask => ("bpmn:userTask", String::new()),
                 Kind::Parallel => ("bpmn:parallelGateway", String::new()),
+                Kind::Inclusive => ("bpmn:inclusiveGateway", String::new()),
                 Kind::Exclusive => {
                     // An exclusive split needs a default flow; by construction
                     // it is always the last outgoing one.
@@ -290,6 +295,8 @@ impl Builder {
 pub struct Generated {
     pub xml: String,
     pub root: Node,
+    /// The elements and flows behind `xml` — the surface mutations act on.
+    pub skeleton: Builder,
 }
 
 pub fn build(block: &Block) -> Generated {
@@ -302,6 +309,7 @@ pub fn build(block: &Block) -> Generated {
     Generated {
         xml: b.to_xml(),
         root,
+        skeleton: b,
     }
 }
 
