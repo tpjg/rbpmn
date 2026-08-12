@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<!-- The scoped error handler: a failure anywhere inside the subprocess is
+     caught by the boundary on the subprocess itself, tearing the whole
+     scope down and taking the repair path. This is the shape embedded
+     subprocesses exist for. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:error id="err_stock" name="OutOfStock" errorCode="OUT_OF_STOCK" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:subProcess id="sp" name="Fulfil order">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:startEvent id="s2">
+        <bpmn:outgoing>fi1</bpmn:outgoing>
+      </bpmn:startEvent>
+      <bpmn:serviceTask id="reserve" name="Reserve stock">
+        <bpmn:incoming>fi1</bpmn:incoming>
+        <bpmn:outgoing>fi2</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:userTask id="pack" name="Pack">
+        <bpmn:incoming>fi2</bpmn:incoming>
+        <bpmn:outgoing>fi3</bpmn:outgoing>
+      </bpmn:userTask>
+      <bpmn:endEvent id="e2">
+        <bpmn:incoming>fi3</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="fi1" sourceRef="s2" targetRef="reserve" />
+      <bpmn:sequenceFlow id="fi2" sourceRef="reserve" targetRef="pack" />
+      <bpmn:sequenceFlow id="fi3" sourceRef="pack" targetRef="e2" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="be" attachedToRef="sp">
+      <bpmn:outgoing>f3</bpmn:outgoing>
+      <bpmn:errorEventDefinition errorRef="err_stock" />
+    </bpmn:boundaryEvent>
+    <bpmn:userTask id="backorder" name="Raise backorder">
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:endEvent id="end" name="Order fulfilled">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="e_back" name="Backordered">
+      <bpmn:incoming>f4</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sp" />
+    <bpmn:sequenceFlow id="f2" sourceRef="sp" targetRef="end" />
+    <bpmn:sequenceFlow id="f3" sourceRef="be" targetRef="backorder" />
+    <bpmn:sequenceFlow id="f4" sourceRef="backorder" targetRef="e_back" />
+  </bpmn:process>
+</bpmn:definitions>

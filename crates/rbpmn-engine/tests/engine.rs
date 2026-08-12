@@ -754,6 +754,14 @@ async fn leases_renew_while_the_handler_runs() {
         .unwrap();
 
     // Two competing workers with a lease far shorter than the handler.
+    //
+    // This asserts the *happy* path of renewal: one invocation, because the
+    // heartbeat keeps winning. It therefore assumes the renewal UPDATE is not
+    // starved for longer than the 900ms lease — true in a quiet run, and it
+    // can flake under heavy parallel load. Losing that race is legal (delivery
+    // is at-least-once); what must hold regardless is exactly-once state
+    // transition, which `a_starved_renewal_reruns_the_handler_but_applies_once`
+    // pins deterministically.
     let opts = |name: &str| WorkerOptions {
         owner: name.to_string(),
         lease: Duration::from_millis(900),
@@ -3077,5 +3085,115 @@ async fn event_cursor_inputs_are_validated() {
             .await,
         Err(rbpmn_engine::EngineError::InvalidVariables(_))
     ));
+    db.drop().await;
+}
+
+/// The at-least-once contract, demonstrated rather than asserted.
+///
+/// A lease is renewed by an UPDATE on the work-item row, so anything holding
+/// that row longer than the remaining lease starves the heartbeat: the lease
+/// lapses and a peer re-runs the handler. That is *allowed* — delivery is
+/// at-least-once and handlers must be idempotent. What must not happen is a
+/// second **state transition**.
+///
+/// Blocking the row on purpose makes the race deterministic, which is also the
+/// mechanism behind occasional flakes in
+/// `leases_renew_while_the_handler_runs`: that test asserts renewal keeps the
+/// handler to one invocation, which holds only while the renewal is not
+/// starved. Under heavy load it can be, and the engine is still correct.
+#[tokio::test]
+async fn a_starved_renewal_reruns_the_handler_but_applies_once() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+
+    struct SlowHandler(Arc<AtomicUsize>);
+    impl ServiceTaskHandler for SlowHandler {
+        fn execute(
+            &self,
+            _item: WorkItem,
+        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, HandlerFailure>> + Send + '_>>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(2500)).await;
+                Ok(serde_json::json!({ "slow": true }))
+            })
+        }
+    }
+    let invocations = Arc::new(AtomicUsize::new(0));
+    engine.register_handler("payments", Arc::new(SlowHandler(invocations.clone())));
+    engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new().topic("st", "payments"),
+        )
+        .await
+        .unwrap();
+
+    let opts = |name: &str| WorkerOptions {
+        owner: name.to_string(),
+        lease: Duration::from_millis(900),
+        poll_interval: Duration::from_millis(150),
+    };
+    let w1 = tokio::spawn({
+        let (engine, o) = (engine.clone(), opts("w1"));
+        async move { engine.run_worker(o).await }
+    });
+    let w2 = tokio::spawn({
+        let (engine, o) = (engine.clone(), opts("w2"));
+        async move { engine.run_worker(o).await }
+    });
+
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // Wait for the claim, then hold the row past the lease so every renewal
+    // attempt in that window queues behind this transaction.
+    let mut item = None;
+    for _ in 0..200 {
+        let row = sqlx::query("select id from rbpmn_work_item where state = 'locked' limit 1")
+            .fetch_optional(&db.pool)
+            .await
+            .unwrap();
+        if let Some(row) = row {
+            item = Some(row.get::<uuid::Uuid, _>("id"));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let item = item.expect("the work item was never claimed");
+
+    let mut tx = db.pool.begin().await.unwrap();
+    sqlx::query("select 1 from rbpmn_work_item where id = $1 for update")
+        .bind(item)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    tx.rollback().await.unwrap();
+
+    wait_for_status(&db.pool, started.id, "completed").await;
+    w1.abort();
+    w2.abort();
+
+    let invoked = invocations.load(Ordering::SeqCst);
+    assert!(
+        invoked >= 2,
+        "the lease was never actually lost — this test is not exercising \
+         re-delivery (handler ran {invoked} time(s))"
+    );
+    assert_eq!(
+        event_count(&db.pool, started.id, "work-item-completed").await,
+        1,
+        "the handler ran {invoked} times; exactly-once state transition means \
+         the engine must still have applied exactly one completion"
+    );
+    assert_eq!(
+        event_count(&db.pool, started.id, "variables-patched").await,
+        1,
+        "the merge patch was applied more than once"
+    );
     db.drop().await;
 }
