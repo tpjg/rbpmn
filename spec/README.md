@@ -11,6 +11,7 @@ Run with `just tla` (needs `java`; fetches `tla2tools.jar` on first use).
 | `LockOrder.tla` | the instance row plus every per-instance row a step touches (`RowOrder`: tokens, work items, timers, subscriptions, scopes), across N nodes | one lock order for the *stepping* paths; no AB/BA deadlock; every transaction returns to idle |
 | `Lease.tla` | the work-item lease: TTL, renewal, expiry, completion | no double delivery; exactly-once completion under at-least-once delivery; nothing stranded |
 | `TimerTeardown.tla` | the scheduler's unlocked timer pick racing a scope teardown | no timer row outlives the token it is armed on; no timer ever fires with its token gone |
+| `Retention.tla` | a retention pass across its transaction-free archive gap | nothing deleted without an archive; the truncation floor covers every deletion and invents none; only due records go |
 
 Each spec ships with a companion config that is **expected to fail**, so the
 checks are known to have teeth rather than passing vacuously:
@@ -23,6 +24,9 @@ checks are known to have teeth rather than passing vacuously:
 | `Lease_DoubleBelief.cfg` | **violation** | two workers really can both believe they hold one item |
 | `TimerTeardown.cfg` | holds | the shipped teardown |
 | `TimerTeardown_Buggy.cfg` | **violation** | the phase-6 bug: teardown reaping tokens but not their timers |
+| `Retention.cfg` | holds | the shipped pass |
+| `Retention_FloorFromPlan.cfg` | **violation** | advancing the floor from the plan instead of the deletions |
+| `Retention_NoRecheck.cfg` | **violation** | trusting the plan's DUE verdict across the archive gap |
 
 ## What the failures show
 
@@ -61,6 +65,44 @@ both workers believe they hold the item. That state is *reachable and fine*:
 every mutation is conditional on `lock_owner = $me AND lock_until > now()` in
 the database, so belief is never authority. Safety does not come from
 preventing the confusion — it comes from the confusion not mattering.
+
+## What the Lease spec does and does not claim
+
+`Complete` is transcribed from `guard_lease`, which refuses only when
+**another** owner holds a **live** lease. It does not require the completer to
+hold anything — it cannot, because push-mode workers and the ownerless HTTP
+path complete items too. So the checked property is
+`NoLiveForeignCompletion`: a worker demonstrably still working cannot have its
+item completed underneath it. An earlier version of this spec required a live
+lease to complete and therefore proved a protocol the engine does not
+implement, which is worse than having no spec: it manufactures confidence.
+
+For the same reason `NeverStranded` is gone. It held only because the model
+had no failure path. With retry backoff and the incident freeze modelled, an
+item genuinely can be neither claimable nor completable, so the property is
+now `StrandedOnlyForAStatedReason` — it can happen, for exactly two reasons,
+both intended.
+
+## Retention and the archive gap
+
+`Retention.tla` models the one place phase 7 is subtle: `plan` → archive →
+`execute` deliberately holds **no transaction** across the sink call (an open
+transaction would pin the cluster-wide `pg_snapshot_xmin` the event stream's
+horizon is built on). Everything in the model follows from that gap being
+open — `skip locked` dropping planned instances, a policy changing under the
+sweep, two sweepers overlapping.
+
+The two floor obligations pull against each other, which is what makes them
+worth checking together: nothing deleted may sit *above* the floor (or a
+reader above it loses events silently), and the floor may not sit above
+everything actually deleted (or readers get `CursorTruncated` for nothing).
+The second is exactly what `delete_records`' comment warns about, and
+`Retention_FloorFromPlan.cfg` is that mistake made on purpose.
+
+TLC also found a bug in this spec while checking it: `undue' = undue \/ X`
+parses as `(undue' = undue) \/ X`, so the variable went unassigned whenever
+`X` was true. The shipped config never noticed — `X` is unreachable there —
+and only the counterexample config exposed it.
 
 ## Scope
 

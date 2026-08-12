@@ -78,34 +78,44 @@ vars == <<lock, pc, kind, target>>
 OtherRows == SelectSeq(RowOrder, LAMBDA r : r # "timer")
 
 Order(n) ==
-    IF kind[n] = "timer" /\ HistoricalTimerOrder
-        THEN <<"timer", "inst">> \o OtherRows
-        ELSE <<"inst">> \o RowOrder
+    CASE kind[n] = "claim" -> <<"item">>
+      [] kind[n] = "timer" /\ HistoricalTimerOrder -> <<"timer", "inst">> \o OtherRows
+      [] OTHER -> <<"inst">> \o RowOrder
 
-Last == Len(RowOrder) + 1
+LastOf(n) == Len(Order(n))
+
+\* The three transaction shapes that take row locks. `claim` is `get_task`
+\* and the worker's `work_once`: a single statement that locks ONE work-item
+\* row with SKIP LOCKED and commits, never touching the instance row. It was
+\* missing from this model, and its absence is what let the old
+\* `SingleLockOrder` invariant look true.
+Kinds == {"complete", "timer", "claim"}
+
+MaxLen == Len(RowOrder) + 1
 
 Res(n, j) == <<Order(n)[j], target[n]>>
 
-\* A timer claim never waits: NOWAIT on the instance row, SKIP LOCKED on the
-\* timer row. It gives the attempt up and defers instead of blocking.
-FirstIsTry(n) == kind[n] = "timer"
+\* Neither the timer claim nor the work-item claim ever waits for its first
+\* lock: NOWAIT on the instance row, SKIP LOCKED on the work-item row. They
+\* give the attempt up rather than queue.
+FirstIsTry(n) == kind[n] \in {"timer", "claim"}
 
 TypeOK ==
     /\ lock \in [Resources -> Nodes \cup {NoOne}]
-    /\ pc \in [Nodes -> 0..(Last + 1)]
-    /\ kind \in [Nodes -> {"complete", "timer"}]
+    /\ pc \in [Nodes -> 0..(MaxLen + 1)]
+    /\ kind \in [Nodes -> Kinds]
     /\ target \in [Nodes -> Instances]
 
 Init ==
     /\ lock = [r \in Resources |-> NoOne]
     /\ pc = [n \in Nodes |-> 0]
-    /\ kind \in [Nodes -> {"complete", "timer"}]
+    /\ kind \in [Nodes -> Kinds]
     /\ target \in [Nodes -> Instances]
 
 \* Begin a transaction: pick what this node is doing and which instance.
 Begin(n) ==
     /\ pc[n] = 0
-    /\ \E k \in {"complete", "timer"}, i \in Instances :
+    /\ \E k \in Kinds, i \in Instances :
         /\ kind' = [kind EXCEPT ![n] = k]
         /\ target' = [target EXCEPT ![n] = i]
     /\ pc' = [pc EXCEPT ![n] = 1]
@@ -129,14 +139,14 @@ GiveUp(n) ==
 \* Every subsequent lock is taken blocking: this action is simply not
 \* enabled while another node holds the row. That is what can deadlock.
 AcquireNext(n) ==
-    /\ pc[n] \in 2..Last
+    /\ pc[n] \in 2..LastOf(n)
     /\ lock[Res(n, pc[n])] = NoOne
     /\ lock' = [lock EXCEPT ![Res(n, pc[n])] = n]
     /\ pc' = [pc EXCEPT ![n] = pc[n] + 1]
     /\ UNCHANGED <<kind, target>>
 
 Commit(n) ==
-    /\ pc[n] = Last + 1
+    /\ pc[n] = LastOf(n) + 1
     /\ lock' = [r \in Resources |-> IF lock[r] = n THEN NoOne ELSE lock[r]]
     /\ pc' = [pc EXCEPT ![n] = 0]
     /\ UNCHANGED <<kind, target>>
@@ -158,21 +168,34 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 -----------------------------------------------------------------------------
 
 (***************************************************************************)
-(* The engine's stated invariant: "the one lock order engine-wide           *)
-(* (instance row, then item row)". Nobody ever holds an item/timer row lock *)
-(* without already holding its instance row lock.                           *)
+(* What the engine actually guarantees, and the only thing that has to be   *)
+(* true to rule out a cycle: **no transaction holds a per-instance row      *)
+(* while it still needs that instance's row lock.**                         *)
+(*                                                                          *)
+(* The obvious stronger phrasing — "nobody holds a per-instance row without *)
+(* holding the instance row" — is FALSE of the shipped engine, and this     *)
+(* spec asserted it for a while. `get_task` and the worker's `work_once`    *)
+(* both run `... for update of w skip locked` on a work-item row with no    *)
+(* instance lock at all (the `claim` kind here). That is safe because such  *)
+(* a transaction never goes on to want the instance row, which is exactly   *)
+(* what this invariant says and the stronger one confused with it.          *)
 (***************************************************************************)
-SingleLockOrder ==
-    \A i \in Instances, k \in Range(RowOrder) :
-        lock[<<k, i>>] # NoOne =>
-            lock[<<"inst", i>>] = lock[<<k, i>>]
+HoldsSomeRow(n) ==
+    \E k \in Range(RowOrder) : lock[<<k, target[n]>>] = n
+
+StillNeedsInstance(n) ==
+    /\ pc[n] \in 1..LastOf(n)
+    /\ \E j \in pc[n]..LastOf(n) : Order(n)[j] = "inst"
+
+NeverHoldsRowsWhileNeedingInstance ==
+    \A n \in Nodes : ~(HoldsSomeRow(n) /\ StillNeedsInstance(n))
 
 (***************************************************************************)
 (* Deadlock freedom is checked by TLC directly (a state with no successor). *)
 (* This is the redundant, explicit form: no node is ever stuck holding one  *)
 (* row while another node holds the row it needs and is itself blocked.     *)
 (***************************************************************************)
-Blocked(n) == pc[n] \in 2..Last /\ lock[Res(n, pc[n])] # NoOne
+Blocked(n) == pc[n] \in 2..LastOf(n) /\ lock[Res(n, pc[n])] # NoOne
 NoWaitCycle ==
     ~ (\E n, m \in Nodes :
         /\ n # m

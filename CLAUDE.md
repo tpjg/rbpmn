@@ -59,7 +59,7 @@ inclusive gateway, block structure, messages-only interaction, build order).
 - `just parity` — MUST stay green: byte-parity of native Rust vs WASM lint
   output over the corpus, plus the bpmnlint plugin's pipeline test.
 - `just tla` — TLA+ model checking of the concurrency protocol (`spec/`).
-  Eight configs; four are *expected* to fail, each matched against the
+  Eleven configs; six are *expected* to fail, each matched against the
   specific violation it demonstrates (a spec that stops parsing must not read
   as "fails as expected"). Two reproduce bugs that were real. The lock order
   is checked at two arities. Needs java; the jar is pinned and
@@ -86,6 +86,8 @@ So: **touching any of these means re-reading `spec/` and re-running
 - the scheduler's claim path (`try_fire`) — pick, NOWAIT, re-check
 - what scope teardown reaps (`step.rs::tear_down_scope`) — specifically that
   a reaped token's arms are withdrawn *with* it
+- retention's plan/archive/execute split, the DUE re-check under the row
+  lock, or how the truncation floor is advanced (`retention.rs`)
 
 Each of those sites carries a comment naming the spec and the property. Two
 distinctions the models make that prose kept blurring, worth knowing before

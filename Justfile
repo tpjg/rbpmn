@@ -42,7 +42,7 @@ parity: wasm
 # on a developer's machine and would make past hold/fail verdicts
 # irreproducible. To move to a new TLA+ release, bump both constants — the
 # recipe refuses to run on a mismatch rather than trusting the download.
-# Four of the eight configs are EXPECTED to fail — they are the
+# Six of the eleven configs are EXPECTED to fail — they are the
 # counterexamples that show the checks have teeth, and two of them
 # reproduce bugs that were real (the AB/BA timer-claim sketch, and the
 # phase-6 scope teardown that left a timer row behind).
@@ -106,6 +106,9 @@ tla:
     # LockOrder, where the flag is deliberately absent.
     check "timer claim vs scope teardown"     TimerTeardown.cfg       TimerTeardown.tla hold "" -deadlock
     check "teardown leaving a timer behind"   TimerTeardown_Buggy.cfg TimerTeardown.tla fail "Invariant NeverFiredADanglingTimer is violated" -deadlock
+    check "retention: floor and the archive gap" Retention.cfg              Retention.tla hold "" -deadlock
+    check "retention: floor from the plan"       Retention_FloorFromPlan.cfg Retention.tla fail "Invariant FloorIsSomethingDeleted is violated" -deadlock
+    check "retention: no DUE re-check"           Retention_NoRecheck.cfg     Retention.tla fail "Invariant OnlyDueRecordsDeleted is violated" -deadlock
 
 # Differential the FEEL subset against dsntk (the DMN-TCK-verified reference):
 # every condition we accept must evaluate identically there. Outside the
