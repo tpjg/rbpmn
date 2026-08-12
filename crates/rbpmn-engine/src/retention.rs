@@ -1,19 +1,26 @@
 //! Retention (phase 7): the bounded deletion of history, and nothing else.
 //!
-//! **Retirement is two-stage, and only the second stage destroys anything.**
-//! Runtime retention deletes an instance's *children* — tokens, work items,
-//! timers, subscriptions, scopes — and stamps `pruned_at`. That is what
-//! reclaims the hot working set (the tables carrying the claim, due and
-//! correlate indexes); the instance row itself survives as the header of its
-//! own history. History retention then deletes the row and its events
-//! together, as one record, after the archive sink (if any) has been handed
-//! a complete copy. So an event never outlives its instance row, which keeps
-//! `inspect_instance` working across the whole history window and makes
-//! "is this definition still referenced?" a single indexed lookup.
+//! **A record retires whole.** One age per definition; the instance row, its
+//! children and its events go together, in one transaction, after the archive
+//! sink (if any) has been handed a complete copy. A two-stage design was
+//! built first — retire the children early, keep the record as its own
+//! history header — and then collapsed on measurement: a completed instance
+//! emits tens of events against a handful of work items, and its tokens,
+//! timers, subscriptions and scopes are already gone (completion removes
+//! them), so the early stage reclaimed roughly a tenth of the footprint in
+//! exchange for a column, a partial index, a guard on the hot step path, a
+//! second planner, and a narrowed idempotency contract. Events dominate that
+//! arithmetic completely, and long histories belong in the archive rather
+//! than in Postgres.
 //!
-//! **Three phases, and the middle one holds no transaction.** A pass is
-//! `plan` → `archive` → `execute`. The archive call reaches an object store
-//! over the network, and *any* open transaction holds back
+//! Collapsing it also let `rbpmn_event.instance_id` become a real foreign
+//! key (`on delete cascade`, migration 0007). "An event never outlives its
+//! instance" is no longer an invariant this codebase asserts and tests — it
+//! is one the database will not let it break.
+//!
+//! **Two phases, and the gap between them holds no transaction.** A pass is
+//! `plan` → `execute`, with the archive call in between. The sink reaches an
+//! object store over the network, and *any* open transaction holds back
 //! `pg_snapshot_xmin` — which is cluster-wide, and which is exactly what the
 //! event stream's safe horizon is built on. A sink call inside the deletion
 //! transaction would stall every tailing consumer in the cluster for the
@@ -23,50 +30,42 @@
 //! forever if a pass were cancelled mid-flight) — the same "a lease is a row
 //! value, never an open transaction" rule the task API already follows.
 //!
-//! What makes a three-phase pass safe across the gap is that **retention
-//! only ever selects immutable data**: a terminal instance cannot become
-//! non-terminal, and its events are append-only and closed. The planned set
-//! therefore cannot change under the archive call, so `execute` needs no
-//! reconciliation — only a re-check under the row lock, which it does anyway.
+//! What makes the gap safe is that **retention only ever selects immutable
+//! data**: a terminal instance cannot become non-terminal, and its events are
+//! append-only and closed. The planned set cannot change under the archive
+//! call, so [`Engine::execute_retention`] needs no reconciliation — only a
+//! re-check under the row lock, which it does anyway.
 //!
 //! Failure modes, stated rather than discovered:
 //!
-//! - **The sink fails → nothing is deleted.** No archive, no deletion, ever.
-//!   Storage grows until the sink is fixed; that is the correct bias.
+//! - **The sink fails → nothing is deleted.** No archive, no deletion, ever —
+//!   on *every* path, because `execute_retention` runs the sink itself rather
+//!   than trusting its caller to have done so.
 //! - **The sink succeeds, then the process dies → the batch is archived
-//!   again next pass.** Export is **at-least-once**; every record carries
-//!   its instance id, so an object-per-instance layout makes the retry an
+//!   again next pass.** Export is **at-least-once**; every record carries its
+//!   instance id, so an object-per-instance layout makes the retry an
 //!   idempotent overwrite. Two sweepers whose leases overlap have the same
 //!   effect.
 //!
-//! **What retention will not do.** It never touches an active instance
-//! (rows or events). It never touches a `failed` one at any age — an
-//! incident is frozen evidence and a repair target, and a sweep that tidied
-//! it away would destroy both. It never deletes a definition, because an
-//! automatic sweep is justified by unbounded growth and by nothing else:
-//! definitions grow with deployments, not throughput, and a deleted
-//! definition turns an archive into a pile of element ids. Definitions go
-//! only through [`Engine::delete_definition`], named one at a time, guarded.
-//! And retention writes nothing to the event stream — it would grow what it
-//! prunes and inject rows for instances that no longer exist.
+//! **What retention will not do.** It never touches an active instance. It
+//! never touches a `failed` one at any age — an incident is frozen evidence
+//! and a repair target, and a sweep that tidied it away would destroy both.
+//! It never deletes a definition, because an automatic sweep is justified by
+//! unbounded growth and by nothing else: definitions grow with deployments,
+//! not throughput, and a deleted definition turns an archive into a pile of
+//! element ids. Definitions go only through [`Engine::delete_definition`],
+//! named one at a time, guarded. And retention writes nothing to the event
+//! stream — it would grow what it prunes and inject rows for instances that
+//! no longer exist.
 //!
-//! **One contract does narrow, and it is worth knowing.** Completing or
-//! failing an already-closed work item is normally an idempotent no-op
-//! (`Completion::AlreadyClosed`) rather than an error, because handlers are
-//! at-least-once and a late retry must not look like a fault. Once runtime
-//! retention has retired that instance's children the row is gone, so the
-//! same late retry gets `UnknownWorkItem` instead. `retain_runtime` is
-//! therefore also the window in which a straggling worker can still
-//! recognise its own completed work — set it comfortably longer than any
-//! handler's retry horizon.
-//!
-//! Because eligibility is evaluated **per instance**, a wedged instance
-//! never blocks its neighbours' retirement. The tempting alternative — a
-//! global watermark at "the oldest event of any non-terminal instance" — is
-//! one number, trivially safe, and permanently jammed by a single stuck
-//! instance until the disk fills.
+//! Because eligibility is evaluated **per instance**, a wedged instance never
+//! blocks its neighbours' retirement. The tempting alternative — a global
+//! watermark at "the oldest event of any non-terminal instance" — is one
+//! number, trivially safe, and permanently jammed by a single stuck instance
+//! until the disk fills.
 
 use crate::events::{EventCursor, EventRecord};
+use crate::runtime::ts;
 use crate::{Engine, EngineError};
 use sqlx::{PgConnection, Row};
 use std::future::Future;
@@ -74,58 +73,50 @@ use std::pin::Pin;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// How long each stage of a record is kept, measured from `completed_at`.
-/// `None` means forever — the default for everything, because deleting data
-/// is opted into, never inherited.
+/// Seconds are stored as `bigint`, so a duration must fit one. Rejected at
+/// construction rather than cast: `Duration::MAX.as_secs() as i64` is `-1`,
+/// which turns `now() - interval` into a cutoff in the *future* and deletes
+/// every terminal record on the next sweep. "Forever" is spelled `None`.
+const MAX_RETAIN_SECS: u64 = i64::MAX as u64;
+
+/// How long a completed record is kept, measured from `completed_at`.
+/// Constructed only through [`RetentionPolicy::new`] and
+/// [`RetentionPolicy::forever`] — the field is private so the validation
+/// cannot be walked around with a struct literal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
-    /// How long an instance keeps its runtime children (tokens, work items,
-    /// timers, subscriptions, scopes). Reclaims query latency.
-    pub retain_runtime: Option<Duration>,
-    /// How long the record itself — instance header, variables, events —
-    /// is kept. Reclaims storage, and is the only stage that destroys the
-    /// sole copy of anything, so it is the one the archive hook covers.
-    pub retain_history: Option<Duration>,
+    retain: Option<Duration>,
 }
 
 impl RetentionPolicy {
-    /// Keep everything, forever. An explicit and entirely valid choice.
+    /// Keep everything, forever. An explicit and entirely valid choice, and
+    /// the default for everything: deleting data is opted into, never
+    /// inherited.
     pub fn forever() -> Self {
-        RetentionPolicy {
-            retain_runtime: None,
-            retain_history: None,
-        }
+        RetentionPolicy { retain: None }
     }
 
-    /// Rejects `retain_runtime > retain_history`: pruning children *after*
-    /// the record they belong to has been deleted is not a policy, it is a
-    /// typo. `retain_runtime: None` with a finite history is allowed and
-    /// coherent — "never prune early, drop the whole record at the end" —
-    /// because history retention deletes children too.
-    pub fn new(
-        retain_runtime: Option<Duration>,
-        retain_history: Option<Duration>,
-    ) -> Result<Self, EngineError> {
-        if let (Some(runtime), Some(history)) = (retain_runtime, retain_history)
-            && runtime > history
+    /// Keep records for `retain` past completion. `None` means forever.
+    pub fn new(retain: Option<Duration>) -> Result<Self, EngineError> {
+        if let Some(d) = retain
+            && d.as_secs() > MAX_RETAIN_SECS
         {
             return Err(EngineError::InvalidRetentionPolicy(format!(
-                "retain_runtime ({runtime:?}) is longer than retain_history ({history:?}) — \
-                 the children would outlive the record they belong to"
+                "retention age {d:?} is out of range (at most {MAX_RETAIN_SECS} seconds) — \
+                 spell 'keep forever' as None, never as a very large duration"
             )));
         }
-        Ok(RetentionPolicy {
-            retain_runtime,
-            retain_history,
-        })
+        Ok(RetentionPolicy { retain })
     }
 
-    fn runtime_secs(&self) -> Option<i64> {
-        self.retain_runtime.map(|d| d.as_secs() as i64)
+    /// The configured age; `None` is forever.
+    pub fn retain(&self) -> Option<Duration> {
+        self.retain
     }
 
-    fn history_secs(&self) -> Option<i64> {
-        self.retain_history.map(|d| d.as_secs() as i64)
+    fn secs(&self) -> Option<i64> {
+        // Lossless: the constructor refused anything wider.
+        self.retain.map(|d| d.as_secs() as i64)
     }
 }
 
@@ -139,13 +130,13 @@ pub struct RetentionOptions {
     pub default_policy: RetentionPolicy,
     /// How long to wait after a pass that found nothing.
     pub sweep_interval: Duration,
-    /// Instances considered per pass, per stage.
+    /// Instances considered per pass.
     pub max_instances: u32,
     /// Soft ceiling on events archived+deleted per pass. Never splits an
     /// instance: a record is archived whole or not at all.
     pub max_events: u32,
-    /// How long a pass's claim on the sweep is held. A pass that overruns
-    /// it may be joined by another node — which costs a duplicate archive
+    /// How long a pass's claim on the sweep is held. A pass that overruns it
+    /// may be joined by another node — which costs a duplicate archive
     /// upload, never a lost or double deletion.
     pub lease_ttl: Duration,
 }
@@ -204,7 +195,6 @@ pub struct InstanceRecord {
     pub variables: serde_json::Value,
     pub created_at: String,
     pub completed_at: Option<String>,
-    pub pruned_at: Option<String>,
     /// The instance's full history, ascending by `id` — which is its
     /// semantic order (see the [`crate::events`] contract).
     pub events: Vec<EventRecord>,
@@ -227,27 +217,21 @@ impl ArchiveBatch {
     }
 }
 
-/// What one pass proposes to do. Produced by [`Engine::plan_retention`],
-/// consumed by [`Engine::execute_retention`], with the archive in between.
+/// What one pass proposes to delete. Produced by [`Engine::plan_retention`],
+/// consumed by [`Engine::execute_retention`].
 #[derive(Debug, Clone, Default)]
 pub struct RetentionBatch {
-    runtime_prune: Vec<Uuid>,
-    history: ArchiveBatch,
+    records: ArchiveBatch,
 }
 
 impl RetentionBatch {
     pub fn is_empty(&self) -> bool {
-        self.runtime_prune.is_empty() && self.history.is_empty()
+        self.records.is_empty()
     }
 
-    /// Instances whose children this pass would retire (the record stays).
-    pub fn runtime_prune(&self) -> &[Uuid] {
-        &self.runtime_prune
-    }
-
-    /// The records this pass would delete outright — what to archive.
-    pub fn history(&self) -> &ArchiveBatch {
-        &self.history
+    /// The records this pass would delete — what gets archived.
+    pub fn records(&self) -> &ArchiveBatch {
+        &self.records
     }
 }
 
@@ -255,9 +239,6 @@ impl RetentionBatch {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetentionReport {
-    /// Instances whose children were retired; the record survives.
-    pub instances_pruned: u64,
-    /// Records deleted outright.
     pub instances_deleted: u64,
     pub events_deleted: u64,
     /// The truncation floor after the pass.
@@ -268,7 +249,7 @@ impl RetentionReport {
     /// Did this pass move anything? Drives the sweeper's sleep, exactly as
     /// `Drain` drives the scheduler's.
     pub fn moved(&self) -> bool {
-        self.instances_pruned > 0 || self.instances_deleted > 0
+        self.instances_deleted > 0
     }
 }
 
@@ -279,56 +260,65 @@ pub struct PrunableDefinition {
     pub definition_id: Uuid,
     pub key: String,
     pub version: i32,
-    /// Instance rows still referencing it — live, terminal or pruned. Each
-    /// one is either runtime state or a history record, and both need the
-    /// definition to be intelligible.
+    /// Instance rows still referencing it. Each is either live runtime state
+    /// or a retained history record, and both need the definition to be
+    /// intelligible.
     pub instances: i64,
     /// `None` when the version is safe to delete.
     pub blocked_by: Option<String>,
 }
 
-/// Timestamp rendering shared with the event stream: RFC 3339, UTC,
-/// microsecond precision, database time.
-const TS: &str = "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'";
-
-fn ts(column: &str, alias: &str) -> String {
-    format!("to_char({column} at time zone 'UTC', {TS}) as {alias}")
-}
+/// The one eligibility predicate, shared by the planner and nothing else —
+/// but written once so the two places it is interpolated cannot drift.
+/// `case when p.definition_key is null` and **not** `coalesce`: a null column
+/// means *forever*, which is a policy, while a missing row means *no
+/// override*. Coalescing conflates them, and the key that asked to keep its
+/// history forever silently inherits the sweeper's default — the one way this
+/// feature could delete data nobody asked it to.
+const DUE: &str = "i.status in ('completed', 'terminated') \
+     and i.completed_at is not null \
+     and (case when p.definition_key is null then $1 else p.retain_secs end) is not null \
+     and i.completed_at < now() - make_interval(secs => \
+           (case when p.definition_key is null then $1 else p.retain_secs end)::double precision)";
 
 impl Engine {
     /// The current truncation floor: everything at or below it may have been
     /// deleted. A consumer that has been away resumes here after a
     /// [`EngineError::CursorTruncated`].
     pub async fn retention_floor(&self) -> Result<EventCursor, EngineError> {
-        let row = sqlx::query("select txid::text::bigint as txid, id from rbpmn_retention_floor")
-            .fetch_one(self.pool())
-            .await?;
-        Ok(EventCursor {
-            txid: row.get("txid"),
-            id: row.get("id"),
-        })
+        let mut conn = self.pool().acquire().await?;
+        read_floor(&mut conn).await
     }
 
-    /// Set (or clear) the policy for one definition key. Keyed by key, not
-    /// version — retention is operational, not semantic. Idempotent.
+    /// Set the policy for one definition key. Keyed by key, not version —
+    /// retention is operational, not semantic. Idempotent.
+    ///
+    /// Refuses a key that has never been deployed. A typo'd key would
+    /// otherwise be stored happily while the sweeper's default kept deleting
+    /// the very history the call meant to protect — "seems to run", which is
+    /// what deploy-time validation exists to prevent everywhere else.
     pub async fn set_retention_policy(
         &self,
         definition_key: &str,
         policy: RetentionPolicy,
     ) -> Result<(), EngineError> {
         crate::runtime::reject_nul_text(definition_key, "definition key")?;
+        let known: bool =
+            sqlx::query_scalar("select exists (select 1 from rbpmn_definition where key = $1)")
+                .bind(definition_key)
+                .fetch_one(self.pool())
+                .await?;
+        if !known {
+            return Err(EngineError::UnknownDefinition(definition_key.to_string()));
+        }
         sqlx::query(
-            "insert into rbpmn_retention_policy \
-                 (definition_key, retain_runtime_secs, retain_history_secs) \
-             values ($1, $2, $3) \
+            "insert into rbpmn_retention_policy (definition_key, retain_secs) \
+             values ($1, $2) \
              on conflict (definition_key) do update \
-                 set retain_runtime_secs = excluded.retain_runtime_secs, \
-                     retain_history_secs = excluded.retain_history_secs, \
-                     updated_at = now()",
+                 set retain_secs = excluded.retain_secs, updated_at = now()",
         )
         .bind(definition_key)
-        .bind(policy.runtime_secs())
-        .bind(policy.history_secs())
+        .bind(policy.secs())
         .execute(self.pool())
         .await?;
         Ok(())
@@ -339,20 +329,27 @@ impl Engine {
         &self,
         definition_key: &str,
     ) -> Result<Option<RetentionPolicy>, EngineError> {
-        let row = sqlx::query(
-            "select retain_runtime_secs, retain_history_secs from rbpmn_retention_policy \
-             where definition_key = $1",
-        )
-        .bind(definition_key)
-        .fetch_optional(self.pool())
-        .await?;
-        Ok(row.map(|r| RetentionPolicy {
-            retain_runtime: r
-                .get::<Option<i64>, _>("retain_runtime_secs")
-                .map(|s| Duration::from_secs(s.max(0) as u64)),
-            retain_history: r
-                .get::<Option<i64>, _>("retain_history_secs")
-                .map(|s| Duration::from_secs(s.max(0) as u64)),
+        let row =
+            sqlx::query("select retain_secs from rbpmn_retention_policy where definition_key = $1")
+                .bind(definition_key)
+                .fetch_optional(self.pool())
+                .await?;
+        let Some(row) = row else { return Ok(None) };
+        let secs: Option<i64> = row.get("retain_secs");
+        // A negative age would be a cutoff in the future — "delete
+        // everything, now". Refuse it rather than clamp: a stored value this
+        // wrong means something bypassed the constructor and the CHECK, and
+        // guessing what it meant is exactly the silent reinterpretation this
+        // engine refuses.
+        if let Some(s) = secs
+            && s < 0
+        {
+            return Err(EngineError::InvalidRetentionPolicy(format!(
+                "stored retention age for '{definition_key}' is negative ({s}s)"
+            )));
+        }
+        Ok(Some(RetentionPolicy {
+            retain: secs.map(|s| Duration::from_secs(s as u64)),
         }))
     }
 
@@ -363,82 +360,62 @@ impl Engine {
     /// a sink is registered: a plan that reported different content depending
     /// on hidden engine state would be a poor thing to hand an operator
     /// driving `plan`/`execute` from their own job runner.
-    /// [`RetentionOptions::max_events`] is what keeps that affordable.
+    /// [`RetentionOptions::max_events`] is what keeps that affordable, and
+    /// the load is three set-based queries regardless of batch size.
     pub async fn plan_retention(
         &self,
         options: &RetentionOptions,
     ) -> Result<RetentionBatch, EngineError> {
         let mut conn = self.pool().acquire().await?;
-        let history = plan_history(&mut conn, options).await?;
-        let doomed: std::collections::HashSet<Uuid> =
-            history.instances.iter().map(|i| i.id).collect();
-        // An instance can be due for both stages at once (equal ages, or a
-        // first sweep after a long silence). Retiring the children of a
-        // record this same pass is about to delete outright is pure work,
-        // and it would double-count it in the report.
-        let runtime_prune: Vec<Uuid> = plan_runtime(&mut conn, options)
-            .await?
-            .into_iter()
-            .filter(|id| !doomed.contains(id))
-            .collect();
         Ok(RetentionBatch {
-            runtime_prune,
-            history,
+            records: plan_due(&mut conn, options).await?,
         })
     }
 
-    /// Phase three: the short transaction. Re-checks every instance under
-    /// its row lock (`skip locked` — an instance being stepped right now is
-    /// left for the next pass, never an error), deletes, and advances the
-    /// floor to the highest `(txid, id)` it actually removed.
+    /// Phase two: archive, then the short transaction. Re-checks every
+    /// instance under its row lock (`skip locked` — an instance being stepped
+    /// right now is left for the next pass, never an error), deletes, and
+    /// advances the floor to the highest `(txid, id)` it actually removed.
+    ///
+    /// Runs the archive sink itself rather than trusting the caller to have
+    /// done so: this is a public entry point, and "no archive, no deletion"
+    /// has to be a property of the code rather than of the calling
+    /// convention. The sink is invoked *before* the transaction opens, so the
+    /// no-transaction-across-the-network rule is preserved.
     pub async fn execute_retention(
         &self,
         batch: &RetentionBatch,
     ) -> Result<RetentionReport, EngineError> {
+        self.run_archive(batch.records()).await?;
+
+        let ids: Vec<Uuid> = batch.records.instances.iter().map(|i| i.id).collect();
         let mut tx = self.pool().begin().await?;
         let mut report = RetentionReport::default();
-
-        if !batch.runtime_prune.is_empty() {
-            let ids: Vec<Uuid> = sqlx::query_scalar(
-                "select id from rbpmn_instance \
-                 where id = any($1) and pruned_at is null \
-                   and status in ('completed', 'terminated') \
-                 for update skip locked",
-            )
-            .bind(&batch.runtime_prune)
-            .fetch_all(&mut *tx)
-            .await?;
-            if !ids.is_empty() {
-                report.instances_pruned = prune_children(&mut tx, &ids).await?;
-            }
-        }
-
-        let history_ids: Vec<Uuid> = batch.history.instances.iter().map(|i| i.id).collect();
-        if !history_ids.is_empty() {
-            let ids: Vec<Uuid> = sqlx::query_scalar(
+        if !ids.is_empty() {
+            let locked: Vec<Uuid> = sqlx::query_scalar(
                 "select id from rbpmn_instance \
                  where id = any($1) and status in ('completed', 'terminated') \
                  for update skip locked",
             )
-            .bind(&history_ids)
+            .bind(&ids)
             .fetch_all(&mut *tx)
             .await?;
-            if !ids.is_empty() {
-                let (events, instances) = delete_records(&mut tx, &ids).await?;
+            if !locked.is_empty() {
+                let (events, instances) = delete_records(&mut tx, &locked).await?;
                 report.events_deleted = events;
                 report.instances_deleted = instances;
             }
         }
-
         report.floor = read_floor(&mut tx).await?;
         tx.commit().await?;
         Ok(report)
     }
 
-    /// One complete pass: claim the lease, plan, archive, execute. Returns
-    /// an empty report when another node holds the lease or nothing is due.
-    /// Deterministic and side-effect-complete — the unit tests drive this,
-    /// and so can a cron job that would rather not run a daemon.
+    /// One complete pass: claim the lease, plan, archive, execute. Returns an
+    /// empty report (carrying the real floor) when another node holds the
+    /// lease or nothing is due. Deterministic and side-effect-complete — the
+    /// tests drive this, and so can a cron job that would rather not run a
+    /// daemon.
     pub async fn sweep_retention_once(
         &self,
         options: &RetentionOptions,
@@ -467,10 +444,8 @@ impl Engine {
         if batch.is_empty() {
             return self.idle_report().await;
         }
-        self.run_archive(batch.history()).await?;
         let report = self.execute_retention(&batch).await?;
         tracing::info!(
-            pruned = report.instances_pruned,
             deleted = report.instances_deleted,
             events = report.events_deleted,
             floor_txid = report.floor.txid,
@@ -491,8 +466,8 @@ impl Engine {
         })
     }
 
-    /// Hand a batch to the archive sink, if one is registered. Any failure
-    /// is fatal to the pass: no archive, no deletion.
+    /// Hand a batch to the archive sink, if one is registered. Any failure is
+    /// fatal to the pass: no archive, no deletion.
     async fn run_archive(&self, batch: &ArchiveBatch) -> Result<(), EngineError> {
         if batch.is_empty() {
             return Ok(());
@@ -516,7 +491,10 @@ impl Engine {
                 Ok(_) => options.sweep_interval,
                 Err(e) => {
                     tracing::warn!(error = %e, "retention pass failed; backing off");
-                    options.sweep_interval.min(Duration::from_secs(60))
+                    // At *least* the idle interval, never less: a failing
+                    // pass still runs a full plan, and retrying it more often
+                    // than a healthy idle pass is not what backing off means.
+                    options.sweep_interval.max(ERROR_BACKOFF)
                 }
             };
             tokio::time::sleep(wait.max(Duration::from_secs(1))).await;
@@ -560,21 +538,24 @@ impl Engine {
     /// Refuses an active instance; terminate it first.
     pub async fn delete_instance(&self, id: Uuid) -> Result<RetentionReport, EngineError> {
         let mut conn = self.pool().acquire().await?;
-        let record = load_record(&mut conn, id)
+        let record = load_records(&mut conn, &[id])
             .await?
+            .pop()
             .ok_or(EngineError::UnknownInstance(id))?;
         if record.status == "active" {
             return Err(EngineError::InstanceStillActive(id));
         }
         drop(conn);
 
-        let batch = ArchiveBatch {
+        self.run_archive(&ArchiveBatch {
             instances: vec![record],
-        };
-        self.run_archive(&batch).await?;
+        })
+        .await?;
 
         let mut tx = self.pool().begin().await?;
-        // Same lock order as every other path: the instance row first.
+        // Same lock order as every other path: the instance row first. It is
+        // terminal, so no step path contends for it; at worst a sweep's own
+        // short delete transaction holds it for a moment.
         let locked: Option<Uuid> =
             sqlx::query_scalar("select id from rbpmn_instance where id = $1 for update")
                 .bind(id)
@@ -613,9 +594,8 @@ impl Engine {
                     instances,
                     blocked_by: (instances > 0).then(|| {
                         format!(
-                            "{instances} instance(s) still reference it (live, terminal or \
-                             pruned — each is runtime state or a history record, and both \
-                             need the definition to be intelligible)"
+                            "{instances} instance(s) still reference it — live runtime state or \
+                             retained history, and both need the definition to be intelligible"
                         )
                     }),
                 }
@@ -624,15 +604,14 @@ impl Engine {
     }
 
     /// Delete one definition version. Never automatic: definitions grow with
-    /// deployments, not throughput, so there is no growth to justify the
-    /// risk — only the risk of turning an archive into a pile of element
-    /// ids. Refuses while anything still references it.
+    /// deployments, not throughput, so there is no growth to justify the risk
+    /// — only the risk of turning an archive into a pile of element ids.
+    /// Refuses while anything still references it.
     ///
     /// Checking instance rows is sufficient to prove no events reference it:
-    /// history retention deletes an instance's events *with* its row, in one
-    /// transaction, so an event never outlives its instance. That invariant
-    /// is what keeps this an indexed lookup instead of a scan of the largest
-    /// table in the schema (the fsck asserts it).
+    /// `rbpmn_event.instance_id` is a foreign key with `on delete cascade`,
+    /// so an event cannot outlive its instance. That is what keeps this an
+    /// indexed lookup instead of a scan of the largest table in the schema.
     pub async fn delete_definition(&self, key: &str, version: i32) -> Result<(), EngineError> {
         let mut tx = self.pool().begin().await?;
         let row = sqlx::query("select id from rbpmn_definition where key = $1 and version = $2")
@@ -676,60 +655,30 @@ impl Engine {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        // The compiled-process cache is documented as bounded by deploys.
+        // Deleting a definition without evicting it would quietly break that
+        // bound: one leaked `ExecutableProcess` per deleted version, forever.
+        self.forget_compiled(definition_id);
         Ok(())
     }
 }
 
-/// Instances whose children are due for retirement.
-async fn plan_runtime(
-    conn: &mut PgConnection,
-    options: &RetentionOptions,
-) -> Result<Vec<Uuid>, EngineError> {
-    // `case when p.definition_key is null` and **not** `coalesce`: a null
-    // column means *forever*, which is a policy, while a missing row means
-    // *no override*. Coalescing conflates them, and the key that asked to
-    // keep its history forever silently inherits the sweeper's default —
-    // the one way this feature could delete data nobody asked it to.
-    sqlx::query_scalar(
-        "select i.id from rbpmn_instance i \
-         left join rbpmn_retention_policy p on p.definition_key = i.definition_key \
-         where i.status in ('completed', 'terminated') \
-           and i.pruned_at is null \
-           and i.completed_at is not null \
-           and (case when p.definition_key is null then $1 \
-                     else p.retain_runtime_secs end) is not null \
-           and i.completed_at < now() - make_interval(secs => \
-                 (case when p.definition_key is null then $1 \
-                       else p.retain_runtime_secs end)::double precision) \
-         order by i.completed_at limit $2",
-    )
-    .bind(options.default_policy.runtime_secs())
-    .bind(i64::from(options.max_instances))
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(EngineError::from)
-}
+/// A failing pass waits at least this long, on top of the sweep interval.
+const ERROR_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Records due for deletion, materialised whole. Bounded by both instance
-/// and event count, and never splitting an instance — an archived record is
-/// complete or absent.
-async fn plan_history(
+/// Records due for deletion, materialised whole. Bounded by both instance and
+/// event count, and never splitting an instance — an archived record is
+/// complete or absent. Three set-based queries, whatever the batch size.
+async fn plan_due(
     conn: &mut PgConnection,
     options: &RetentionOptions,
 ) -> Result<ArchiveBatch, EngineError> {
-    let candidates: Vec<Uuid> = sqlx::query_scalar(
+    let candidates: Vec<Uuid> = sqlx::query_scalar(&format!(
         "select i.id from rbpmn_instance i \
          left join rbpmn_retention_policy p on p.definition_key = i.definition_key \
-         where i.status in ('completed', 'terminated') \
-           and i.completed_at is not null \
-           and (case when p.definition_key is null then $1 \
-                     else p.retain_history_secs end) is not null \
-           and i.completed_at < now() - make_interval(secs => \
-                 (case when p.definition_key is null then $1 \
-                       else p.retain_history_secs end)::double precision) \
-         order by i.completed_at limit $2",
-    )
-    .bind(options.default_policy.history_secs())
+         where {DUE} order by i.completed_at limit $2"
+    ))
+    .bind(options.default_policy.secs())
     .bind(i64::from(options.max_instances))
     .fetch_all(&mut *conn)
     .await?;
@@ -764,101 +713,87 @@ async fn plan_history(
         chosen.push(id);
     }
 
-    let mut instances = Vec::with_capacity(chosen.len());
-    for id in chosen {
-        if let Some(record) = load_record(&mut *conn, id).await? {
-            instances.push(record);
-        }
-    }
-    Ok(ArchiveBatch { instances })
+    Ok(ArchiveBatch {
+        instances: load_records(&mut *conn, &chosen).await?,
+    })
 }
 
-/// One instance, header and history, exactly as it will be archived.
-async fn load_record(
+/// Headers and histories for a set of instances, in two queries rather than
+/// two per instance. Returned in the order given.
+async fn load_records(
     conn: &mut PgConnection,
-    id: Uuid,
-) -> Result<Option<InstanceRecord>, EngineError> {
-    let sql = format!(
+    ids: &[Uuid],
+) -> Result<Vec<InstanceRecord>, EngineError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let headers = sqlx::query(&format!(
         "select i.id, i.definition_key, d.version, i.business_key, i.status, i.variables, \
-                {}, {}, {} \
+                {}, {} \
          from rbpmn_instance i join rbpmn_definition d on d.id = i.definition_id \
-         where i.id = $1",
+         where i.id = any($1)",
         ts("i.created_at", "created_at"),
         ts("i.completed_at", "completed_at"),
-        ts("i.pruned_at", "pruned_at"),
-    );
-    let Some(row) = sqlx::query(&sql)
-        .bind(id)
-        .fetch_optional(&mut *conn)
-        .await?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(InstanceRecord {
-        id: row.get("id"),
-        definition_key: row.get("definition_key"),
-        definition_version: row.get("version"),
-        business_key: row.get("business_key"),
-        status: row.get("status"),
-        variables: row.get("variables"),
-        created_at: row.get("created_at"),
-        completed_at: row.get("completed_at"),
-        pruned_at: row.get("pruned_at"),
-        events: load_history(&mut *conn, id).await?,
-    }))
-}
+    ))
+    .bind(ids)
+    .fetch_all(&mut *conn)
+    .await?;
 
-/// An instance's events in semantic order — `id`, per the stream contract.
-async fn load_history(conn: &mut PgConnection, id: Uuid) -> Result<Vec<EventRecord>, EngineError> {
-    let sql = format!(
+    let event_rows = sqlx::query(&format!(
         "select id, txid::text::bigint as txid, instance_id, definition_key, kind, \
                 element_id, payload, {} \
-         from rbpmn_event where instance_id = $1 order by id",
+         from rbpmn_event where instance_id = any($1) order by instance_id, id",
         ts("at", "at"),
-    );
-    let rows = sqlx::query(&sql).bind(id).fetch_all(&mut *conn).await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| EventRecord {
+    ))
+    .bind(ids)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    // Ascending `id` per instance is the semantic order (the stream
+    // contract); the query's ORDER BY already delivers it that way.
+    let mut histories: std::collections::HashMap<Uuid, Vec<EventRecord>> =
+        std::collections::HashMap::new();
+    for r in event_rows {
+        let instance_id: Uuid = r.get("instance_id");
+        histories.entry(instance_id).or_default().push(EventRecord {
             id: r.get("id"),
             txid: r.get("txid"),
-            instance_id: r.get("instance_id"),
+            instance_id,
             definition_key: r.get("definition_key"),
             kind: r.get("kind"),
             element_id: r.get("element_id"),
             payload: r.get("payload"),
             at: r.get("at"),
-        })
-        .collect())
-}
-
-/// Retire the runtime children of already-locked instances; the records
-/// stay. Deleted explicitly rather than by cascade, because the cascade is
-/// reserved for deleting the record itself.
-async fn prune_children(conn: &mut PgConnection, ids: &[Uuid]) -> Result<u64, EngineError> {
-    for table in [
-        "rbpmn_work_item",
-        "rbpmn_timer",
-        "rbpmn_subscription",
-        "rbpmn_token",
-        "rbpmn_scope",
-    ] {
-        sqlx::query(&format!("delete from {table} where instance_id = any($1)"))
-            .bind(ids)
-            .execute(&mut *conn)
-            .await?;
+        });
     }
-    let pruned = sqlx::query("update rbpmn_instance set pruned_at = now() where id = any($1)")
-        .bind(ids)
-        .execute(&mut *conn)
-        .await?
-        .rows_affected();
-    Ok(pruned)
+
+    let mut by_id: std::collections::HashMap<Uuid, InstanceRecord> = headers
+        .into_iter()
+        .map(|row| {
+            let id: Uuid = row.get("id");
+            (
+                id,
+                InstanceRecord {
+                    id,
+                    definition_key: row.get("definition_key"),
+                    definition_version: row.get("version"),
+                    business_key: row.get("business_key"),
+                    status: row.get("status"),
+                    variables: row.get("variables"),
+                    created_at: row.get("created_at"),
+                    completed_at: row.get("completed_at"),
+                    events: histories.remove(&id).unwrap_or_default(),
+                },
+            )
+        })
+        .collect();
+    Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
 
-/// Delete records outright: events and instance rows together, floor
-/// advanced to the highest `(txid, id)` actually removed. Returns
-/// `(events, instances)`.
+/// Delete records outright, floor advanced to the highest `(txid, id)`
+/// actually removed. Returns `(events, instances)`. Events go by cascade from
+/// the instance row — the foreign key added in 0007 is what makes that both
+/// automatic and impossible to get wrong.
 async fn delete_records(conn: &mut PgConnection, ids: &[Uuid]) -> Result<(u64, u64), EngineError> {
     // The floor comes from the rows being deleted *now*, not from the plan:
     // `skip locked` may have dropped instances between the two, and a floor
@@ -870,13 +805,12 @@ async fn delete_records(conn: &mut PgConnection, ids: &[Uuid]) -> Result<(u64, u
     .bind(ids)
     .fetch_optional(&mut *conn)
     .await?;
+    let events: i64 =
+        sqlx::query_scalar("select count(*) from rbpmn_event where instance_id = any($1)")
+            .bind(ids)
+            .fetch_one(&mut *conn)
+            .await?;
 
-    let events = sqlx::query("delete from rbpmn_event where instance_id = any($1)")
-        .bind(ids)
-        .execute(&mut *conn)
-        .await?
-        .rows_affected();
-    // Children go with it, by cascade.
     let instances = sqlx::query("delete from rbpmn_instance where id = any($1)")
         .bind(ids)
         .execute(&mut *conn)
@@ -898,7 +832,7 @@ async fn delete_records(conn: &mut PgConnection, ids: &[Uuid]) -> Result<(u64, u
         .execute(&mut *conn)
         .await?;
     }
-    Ok((events, instances))
+    Ok((events.max(0) as u64, instances))
 }
 
 async fn read_floor(conn: &mut PgConnection) -> Result<EventCursor, EngineError> {

@@ -1,10 +1,16 @@
 //! Events: the single output of the semantic core.
 //!
 //! One list serves three purposes: it is the projection's to-do list (create
-//! this work-item row, mark the instance completed), the append-only history
-//! (filtered by configured history level at write time), and the golden
-//! trace the scenario fixtures assert line by line. The `Display` format is
-//! that golden format — stable, like rule IDs.
+//! this work-item row, mark the instance completed), the append-only history,
+//! and the golden trace the scenario fixtures assert line by line. The
+//! `Display` format is that golden format — stable, like rule IDs.
+//!
+//! Every event is written; nothing is filtered at write time. The brief's
+//! "history level" (per-definition event-kind filtering) is a roadmap item,
+//! deliberately not folded into retention: it changes the stream's
+//! *completeness* contract, because a consumer could no longer tell "did not
+//! happen" from "was not recorded". Retention makes a narrower claim — this
+//! was here, it was deleted, here is the floor.
 
 use crate::compile::{TimerDue, WorkKind};
 use crate::state::{SubscriptionId, TimerId, WorkItemId};

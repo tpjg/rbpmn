@@ -123,35 +123,56 @@ impl Engine {
                 "event page limit must be at least 1".to_string(),
             ));
         }
-        // A *resume* below the floor is a truncation and must be loud. A
-        // zero cursor is not a resume: it means "from the oldest retained".
-        // Checked before the page query rather than folded into it, because
-        // truncation matters most exactly when the page comes back empty.
-        if after != EventCursor::default() {
-            let floor = self.retention_floor().await?;
-            if after < floor {
-                return Err(EngineError::CursorTruncated {
-                    cursor: after,
-                    floor,
-                });
-            }
-        }
-        let rows = sqlx::query(
-            "select id, txid::text::bigint as txid, instance_id, definition_key, \
-             kind, element_id, payload, \
-             to_char(at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as at \
-             from rbpmn_event \
-             where (txid, id) > ($1::text::xid8, $2) \
-               and txid < pg_snapshot_xmin(pg_current_snapshot()) \
-             order by txid, id limit $3",
-        )
+        // The floor and the page are read in **one statement**, so they
+        // share one snapshot. Reading the floor first in its own query left
+        // a window in which a retention pass could commit in between: the
+        // check would pass against the old floor while the page returned
+        // post-deletion rows, and the consumer would advance past the gap
+        // having been told nothing — the exact silence the floor exists to
+        // break. The one-row floor table is cross-joined so the floor comes
+        // back even when the page is empty, which is precisely when a
+        // truncation matters most.
+        let rows = sqlx::query(&format!(
+            "select f.txid::text::bigint as floor_txid, f.id as floor_id, \
+                    e.id, e.txid::text::bigint as txid, e.instance_id, e.definition_key, \
+                    e.kind, e.element_id, e.payload, {} \
+             from rbpmn_retention_floor f \
+             left join lateral (\
+                 select id, txid, instance_id, definition_key, kind, element_id, payload, at \
+                 from rbpmn_event \
+                 where (txid, id) > ($1::text::xid8, $2) \
+                   and txid < pg_snapshot_xmin(pg_current_snapshot()) \
+                 order by txid, id limit $3\
+             ) e on true \
+             order by e.txid, e.id",
+            crate::runtime::ts("e.at", "at"),
+        ))
         .bind(after.txid.to_string())
         .bind(after.id)
         .bind(i64::from(limit.min(1000)))
         .fetch_all(self.pool())
         .await?;
+
+        // Exactly one row always comes back (the floor); its event columns
+        // are NULL when the page is empty.
+        let floor = rows
+            .first()
+            .map(|r| EventCursor {
+                txid: r.get("floor_txid"),
+                id: r.get("floor_id"),
+            })
+            .unwrap_or_default();
+        // A *resume* below the floor is a truncation and must be loud. A
+        // zero cursor is not a resume: it means "from the oldest retained".
+        if after != EventCursor::default() && after < floor {
+            return Err(EngineError::CursorTruncated {
+                cursor: after,
+                floor,
+            });
+        }
         Ok(rows
             .into_iter()
+            .filter(|r| r.get::<Option<i64>, _>("id").is_some())
             .map(|r| EventRecord {
                 id: r.get("id"),
                 txid: r.get("txid"),

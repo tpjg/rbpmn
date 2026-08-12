@@ -1,28 +1,38 @@
--- Phase 7: retention. Two knobs, one floor, and no automatic deletion of
--- anything that does not grow.
+-- Phase 7: retention. One age per definition, one floor, and no automatic
+-- deletion of anything that does not grow.
 --
--- Retirement is two-stage. Runtime retention deletes an instance's
--- *children* (tokens, work items, timers, subscriptions, scopes) — the hot
--- rows carrying the claim/due/correlate indexes — and stamps `pruned_at`.
--- The instance row itself survives as the header of its own history, which
--- is what keeps `inspect_instance` working, keeps business keys queryable,
--- and means an event never exists without its instance. History retention
--- then deletes the row and its events together, as one record.
+-- A record retires whole: the instance row, its children and its events go
+-- together, in one transaction, after the archive sink (if any) has been
+-- handed a complete copy. A two-stage variant was built first — retire the
+-- children early, keep the record as its own history header — and then
+-- collapsed: a completed instance emits tens of events against a handful of
+-- work items, and its tokens, timers, subscriptions and scopes are already
+-- gone (completion removes them), so the early stage reclaimed roughly a
+-- tenth of the footprint in exchange for a column, an index, a guard on the
+-- hot step path, and a second planner. Events dominate; the archive is where
+-- long histories belong.
 
--- Null until runtime retention retires the children. A pruned instance is
--- terminal, has no children, and cannot be stepped.
-alter table rbpmn_instance add column pruned_at timestamptz;
+-- `rbpmn_event.instance_id` has been an unenforced reference since 0001,
+-- deliberately, so that history could outlive its instance. One-stage
+-- retention makes that impossible by construction, so it becomes a real
+-- foreign key: the cascade replaces an explicit delete, and "an event never
+-- outlives its instance" stops being an invariant this codebase asserts and
+-- becomes one the database will not let it break. That is also what keeps
+-- `delete_definition`'s "is anything still referencing this?" an indexed
+-- lookup on rbpmn_instance instead of a scan of the largest table here.
+--
+-- The referential-integrity check lands on the highest-volume insert path in
+-- the system, which is affordable for a specific reason: a step already
+-- holds its instance row FOR UPDATE, so the check's KEY SHARE lock is
+-- uncontended — it costs an index probe per event row, nothing more.
+alter table rbpmn_event
+    add constraint rbpmn_event_instance_fk
+    foreign key (instance_id) references rbpmn_instance (id) on delete cascade;
 
--- The two sweep planners, indexed on purpose (the query the engine runs).
--- Separate partial indexes rather than one shared index: the runtime index
--- *shrinks* as instances are pruned (rows leave its predicate), so the
--- runtime sweep never scans the long tail of already-pruned rows that a
--- combined index would accumulate over a year-long history retention.
--- 'failed' is absent from both by design: an incident is frozen evidence
--- and a repair target, never something a sweep may tidy away.
-create index rbpmn_instance_prune_runtime on rbpmn_instance (completed_at)
-    where pruned_at is null and status in ('completed', 'terminated');
-create index rbpmn_instance_prune_history on rbpmn_instance (completed_at)
+-- The sweep planner, indexed on purpose (the query the engine runs).
+-- 'failed' is absent by design: an incident is frozen evidence and a repair
+-- target, never something a sweep may tidy away.
+create index rbpmn_instance_retire on rbpmn_instance (completed_at)
     where status in ('completed', 'terminated');
 
 -- `delete_definition` asks "does anything still reference this version?",
@@ -45,17 +55,17 @@ insert into rbpmn_retention_floor (only_row) values (true);
 -- definition **key** and not by version: "orders history: 7 years" is a
 -- property of the process, not of v3 of the process. Keying by version
 -- would force a redeploy to change an operational knob and would let two
--- live versions of one process disagree. Null means "fall back to the
--- sweeper's default policy"; the definition rows stay immutable.
+-- live versions of one process disagree. Null means *forever* — and the
+-- row's presence, not its nullness, is what decides whether the sweeper's
+-- default applies. The definition rows stay immutable.
 create table rbpmn_retention_policy (
-    definition_key      text primary key,
-    retain_runtime_secs bigint,
-    retain_history_secs bigint,
-    updated_at          timestamptz not null default now()
+    definition_key text primary key,
+    retain_secs    bigint check (retain_secs is null or retain_secs >= 0),
+    updated_at     timestamptz not null default now()
 );
 
 -- The sweep's cross-node claim. A *lease* (a row value), never an open
--- transaction and never a session advisory lock: a sweep pass spans three
+-- transaction and never a session advisory lock: a sweep pass spans two
 -- transactions with an archive upload in the gap, and both of those
 -- alternatives would either pin `xmin` across a network round-trip (which
 -- stalls every event-stream reader in the cluster) or leak the lock forever

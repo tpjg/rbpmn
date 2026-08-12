@@ -89,22 +89,22 @@ migration API, is listed with its status in the design brief's
       nearest enclosing handler — and scope-local terminate (ends the
       subprocess, not the instance). Hierarchical modelling, the style the
       engine exists to serve, is now executable.
-- [x] Phase 7 — **retention**. Two knobs, because there are two growth
-      curves: `retain_runtime` retires an instance's children (tokens, work
-      items, timers, subscriptions, scopes — the hot working set) and stamps
-      `prunedAt`, keeping the record itself; `retain_history` then deletes
-      the record and its events together. A **monotonic truncation floor**
-      keeps the phase-5 cursor contract honest — everything deleted is at or
-      below it, so a cursor above it has provably lost nothing, and a resume
-      from below it fails with `CursorTruncated` (HTTP 410) instead of
-      silently skipping the gap. A pass is `plan` → `archive` → `execute`
-      with **no transaction across the archive**, which is what makes
-      export-before-delete possible without stalling every stream reader in
-      the cluster; a sink failure deletes nothing. Active instances, failed
-      ones (frozen evidence, at any age) and definitions are never swept —
-      the last of those only ever by hand, via `delete_definition`. Opt-in
-      twice over: no sweeper unless you start one, and `RetentionPolicy::
-      forever()` is a valid choice.
+- [x] Phase 7 — **retention**. One age per definition; a record retires
+      whole — instance row, children and events, in one transaction, after
+      the archive sink (if any) has a complete copy. A **monotonic truncation
+      floor** keeps the phase-5 cursor contract honest: everything deleted is
+      at or below it, so a cursor above it has provably lost nothing, and a
+      resume from below it fails with `CursorTruncated` (HTTP 410, carrying
+      the floor as fields) instead of silently skipping the gap. A pass is
+      `plan` → `archive` → `execute` with **no transaction across the
+      archive**, which is what makes export-before-delete possible without
+      stalling every stream reader in the cluster; a sink failure deletes
+      nothing, on every path. `rbpmn_event.instance_id` became a real foreign
+      key here, so "an event never outlives its instance" is enforced rather
+      than asserted. Active instances, failed ones (frozen evidence, at any
+      age) and definitions are never swept — the last only ever by hand, via
+      `delete_definition`. Opt-in twice over: no sweeper unless you start one,
+      and `RetentionPolicy::forever()` is a valid choice.
 
 ## Rule catalogue
 
@@ -255,8 +255,8 @@ Configuration is env-only: `RBPMN_BIND` (default `127.0.0.1:7420`),
 `RBPMN_API_TOKEN` / `RBPMN_API_TOKEN_FILE`, `RBPMN_ALLOW_NON_LOOPBACK`,
 `RBPMN_DATABASE_URL` (required), `RBPMN_TOPICS` (comma-separated declared
 worker topics), `RBPMN_HTTP_HANDLERS` (`topic=url;...`), `RBPMN_WORKERS`,
-and `RBPMN_RETAIN_RUNTIME` / `RBPMN_RETAIN_HISTORY` (retention ages in days;
-set neither and no sweeper runs at all — nothing is even scanned).
+and `RBPMN_RETAIN` (retention age in days; unset means no sweeper runs at
+all — nothing is even scanned).
 Startup re-validates persisted definitions against the configured
 environment and refuses to start on drift.
 Security posture and roadmap: [docs/http-security.md](docs/http-security.md).

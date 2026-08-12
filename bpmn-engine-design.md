@@ -700,7 +700,13 @@ nobody ever silently misses an event.
   A zero cursor still means "from the beginning", which now reads as *from
   the oldest retained event*: a new consumer has no completeness expectation
   to violate. One row of state, **zero coordination** — third-party
-  consumers over HTTP get the guarantee without registering anything.
+  consumers over HTTP get the guarantee without registering anything. The
+  floor and the page are read in **one statement**, sharing one snapshot: the
+  first implementation read the floor first, in its own query, which left a
+  window where a sweep committing in between produced a page silently missing
+  its deleted events with the check having passed against the old floor — the
+  exact silence the floor exists to break, reintroduced by the order of two
+  queries.
 - **A read horizon was considered and deferred**, on an argument worth
   keeping: if a registered reader's TTL is ≤ the retention age, the age floor
   already protects it for longer, so the horizon is dead weight. It earns its
@@ -728,7 +734,10 @@ nobody ever silently misses an event.
   archives history would freeze the stream that reads it. The gap is safe
   because retention only ever selects immutable data (terminal instances,
   closed event histories). Export is at-least-once, and a sink failure
-  deletes nothing. For the same reason the cross-node claim is a **lease
+  deletes nothing — on *every* path, because `execute_retention` runs the
+  sink itself rather than trusting its caller to have done so; it is public,
+  and the invariant has to be a property of the code rather than of the
+  calling convention. For the same reason the cross-node claim is a **lease
   row**, never a session advisory lock (which would leak forever on a
   cancelled pass) — the task API's "a lease is a row value, never an open
   transaction" rule, applied again.

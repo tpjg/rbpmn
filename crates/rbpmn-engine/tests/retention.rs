@@ -43,11 +43,7 @@ fn options(policy: RetentionPolicy) -> RetentionOptions {
 }
 
 fn after(secs: u64) -> RetentionPolicy {
-    RetentionPolicy::new(
-        Some(Duration::from_secs(secs)),
-        Some(Duration::from_secs(secs)),
-    )
-    .unwrap()
+    RetentionPolicy::new(Some(Duration::from_secs(secs))).unwrap()
 }
 
 /// Move an instance's completion into the past — the deterministic stand-in
@@ -366,48 +362,11 @@ async fn a_failing_archive_deletes_nothing() {
 
 // ------------------------------------------------------------- the two knobs
 
-/// Runtime retention reclaims the hot rows and keeps the record: inspection
-/// keeps working, and `prunedAt` is what distinguishes "retired" from
-/// "finished cleanly".
+/// A record retires whole: header, children and events, in one transaction,
+/// after the sink has a complete copy. Inspection goes away with it, because
+/// the record genuinely no longer exists — it is in the archive.
 #[tokio::test]
-async fn runtime_pruning_keeps_the_record_and_inspection_works() {
-    let db = TestDb::create().await;
-    let engine = engine(&db).await;
-    deploy_task_kinds(&engine).await;
-
-    let done = completed_instance(&engine, &db.pool, "o-1").await;
-    backdate(&db.pool, done, 3600).await;
-    assert!(work_items_of(&db.pool, done).await > 0);
-    let history = events_of(&db.pool, done).await;
-
-    // Runtime expires, history does not.
-    let policy = RetentionPolicy::new(Some(Duration::from_secs(60)), None).unwrap();
-    let report = engine.sweep_retention_once(&options(policy)).await.unwrap();
-    assert_eq!((report.instances_pruned, report.instances_deleted), (1, 0));
-
-    assert_eq!(work_items_of(&db.pool, done).await, 0);
-    assert_eq!(events_of(&db.pool, done).await, history);
-    assert_eq!(
-        engine.retention_floor().await.unwrap(),
-        EventCursor::default()
-    );
-
-    let view = engine.inspect_instance(done).await.unwrap();
-    assert_eq!(view.status, "completed");
-    assert!(view.pruned_at.is_some());
-    assert!(view.work_items.is_empty());
-    assert_eq!(view.events.len() as i64, history);
-
-    // Idempotent: a pruned instance is not a candidate twice.
-    let again = engine.sweep_retention_once(&options(policy)).await.unwrap();
-    assert_eq!(again.instances_pruned, 0);
-    db.drop().await;
-}
-
-/// History retention deletes the record outright — and only then does
-/// inspection go away, because the record genuinely no longer exists.
-#[tokio::test]
-async fn history_retention_deletes_the_record() {
+async fn retirement_deletes_the_whole_record() {
     let db = TestDb::create().await;
     let engine = engine(&db).await;
     deploy_task_kinds(&engine).await;
@@ -448,9 +407,12 @@ async fn history_retention_deletes_the_record() {
     db.drop().await;
 }
 
-/// An event never outlives its instance row. That invariant is what lets
-/// `delete_definition` answer "is anything still referencing this?" with an
-/// indexed lookup instead of a scan of the largest table in the schema.
+/// An event never outlives its instance row — enforced by the 0007 foreign
+/// key rather than asserted, which is what lets `delete_definition` answer
+/// "is anything still referencing this?" with an indexed lookup instead of a
+/// scan of the largest table in the schema. The direct insert proves the
+/// constraint is real and not merely a convention the sweeper happens to
+/// honour.
 #[tokio::test]
 async fn no_event_ever_outlives_its_instance() {
     let db = TestDb::create().await;
@@ -461,12 +423,6 @@ async fn no_event_ever_outlives_its_instance() {
     let b = completed_instance(&engine, &db.pool, "o-b").await;
     backdate(&db.pool, a, 3600).await;
     backdate(&db.pool, b, 3600).await;
-    // One runtime-pruned, one deleted outright, in the same pass.
-    sqlx::query("update rbpmn_instance set pruned_at = now() where id = $1")
-        .bind(a)
-        .execute(&db.pool)
-        .await
-        .unwrap();
 
     engine
         .sweep_retention_once(&options(after(60)))
@@ -481,6 +437,16 @@ async fn no_event_ever_outlives_its_instance() {
     .await
     .unwrap();
     assert_eq!(orphans, 0);
+
+    // The database refuses to create one, which is the point of the FK.
+    let orphaned = sqlx::query(
+        "insert into rbpmn_event (instance_id, definition_id, definition_key, kind, payload) \
+         select gen_random_uuid(), d.id, d.key, 'invented', '{}'::jsonb \
+         from rbpmn_definition d limit 1",
+    )
+    .execute(&db.pool)
+    .await;
+    assert!(orphaned.is_err(), "the FK let an orphan event in");
     db.drop().await;
 }
 
@@ -594,40 +560,42 @@ async fn per_key_policy_overrides_the_default() {
     db.drop().await;
 }
 
+/// "Forever" is spelled `None`, never as a very large duration: seconds are
+/// stored as bigint, and `Duration::MAX.as_secs() as i64` is -1 — a cutoff in
+/// the *future*, which would delete every terminal record on the next sweep.
 #[tokio::test]
-async fn a_policy_whose_children_outlive_the_record_is_rejected() {
-    let err = RetentionPolicy::new(
-        Some(Duration::from_secs(600)),
-        Some(Duration::from_secs(60)),
-    )
-    .unwrap_err();
+async fn an_out_of_range_retention_age_is_refused() {
+    let err = RetentionPolicy::new(Some(Duration::MAX)).unwrap_err();
     assert!(matches!(err, EngineError::InvalidRetentionPolicy(_)));
-    // Forever-runtime with a finite history is coherent: never prune early,
-    // drop the whole record at the end.
-    RetentionPolicy::new(None, Some(Duration::from_secs(60))).unwrap();
+    assert_eq!(RetentionPolicy::forever().retain(), None);
+    assert_eq!(
+        RetentionPolicy::new(Some(Duration::from_secs(60)))
+            .unwrap()
+            .retain(),
+        Some(Duration::from_secs(60))
+    );
 }
 
-/// A pruned instance is a history record, not a runtime one. Nothing can
-/// reach it in practice; the guard is there so that if anything ever did,
-/// it fails loudly instead of rehydrating state whose rows were deleted.
+/// A policy naming a definition that was never deployed is refused, not
+/// stored: it would otherwise sit there looking like protection while the
+/// sweeper's default deleted the very history it meant to keep.
 #[tokio::test]
-async fn a_pruned_instance_cannot_be_stepped() {
+async fn a_policy_for_an_unknown_definition_is_refused() {
     let db = TestDb::create().await;
     let engine = engine(&db).await;
     deploy_task_kinds(&engine).await;
-    let done = completed_instance(&engine, &db.pool, "o-1").await;
-    backdate(&db.pool, done, 3600).await;
-    let policy = RetentionPolicy::new(Some(Duration::from_secs(60)), None).unwrap();
-    engine.sweep_retention_once(&options(policy)).await.unwrap();
 
-    let mut tx = db.pool.begin().await.unwrap();
-    let err = engine
-        .correlate_in_tx(&mut tx, "ShipmentConfirmed", "o-1", serde_json::json!({}))
+    assert!(matches!(
+        engine
+            .set_retention_policy("odrers", RetentionPolicy::forever())
+            .await,
+        Err(EngineError::UnknownDefinition(_))
+    ));
+    assert_eq!(engine.retention_policy("odrers").await.unwrap(), None);
+    engine
+        .set_retention_policy("p", RetentionPolicy::forever())
         .await
-        .unwrap_err();
-    // Its subscription is gone, so correlation cannot even find it — which
-    // is the real defence; the pruned guard sits behind that one.
-    assert!(matches!(err, EngineError::NoSubscription { .. }));
+        .unwrap();
     db.drop().await;
 }
 

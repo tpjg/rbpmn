@@ -11,12 +11,6 @@ pub struct InstanceInspection {
     pub id: Uuid,
     pub definition_key: String,
     pub status: String,
-    /// Set once retention has retired the runtime rows (phase 7). The
-    /// instance row survives as its own history header, so inspection keeps
-    /// working — but empty token/work-item/timer/subscription lists now mean
-    /// "retired", not "finished cleanly", and only this field can tell a
-    /// caller which. RFC 3339 UTC, database time.
-    pub pruned_at: Option<String>,
     pub variables: serde_json::Value,
     pub bpmn_xml: String,
     pub tokens: Vec<TokenView>,
@@ -105,9 +99,7 @@ impl Engine {
         id: Uuid,
     ) -> Result<InstanceInspection, EngineError> {
         let inst = sqlx::query(
-            "select i.definition_key, i.status, i.variables, d.bpmn_xml, \
-                    to_char(i.pruned_at at time zone 'UTC', \
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as pruned_at \
+            "select i.definition_key, i.status, i.variables, d.bpmn_xml \
              from rbpmn_instance i join rbpmn_definition d on d.id = i.definition_id where i.id = $1",
         )
         .bind(id)
@@ -223,7 +215,6 @@ impl Engine {
             id,
             definition_key: inst.get("definition_key"),
             status: inst.get("status"),
-            pruned_at: inst.get("pruned_at"),
             variables: inst.get("variables"),
             bpmn_xml: inst.get("bpmn_xml"),
             tokens,

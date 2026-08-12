@@ -28,14 +28,18 @@ inclusive gateway, block structure, messages-only interaction, build order).
   everything else against a missing value is a type mismatch, so null, `!=`
   included. Don't re-merge those match arms; that was the bug.
 - Retention never deletes silently and never deletes what does not grow.
-  The truncation floor is monotonic and is what keeps the `/v1/events`
-  cursor contract honest (`CursorTruncated` → HTTP 410); an event never
-  outlives its instance row (that is what makes `delete_definition` an
-  indexed lookup); the archive call must stay **outside** every transaction,
-  because `pg_snapshot_xmin` is cluster-wide and an open transaction stalls
-  the whole event stream. In the policy table a null column means *forever*
-  and a missing row means *no override* — never `coalesce` the two; that
-  was the bug.
+  A record retires **whole** (one age, one transaction) — the two-stage
+  version was built, measured and collapsed; don't reintroduce it without
+  numbers. The truncation floor is monotonic and keeps the `/v1/events`
+  cursor contract honest (`CursorTruncated` → HTTP 410), and the floor and
+  the page must be read in **one statement**: two queries leave a window in
+  which a sweep commits between them and the page comes back silently short.
+  The archive call must stay **outside** every transaction, because
+  `pg_snapshot_xmin` is cluster-wide and an open transaction stalls the whole
+  event stream. In the policy table a null column means *forever* and a
+  missing row means *no override* — never `coalesce` the two; that was the
+  bug. Durations are stored as bigint seconds, so "forever" is `None`, never
+  a huge `Duration` (`as i64` wraps negative → a cutoff in the future).
 - dsntk must never become a dependency of `rbpmn-model`: its number crate
   binds a C library (`dfp-number-sys`), which kills wasm32 and the whole
   playground/bpmnlint chain. `feel-parity` is outside the workspace for this

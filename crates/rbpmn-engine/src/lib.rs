@@ -428,6 +428,13 @@ impl Engine {
         self.inner.archive.read().unwrap().clone()
     }
 
+    /// Evict a compiled definition. The cache is documented as bounded by
+    /// deploys; once definitions can be deleted, that bound holds only if
+    /// deletion evicts.
+    pub(crate) fn forget_compiled(&self, definition_id: uuid::Uuid) {
+        self.inner.compiled.write().unwrap().remove(&definition_id);
+    }
+
     /// Register (or re-register: latest binding wins) a push-mode handler.
     /// Idempotent; callable at any time.
     pub fn register_handler(&self, topic: impl Into<String>, handler: Arc<dyn ServiceTaskHandler>) {

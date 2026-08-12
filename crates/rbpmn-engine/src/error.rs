@@ -76,11 +76,6 @@ pub enum EngineError {
     IncidentOpen(Uuid),
     #[error("instance {0} is still active; terminate it before deleting it")]
     InstanceStillActive(Uuid),
-    #[error(
-        "instance {0} has been pruned by retention (its runtime rows were retired); \
-         it is a history record and cannot be stepped"
-    )]
-    InstancePruned(Uuid),
     #[error("definition no longer compiles: {0}")]
     Compile(#[from] rbpmn_core::CompileError),
     #[error("semantic core rejected the step: {0}")]

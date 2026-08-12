@@ -399,11 +399,25 @@ fn engine_error(e: EngineError) -> Response {
             (StatusCode::CONFLICT, e.to_string())
         }
         // 410 Gone is exactly this: the resource existed and was
-        // deliberately removed. The message carries the floor to resume from.
-        EngineError::CursorTruncated { .. } => (StatusCode::GONE, e.to_string()),
-        EngineError::InstanceStillActive(_)
-        | EngineError::InstancePruned(_)
-        | EngineError::DefinitionInUse { .. } => (StatusCode::CONFLICT, e.to_string()),
+        // deliberately removed. The floor is returned as fields, not only
+        // inside the prose — the documented recovery path is "resume from
+        // the floor", and a client should not have to parse English to take
+        // it. Returned early because it is the one error with a body shape
+        // of its own.
+        EngineError::CursorTruncated { floor, .. } => {
+            return (
+                StatusCode::GONE,
+                Json(json!({
+                    "error": e.to_string(),
+                    "floorTxid": floor.txid,
+                    "floorId": floor.id,
+                })),
+            )
+                .into_response();
+        }
+        EngineError::InstanceStillActive(_) | EngineError::DefinitionInUse { .. } => {
+            (StatusCode::CONFLICT, e.to_string())
+        }
         EngineError::InvalidRetentionPolicy(_) => (StatusCode::BAD_REQUEST, e.to_string()),
         EngineError::ArchiveFailed(_) => {
             tracing::error!(error = %e, "retention archive sink failed");

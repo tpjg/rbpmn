@@ -468,6 +468,17 @@ fn require_object(value: &serde_json::Value, what: &str) -> Result<(), EngineErr
 
 /// Text parameters bound into queries hit the same NUL limitation as jsonb;
 /// reject at the boundary so it is a 400, not a transaction-poisoning 500.
+/// The one timestamp rendering: RFC 3339, UTC, microsecond precision,
+/// database time. Shared by the event stream, the inspection view and the
+/// retention archive, which are documented as the same public contract —
+/// three hand-written copies of the format string were three chances for
+/// them to quietly diverge.
+pub(crate) fn ts(column: &str, alias: &str) -> String {
+    format!(
+        "to_char({column} at time zone 'UTC', \'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"\') as {alias}"
+    )
+}
+
 pub(crate) fn reject_nul_text(value: &str, what: &str) -> Result<(), EngineError> {
     if value.contains('\u{0}') {
         return Err(EngineError::InvalidVariables(format!(
@@ -625,7 +636,7 @@ pub(crate) async fn load_instance_nowait(
     let sql = format!(
         "select i.definition_id, i.definition_key, i.status, i.variables, \
                 i.next_token, i.next_work_item, i.next_timer, i.next_subscription, \
-                i.next_scope, i.pruned_at is not null as pruned \
+                i.next_scope \
          from rbpmn_instance i where i.id = $1 for update{}",
         if nowait { " nowait" } else { "" }
     );
@@ -641,15 +652,6 @@ pub(crate) async fn load_instance_nowait(
         }
         Err(e) => return Err(e.into()),
     };
-
-    // Nothing can reach a pruned instance — its work items, timers and
-    // subscriptions are gone, so no claim, fire or correlation addresses it.
-    // Guarded anyway: rehydrating one would rebuild a state whose rows were
-    // deliberately deleted, and inventing state is exactly the failure this
-    // codebase refuses to have. Loud beats impossible-but-catastrophic.
-    if inst.get::<bool, _>("pruned") {
-        return Err(EngineError::InstancePruned(instance_id));
-    }
 
     let key: String = inst.get("definition_key");
     let definition = DefinitionRef {
