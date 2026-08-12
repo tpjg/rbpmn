@@ -202,6 +202,7 @@ just serve            # run the HTTP server with a throwaway token
 just playground       # linter playground (builds WASM first)
 just parity           # Rust-vs-WASM byte parity + bpmnlint plugin test
 just feel-parity      # FEEL subset differentialled against dsntk (own lockfile)
+just tla              # TLA+ model check of the locking + lease protocol
 ```
 
 ## HTTP server (optional)

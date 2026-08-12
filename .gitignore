@@ -10,3 +10,6 @@ playground/src/fixtures.generated.js
 bpmnlint-plugin-rbpmn/wasm/
 e2e/screenshots/
 __pycache__/
+# TLA+: fetched by `just tla`, plus TLC's scratch output.
+/spec/.tla2tools.jar
+/spec/states/

@@ -35,6 +35,40 @@ parity: wasm
     cd playground && npm install && npm run parity
     cd bpmnlint-plugin-rbpmn && npm install && npm test
 
+# TLA+ model checking of the concurrency protocol (spec/README.md). Needs
+# java; fetches tla2tools.jar into spec/ on first use (gitignored). Two of the
+# four configs are EXPECTED to fail — they are the counterexamples that show
+# the checks have teeth.
+tla:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd spec
+    jar=.tla2tools.jar
+    if [ ! -f "$jar" ]; then
+        echo "fetching tla2tools.jar ..."
+        curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+    fi
+    check() { # name, config, module, expectation(hold|fail)
+        local out
+        if out=$(java -cp "$jar" tlc2.TLC -config "$2" "$3" 2>&1); then
+            if [ "$4" = "hold" ]; then
+                echo "  ok       $1"
+            else
+                echo "  MISSING  $1 — expected a counterexample, TLC found none"; return 1
+            fi
+        else
+            if [ "$4" = "fail" ]; then
+                echo "  ok       $1 (counterexample found, as expected)"
+            else
+                echo "  BROKEN   $1"; echo "$out" | tail -40; return 1
+            fi
+        fi
+    }
+    check "lock order: shipped protocol"      LockOrder.cfg           LockOrder.tla hold
+    check "lock order: rejected AB/BA sketch" LockOrderHistorical.cfg LockOrder.tla fail
+    check "lease: safety"                     Lease.cfg               Lease.tla     hold
+    check "lease: double belief is reachable" Lease_DoubleBelief.cfg  Lease.tla     fail
+
 # Differential the FEEL subset against dsntk (the DMN-TCK-verified reference):
 # every condition we accept must evaluate identically there. Outside the
 # workspace and not part of `test` — dsntk pulls ~170 crates and a C library.

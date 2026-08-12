@@ -631,14 +631,30 @@ transfer, the event horizon — none of it is reachable from Rust-level
 symbolic execution, because the interesting behavior lives in Postgres's
 concurrency semantics, not in the Rust.
 
-If those claims deserve formal treatment, the right tool is **TLA+ (PlusCal)
-on the protocol, not the code**: model the timer-claim path, the completion
-path, the lease, and the deploy/undeclare race as abstract actions over an
-abstract store, and let TLC check deadlock-freedom and exactly-once under all
-interleavings. That is a two-day spec, and it targets exactly the class of
-finding the brief describes reaching by careful reasoning — the AB/BA lock
-inversion in the original timer-claim sketch. Careful reasoning found it
-once; a spec finds the next one.
+If those claims deserve formal treatment, the right tool is **TLA+ on the
+protocol, not the code**: model the locking paths and the lease as abstract
+actions over an abstract store, and let TLC check deadlock-freedom and
+exactly-once under all interleavings.
+
+**Landed** in `spec/` (`just tla`, see `spec/README.md`). `LockOrder.tla`
+models instance-row and item-row locking across N nodes; `Lease.tla` models
+the work-item lease. Each ships with a companion config that is *expected to
+fail*, so the checks are known to have teeth: `LockOrderHistorical.cfg`
+restores the timer-claim order the design brief rejected and TLC reports
+`Deadlock reached`, and `Lease_DoubleBelief.cfg` shows that two workers really
+can both believe they hold one item — reachable, and harmless, because every
+mutation is conditional on `lock_owner = $me AND lock_until > now()`.
+
+> **Checking the model corrected a piece of the prose.** Deleting the
+> NOWAIT/give-up action does *not* reintroduce the deadlock: with a single
+> lock order there is no cycle to find, whoever waits. Deadlock freedom comes
+> from the **order**; `NOWAIT` buys the separate thing `scheduler.rs`
+> describes — not parking the drain loop behind an embedder's long-running
+> `*_in_tx` transaction. Safety and throughput, two mechanisms, easy to
+> conflate in prose and impossible to conflate in a model.
+
+Still unmodelled and named as candidates: the event-stream safe horizon (xid8
+visibility) and the deploy/undeclare race.
 
 ---
 
@@ -677,16 +693,17 @@ Randomized testing **falsifies**; it does not prove. Stated precisely:
 | 7 | Storm + replay verification + fsck (§4) | 3–5 d | The projection claim; deadlock freedom |
 | 8 | Chaos (§5) | 2–3 d | Closes testing-strategy #5 |
 | 9 | Kani on `iso8601` + `condition` parsers (§7) | 2–3 d | Panic/overflow proofs on untrusted input |
-| 10 | TLA+ spec of the concurrency protocol (§7) | 2 d | The distributed claims |
+| ~~10~~ | ~~TLA+ spec of the concurrency protocol (§7)~~ | done | **Landed**: `spec/`, `just tla` |
 
 Items 3, 4, 5 and 6 are done, and they compose: the generator feeds both the
 explorer and the mutation fuzz, all three sharing one invariant set. Of the
 six third outcomes, 1, 2, 5 and 6 are now hunted; **3 and 4 are not, and they
 are the ones that live in the Postgres layer** — which is also the newest and
-most concurrent code in the repo, verified by hand-written cases. That makes
-item 7 (storm + replay verification) the highest-value work remaining, with
-item 10 (the TLA+ spec) before it since it is independent of all the Rust work
-and tells the storm which interleavings to build for.
+most concurrent code in the repo, verified by hand-written cases. Item 10 is done, which
+leaves **item 7 (storm + replay verification) as the highest-value work
+remaining** — and the specs now say which interleavings it should be built to
+exercise: lease expiry racing reacquisition, and timer claims racing
+completions on one instance.
 
 Item 1 is cheaper than listed — the invariant set already exists, leaving the
 random driver and the rehydration differential. Extending the generator to

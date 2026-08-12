@@ -1,0 +1,59 @@
+# TLA+ specs — the concurrency protocol
+
+`docs/stress-testing.md` §7, item 10. These model the **protocol**, not the
+code: Rust-level tools cannot reach these claims, because the behaviour lives
+in PostgreSQL's concurrency semantics rather than in the Rust.
+
+Run with `just tla` (needs `java`; fetches `tla2tools.jar` on first use).
+
+| Spec | Models | Checks |
+|---|---|---|
+| `LockOrder.tla` | instance-row and item/timer-row locking across N nodes | one lock order engine-wide; no AB/BA deadlock; every transaction returns to idle |
+| `Lease.tla` | the work-item lease: TTL, renewal, expiry, completion | no double delivery; exactly-once completion under at-least-once delivery; nothing stranded |
+
+Each spec ships with a companion config that is **expected to fail**, so the
+checks are known to have teeth rather than passing vacuously:
+
+| Config | Expected | Demonstrates |
+|---|---|---|
+| `LockOrder.cfg` | holds | the shipped protocol |
+| `LockOrderHistorical.cfg` | **deadlock** | the timer-claim order the design brief rejected |
+| `Lease.cfg` | holds | the shipped lease |
+| `Lease_DoubleBelief.cfg` | **violation** | two workers really can both believe they hold one item |
+
+## What the failures show
+
+`LockOrderHistorical` restores the originally sketched timer claim — timer row
+first, then the instance row — which is the opposite order from every other
+step path. TLC reports `Deadlock reached`.
+
+Checking the model also separated two things the prose around this tends to
+conflate. Deleting `GiveUp` — making the timer claim block like every other
+path — does **not** reintroduce the deadlock: with a single lock order there
+is no cycle to find, whoever waits. **Deadlock freedom comes from the order,
+not from `NOWAIT`.** `NOWAIT` buys something else, and `scheduler.rs` says
+what: an embedder's `*_in_tx` transaction can hold an instance row for a long
+time, and the drain loop must move on to other instances' timers rather than
+park behind it. Order is the safety property; `NOWAIT` is throughput.
+
+`Lease_DoubleBelief` shows that after a lease lapses and a peer reacquires,
+both workers believe they hold the item. That state is *reachable and fine*:
+every mutation is conditional on `lock_owner = $me AND lock_until > now()` in
+the database, so belief is never authority. Safety does not come from
+preventing the confusion — it comes from the confusion not mattering.
+
+## Scope
+
+Bounded models: 3 nodes / 2 instances, and 2 workers / TTL 2 / 4 ticks. That
+is enough for these properties — the interleavings that break lock ordering
+and lease authority need two participants, not many — but it is exhaustive
+only within those bounds, not a proof for all N.
+
+The specs are hand-maintained abstractions. They are only as true as their
+correspondence to `scheduler.rs`, `runtime.rs` and `tasks.rs`; nothing
+enforces that link. Changing the locking or lease protocol means changing
+these too.
+
+Not modelled yet: the event-stream safe horizon (xid8 visibility) and the
+deploy/undeclare race. Both are named in `docs/stress-testing.md` as
+candidates.
