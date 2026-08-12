@@ -138,6 +138,18 @@ async fn the_engine_converges_through_chaos() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(24);
+    // A node killed while holding a work-item lease strands that item until
+    // the lease lapses — there is no reaper, by design. So the lease IS the
+    // crash-recovery window, and the drain below must outlast it. 250ms keeps
+    // the suite quick; raise it to watch the real bound
+    // (RBPMN_CHAOS_LEASE_MS=30000 takes ~90s and still converges).
+    let worker_lease = Duration::from_millis(
+        std::env::var("RBPMN_CHAOS_LEASE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(250),
+    );
+    let drain_budget = std::cmp::max(Duration::from_secs(15), worker_lease * 3);
 
     // Nodes are rebuilt during the run, so they live behind a swappable slot.
     let url = db.url();
@@ -171,7 +183,7 @@ async fn the_engine_converges_through_chaos() {
                 // minutes — correct, and far longer than this test waits.
                 let _ = engine
                     .work_once(&WorkerOptions {
-                        lease: Duration::from_millis(250),
+                        lease: worker_lease,
                         poll_interval: Duration::from_millis(10),
                         ..WorkerOptions::default()
                     })
@@ -185,10 +197,19 @@ async fn the_engine_converges_through_chaos() {
     // Pull-mode consumers on a deliberately tiny lease: expiry and reclaim
     // race continuously, so completions from stale owners must be refused.
     let completed = Arc::new(AtomicUsize::new(0));
-    let refused = Arc::new(AtomicUsize::new(0));
+    // Kept apart deliberately: `ItemLeased` is the property under test (a
+    // peer reclaimed and the stale completion was refused), while chaos also
+    // produces ordinary connection errors from the backends it terminates.
+    // Counting them together would let the second masquerade as the first.
+    let refused_by_lease = Arc::new(AtomicUsize::new(0));
+    let other_errors = Arc::new(AtomicUsize::new(0));
     for w in 0..6 {
         let (slot, stop) = (slots[w % slots.len()].clone(), stop.clone());
-        let (completed, refused) = (completed.clone(), refused.clone());
+        let (completed, refused_by_lease, other_errors) = (
+            completed.clone(),
+            refused_by_lease.clone(),
+            other_errors.clone(),
+        );
         actors.push(tokio::spawn(async move {
             let mut options = rbpmn_engine::GetTaskOptions::new(format!("chaos-worker-{w}"));
             // The floor the API allows (10ms), so leases lapse *during* the
@@ -208,7 +229,10 @@ async fn the_engine_converges_through_chaos() {
                             .await
                         {
                             Ok(_) => completed.fetch_add(1, Ordering::Relaxed),
-                            Err(_) => refused.fetch_add(1, Ordering::Relaxed),
+                            Err(rbpmn_engine::EngineError::ItemLeased(_)) => {
+                                refused_by_lease.fetch_add(1, Ordering::Relaxed)
+                            }
+                            Err(_) => other_errors.fetch_add(1, Ordering::Relaxed),
                         };
                     }
                 }
@@ -276,7 +300,8 @@ async fn the_engine_converges_through_chaos() {
     actors.remove(actors.len() - 1).abort(); // the chaos loop only
 
     let mut drained = false;
-    for _ in 0..300 {
+    let deadline = std::time::Instant::now() + drain_budget;
+    while std::time::Instant::now() < deadline {
         let active = count(
             &db.pool,
             "select count(*) from rbpmn_instance where status = 'active'",
@@ -364,7 +389,7 @@ async fn the_engine_converges_through_chaos() {
     // property `spec/Lease.tla` proves of the protocol, checked here against
     // the database.
     assert!(
-        refused.load(Ordering::Relaxed) > 0,
+        refused_by_lease.load(Ordering::Relaxed) > 0,
         "no completion was ever refused — the lease was never actually \
          contested, so completion authority is untested here"
     );
@@ -380,10 +405,12 @@ async fn the_engine_converges_through_chaos() {
     .collect();
     println!(
         "chaos: {} instances, {events} events replayed, {killed_total} backends killed, \
-         {restarts_total} node restarts, {} completions, {} refused by lease",
+         {restarts_total} node restarts, {} completions, {} refused by lease, \
+         {} other errors, lease {worker_lease:?}",
         instances.len(),
         completed.load(Ordering::Relaxed),
-        refused.load(Ordering::Relaxed),
+        refused_by_lease.load(Ordering::Relaxed),
+        other_errors.load(Ordering::Relaxed),
     );
     println!("  statuses: {statuses:?}");
     db.drop().await;
