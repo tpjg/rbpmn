@@ -21,6 +21,15 @@
         <bpmn:incoming>fi1</bpmn:incoming>
         <bpmn:outgoing>fi2</bpmn:outgoing>
       </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="bt_slow" attachedToRef="reserve">
+        <bpmn:outgoing>fi4</bpmn:outgoing>
+        <bpmn:timerEventDefinition>
+          <bpmn:timeDuration>PT1H</bpmn:timeDuration>
+        </bpmn:timerEventDefinition>
+      </bpmn:boundaryEvent>
+      <bpmn:endEvent id="e_slow" name="Supplier too slow">
+        <bpmn:incoming>fi4</bpmn:incoming>
+      </bpmn:endEvent>
       <bpmn:userTask id="pack" name="Pack">
         <bpmn:incoming>fi2</bpmn:incoming>
         <bpmn:outgoing>fi3</bpmn:outgoing>
@@ -31,6 +40,7 @@
       <bpmn:sequenceFlow id="fi1" sourceRef="s2" targetRef="reserve" />
       <bpmn:sequenceFlow id="fi2" sourceRef="reserve" targetRef="pack" />
       <bpmn:sequenceFlow id="fi3" sourceRef="pack" targetRef="e2" />
+      <bpmn:sequenceFlow id="fi4" sourceRef="bt_slow" targetRef="e_slow" />
     </bpmn:subProcess>
     <bpmn:boundaryEvent id="be" attachedToRef="sp">
       <bpmn:outgoing>f3</bpmn:outgoing>
@@ -98,11 +108,17 @@
       <bpmndi:BPMNShape id="reserve_di" bpmnElement="reserve">
         <dc:Bounds x="175" y="30" width="100" height="80" />
       </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="bt_slow_di" bpmnElement="bt_slow">
+        <dc:Bounds x="207" y="92" width="36" height="36" />
+      </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="pack_di" bpmnElement="pack">
         <dc:Bounds x="325" y="30" width="100" height="80" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="e2_di" bpmnElement="e2">
         <dc:Bounds x="507" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="e_slow_di" bpmnElement="e_slow">
+        <dc:Bounds x="357" y="192" width="36" height="36" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNEdge id="fi1_di" bpmnElement="fi1">
         <di:waypoint x="93" y="70" />
@@ -111,6 +127,11 @@
       <bpmndi:BPMNEdge id="fi2_di" bpmnElement="fi2">
         <di:waypoint x="275" y="70" />
         <di:waypoint x="325" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fi4_di" bpmnElement="fi4">
+        <di:waypoint x="225" y="128" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="357" y="210" />
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="fi3_di" bpmnElement="fi3">
         <di:waypoint x="425" y="70" />

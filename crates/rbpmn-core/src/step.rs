@@ -180,11 +180,13 @@ pub fn step(
             }
             match caught {
                 Some((target, boundary_ix)) => {
-                    // The failing task's own token dies with its scope when
-                    // the catcher is an enclosing subprocess.
-                    if target != token_id {
-                        state.tokens.remove(&token_id);
-                    }
+                    // When the catcher is an enclosing subprocess, the
+                    // failing task's token is inside the doomed scope, so
+                    // the teardown reaps it — *with* its armed boundary
+                    // timers. Removing it here first would hide it from
+                    // `tear_down_scope`, stranding those timers on a token
+                    // that no longer exists: the scheduler would later fire
+                    // one and wedge the instance on an Invariant error.
                     adv.interrupt_to_boundary(state, target, boundary_ix)?;
                     adv.run(state)
                 }
@@ -344,7 +346,9 @@ struct Advancer<'a> {
     events: Vec<Event>,
     queue: VecDeque<Move>,
     /// The runtime scope of the move being processed. Sequence flows never
-    /// cross a scope boundary (`cross-scope-flow` rejects that), so a token
+    /// cross a scope boundary (`bpmn-structure` rejects endpoints that do
+    /// not resolve within one scope — see the `cross-scope-flow`
+    /// fixture), so a token
     /// following a flow stays in this scope — which is why parking and
     /// leaving can read it here instead of threading it through every
     /// signature. The two places that *do* change scope — entering a
@@ -507,7 +511,7 @@ impl<'a> Advancer<'a> {
                 let inner = state.next_token_id();
                 self.queue.push_back(Move {
                     token: inner,
-                    node: self.proc.scope(child_static).start,
+                    node: self.proc.scope_start(child_static),
                     via: None,
                     scope: child,
                 });
@@ -913,11 +917,11 @@ impl<'a> Advancer<'a> {
     /// No token of `scope` remains — neither parked nor still in flight.
     /// The queue matters: a sibling branch mid-advance is not "gone".
     fn scope_is_empty(&self, state: &InstanceState, scope: ScopeId) -> bool {
+        // A nested scope still open needs no separate check: its parent
+        // token is parked in this scope (`WaitKind::Scope`), so the token
+        // test below already reports the scope as non-empty.
         !state.tokens.values().any(|t| t.scope == scope)
             && !self.queue.iter().any(|m| m.scope == scope)
-            // A nested scope still open means its parent token is parked
-            // here, so the parent scope is not empty either.
-            && !state.scopes.values().any(|s| s.parent == scope)
     }
 
     fn complete_scope(

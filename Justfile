@@ -36,18 +36,36 @@ parity: wasm
     cd bpmnlint-plugin-rbpmn && npm install && npm test
 
 # TLA+ model checking of the concurrency protocol (spec/README.md). Needs
-# java; fetches tla2tools.jar into spec/ on first use (gitignored). Two of the
-# four configs are EXPECTED to fail — they are the counterexamples that show
-# the checks have teeth.
+# java; fetches tla2tools.jar into spec/ on first use (gitignored). The
+# version is pinned and the download is checksum-verified before java ever
+# runs it: an unpinned `releases/latest` would silently change what executes
+# on a developer's machine and would make past hold/fail verdicts
+# irreproducible. To move to a new TLA+ release, bump both constants — the
+# recipe refuses to run on a mismatch rather than trusting the download.
+# Two of the four configs are EXPECTED to fail — they are the
+# counterexamples that show the checks have teeth.
 tla:
     #!/usr/bin/env bash
     set -euo pipefail
     cd spec
-    jar=.tla2tools.jar
+    version=v1.7.4
+    sha=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+    jar=.tla2tools-$version.jar
+    verify() { # jar -> 0 when it matches the pinned checksum
+        local got
+        got=$(shasum -a 256 "$1" | cut -d' ' -f1)
+        [ "$got" = "$sha" ] || { echo "  checksum mismatch for $1"; echo "    expected $sha"; echo "    got      $got"; return 1; }
+    }
     if [ ! -f "$jar" ]; then
-        echo "fetching tla2tools.jar ..."
-        curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+        echo "fetching tla2tools.jar $version ..."
+        curl -fsSL -o "$jar.part" \
+            "https://github.com/tlaplus/tlaplus/releases/download/$version/tla2tools.jar"
+        # Verify BEFORE the file is usable: never leave an unverified jar
+        # where the next run would find it and skip the check.
+        verify "$jar.part" || { rm -f "$jar.part"; exit 1; }
+        mv "$jar.part" "$jar"
     fi
+    verify "$jar" || exit 1
     check() { # name, config, module, expectation(hold|fail)
         local out
         if out=$(java -cp "$jar" tlc2.TLC -config "$2" "$3" 2>&1); then

@@ -19,16 +19,6 @@ pub type FlowIx = usize;
 /// scope instances a token lives in are `ScopeId`s in the instance state.
 pub type ScopeIx = usize;
 
-/// One static scope: the process body, or an embedded subprocess's body.
-#[derive(Debug, Clone)]
-pub struct ExecScope {
-    /// The subprocess node owning this scope (`None` for the root).
-    pub owner: Option<NodeIx>,
-    pub parent: Option<ScopeIx>,
-    /// The scope's single start event (`single-start-event` guarantees it).
-    pub start: NodeIx,
-}
-
 /// The per-definition wiring from the deployment manifest: element ->
 /// work-item topic, and message element -> correlation key (a FEEL qualified
 /// name into the instance variables). Unmapped tasks default to their
@@ -187,10 +177,10 @@ pub struct ExecutableProcess {
     /// host node -> its interrupting timer boundary nodes, armed on the
     /// host's token whenever the host starts waiting.
     timer_boundaries: BTreeMap<NodeIx, Vec<NodeIx>>,
-    /// The static scope tree; index 0 is the process root.
-    scopes: Vec<ExecScope>,
-    /// Which scope each node lives in (indexed by `NodeIx`).
-    node_scope: Vec<ScopeIx>,
+    /// Each static scope's start event; index 0 is the process root. The
+    /// rest of the scope tree (parents, owners) is only needed while
+    /// compiling, so it does not survive into the runtime model.
+    scope_starts: Vec<NodeIx>,
     start: NodeIx,
 }
 
@@ -323,11 +313,6 @@ impl ExecutableProcess {
         // scope each node came from. Ids are unique across scopes (the
         // linter enforces it), so one global id map still resolves flows.
         let mut scope_bodies: Vec<&FlowScope> = vec![scope];
-        let mut exec_scopes: Vec<ExecScope> = vec![ExecScope {
-            owner: None,
-            parent: None,
-            start: 0, // resolved once nodes exist
-        }];
         let mut flat: Vec<(ScopeIx, &FlowNode)> = Vec::new();
         let mut child_scope: BTreeMap<NodeIx, ScopeIx> = BTreeMap::new();
         let mut si = 0;
@@ -340,11 +325,6 @@ impl ExecutableProcess {
                         return Err(not_yet(node, "event subprocesses arrive in v3"));
                     }
                     child_scope.insert(flat_ix, scope_bodies.len());
-                    exec_scopes.push(ExecScope {
-                        owner: Some(flat_ix),
-                        parent: Some(si),
-                        start: 0,
-                    });
                     scope_bodies.push(&sp.body);
                 }
             }
@@ -352,7 +332,8 @@ impl ExecutableProcess {
         }
 
         let mut nodes: Vec<ExecNode> = Vec::with_capacity(flat.len());
-        let mut node_scope: Vec<ScopeIx> = Vec::with_capacity(flat.len());
+        let mut scope_starts: Vec<Option<NodeIx>> = vec![None; scope_bodies.len()];
+        let mut default_flow_ids: Vec<(NodeIx, &str)> = Vec::new();
         let mut node_ix: BTreeMap<&str, NodeIx> = BTreeMap::new();
         let mut boundary_hosts: Vec<(NodeIx, String)> = Vec::new();
         for (ix, (owning_scope, node)) in flat.iter().enumerate() {
@@ -376,8 +357,12 @@ impl ExecutableProcess {
                         .cloned()
                         .unwrap_or_else(|| node.id.clone()),
                 },
-                NodeKind::ExclusiveGateway { .. } => {
-                    // The default flow index is resolved after flows are built.
+                NodeKind::ExclusiveGateway { default_flow } => {
+                    // Resolved once flows exist; recorded here so nothing
+                    // has to rescan the flattened node array later.
+                    if let Some(id) = default_flow {
+                        default_flow_ids.push((ix, id.as_str()));
+                    }
                     ExecKind::ExclusiveGateway { default_flow: None }
                 }
                 NodeKind::ParallelGateway => ExecKind::ParallelGateway,
@@ -452,7 +437,9 @@ impl ExecutableProcess {
                 }
             };
             node_ix.insert(node.id.as_str(), ix);
-            node_scope.push(*owning_scope);
+            if kind == ExecKind::Start {
+                scope_starts[*owning_scope] = Some(ix);
+            }
             nodes.push(ExecNode {
                 id: node.id.clone(),
                 kind,
@@ -493,15 +480,14 @@ impl ExecutableProcess {
             }
         }
 
-        for node in &mut nodes {
-            if let ExecKind::ExclusiveGateway { default_flow } = &mut node.kind {
-                let model_node = flat.iter().find(|(_, n)| n.id == node.id).unwrap().1;
-                if let NodeKind::ExclusiveGateway {
-                    default_flow: Some(id),
-                } = &model_node.kind
-                {
-                    *default_flow = flows.iter().position(|f| &f.id == id);
-                }
+        let flow_by_id: BTreeMap<&str, FlowIx> = flows
+            .iter()
+            .enumerate()
+            .map(|(fi, f)| (f.id.as_str(), fi))
+            .collect();
+        for (gateway, flow_id) in default_flow_ids {
+            if let ExecKind::ExclusiveGateway { default_flow } = &mut nodes[gateway].kind {
+                *default_flow = flow_by_id.get(flow_id).copied();
             }
         }
 
@@ -555,15 +541,16 @@ impl ExecutableProcess {
             }
         }
 
-        // Each scope has exactly one start event (`single-start-event`).
-        for (s, exec_scope) in exec_scopes.iter_mut().enumerate() {
-            exec_scope.start = nodes
-                .iter()
-                .enumerate()
-                .position(|(ix, n)| node_scope[ix] == s && n.kind == ExecKind::Start)
-                .ok_or_else(|| CompileError::Internal(format!("scope {s} has no start event")))?;
-        }
-        let start = exec_scopes[0].start;
+        // Each scope has exactly one start event (`single-start-event`),
+        // recorded during the node pass above rather than rescanned here.
+        let scope_starts: Vec<NodeIx> = scope_starts
+            .into_iter()
+            .enumerate()
+            .map(|(s, start)| {
+                start.ok_or_else(|| CompileError::Internal(format!("scope {s} has no start event")))
+            })
+            .collect::<Result<_, _>>()?;
+        let start = scope_starts[0];
 
         let ids = nodes
             .iter()
@@ -577,8 +564,7 @@ impl ExecutableProcess {
             ids,
             error_boundaries,
             timer_boundaries,
-            scopes: exec_scopes,
-            node_scope,
+            scope_starts,
             start,
         })
     }
@@ -612,13 +598,15 @@ impl ExecutableProcess {
             .map(|(_, b)| *b)
     }
 
-    /// The static scope a node lives in.
-    pub fn scope_of(&self, node: NodeIx) -> ScopeIx {
-        self.node_scope[node]
+    /// Where execution begins inside a static scope.
+    pub fn scope_start(&self, scope: ScopeIx) -> NodeIx {
+        self.scope_starts[scope]
     }
 
-    pub fn scope(&self, scope: ScopeIx) -> &ExecScope {
-        &self.scopes[scope]
+    /// [`Self::scope_start`] for callers enumerating scopes they did not
+    /// count (the state-space explorer roots its walk at every scope).
+    pub fn try_scope_start(&self, scope: ScopeIx) -> Option<NodeIx> {
+        self.scope_starts.get(scope).copied()
     }
 
     /// The interrupting timer boundaries armed whenever `host` starts

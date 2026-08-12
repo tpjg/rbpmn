@@ -25,8 +25,8 @@ mod state;
 mod step;
 
 pub use compile::{
-    Bindings, CompileError, ExecKind, ExecScope, ExecutableProcess, FlowIx, NodeIx, ScopeIx,
-    TimerDue, WorkKind,
+    Bindings, CompileError, ExecKind, ExecutableProcess, FlowIx, NodeIx, ScopeIx, TimerDue,
+    WorkKind,
 };
 pub use event::Event;
 pub use merge_patch::merge_patch;

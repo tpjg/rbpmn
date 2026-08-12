@@ -875,17 +875,32 @@ pub(crate) async fn persist_step(
         .bind(instance_id)
         .execute(&mut *tx)
         .await?;
+    // One multi-row insert, like the token snapshot below: round-trips here
+    // happen inside the held instance lock, and a deeply nested model has
+    // one scope per level.
+    let mut scope_nos: Vec<i64> = Vec::new();
+    let mut scope_parents: Vec<i64> = Vec::new();
+    let mut scope_elements: Vec<&str> = Vec::new();
+    let mut scope_tokens: Vec<i64> = Vec::new();
     for (id, scope) in state.scopes() {
+        scope_nos.push(id.0 as i64);
+        scope_parents.push(scope.parent.0 as i64);
+        scope_elements.push(proc.node_id(scope.element));
+        scope_tokens.push(scope.token.0 as i64);
+    }
+    if !scope_nos.is_empty() {
         sqlx::query(
             "insert into rbpmn_scope \
              (instance_id, scope_no, parent_scope_no, element_id, token_no) \
-             values ($1, $2, $3, $4, $5)",
+             select $1, s.no, s.parent, s.el, s.tok \
+             from unnest($2::bigint[], $3::bigint[], $4::text[], $5::bigint[]) \
+               as s(no, parent, el, tok)",
         )
         .bind(instance_id)
-        .bind(id.0 as i64)
-        .bind(scope.parent.0 as i64)
-        .bind(proc.node_id(scope.element))
-        .bind(scope.token.0 as i64)
+        .bind(&scope_nos)
+        .bind(&scope_parents)
+        .bind(&scope_elements)
+        .bind(&scope_tokens)
         .execute(&mut *tx)
         .await?;
     }

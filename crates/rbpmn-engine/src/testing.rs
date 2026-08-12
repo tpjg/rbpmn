@@ -41,8 +41,16 @@ impl TestDb {
     /// own pools rather than a clone of this one (the storm runs several
     /// engines as genuinely separate nodes).
     pub fn url(&self) -> String {
-        let base = self.admin_url.rsplit_once('/').unwrap().0;
-        format!("{base}/{}", self.name)
+        // Parsed, not split: string surgery on the last '/' drops any query
+        // string, so an admin URL carrying `?sslmode=require` would hand the
+        // storm's node pools different connection options than `self.pool`.
+        use sqlx::ConnectOptions;
+        use std::str::FromStr;
+        sqlx::postgres::PgConnectOptions::from_str(&self.admin_url)
+            .expect("admin URL parses")
+            .database(&self.name)
+            .to_url_lossy()
+            .to_string()
     }
 
     /// Drops the throwaway database (call at the end of a passing test; a

@@ -121,14 +121,40 @@ pub fn check(proc: &ExecutableProcess, s: &InstanceState) -> Result<(), String> 
         }
     }
 
-    // The uniform incident freeze: exactly one token, parked where it failed.
+    // The uniform incident freeze: at least one token parked where it
+    // failed. NOT exactly one — `Advancer::freeze` deliberately parks every
+    // sibling that was still in flight as `Incident` too, so that a frozen
+    // parallel branch is not silently lost (token conservation survives the
+    // freeze, which is what makes a future repair API possible).
     if s.status == InstanceStatus::Failed {
         let incidents = s
             .tokens()
             .filter(|(_, t)| matches!(t.wait, WaitKind::Incident))
             .count();
-        if incidents != 1 {
-            return Err(format!("failed instance has {incidents} incident tokens"));
+        if incidents == 0 {
+            return Err("failed instance has no incident token".to_string());
+        }
+    }
+
+    // Scopes: nothing left behind, and every open scope is answered by the
+    // token parked on it (mirrors the SQL fsck's scope predicates).
+    if matches!(
+        s.status,
+        InstanceStatus::Completed | InstanceStatus::Terminated
+    ) && s.scopes().count() > 0
+    {
+        return Err(format!("terminal status {:?} left open scopes", s.status));
+    }
+    for (id, scope) in s.scopes() {
+        match s.tokens().find(|(t, _)| *t == scope.token) {
+            Some((_, t)) if t.wait == WaitKind::Scope(id) && t.node == scope.element => {}
+            Some(_) => return Err(format!("scope {id:?}'s parked token disagrees with it")),
+            None => return Err(format!("scope {id:?} has no parked parent token")),
+        }
+        if scope.parent != rbpmn_core::ScopeId::ROOT
+            && !s.scopes().any(|(other, _)| other == scope.parent)
+        {
+            return Err(format!("scope {id:?} has a missing parent scope"));
         }
     }
     Ok(())
@@ -207,7 +233,11 @@ pub fn canonical(proc: &ExecutableProcess, s: &InstanceState) -> String {
 /// collect the conditions on their outgoing flows.
 pub fn reachable_conditions(proc: &ExecutableProcess, codes: &[String]) -> Vec<Expr> {
     let mut seen = HashSet::new();
-    let mut queue = VecDeque::from([proc.start()]);
+    // Every scope's start is a root: no sequence flow connects a subprocess
+    // to its body, so walking flows alone never enters one — the alphabet
+    // would come back empty for every hierarchical model and the
+    // exploration would silently never drive a gateway inside a subprocess.
+    let mut queue: VecDeque<NodeIx> = (0..).map_while(|s| proc.try_scope_start(s)).collect();
     let mut found = Vec::new();
     while let Some(n) = queue.pop_front() {
         if !seen.insert(n) {

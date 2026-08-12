@@ -125,10 +125,13 @@ const FSCK: &[(&str, &str)] = &[
          where t.scope_no <> 0 and s.scope_no is null",
     ),
     (
-        "a failed instance is not frozen at exactly one incident token",
+        // At least one, not exactly one: the freeze parks every token that
+        // was still in flight (a parallel sibling mid-advance) as an
+        // incident too, so token conservation survives the freeze.
+        "a failed instance is not frozen at an incident token",
         "select i.id::text from rbpmn_instance i where i.status = 'failed' \
-           and (select count(*) from rbpmn_token t \
-                where t.instance_id = i.id and t.wait_kind = 'incident') <> 1",
+           and not exists (select 1 from rbpmn_token t \
+                where t.instance_id = i.id and t.wait_kind = 'incident')",
     ),
     (
         "a work item is locked without a live lease or an owner",

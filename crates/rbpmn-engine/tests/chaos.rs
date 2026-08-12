@@ -67,7 +67,12 @@ impl ServiceTaskHandler for ChaoticHandler {
             match n % 4 {
                 0 | 1 => Ok(serde_json::json!({ "handled": n })),
                 2 => Err(HandlerFailure {
-                    code: None,
+                    // OUT_OF_STOCK matches the error boundary on the
+                    // `scoped` deployment's subprocess. With code: None the
+                    // catch walk in `step` cannot match anything, so every
+                    // scoped instance froze as an incident and the scope
+                    // teardown this fixture exists to stress never ran.
+                    code: Some("OUT_OF_STOCK".into()),
                     message: "chaos: deliberate handler failure".into(),
                 }),
                 _ => panic!(
