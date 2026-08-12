@@ -65,9 +65,21 @@ preventing the confusion — it comes from the confusion not mattering.
 ## Scope
 
 `LockOrder` is parameterised over the per-instance rows a step touches
-(`RowOrder`): since phase 6 that is tokens, work items, timers, subscriptions
-and scopes, so the claim checked is about *any* of them rather than a single
-"item" standing in for five tables.
+(`RowOrder`), and is checked at two arities because they answer different
+questions:
+
+- `LockOrder.cfg` / `LockOrderHistorical.cfg` — 3 nodes, 2 instances, **2
+  rows**: the cross-instance question, where contention between nodes lives.
+- `LockOrderAllRows.cfg` / `...Historical.cfg` — 2 nodes, 1 instance, **all
+  five rows** a step really touches since phase 6 (tokens, work items,
+  timers, subscriptions, scopes): the arity question.
+
+The all-rows run finishes in 112 states, and that number is the point rather
+than a disappointment: once a node holds the instance row, no peer can take
+any of that instance's rows, so per-instance rows are **never contended**.
+Arity adds path length, not branching. That is *why* the ordering rule scales
+to however many tables a step grows — but it is now checked at the real
+number instead of asserted from two.
 
 Bounded models: 3 nodes / 2 instances / 2 row kinds, 2 workers / TTL 2 / 4
 ticks, and 2 nodes / 2 tokens / 2 timers. That

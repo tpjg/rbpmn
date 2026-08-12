@@ -742,7 +742,11 @@ re-check under the instance lock verifies the timer *row* still exists, never
 that the row's *token* does, so the claim path's safety rests on an invariant
 of teardown rather than on the re-check. `LockOrder.tla` is now parameterised
 over the per-instance rows a step touches, since phase 6 made that five tables
-rather than one.
+rather than one — and checked at both two rows (across instances, where node
+contention lives) and all five (within one instance, the arity question). The
+five-row run is only 112 states, which is itself the explanation: holding the
+instance row means no peer can touch that instance's rows at all, so arity
+adds path length rather than contention.
 
 > **The specs do not adapt themselves.** Phase 6 landed and `spec/` was not
 > touched; the conclusion that scope rows changed nothing was an argument,

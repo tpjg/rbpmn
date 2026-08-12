@@ -42,7 +42,7 @@ parity: wasm
 # on a developer's machine and would make past hold/fail verdicts
 # irreproducible. To move to a new TLA+ release, bump both constants — the
 # recipe refuses to run on a mismatch rather than trusting the download.
-# Three of the six configs are EXPECTED to fail — they are the
+# Four of the eight configs are EXPECTED to fail — they are the
 # counterexamples that show the checks have teeth, and two of them
 # reproduce bugs that were real (the AB/BA timer-claim sketch, and the
 # phase-6 scope teardown that left a timer row behind).
@@ -86,6 +86,8 @@ tla:
     }
     check "lock order: shipped protocol"      LockOrder.cfg           LockOrder.tla hold
     check "lock order: rejected AB/BA sketch" LockOrderHistorical.cfg LockOrder.tla fail
+    check "lock order: all five per-instance rows"  LockOrderAllRows.cfg           LockOrder.tla hold
+    check "lock order: five rows, wrong order"      LockOrderAllRowsHistorical.cfg LockOrder.tla fail
     check "lease: safety"                     Lease.cfg               Lease.tla     hold
     check "lease: double belief is reachable" Lease_DoubleBelief.cfg  Lease.tla     fail
     # -deadlock: a terminal state is legitimate here (everything torn down,

@@ -42,8 +42,14 @@ Range(seq) == {seq[i] : i \in 1..Len(seq)}
 
 \* Config files cannot carry tuple literals, so the concrete row lists live
 \* here and the .cfg overrides `RowOrder` with one of them.
+\* Two rows is enough to exhibit the ordering question and cheap enough to
+\* check across several nodes and instances.
 TwoRows == <<"item", "timer">>
-ThreeRows == <<"item", "timer", "scope">>
+\* Every per-instance row a step actually touches since phase 6. Checked in
+\* LockOrderAllRows.cfg, which trades node and instance count for row count —
+\* the arity question is within one instance, and the cross-instance question
+\* is what the TwoRows configs cover.
+AllRows == <<"token", "item", "timer", "subscription", "scope">>
 
 \* The instance row, plus every per-instance row a step may touch. Since
 \* phase 6 that is tokens, work items, timers, subscriptions AND scopes — so
