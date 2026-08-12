@@ -625,7 +625,7 @@ pub(crate) async fn load_instance_nowait(
     let sql = format!(
         "select i.definition_id, i.definition_key, i.status, i.variables, \
                 i.next_token, i.next_work_item, i.next_timer, i.next_subscription, \
-                i.next_scope \
+                i.next_scope, i.pruned_at is not null as pruned \
          from rbpmn_instance i where i.id = $1 for update{}",
         if nowait { " nowait" } else { "" }
     );
@@ -641,6 +641,15 @@ pub(crate) async fn load_instance_nowait(
         }
         Err(e) => return Err(e.into()),
     };
+
+    // Nothing can reach a pruned instance — its work items, timers and
+    // subscriptions are gone, so no claim, fire or correlation addresses it.
+    // Guarded anyway: rehydrating one would rebuild a state whose rows were
+    // deliberately deleted, and inventing state is exactly the failure this
+    // codebase refuses to have. Loud beats impossible-but-catastrophic.
+    if inst.get::<bool, _>("pruned") {
+        return Err(EngineError::InstancePruned(instance_id));
+    }
 
     let key: String = inst.get("definition_key");
     let definition = DefinitionRef {

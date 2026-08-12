@@ -22,6 +22,7 @@ mod events;
 mod http_handler;
 mod inspect;
 mod listen;
+mod retention;
 mod runtime;
 mod scheduler;
 mod tasks;
@@ -39,6 +40,10 @@ pub use inspect::{
     EventView, InstanceInspection, ScopeView, SubscriptionView, TimerView, TokenView, WorkItemView,
 };
 pub use rbpmn_core::{Bindings, Event};
+pub use retention::{
+    ArchiveBatch, ArchiveError, InstanceRecord, PrunableDefinition, RetentionArchive,
+    RetentionBatch, RetentionOptions, RetentionPolicy, RetentionReport,
+};
 pub use runtime::FailOptions;
 pub use scheduler::SchedulerOptions;
 pub use sqlx::PgPool;
@@ -86,6 +91,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "subprocess_scopes",
         include_str!("../migrations/0006_subprocess_scopes.sql"),
     ),
+    (
+        7,
+        "retention",
+        include_str!("../migrations/0007_retention.sql"),
+    ),
 ];
 
 /// A claimed unit of service work, as handed to a push-mode handler.
@@ -132,6 +142,7 @@ pub struct EngineBuilder {
     pool: PgPool,
     env: Environment,
     retry_backoff: std::time::Duration,
+    archive: Option<Arc<dyn retention::RetentionArchive>>,
 }
 
 impl EngineBuilder {
@@ -157,6 +168,15 @@ impl EngineBuilder {
         self
     }
 
+    /// Where records are written before retention deletes them. Every
+    /// deletion path consults it — the sweeper and the explicit
+    /// [`Engine::delete_instance`] alike — and a sink failure means nothing
+    /// is deleted.
+    pub fn archive(mut self, archive: Arc<dyn retention::RetentionArchive>) -> Self {
+        self.archive = Some(archive);
+        self
+    }
+
     pub fn build(self) -> Engine {
         Engine {
             inner: Arc::new(Inner {
@@ -165,6 +185,7 @@ impl EngineBuilder {
                 retry_backoff: self.retry_backoff,
                 deferrals: std::sync::Mutex::new(BTreeMap::new()),
                 compiled: RwLock::new(BTreeMap::new()),
+                archive: RwLock::new(self.archive),
             }),
         }
     }
@@ -181,6 +202,11 @@ struct Inner {
     /// Compiled definitions by definition id — immutable rows, cached
     /// forever; definitions are few, growth is bounded by deploys.
     compiled: RwLock<BTreeMap<uuid::Uuid, Arc<rbpmn_core::ExecutableProcess>>>,
+    /// Where records go before retention deletes them. On the engine rather
+    /// than in `RetentionOptions` so that *every* deletion path passes
+    /// through it — an escape hatch that could bypass the audit trail would
+    /// not be one.
+    archive: RwLock<Option<Arc<dyn retention::RetentionArchive>>>,
 }
 
 /// The one claimability predicate, shared verbatim by the push worker's
@@ -241,6 +267,7 @@ impl Engine {
             pool,
             env: Environment::default(),
             retry_backoff: std::time::Duration::from_secs(5),
+            archive: None,
         }
     }
 
@@ -389,6 +416,16 @@ impl Engine {
             .await?;
         self.inner.env.write().unwrap().declared.extend(rows);
         Ok(())
+    }
+
+    /// Register (or replace) the retention archive sink at any time — the
+    /// runtime twin of [`EngineBuilder::archive`].
+    pub fn register_archive(&self, archive: Arc<dyn retention::RetentionArchive>) {
+        *self.inner.archive.write().unwrap() = Some(archive);
+    }
+
+    pub(crate) fn inner_archive(&self) -> Option<Arc<dyn retention::RetentionArchive>> {
+        self.inner.archive.read().unwrap().clone()
     }
 
     /// Register (or re-register: latest binding wins) a push-mode handler.

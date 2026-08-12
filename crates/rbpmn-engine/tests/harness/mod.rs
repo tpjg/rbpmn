@@ -138,6 +138,32 @@ const FSCK: &[(&str, &str)] = &[
         "select id::text from rbpmn_work_item \
          where state = 'locked' and (lock_owner is null or lock_until is null)",
     ),
+    (
+        // Retention deletes an instance's events *with* its row, in one
+        // transaction, and prunes runtime children without touching either.
+        // That is what lets `delete_definition` prove "nothing references
+        // this" from an indexed instance lookup instead of scanning the
+        // largest table in the schema — so it is an invariant, not a habit.
+        "an event outlives the instance it belongs to",
+        "select distinct e.instance_id::text from rbpmn_event e \
+         where not exists (select 1 from rbpmn_instance i where i.id = e.instance_id)",
+    ),
+    (
+        "a pruned instance still holds runtime rows",
+        "select i.id::text from rbpmn_instance i where i.pruned_at is not null \
+           and (exists (select 1 from rbpmn_token t where t.instance_id = i.id) \
+             or exists (select 1 from rbpmn_work_item w where w.instance_id = i.id) \
+             or exists (select 1 from rbpmn_timer t where t.instance_id = i.id) \
+             or exists (select 1 from rbpmn_subscription s where s.instance_id = i.id) \
+             or exists (select 1 from rbpmn_scope s where s.instance_id = i.id))",
+    ),
+    (
+        // Retention only ever retires terminal records; an active or failed
+        // instance being pruned would mean a repair target lost its state.
+        "a pruned instance is not terminal",
+        "select id::text from rbpmn_instance \
+         where pruned_at is not null and status not in ('completed', 'terminated')",
+    ),
 ];
 
 pub async fn fsck(pool: &PgPool) -> Vec<String> {

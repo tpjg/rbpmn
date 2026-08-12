@@ -685,14 +685,87 @@ terminate ends its own scope, not the instance. The linter already recurses
 into subprocess scopes and `13-subprocess.bpmn` already sits in the accept
 corpus — the groundwork was laid on purpose.
 
-**Phase 7 — Retention (v1-completing).** Small, and now urgent for a reason
-that did not exist before phase 5: `/v1/events` publishes a cursor contract,
-so a retention job that deletes events a tailing consumer has not read
-silently breaks it. Decide the interaction while the contract is fresh —
-minimum age, a read horizon, or both — plus what is deletable at all
-(completed instances' non-terminal events?) and whether `rbpmn_event` gets
-native partitioning by definition, which the Postgres notes above already
-flag as the place growth will hurt first.
+**Phase 7 — Retention (v1-completing; decided and shipped).** Urgent for a
+reason that did not exist before phase 5: `/v1/events` publishes a cursor
+contract, so a retention job that deletes events a tailing consumer has not
+read silently breaks it. The resolution reframes the problem — you cannot
+promise never to delete data someone might want, but you *can* promise that
+nobody ever silently misses an event.
+
+- **A monotonic truncation floor** is the primary mechanism: one row holding
+  the highest `(txid, id)` ever deleted. Everything deleted is at or below
+  it, so a cursor at or above it has provably lost nothing however scattered
+  the deleted set, and a *resume* from below it fails loudly with
+  `CursorTruncated` (HTTP **410 Gone**, carrying the floor to resume from).
+  A zero cursor still means "from the beginning", which now reads as *from
+  the oldest retained event*: a new consumer has no completeness expectation
+  to violate. One row of state, **zero coordination** — third-party
+  consumers over HTTP get the guarantee without registering anything.
+- **A read horizon was considered and deferred**, on an argument worth
+  keeping: if a registered reader's TTL is ≤ the retention age, the age floor
+  already protects it for longer, so the horizon is dead weight. It earns its
+  keep only under a "keep as long as the slowest consumer needs, *beyond* the
+  nominal age" policy — and adding it later is purely additive, since it can
+  only make truncation rarer, never change what a cursor means. The loud
+  mechanism had to ship in v1 because it changes the contract; the
+  optimisation did not.
+- **Two knobs, because there are two growth curves.** `retain_runtime`
+  deletes an instance's *children* (tokens, work items, timers,
+  subscriptions, scopes) and stamps `pruned_at` — that is the hot working
+  set, and it reclaims latency. `retain_history` then deletes the record and
+  its events together — that is the archive, and it reclaims storage. The
+  instance row deliberately survives stage one as the header of its own
+  history: inspection keeps working (with `prunedAt` distinguishing "retired"
+  from "finished cleanly"), business keys stay queryable, and **an event
+  never outlives its instance row** — which is also what keeps
+  "is this definition still referenced?" an indexed lookup rather than a scan
+  of the largest table in the schema.
+- **Three phases, and the middle one holds no transaction**, so that
+  export-before-delete (S3, a warehouse, a compliance log) is possible at
+  all: `plan` → `archive` → `execute`. A sink call inside the deletion
+  transaction would pin `pg_snapshot_xmin` — cluster-wide — for the duration
+  of a network upload, stalling every event-stream reader: the feature that
+  archives history would freeze the stream that reads it. The gap is safe
+  because retention only ever selects immutable data (terminal instances,
+  closed event histories). Export is at-least-once, and a sink failure
+  deletes nothing. For the same reason the cross-node claim is a **lease
+  row**, never a session advisory lock (which would leak forever on a
+  cancelled pass) — the task API's "a lease is a row value, never an open
+  transaction" rule, applied again.
+- **What it will not touch**: active instances, `failed` ones at any age (an
+  incident is frozen evidence and a repair target), anything younger than its
+  policy, and definitions. Eligibility is evaluated **per instance**, so a
+  wedged instance never blocks its neighbours' retirement — the tempting
+  alternative, a global watermark at "the oldest event of any non-terminal
+  instance", is one number, trivially safe, and permanently jammed by a
+  single stuck instance until the disk fills. `Engine::delete_instance` is
+  the explicit escape hatch for a triaged incident, and it archives too: an
+  escape hatch that bypassed the audit trail would not be one.
+- **Definitions and config go only by hand**, which generalises into a rule:
+  *an automatic sweep is justified by unbounded growth and by nothing else*.
+  Definitions grow with deployments, not throughput, so there is no growth to
+  justify the risk — only the risk of turning an archive into a pile of
+  element ids. `prunable_definitions` is the dry run; `delete_definition`
+  refuses while anything references the version.
+- **Retention is opt-in twice over**: no sweeper runs unless one is started,
+  and starting one means naming the default policy (`forever()` is a valid
+  and explicit choice). Per-definition overrides are keyed by definition
+  **key**, not version — retention is operational, not semantic, and keying
+  by version would force a redeploy to change an operational knob. The
+  policy row's presence, not its nullness, decides: a null column means
+  *forever*, a missing row means *no override*, and conflating them (the
+  first implementation did, via `coalesce`) silently deletes the history a
+  key explicitly asked to keep.
+- **Partitioning: no, and the axis matters.** Partition-by-definition only
+  pays if a whole definition retires at once, but retention is per-instance
+  and time-based, so row deletes would continue inside every partition. The
+  axis that pays is range-on-time, where retention becomes `DROP PARTITION` —
+  at the cost of coarse time buckets, per-instance atomicity, and complexity
+  around the global `(txid, id)` index the cursor contract rests on. It is
+  also *physical*, so it can be adopted later without touching a contract.
+  Same call for **history level** (which event kinds get written): it changes
+  the stream's *completeness* contract — a consumer could no longer tell
+  "didn't happen" from "not recorded" — so it is a different feature.
 
 **Phase 8 — Authoring & inspection surfaces (v1-completing).** An editor for
 the model+manifest *pair* and a read-only single-instance inspector, both
@@ -986,9 +1059,11 @@ question is purely internal.
 
 | Item | Why it matters | Complexity | Status |
 |---|---|---|---|
-| **Embedded subprocesses** | The modelling style the engine exists to serve; unmodellable today | High | **v1, phase 6 — in progress** |
-| **Retention** | The failure mode that kills BPM installations; interacts with the new event cursor | Low | **v1, phase 7 — next** |
-| **Authoring & inspection surfaces** | A `.bpmn` is half-deployable without its manifest, and nothing outside this repo knows the manifest exists; the project's own debugger is dev-only | Medium | **v1, phase 8** |
+| **Embedded subprocesses** | The modelling style the engine exists to serve; unmodellable today | High | **v1, phase 6 — shipped** |
+| **Retention** | The failure mode that kills BPM installations; interacts with the new event cursor | Low | **v1, phase 7 — shipped** |
+| **Authoring & inspection surfaces** | A `.bpmn` is half-deployable without its manifest, and nothing outside this repo knows the manifest exists; the project's own debugger is dev-only | Medium | **v1, phase 8 — next** |
+| Event-stream read horizon | Hold history for a registered slow consumer *beyond* the nominal retention age | Low | Roadmap — purely additive over the phase-7 floor; see phase 7 for why the age subsumes it otherwise |
+| `rbpmn_event` time partitioning | Turns retention into `DROP PARTITION` at very large scale | Medium | Roadmap — physical only, no contract change; see phase 7 |
 | Non-interrupting boundary events | "Every 30 days while this runs"; rides on scope machinery | Medium | v2 — held out of v1 so it does not double phase 6's risk |
 | Link events | Diagram hygiene once big models are common | Trivial | v2 |
 | Event subprocesses | "Cancel my order at any point" without boundary spaghetti | Medium | v3 |

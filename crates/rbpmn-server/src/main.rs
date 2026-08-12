@@ -49,6 +49,26 @@ async fn main() -> ExitCode {
         });
     }
 
+    // Retention is opt-in twice over: no sweeper runs unless the operator
+    // names a policy, and the policy they name can still be "forever". A
+    // server started without RBPMN_RETAIN_* deletes nothing, ever.
+    match retention_options() {
+        Ok(Some(options)) => {
+            tracing::info!(
+                runtime = ?options.default_policy.retain_runtime,
+                history = ?options.default_policy.retain_history,
+                "retention sweeper enabled"
+            );
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.run_retention(options).await });
+        }
+        Ok(None) => {}
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::from(2);
+        }
+    }
+
     match rbpmn_server::serve(config, engine).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
@@ -56,6 +76,43 @@ async fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// The sweeper's default policy, from the environment. `RBPMN_RETAIN_RUNTIME`
+/// and `RBPMN_RETAIN_HISTORY` are durations in **days** (fractions allowed);
+/// `forever` is spelled by omitting one. Neither set means no sweeper at all,
+/// which is a different and even safer thing than a sweeper that keeps
+/// everything: nothing is even scanned.
+///
+/// Per-definition overrides do not live here — they are registration-time
+/// wiring in the embedding application, like topics and indexes.
+fn retention_options() -> Result<Option<rbpmn_engine::RetentionOptions>, String> {
+    fn days(name: &str) -> Result<Option<std::time::Duration>, String> {
+        match std::env::var(name) {
+            Err(_) => Ok(None),
+            Ok(raw) => {
+                let value: f64 = raw
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("invalid {name} '{raw}' (expected days, e.g. 30)"))?;
+                if !value.is_finite() || value < 0.0 {
+                    return Err(format!(
+                        "invalid {name} '{raw}' (expected a positive number)"
+                    ));
+                }
+                Ok(Some(std::time::Duration::from_secs_f64(
+                    value * 24.0 * 3600.0,
+                )))
+            }
+        }
+    }
+    let runtime = days("RBPMN_RETAIN_RUNTIME")?;
+    let history = days("RBPMN_RETAIN_HISTORY")?;
+    if runtime.is_none() && history.is_none() {
+        return Ok(None);
+    }
+    let policy = rbpmn_engine::RetentionPolicy::new(runtime, history).map_err(|e| e.to_string())?;
+    Ok(Some(rbpmn_engine::RetentionOptions::new(policy)))
 }
 
 /// Environment before definitions: wire handlers and declared topics from

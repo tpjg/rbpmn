@@ -393,9 +393,24 @@ fn engine_error(e: EngineError) -> Response {
     let (status, message) = match &e {
         EngineError::UnknownDefinition(_)
         | EngineError::UnknownWorkItem(_)
-        | EngineError::UnknownInstance(_) => (StatusCode::NOT_FOUND, e.to_string()),
+        | EngineError::UnknownInstance(_)
+        | EngineError::UnknownDefinitionVersion { .. } => (StatusCode::NOT_FOUND, e.to_string()),
         EngineError::IncidentOpen(_) | EngineError::InstanceNotActive(..) => {
             (StatusCode::CONFLICT, e.to_string())
+        }
+        // 410 Gone is exactly this: the resource existed and was
+        // deliberately removed. The message carries the floor to resume from.
+        EngineError::CursorTruncated { .. } => (StatusCode::GONE, e.to_string()),
+        EngineError::InstanceStillActive(_)
+        | EngineError::InstancePruned(_)
+        | EngineError::DefinitionInUse { .. } => (StatusCode::CONFLICT, e.to_string()),
+        EngineError::InvalidRetentionPolicy(_) => (StatusCode::BAD_REQUEST, e.to_string()),
+        EngineError::ArchiveFailed(_) => {
+            tracing::error!(error = %e, "retention archive sink failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
         }
         EngineError::ItemLeased(_) => (StatusCode::CONFLICT, e.to_string()),
         EngineError::TopicInUse { .. } => (StatusCode::CONFLICT, e.to_string()),

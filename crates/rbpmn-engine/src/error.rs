@@ -45,10 +45,42 @@ pub enum EngineError {
     AmbiguousCorrelation { message: String, key: String },
     #[error("variables rejected: {0}")]
     InvalidVariables(String),
+    /// The cursor points below the retention floor: history it has not read
+    /// has been deleted. Never silent — a consumer either resumes above the
+    /// floor with a provably complete stream, or is told exactly this.
+    #[error(
+        "event cursor ({}, {}) points into deleted history — retention has removed events \
+         at or below ({}, {}); resume from the floor (accepting the gap) or replay from \
+         your archive",
+        .cursor.txid, .cursor.id, .floor.txid, .floor.id
+    )]
+    CursorTruncated {
+        cursor: crate::EventCursor,
+        floor: crate::EventCursor,
+    },
+    #[error("definition '{key}' version {version} is still in use: {reason}")]
+    DefinitionInUse {
+        key: String,
+        version: i32,
+        reason: String,
+    },
+    #[error("no deployed definition '{key}' version {version}")]
+    UnknownDefinitionVersion { key: String, version: i32 },
+    #[error("retention policy is invalid: {0}")]
+    InvalidRetentionPolicy(String),
+    #[error("the archive sink rejected the batch, so nothing was deleted: {0}")]
+    ArchiveFailed(String),
     #[error("instance {0} is not active (status: {1})")]
     InstanceNotActive(Uuid, String),
     #[error("instance {0} has an open incident; resolve it first")]
     IncidentOpen(Uuid),
+    #[error("instance {0} is still active; terminate it before deleting it")]
+    InstanceStillActive(Uuid),
+    #[error(
+        "instance {0} has been pruned by retention (its runtime rows were retired); \
+         it is a history record and cannot be stepped"
+    )]
+    InstancePruned(Uuid),
     #[error("definition no longer compiles: {0}")]
     Compile(#[from] rbpmn_core::CompileError),
     #[error("semantic core rejected the step: {0}")]

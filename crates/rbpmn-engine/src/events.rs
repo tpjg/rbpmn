@@ -32,6 +32,22 @@
 //! everything over HTTP — never trigger it: their xid and their lock are
 //! taken in the same statement.
 //!
+//! **Retention interacts with exactly one of these guarantees, and loudly**
+//! (phase 7). Deleted history cannot be read, so guarantee 2 is restated
+//! rather than abandoned: retention advances a monotonic **floor** — the
+//! highest `(txid, id)` it has ever deleted — and a resume from a cursor
+//! *below* the floor fails with [`EngineError::CursorTruncated`] (HTTP 410)
+//! instead of silently skipping the gap. Everything deleted is at or below
+//! the floor, so a cursor at or above it has provably lost nothing, however
+//! scattered the deleted set. A zero cursor still means "from the
+//! beginning", which now reads as *from the oldest retained event*: a new
+//! consumer has no completeness expectation to violate, and only a **resume**
+//! across a truncation must be loud. The floor may leap over events a lagging
+//! consumer had in fact already read (retention deletes whole instances, so
+//! the gap is scattered rather than a prefix) — conservative in the safe
+//! direction, and only reachable by a consumer lagging further behind than
+//! the entire retention age.
+//!
 //! The horizon is **cluster-wide** (transaction ids are global to the
 //! PostgreSQL cluster, not per database): one long-running transaction —
 //! anyone's, in any database of the cluster — holds it back. The engine's
@@ -106,6 +122,19 @@ impl Engine {
             return Err(EngineError::InvalidVariables(
                 "event page limit must be at least 1".to_string(),
             ));
+        }
+        // A *resume* below the floor is a truncation and must be loud. A
+        // zero cursor is not a resume: it means "from the oldest retained".
+        // Checked before the page query rather than folded into it, because
+        // truncation matters most exactly when the page comes back empty.
+        if after != EventCursor::default() {
+            let floor = self.retention_floor().await?;
+            if after < floor {
+                return Err(EngineError::CursorTruncated {
+                    cursor: after,
+                    floor,
+                });
+            }
         }
         let rows = sqlx::query(
             "select id, txid::text::bigint as txid, instance_id, definition_key, \
