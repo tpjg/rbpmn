@@ -37,6 +37,14 @@ impl TestDb {
         }
     }
 
+    /// Connection URL of the throwaway database — for tests that need their
+    /// own pools rather than a clone of this one (the storm runs several
+    /// engines as genuinely separate nodes).
+    pub fn url(&self) -> String {
+        let base = self.admin_url.rsplit_once('/').unwrap().0;
+        format!("{base}/{}", self.name)
+    }
+
     /// Drops the throwaway database (call at the end of a passing test; a
     /// panicked test leaves its database behind for inspection).
     pub async fn drop(self) {

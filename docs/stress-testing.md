@@ -24,8 +24,8 @@ are six, and each is a distinct target:
 |---|---|---|
 | 1 | Linter accepts → `StepError::Invariant` or panic | mutation fuzz (§3c) — *hunted, nothing found* |
 | 2 | Linter accepts → stuck token, no pending stimulus | state-space exploration (§2, §7) |
-| 3 | Runs, but differently in Postgres than in the core | replay verification (§4) |
-| 4 | Correct alone, wrong under concurrency | the storm (§4), chaos (§5) |
+| 3 | Runs, but differently in Postgres than in the core | replay verification (§4) — *hunted, nothing found* |
+| 4 | Correct alone, wrong under concurrency | the storm (§4) — *hunted*; chaos (§5) still open |
 | 5 | Linter **rejects a valid model** (false positive) | model generator (§3) |
 | 6 | Native and WASM lint disagree | parity fuzz (§6) |
 
@@ -275,6 +275,15 @@ however many you care to generate (§6).
 The naive storm ("N workers, M instances, did anything explode?") proves
 little. Here is the version that proves a lot.
 
+**Landed** as `crates/rbpmn-engine/tests/storm.rs`: the fsck, replay
+verification, and a storm across three engines on separate connection pools.
+
+> **Result: 60 instances, 1048 events, every history re-derived from the core;
+> fsck clean, zero PostgreSQL deadlocks, no work item completed twice, no
+> timer fired twice, no message delivered twice, and the tailing cursor
+> delivered every event exactly once in `(txid, id)` order.** Scales on
+> `RBPMN_STORM_ROUNDS` (300 instances / 5162 events in ~3 s).
+
 **Replay verification.** After the storm, `rbpmn_event` holds the full ordered
 history of every instance — and it is rich enough to *reconstruct the command
 sequence* (`work-item-completed` + `variables-patched` → `CompleteWorkItem`,
@@ -285,10 +294,20 @@ onto core-visible kinds.
 
 That single check converts a load test into a semantic conformance run over
 every execution that happened. It is the systematic form of
-`full_flow_matches_the_core_golden_trace`, which today covers exactly one
-fixture — and it directly tests the claim the architecture rests on: *the
-Postgres layer is a projection of this core*. It is the only test of
-outcome 3.
+`full_flow_matches_the_core_golden_trace`, which covered exactly one fixture —
+and it directly tests the claim the architecture rests on: *the Postgres layer
+is a projection of this core*. It is the only test of outcome 3.
+
+Two details make it work without a hand-maintained list to drift. Engine-level
+events (`work-item-retrying`, `timer-fire-failed`) are not `Event` variants, so
+*failing to deserialize* is precisely the projection onto core-visible kinds.
+And a `variables-patched` event always immediately follows the command that
+carried the patch, so the merge patch is recoverable from the log — only the
+initial variables of `Start` are not recorded, and the driver supplies those.
+
+Verified non-vacuous by injecting a real projection bug: dropping `FlowTaken`
+from what `persist_step` writes makes replay report the exact index where the
+database trace and the core trace diverge.
 
 The per-instance projection is well-defined precisely because of the phase-5
 guarantee: all of an instance's events are written under its row lock, so
@@ -320,7 +339,10 @@ rows*.
 - **Zero orphans.** No token / work item / timer / subscription belonging to
   a non-active instance.
 
-**`fsck` for rbpmn.** Factor these into
+**`fsck` for rbpmn** — implemented as eleven SQL queries rather than
+"rehydrate and check", deliberately: that is what someone debugging a
+production database would actually run, and it does not depend on the loader
+being correct, which is part of what is under test. Factor these into
 `check_invariants(pool) -> Vec<Violation>`, runnable against a live database
 at any moment: every active instance's rows must rehydrate into a state that
 satisfies §1. That is simultaneously the storm's assertion, the precondition
@@ -690,7 +712,7 @@ Randomized testing **falsifies**; it does not prove. Stated precisely:
 | ~~4~~ | ~~Model generator + structural oracle (§3a, §3b)~~ | done | **Landed**: `tests/modelgen/` + `tests/generator.rs` |
 | ~~5~~ | ~~Explicit-state exploration (§7)~~ | done | **Landed**: `crates/rbpmn-core/tests/explore.rs` |
 | ~~6~~ | ~~Mutation fuzz (§3c) + restriction counterexamples (§3d)~~ | done | **Landed**: `tests/mutation.rs` |
-| 7 | Storm + replay verification + fsck (§4) | 3–5 d | The projection claim; deadlock freedom |
+| ~~7~~ | ~~Storm + replay verification + fsck (§4)~~ | done | **Landed**: `tests/storm.rs` |
 | 8 | Chaos (§5) | 2–3 d | Closes testing-strategy #5 |
 | 9 | Kani on `iso8601` + `condition` parsers (§7) | 2–3 d | Panic/overflow proofs on untrusted input |
 | ~~10~~ | ~~TLA+ spec of the concurrency protocol (§7)~~ | done | **Landed**: `spec/`, `just tla` |
@@ -699,11 +721,13 @@ Items 3, 4, 5 and 6 are done, and they compose: the generator feeds both the
 explorer and the mutation fuzz, all three sharing one invariant set. Of the
 six third outcomes, 1, 2, 5 and 6 are now hunted; **3 and 4 are not, and they
 are the ones that live in the Postgres layer** — which is also the newest and
-most concurrent code in the repo, verified by hand-written cases. Item 10 is done, which
-leaves **item 7 (storm + replay verification) as the highest-value work
-remaining** — and the specs now say which interleavings it should be built to
-exercise: lease expiry racing reacquisition, and timer claims racing
-completions on one instance.
+most concurrent code in the repo, verified by hand-written cases. Item 7 is done too, built on the interleaving the specs pointed at (timer
+claims racing completions on one instance). **Chaos (item 8) is now the
+highest-value work remaining**: it is the last unhunted third outcome, it
+closes the design brief's testing-strategy #5 — which still has no
+implementation — and every piece it needs already exists, since the fsck and
+replay verification are exactly the "did it converge?" assertions a chaos
+round has to make.
 
 Item 1 is cheaper than listed — the invariant set already exists, leaving the
 random driver and the rehydration differential. Extending the generator to
