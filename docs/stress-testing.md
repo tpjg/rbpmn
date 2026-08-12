@@ -49,9 +49,12 @@ should be treated as load-bearing infrastructure, not conveniences:
 
 ## 1. Universal invariants
 
-Every technique below checks the same invariant set. Define it once, in
-`rbpmn-core` behind `#[cfg(any(test, feature = "invariants"))]`, as
-`fn check(proc: &ExecutableProcess, state: &InstanceState) -> Result<(), Violation>`:
+Every technique below checks the same invariant set. It lives today as `check`
+in `crates/rbpmn-core/tests/explore.rs`; promote it into the crate behind
+`#[cfg(any(test, feature = "invariants"))]` as soon as a second consumer needs
+it (§2's driver, or the fsck of §4). All of the below are implemented there
+except **no zombie transitions**, which inspects the result of applying
+commands rather than a single state, and so belongs to §2's driver:
 
 - **No deadlock.** `status == Active` ⟹ at least one pending stimulus
   (open work item, armed timer, or open subscription).
@@ -388,11 +391,12 @@ infinite and the visited set never hits:
 
 ### Measured, not estimated
 
-A prototype of exactly the loop above was run against the real `step`. The
-existing corpus is trivial for it:
+**Landed as `crates/rbpmn-core/tests/explore.rs`** — exactly the loop above,
+against the real `step`. The existing corpus is trivial for it:
 
-> **17 accept fixtures: 128 reachable states, 128 transitions, <1 ms total.
-> Zero invariant violations, zero `StepError::Invariant`.**
+> **22 scenario starting points: 145 reachable states, <1 ms. Zero invariant
+> violations, zero `StepError::Invariant`.** Plus synthetic parallel blocks
+> wider than any fixture (702 states), and an `#[ignore]`d wider sweep.
 
 That is the whole executable fixture corpus verified exhaustively, faster
 than a single `cargo test` startup. The interesting question is how it scales,
@@ -584,15 +588,14 @@ Randomized testing **falsifies**; it does not prove. Stated precisely:
 | 2 | Rehydration differential (§2) | ½ d | Crash-safety of the core boundary |
 | 3 | FEEL differential vs dsntk (§6) | 1 d | A stated must-not-change claim, verified |
 | 4 | Model generator + structural oracle (§3a, §3b) | 3–5 d | The synthetic TCK; linter false positives |
-| 5 | Explicit-state exploration (§7) | 1 d | Bounded verification on real code (prototyped: works) |
+| ~~5~~ | ~~Explicit-state exploration (§7)~~ | done | **Landed**: `crates/rbpmn-core/tests/explore.rs` |
 | 6 | Mutation fuzz (§3c) + restriction counterexamples (§3d) | 2 d | The linter-hole hunt |
 | 7 | Storm + replay verification + fsck (§4) | 3–5 d | The projection claim; deadlock freedom |
 | 8 | Chaos (§5) | 2–3 d | Closes testing-strategy #5 |
 | 9 | Kani on `iso8601` + `condition` parsers (§7) | 2–3 d | Panic/overflow proofs on untrusted input |
 | 10 | TLA+ spec of the concurrency protocol (§7) | 2 d | The distributed claims |
 
-Items 1 and 3 are independent and both pay immediately; 1 builds the driver
-that 2, 4, 5 and 6 depend on. Item 5 is unusually high value per day once 1
-and 4 exist — it is most of a model checker for the price of a visited set,
-and the prototype behind §7's table already demonstrates the whole loop
-against the real `step` in about 250 lines.
+Items 3 and 5 are done. Item 1 is now cheaper than listed: `explore.rs`
+already carries the invariant set, so item 1 is the *driver* plus promoting
+`check` out of the test file. Item 4 is the critical path — it is the
+multiplier on 5 and 6, and the only test of outcome 5.
