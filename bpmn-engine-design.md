@@ -694,8 +694,243 @@ minimum age, a read horizon, or both — plus what is deletable at all
 native partitioning by definition, which the Postgres notes above already
 flag as the place growth will hurt first.
 
+**Phase 8 — Authoring & inspection surfaces (v1-completing).** An editor for
+the model+manifest *pair* and a read-only single-instance inspector, both
+shipped as self-contained HTML documents rather than as API clients. Detailed
+in "Authoring & inspection surfaces" below, including why this is not the
+modeler-and-cockpit the non-goals refuse. Last in the order because it is the
+only remaining item whose value depends on the engine already being finished:
+it exposes what phases 0–7 built, and adds no semantics of its own.
+
 *(bpmnlint plugin packaging and the token-overlay debug view were pulled forward:
 plugin → phase 0-B, token overlay → phase 2 exit criterion.)*
+
+## Authoring & inspection surfaces
+
+### Why this is not the modeler and cockpit the non-goals refuse
+
+The original non-goal — *a modeler (use bpmn-io), a cockpit* — was about not
+building a modelling **engine** and not building an operations console. Both
+still hold, unchanged. What changed is that two decisions already recorded in
+this brief left gaps that nothing else can fill:
+
+1. **Wiring lives outside the XML** (see "Registration-time binding"). A
+   `.bpmn` file is therefore *not deployable on its own* — it is half of a
+   pair, and no bpmn-io tool knows the other half exists. Every other engine
+   dodges this by smearing wiring into `camunda:`/`zeebe:` attributes, which is
+   precisely what we refuse. Purity shipped without tooling is a tax the user
+   pays; purity **with** an authoring surface for the pair is strictly better
+   than the vendor-attribute alternative, because the manifest is reviewable
+   JSON in git next to the model.
+2. **The token-overlay debug view already exists** (phase 2 exit criterion) and
+   has been this project's primary debugging instrument through phases 2–7. It
+   lives in the playground, reachable only by a developer running
+   `just playground` against a dev proxy. Turning it into a document an
+   embedding application can hand to a supervisor is packaging, not new scope.
+
+So v1 ships an **editor** (authoring the model+manifest pair) and a
+**read-only inspector** (one instance, no writes). Neither is a cockpit. The
+constraints below are what keep them from becoming one.
+
+### Hard constraints (these have teeth)
+
+- **The inspector is read-only. No buttons. Ever.** No retry, no cancel, no
+  variable edit, no migration. Each of those is a designed API first (see
+  "Everything still open"); a UI is never the reason one ships early.
+- **No lists, no search, no pagination, no queries.** The inspector addresses
+  exactly one instance, by UUID. Finding *which* instance is the embedding
+  application's job — it called `start`, it holds the mapping from its own
+  order/case/ticket to the returned `instanceId`.
+- **rbpmn never authenticates a UI user.** The application does. No cookies, no
+  sessions, no login, and no rbpmn credential ever reaches a browser.
+- **Neither surface persists anything.** The editor reads and writes local
+  files on the user's machine and never uploads a model. There is no draft
+  store and no model repository: definitions live in the application's git
+  repository and reach the engine through `deploy`, which is code.
+
+### The document model — the decision everything else follows from
+
+Both surfaces are **self-contained HTML documents**, not single-page
+applications talking to an API. For the inspector, the data is inlined at
+render time, and that single choice dissolves nearly the whole browser-security
+problem:
+
+- there is no inspector API, so there is nothing to reverse-proxy, no CORS
+  question, no read-only façade, no third token scope, no prefix to configure
+- the application's authorization check becomes the *only* gate — which is what
+  "the application handles auth" has to mean in order to be true
+- snapshot semantics stay honest: `inspect_instance` already reads inside one
+  repeatable-read transaction precisely so the view cannot show a completed
+  instance with live tokens. A document *is* that snapshot; a polling page
+  silently re-tears it on every refresh
+- the artifact is attachable — to a support ticket, an incident review, a bug
+  report — and works with the database unreachable
+
+The library boundary is therefore a **value, not an endpoint**:
+`Engine::inspect_instance(uuid) -> InstanceInspection` already exists, and
+rendering is a pure function over it. An axum handler is a five-line
+convenience wrapper, never the primitive. Redaction then needs no feature —
+an application that must not show variables to tier-1 support strips the field
+from the struct before rendering. That door stays open for free, and it is the
+only "redaction layer" this project will ever build.
+
+The editor is the same shape without the data: one document, served by a
+handler, or opened from disk — which works as a *consequence* of being
+self-contained, not as the distribution model.
+
+### Serving them
+
+A new feature-gated crate, `rbpmn-ui`:
+
+- `render_inspection(&InstanceInspection) -> String` — pure, IO-free, no axum,
+  no engine, unit-testable against fixtures
+- `inspector_router()` / `editor_router()` — thin conveniences for axum hosts.
+  The standalone server mounts them behind its bearer; library users mount them
+  behind their own middleware. Non-axum hosts reverse-proxy the standalone
+  binary; a framework-neutral handler abstraction is not worth its cost.
+
+**The page never knows its own prefix.** Assets and the one optional endpoint
+resolve relative to the document's own location, so `/bpmn-inspector`,
+`/admin/debug/wf` or anything else work with zero configuration. A prefix
+setting is a knob that exists only to be set wrong.
+
+### Three validation tiers
+
+| Tier | Checks | Where |
+|---|---|---|
+| L1 | model-only lint | `rbpmn-model` → WASM. Shipped in phase 0-B |
+| L2 | model **+ manifest**: missing correlations, phase-gated elements, resolved topics | `rbpmn-core::compile` → WASM. **New export** |
+| L3 | are those topics covered by a *running* environment | server: one `GET` returning the covered-topic set |
+
+L2 exists today only inside `deploy`, so no browser tool can see it.
+`rbpmn-core`'s entire dependency set is `rbpmn-model + serde + serde_json +
+thiserror`, and it compiles clean to `wasm32-unknown-unknown` (verified);
+exporting `compile(xml, bindings) -> diagnostics` from `rbpmn-wasm` is what
+lets the editor validate the *pair* offline.
+
+L3 collapses to a set of topic names: the environment side is
+`Engine::covered_topics()` (today `pub(crate)`), the model side is
+`ExecutableProcess::service_topics()`, and the comparison is set subtraction
+the page performs itself. So the endpoint returns a list of strings and **the
+editor never uploads the model** — a confidential process can be validated
+against a production environment without leaving the browser. A dry-run
+endpoint that accepts XML cannot offer that, which is why it is rejected below.
+
+**A consequence to enforce: the dsntk prohibition now extends from
+`rbpmn-model` to `rbpmn-core`.** This is a live collision, not a hypothetical —
+the post-v1 business-rule task would naturally put DMN compile support exactly
+there. Decide it before the DMN spike, not during.
+
+**Severity discipline.** `unresolved-topic` keeps its rule id *and* its error
+severity. Rule ids and severities are stable public API asserted by the fixture
+corpus, and no rule may be contextually downgraded because one surface has less
+information than deploy does. Uncertain wiring is therefore **not** a lint
+diagnostic in the editor: it is a wiring pane with three explicit states —
+*bound*, *defaulted to element id*, *unknown to this server / no server
+attached* — which is more informative than a diagnostic list anyway. A new
+warn-level, environment-free manifest-hygiene rule stays available later; new
+ids are always allowed, renames never.
+
+### What the inspector shows
+
+The diagram alone answers "where", which is rarely the question. The element
+pane fuses three sources, all of them already in the payload:
+
+- **static model facts** from `element.businessObject` — bpmn-js holds the full
+  moddle object for every element after `importXML`, so this costs no
+  dependency and no re-parse
+- **runtime state** — the token and its `wait_kind`, work-item
+  `state`/`retries`/`last_failure`, timer `due_at`, subscription
+  `correlation_key`
+- **that element's slice of the event trace**, in order
+
+Two additions complete it:
+
+- `InstanceInspection` gains the deployed **`bindings` manifest** — one extra
+  column from `rbpmn_definition`, on a row `inspect_in` already joins. Without
+  it only *instantiated* work items reveal a topic, so an unreached service
+  task shows nothing; with it, model and manifest are visible resolved against
+  each other. This is the inspector feature no other engine's cockpit can have,
+  precisely because the manifest is deliberately not in the XML.
+- a **diagnosis line** at the top: token at `charge-card`, `wait_kind =
+  incident`, retries exhausted, `last_failure = "handler answered 502"`.
+  Entirely derivable from today's payload, and it is the actual question the
+  operator arrived with.
+
+Variables render in full, by default. This is a supervisor/admin debug tool
+over an instance the application already decided this person may see; a
+field-level policy engine would be re-answering a question already answered.
+
+Phase 6 note: tokens park inside subprocess planes, and the annotation layer's
+`focus()` already switches drill-down roots — the inspector renders nested
+planes rather than assuming one canvas.
+
+### What we owe the application, and what it owes us
+
+Full detail lands in `docs/http-security.md`; the shape:
+
+**Ours.** Escaping is not sanitization. Declining a redaction policy (*who may
+see this data*) says nothing about correctness (*does an order note containing
+`</script>` render as text*). Inlining business data makes that bug class ours,
+and one mistake ships to every embedder simultaneously — so it gets the corpus
+treatment: hostile fixtures for `</script>`, `<!--`, U+2028/2029 and attribute
+contexts, rendered and asserted.
+
+The document also carries its own lockdown. Executable JS is **one** inline
+script whose SHA-256 is known at build time and constant across every instance;
+the per-instance data goes in `<script type="application/json">`, which is not
+executable and can never be promoted to script. That split makes the policy a
+compile-time constant we emit ourselves as
+`<meta http-equiv="Content-Security-Policy">`:
+
+```
+default-src 'none'; script-src 'sha256-…'; style-src 'sha256-…';
+img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'
+```
+
+`connect-src 'none'` is the guarantee worth stating out loud: **the document
+cannot phone home** — no fetch, no XHR, no WebSocket, no beacon. Tested rather
+than asserted, in the `just parity` tradition: a rendered document must contain
+exactly one executable script, its hash must match the policy the document
+carries, and no `http://` or `https://` reference may appear anywhere in the
+bytes.
+
+**Theirs.** Authenticate and authorize the viewer. Embed in
+`<iframe sandbox="allow-scripts">` **without** `allow-same-origin` — the two
+together let the page remove its own sandbox — so the opaque origin keeps
+business data away from the application's cookies and storage. Add
+`frame-ancestors` by header (meta-CSP cannot express it), plus
+`Cache-Control: no-store` and `nosniff`. Never proxy `/v1` to a browser
+audience: deploy is code. And the flip side of the attachable artifact — a
+saved inspection document is an uncontrolled copy of business data, to be
+treated like a database extract.
+
+### Rejected alternatives
+
+- **An inspector REST API the page calls.** Reintroduces CORS, a token in the
+  browser, a third token scope, a prefix knob, and re-tears the snapshot. The
+  single-document form gets all of that for free.
+- **A dry-run validate endpoint accepting XML.** Uploads the user's model to
+  answer a question that is set subtraction, and forfeits "the confidential
+  model never leaves the browser".
+- **`bpmn-js-properties-panel` in the inspector.** It is an *editing* component
+  whose providers write into the moddle tree, and its vendor packs write the
+  very `camunda:`/`zeebe:` attributes `no-foreign-implementation` exists to
+  warn about. The inspector's pane is read-only and fuses static with runtime,
+  which the stock panel cannot do.
+- **Restricting the editor's palette to the supported subset.** Tempting, and
+  rejected: the linter is the product's front door and teaches *why*. Someone
+  who draws an inclusive gateway should meet `no-inclusive-gateway` and its
+  parallel+skip-bypass rewrite hint, not silently fail to find the shape.
+- **A server-side draft or model store.** Definitions live in git next to the
+  code that binds them; a model repository is a CMS and contradicts
+  deploy-is-code.
+- **Business-key addressing.** `business_key` is nullable, unindexed and
+  non-unique (re-running a process for the same order is legal), and nothing
+  reads it back. If the convenience is ever wanted it is exactly one resolver
+  carrying `correlate()`'s discipline — exactly one match, loud 404 for none,
+  409 with the candidate ids for several — plus an index. Not in v1: the
+  application already holds the UUID it was given.
 
 ## Post-v1: decisions — FEEL / DMN via dsntk
 Candidate dependency: `dsntk` (DecisionToolkit, Rust, Apache-2.0/MIT, formerly `dmntk`).
@@ -753,6 +988,7 @@ question is purely internal.
 |---|---|---|---|
 | **Embedded subprocesses** | The modelling style the engine exists to serve; unmodellable today | High | **v1, phase 6 — in progress** |
 | **Retention** | The failure mode that kills BPM installations; interacts with the new event cursor | Low | **v1, phase 7 — next** |
+| **Authoring & inspection surfaces** | A `.bpmn` is half-deployable without its manifest, and nothing outside this repo knows the manifest exists; the project's own debugger is dev-only | Medium | **v1, phase 8** |
 | Non-interrupting boundary events | "Every 30 days while this runs"; rides on scope machinery | Medium | v2 — held out of v1 so it does not double phase 6's risk |
 | Link events | Diagram hygiene once big models are common | Trivial | v2 |
 | Event subprocesses | "Cancel my order at any point" without boundary spaghetti | Medium | v3 |
@@ -836,6 +1072,9 @@ timer …). Budget fixtures per release, not code.
 - Inclusive/complex gateways, call activities, compensation, BPEL anything
 - Embedded scripting; expression languages in v1 (see "Post-v1: decisions" for the
   planned DMN/FEEL route — business-rule task, not gateway conditions)
-- A modeler (use bpmn-io), a cockpit (the token-overlay debug view is the 80%)
+- A modelling *engine* (we embed bpmn-io's) and an operations cockpit — no
+  writes from any UI, no instance lists, no search, no scheduling views. Phase
+  8's editor and read-only inspector are deliberately narrower than both; the
+  constraints that keep them there are in "Authoring & inspection surfaces"
 - Horizontal scale beyond one Postgres (the DB is the honest ceiling; it is high)
 - History levels beyond event-kind filtering; no separate history store
