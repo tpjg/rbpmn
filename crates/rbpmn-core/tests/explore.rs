@@ -13,6 +13,9 @@
 //! here. Confluence, golden traces and "exactly the winner's end event" belong
 //! to `scenarios.rs` and `properties.rs`. The two are complements.
 
+mod modelgen;
+
+use modelgen::{Block, build};
 use rbpmn_core::*;
 use rbpmn_model::condition::{Expr, Literal};
 use serde::Deserialize;
@@ -425,107 +428,106 @@ fn corpus_state_spaces_hold_the_invariants() {
 
 // ----------------------------------------------------------------- synthetic
 
-/// A block-structured model wider than anything in the corpus: one parallel
-/// split into `branches` branches of `depth` sequential user tasks, joined.
-/// Concurrency is what makes state spaces grow, and the fixtures top out at
-/// three branches.
-fn parallel_block(branches: usize, depth: usize) -> String {
-    let (mut nodes, mut flows) = (String::new(), String::new());
-    let mut n = 0usize;
-    let flow = |flows: &mut String, src: &str, tgt: &str, n: &mut usize| {
-        *n += 1;
-        let id = format!("f{n}");
-        flows.push_str(&format!(
-            "    <bpmn:sequenceFlow id=\"{id}\" sourceRef=\"{src}\" targetRef=\"{tgt}\" />\n"
-        ));
-        id
-    };
+/// Generated block-structured models (see `modelgen`), explored exhaustively:
+/// docs/stress-testing.md §3 crossed with §7. The fixtures top out at three
+/// parallel branches and never nest a loop inside one, so this is where the
+/// interesting state spaces come from.
+fn explore_block(label: &str, block: &Block) -> usize {
+    let g = build(block);
+    let defs = rbpmn_model::parse(&g.xml).expect("generated model parses");
+    let proc = ExecutableProcess::compile(&defs, "p", &Bindings::default())
+        .expect("generated model is block-structured and must compile");
+    assert_clean(label, &proc, json!({}), &[])
+}
 
-    let first = flow(&mut flows, "start", "ps", &mut n);
-    nodes.push_str(&format!(
-        "    <bpmn:startEvent id=\"start\"><bpmn:outgoing>{first}</bpmn:outgoing></bpmn:startEvent>\n"
-    ));
-
-    let (mut split_out, mut join_in, mut tasks) = (Vec::new(), Vec::new(), String::new());
-    for b in 0..branches {
-        let mut incoming = flow(&mut flows, "ps", &format!("t{b}_0"), &mut n);
-        split_out.push(incoming.clone());
-        for i in 0..depth {
-            let me = format!("t{b}_{i}");
-            let target = if i + 1 == depth {
-                "pj".to_string()
-            } else {
-                format!("t{b}_{}", i + 1)
-            };
-            let out = flow(&mut flows, &me, &target, &mut n);
-            tasks.push_str(&format!(
-                "    <bpmn:userTask id=\"{me}\"><bpmn:incoming>{incoming}</bpmn:incoming>\
-                 <bpmn:outgoing>{out}</bpmn:outgoing></bpmn:userTask>\n"
-            ));
-            if i + 1 == depth {
-                join_in.push(out.clone());
-            }
-            incoming = out;
-        }
-    }
-
-    let tag = |name: &str, ids: &[String]| -> String {
-        ids.iter()
-            .map(|i| format!("<bpmn:{name}>{i}</bpmn:{name}>"))
-            .collect()
-    };
-    nodes.push_str(&format!(
-        "    <bpmn:parallelGateway id=\"ps\"><bpmn:incoming>{first}</bpmn:incoming>{}</bpmn:parallelGateway>\n",
-        tag("outgoing", &split_out)
-    ));
-    nodes.push_str(&tasks);
-    let last = flow(&mut flows, "pj", "end", &mut n);
-    nodes.push_str(&format!(
-        "    <bpmn:parallelGateway id=\"pj\">{}<bpmn:outgoing>{last}</bpmn:outgoing></bpmn:parallelGateway>\n",
-        tag("incoming", &join_in)
-    ));
-    nodes.push_str(&format!(
-        "    <bpmn:endEvent id=\"end\"><bpmn:incoming>{last}</bpmn:incoming></bpmn:endEvent>\n"
-    ));
-
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" \
-         id=\"defs\" targetNamespace=\"https://rbpmn.dev/generated\">\n\
-         \x20 <bpmn:process id=\"p\" isExecutable=\"true\">\n{nodes}{flows}  </bpmn:process>\n\
-         </bpmn:definitions>\n"
+/// `Par(branches x depth)` — the concurrency-scaling shape, now expressed in
+/// the generator's grammar rather than hand-rolled XML.
+fn par(branches: usize, depth: usize) -> Block {
+    Block::Par(
+        (0..branches)
+            .map(|_| Block::Seq((0..depth).map(|_| Block::Task).collect()))
+            .collect(),
     )
 }
 
-fn explore_parallel_block(branches: usize, depth: usize) -> usize {
-    let xml = parallel_block(branches, depth);
-    let defs = rbpmn_model::parse(&xml).expect("generated model parses");
-    let proc = ExecutableProcess::compile(&defs, "p", &Bindings::default())
-        .expect("generated model is block-structured and must lint clean");
-    assert_clean(&format!("Par({branches}x{depth})"), &proc, json!({}), &[])
-}
-
-/// Widths and depths beyond what the fixtures reach, kept small enough that
-/// the whole test stays in the tens of milliseconds. Cost is exponential in
-/// branch width and only polynomial in depth, so depth is the cheap axis.
+/// Shapes beyond what the fixtures reach, kept small enough that the whole
+/// test stays in the tens of milliseconds. Cost is exponential in branch
+/// width and only polynomial in depth, so depth is the cheap axis.
 #[test]
-fn synthetic_parallel_blocks_hold_the_invariants() {
+fn generated_models_hold_the_invariants() {
+    let shapes: Vec<(String, Block)> = vec![
+        ("par(2x1)".into(), par(2, 1)),
+        ("par(3x1)".into(), par(3, 1)),
+        ("par(4x1)".into(), par(4, 1)),
+        ("par(2x3)".into(), par(2, 3)),
+        ("par(3x2)".into(), par(3, 2)),
+        ("par(4x2)".into(), par(4, 2)),
+        (
+            "xor inside par".into(),
+            Block::Par(vec![
+                Block::Xor(vec![Block::Task, Block::Task]),
+                Block::Task,
+            ]),
+        ),
+        (
+            "par inside xor".into(),
+            Block::Xor(vec![
+                Block::Par(vec![Block::Task, Block::Task]),
+                Block::Task,
+            ]),
+        ),
+        (
+            "loop around a parallel block".into(),
+            Block::Loop(Box::new(Block::Par(vec![Block::Task, Block::Task]))),
+        ),
+        (
+            "loop inside a parallel branch".into(),
+            Block::Par(vec![Block::Loop(Box::new(Block::Task)), Block::Task]),
+        ),
+        (
+            "nested loops".into(),
+            Block::Loop(Box::new(Block::Seq(vec![
+                Block::Loop(Box::new(Block::Task)),
+                Block::Task,
+            ]))),
+        ),
+    ];
+
     let mut total = 0;
-    for (branches, depth) in [(2, 1), (3, 1), (4, 1), (2, 3), (3, 2), (4, 2), (3, 3)] {
-        total += explore_parallel_block(branches, depth);
+    for (label, block) in shapes {
+        total += explore_block(&label, &block);
     }
-    println!("synthetic: {total} reachable states, all clean");
+    println!("generated: {total} reachable states, all clean");
 }
 
-/// Wider and deeper models — `cargo test -- --ignored`. Cheap today (~0.3s,
-/// ~16k states); it is `#[ignore]`d as the place to widen when investigating,
-/// since cost is exponential in branch width: past ~10 branches this runs for
-/// seconds, past ~16 for minutes.
+/// Wider and deeper — `cargo test -- --ignored`. Cost is exponential in branch
+/// width: past ~10 branches this runs for seconds, past ~16 for minutes.
 #[test]
 #[ignore = "wider sweep: run explicitly with --ignored"]
-fn synthetic_parallel_blocks_hold_the_invariants_deeply() {
-    for (branches, depth) in [(5, 2), (6, 2), (4, 4), (5, 3), (2, 20), (3, 8)] {
-        let states = explore_parallel_block(branches, depth);
-        println!("Par({branches}x{depth}): {states} states");
+fn generated_models_hold_the_invariants_deeply() {
+    let shapes: Vec<(String, Block)> = vec![
+        ("par(5x2)".into(), par(5, 2)),
+        ("par(6x2)".into(), par(6, 2)),
+        ("par(4x4)".into(), par(4, 4)),
+        ("par(2x20)".into(), par(2, 20)),
+        (
+            "par of loops".into(),
+            Block::Par(vec![
+                Block::Loop(Box::new(Block::Task)),
+                Block::Loop(Box::new(Block::Task)),
+                Block::Task,
+            ]),
+        ),
+        (
+            "loop around xor inside par".into(),
+            Block::Loop(Box::new(Block::Par(vec![
+                Block::Xor(vec![Block::Task, Block::Task]),
+                Block::Seq(vec![Block::Task, Block::Task]),
+            ]))),
+        ),
+    ];
+    for (label, block) in shapes {
+        let states = explore_block(&label, &block);
+        println!("{label}: {states} states");
     }
 }

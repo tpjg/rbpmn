@@ -31,9 +31,11 @@ are six, and each is a distinct target:
 
 Outcome 1 is the Camunda-lineage bug class the whole design exists to
 prevent — a model that lints clean and then executes with wrong token
-semantics. Outcome 5 is completely untested today: the `reject/` fixtures
-prove the linter catches what it should, and nothing proves it *doesn't*
-catch what it shouldn't.
+semantics; it is still open, and §3c is the hunt for it. Outcome 5 had no
+test at all until the generator landed — the `reject/` fixtures prove the
+linter catches what it should, and nothing proved it *doesn't* catch what it
+shouldn't. It is now covered for everything the block grammar can express
+(§3a).
 
 Two properties of this codebase make the search unusually cheap, and both
 should be treated as load-bearing infrastructure, not conveniences:
@@ -130,19 +132,55 @@ and let depth, sequence length and nesting grow freely — §7's measurements
 show that keeps every generated model exhaustively verifiable, while wide
 splits are what make the state space explode.
 
+**Status: (a) and (b) are landed** as `crates/rbpmn-core/tests/modelgen/mod.rs`
+(grammar, XML emitter, oracle, driver) and `tests/generator.rs` (the
+properties). The grammar implemented is `Task | Seq | Xor | Par | Loop` —
+enough to cover everything `balanced-gateways` is actually about. `Loop` is
+emitted as the fixture-proven shape: exclusive join, body, a control task, an
+exclusive split whose back-edge is conditional and whose exit is the default.
+
+Not yet generated, and why: `WithBoundary` and `EventGateway` need care that
+the core grammar does not. In the accepted fixtures a boundary path runs its
+handler and then reaches **its own end event** rather than rejoining the main
+flow — so a boundary inside a parallel branch would put an end event in a
+branch (`end-event-in-branch`, a reject fixture) and would starve the join if
+it fired. They are therefore only legal in positions the generator would have
+to reason about specially, and the oracle has to model "this token stops here"
+rather than "this token continues". Worth doing; deliberately not bundled in
+with the part that needed no special cases.
+
 Four properties fall out:
 
 **(a) The linter has no false positives.** Every generated model must lint
-clean. The generator is an *independent second implementation* of "what block
-structure means"; any disagreement is a generator bug or a linter over-reach,
-and both are worth knowing. This is the only test of outcome 5 that exists.
+clean — no errors *and no warnings*: a warning on a machine-generated,
+textbook-block-structured model would mean the rule fires on something it
+should not. The generator is an *independent second implementation* of "what
+block structure means"; any disagreement is a generator bug or a linter
+over-reach, and both are worth knowing. This is the only test of outcome 5
+that exists.
+
+> **Result: 100 000 generated models, zero false positives.** 50 000 on the
+> narrow grammar (depth 4, width ≤3) and 50 000 on the wide one (depth 6,
+> `Par` up to 6), each also driven to completion against the oracle. Every
+> composition the grammar reaches — loops inside parallel branches, parallel
+> blocks inside exclusive branches, nested loops — lints clean and executes as
+> predicted. `balanced-gateways` is not over-strict on anything this grammar
+> can express.
 
 **(b) Structural oracle → differential execution.** The generator holds the
 block tree, so a small recursive interpreter over that tree predicts — for a
-chosen set of XOR decisions and loop counts — exactly which tasks execute, how
-many times, and the final variable document, *without running the engine*.
-Two independent implementations of BPMN semantics, differentially tested.
-That is as close to a TCK as this domain permits.
+chosen set of XOR decisions and loop counts — exactly which tasks execute and
+how many times, *without running the engine*. Two independent implementations
+of BPMN semantics, differentially tested. That is as close to a TCK as this
+domain permits.
+
+The oracle is fifteen lines, which is the point: it is small enough to audit
+by eye, and `the_oracle_itself_is_right` pins it against hand-computed answers
+so a bug in the oracle cannot silently excuse the engine. Decisions are shared
+input to both sides — XOR choices ride in the initial variable document, loop
+counts are enforced by the driver through each loop's control task — and the
+driver picks which open work item to complete pseudo-randomly, so interleaving
+varies while the predicted outcome must not.
 
 For the oracle to be sharp, the generator must control data: give each task a
 disjoint variable namespace when testing confluence, and a deliberately shared
@@ -587,7 +625,7 @@ Randomized testing **falsifies**; it does not prove. Stated precisely:
 | 1 | Invariant set + random driver over the corpus (§1, §2) | 1–2 d | Foundation for four later items |
 | 2 | Rehydration differential (§2) | ½ d | Crash-safety of the core boundary |
 | 3 | FEEL differential vs dsntk (§6) | 1 d | A stated must-not-change claim, verified |
-| 4 | Model generator + structural oracle (§3a, §3b) | 3–5 d | The synthetic TCK; linter false positives |
+| ~~4~~ | ~~Model generator + structural oracle (§3a, §3b)~~ | done | **Landed**: `tests/modelgen/` + `tests/generator.rs` |
 | ~~5~~ | ~~Explicit-state exploration (§7)~~ | done | **Landed**: `crates/rbpmn-core/tests/explore.rs` |
 | 6 | Mutation fuzz (§3c) + restriction counterexamples (§3d) | 2 d | The linter-hole hunt |
 | 7 | Storm + replay verification + fsck (§4) | 3–5 d | The projection claim; deadlock freedom |
@@ -595,7 +633,11 @@ Randomized testing **falsifies**; it does not prove. Stated precisely:
 | 9 | Kani on `iso8601` + `condition` parsers (§7) | 2–3 d | Panic/overflow proofs on untrusted input |
 | 10 | TLA+ spec of the concurrency protocol (§7) | 2 d | The distributed claims |
 
-Items 3 and 5 are done. Item 1 is now cheaper than listed: `explore.rs`
-already carries the invariant set, so item 1 is the *driver* plus promoting
-`check` out of the test file. Item 4 is the critical path — it is the
-multiplier on 5 and 6, and the only test of outcome 5.
+Items 3, 4 and 5 are done, and they compose: `explore.rs` now explores
+*generated* models, so §3 × §7 is live. Item 1 is cheaper than listed —
+`explore.rs` already carries the invariant set, leaving the driver plus
+promoting `check` out of the test file. **Item 6 is next and is now cheap**:
+mutation fuzz reuses the generator wholesale, and it is the hunt for outcome 1
+(a model that lints clean and then executes wrong) — the bug class this engine
+exists to prevent. Extending the generator to boundary events and event-based
+gateways (see §3's status note) is the other open half.
