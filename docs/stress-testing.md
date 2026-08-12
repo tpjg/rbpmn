@@ -294,10 +294,10 @@ itself:
 | Invariant set / fsck (§1) | **Needed work.** The fsck was blind to `rbpmn_scope` entirely, and join arity has to group by `scope_no` now that joins count within a scope instance. |
 | Storm and chaos (§4, §5) | **Needed work.** Their fixtures contained no subprocess, so the scope projection was never stressed, replayed or crashed — green, and meaningless for the newest code. |
 | Model generator (§3) | **Needed work.** No `Sub` in the grammar meant no generated coverage of the newest semantics at all. |
-| TLA+ specs (§7) | **Unaffected.** Scope rows are written under the same instance row lock, so the lock order the spec models is unchanged. |
+| TLA+ specs (§7) | **Looked unaffected, needed work anyway.** Scope rows really are written under the instance row lock, so the lock order held — but that was an argument, not a check, and `LockOrder` was quietly modelling one per-instance row where there are now five. Phase 6 also produced a bug (`TimerTeardown.tla`) squarely in the protocol these specs cover. |
 
 The lesson worth carrying: **the parts keyed on a corpus adapt themselves; the
-parts with a hand-written workload or grammar do not.** A green run after a
+parts with a hand-written workload, grammar or model do not.** A green run after a
 new phase is not evidence that the phase is covered — it is evidence that
 nothing already covered broke. Check the workload actually reaches the new
 code before believing the result. Both storm and chaos now assert they do.
@@ -732,6 +732,24 @@ mutation is conditional on `lock_owner = $me AND lock_until > now()`.
 > describes — not parking the drain loop behind an embedder's long-running
 > `*_in_tx` transaction. Safety and throughput, two mechanisms, easy to
 > conflate in prose and impossible to conflate in a model.
+
+`TimerTeardown.tla` was added after phase 6, and it reproduces a bug that
+actually shipped: teardown reaping tokens without withdrawing their armed
+timers, so the scheduler later fired a timer whose token was gone and wedged
+the instance. TLC finds it in five states (`Arm → Pick → Teardown → Fire`).
+Modelling it separated the defence from the guarantee — the scheduler's
+re-check under the instance lock verifies the timer *row* still exists, never
+that the row's *token* does, so the claim path's safety rests on an invariant
+of teardown rather than on the re-check. `LockOrder.tla` is now parameterised
+over the per-instance rows a step touches, since phase 6 made that five tables
+rather than one.
+
+> **The specs do not adapt themselves.** Phase 6 landed and `spec/` was not
+> touched; the conclusion that scope rows changed nothing was an argument,
+> only verified afterwards by checking all four `rbpmn_scope` access sites sit
+> under the instance row lock. §3-bis's lesson applies here with a sharper
+> edge: a hand-written model has no corpus to carry it forward, and nothing
+> fails when it drifts.
 
 Still unmodelled and named as candidates: the event-stream safe horizon (xid8
 visibility) and the deploy/undeclare race.

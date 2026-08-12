@@ -32,14 +32,24 @@ EXTENDS Naturals, Sequences
 CONSTANTS
     Nodes,                 \* engine processes; there is no leader
     Instances,             \* process instances, one row lock each
+    RowOrder,              \* the per-instance rows a step touches, in order
     NoOne,                 \* the free-lock marker
     HistoricalTimerOrder   \* TRUE = the AB/BA sketch the design rejected
 
 ASSUME NoOne \notin Nodes
 
-\* Two lockable rows per instance: the instance row, and the item/timer row
-\* whose deletion commits with the step.
-Resources == ({"inst"} \X Instances) \cup ({"item"} \X Instances)
+Range(seq) == {seq[i] : i \in 1..Len(seq)}
+
+\* Config files cannot carry tuple literals, so the concrete row lists live
+\* here and the .cfg overrides `RowOrder` with one of them.
+TwoRows == <<"item", "timer">>
+ThreeRows == <<"item", "timer", "scope">>
+
+\* The instance row, plus every per-instance row a step may touch. Since
+\* phase 6 that is tokens, work items, timers, subscriptions AND scopes — so
+\* `RowOrder` is a parameter rather than the single "item" this spec started
+\* with, and the claim being checked is about *any* of them.
+Resources == ({"inst"} \X Instances) \cup (Range(RowOrder) \X Instances)
 
 VARIABLES
     lock,     \* Resources -> Nodes \cup {NoOne}
@@ -49,11 +59,15 @@ VARIABLES
 
 vars == <<lock, pc, kind, target>>
 
-\* The order in which a node takes its two locks.
+\* The order in which a node takes its locks. Shipped: the instance row
+\* first, then every per-instance row. Historical: one per-instance row
+\* first (the SKIP LOCKED timer claim), and only then the instance row.
 Order(n) ==
     IF kind[n] = "timer" /\ HistoricalTimerOrder
-        THEN <<"item", "inst">>
-        ELSE <<"inst", "item">>
+        THEN <<Head(RowOrder), "inst">> \o Tail(RowOrder)
+        ELSE <<"inst">> \o RowOrder
+
+Last == Len(RowOrder) + 1
 
 Res(n, j) == <<Order(n)[j], target[n]>>
 
@@ -63,7 +77,7 @@ FirstIsTry(n) == kind[n] = "timer"
 
 TypeOK ==
     /\ lock \in [Resources -> Nodes \cup {NoOne}]
-    /\ pc \in [Nodes -> 0..3]
+    /\ pc \in [Nodes -> 0..(Last + 1)]
     /\ kind \in [Nodes -> {"complete", "timer"}]
     /\ target \in [Nodes -> Instances]
 
@@ -97,23 +111,23 @@ GiveUp(n) ==
     /\ pc' = [pc EXCEPT ![n] = 0]
     /\ UNCHANGED <<lock, kind, target>>
 
-\* The second lock is always taken blocking: this action is simply not
+\* Every subsequent lock is taken blocking: this action is simply not
 \* enabled while another node holds the row. That is what can deadlock.
-AcquireSecond(n) ==
-    /\ pc[n] = 2
-    /\ lock[Res(n, 2)] = NoOne
-    /\ lock' = [lock EXCEPT ![Res(n, 2)] = n]
-    /\ pc' = [pc EXCEPT ![n] = 3]
+AcquireNext(n) ==
+    /\ pc[n] \in 2..Last
+    /\ lock[Res(n, pc[n])] = NoOne
+    /\ lock' = [lock EXCEPT ![Res(n, pc[n])] = n]
+    /\ pc' = [pc EXCEPT ![n] = pc[n] + 1]
     /\ UNCHANGED <<kind, target>>
 
 Commit(n) ==
-    /\ pc[n] = 3
+    /\ pc[n] = Last + 1
     /\ lock' = [r \in Resources |-> IF lock[r] = n THEN NoOne ELSE lock[r]]
     /\ pc' = [pc EXCEPT ![n] = 0]
     /\ UNCHANGED <<kind, target>>
 
 Next == \E n \in Nodes :
-    Begin(n) \/ AcquireFirst(n) \/ GiveUp(n) \/ AcquireSecond(n) \/ Commit(n)
+    Begin(n) \/ AcquireFirst(n) \/ GiveUp(n) \/ AcquireNext(n) \/ Commit(n)
 
 \* Strong fairness per node, and deliberately NOT on Begin: nothing obliges a
 \* node to start work, but once started it must finish. SF rather than WF
@@ -122,7 +136,7 @@ Next == \E n \in Nodes :
 \* queueing its lock waiters.
 Fairness ==
     \A n \in Nodes :
-        SF_vars(AcquireFirst(n) \/ GiveUp(n) \/ AcquireSecond(n) \/ Commit(n))
+        SF_vars(AcquireFirst(n) \/ GiveUp(n) \/ AcquireNext(n) \/ Commit(n))
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
@@ -134,22 +148,22 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 (* without already holding its instance row lock.                           *)
 (***************************************************************************)
 SingleLockOrder ==
-    \A i \in Instances :
-        lock[<<"item", i>>] # NoOne =>
-            lock[<<"inst", i>>] = lock[<<"item", i>>]
+    \A i \in Instances, k \in Range(RowOrder) :
+        lock[<<k, i>>] # NoOne =>
+            lock[<<"inst", i>>] = lock[<<k, i>>]
 
 (***************************************************************************)
 (* Deadlock freedom is checked by TLC directly (a state with no successor). *)
 (* This is the redundant, explicit form: no node is ever stuck holding one  *)
 (* row while another node holds the row it needs and is itself blocked.     *)
 (***************************************************************************)
-Blocked(n) == pc[n] = 2 /\ lock[Res(n, 2)] # NoOne
+Blocked(n) == pc[n] \in 2..Last /\ lock[Res(n, pc[n])] # NoOne
 NoWaitCycle ==
     ~ (\E n, m \in Nodes :
         /\ n # m
         /\ Blocked(n) /\ Blocked(m)
-        /\ lock[Res(n, 2)] = m
-        /\ lock[Res(m, 2)] = n)
+        /\ lock[Res(n, pc[n])] = m
+        /\ lock[Res(m, pc[m])] = n)
 
 (***************************************************************************)
 (* Liveness: every node that begins a transaction eventually returns to     *)

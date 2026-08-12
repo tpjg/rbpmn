@@ -10,6 +10,7 @@ Run with `just tla` (needs `java`; fetches `tla2tools.jar` on first use).
 |---|---|---|
 | `LockOrder.tla` | instance-row and item/timer-row locking across N nodes | one lock order engine-wide; no AB/BA deadlock; every transaction returns to idle |
 | `Lease.tla` | the work-item lease: TTL, renewal, expiry, completion | no double delivery; exactly-once completion under at-least-once delivery; nothing stranded |
+| `TimerTeardown.tla` | the scheduler's unlocked timer pick racing a scope teardown | no timer row outlives the token it is armed on; no timer ever fires with its token gone |
 
 Each spec ships with a companion config that is **expected to fail**, so the
 checks are known to have teeth rather than passing vacuously:
@@ -20,6 +21,8 @@ checks are known to have teeth rather than passing vacuously:
 | `LockOrderHistorical.cfg` | **deadlock** | the timer-claim order the design brief rejected |
 | `Lease.cfg` | holds | the shipped lease |
 | `Lease_DoubleBelief.cfg` | **violation** | two workers really can both believe they hold one item |
+| `TimerTeardown.cfg` | holds | the shipped teardown |
+| `TimerTeardown_Buggy.cfg` | **violation** | the phase-6 bug: teardown reaping tokens but not their timers |
 
 ## What the failures show
 
@@ -36,6 +39,23 @@ what: an embedder's `*_in_tx` transaction can hold an instance row for a long
 time, and the drain loop must move on to other instances' timers rather than
 park behind it. Order is the safety property; `NOWAIT` is throughput.
 
+`TimerTeardown_Buggy` reproduces a bug that actually shipped and was fixed in
+the phase-6 review. When an error was caught by a boundary on an *enclosing*
+subprocess, the failing task's token was removed before teardown ran, so
+teardown — which only reaps tokens still present — never withdrew that token's
+armed boundary timers. The timer row outlived its token; the scheduler later
+picked it, re-checked it under the instance lock, found the row still there,
+fired it, and wedged the instance on an `Invariant`. TLC finds it in five
+states: `Arm -> Pick -> Teardown -> Fire`.
+
+Modelling it separates the defence from the guarantee. The scheduler's
+re-check under the instance lock verifies the timer **row** still exists — it
+never verifies the row's **token** does. Those come apart exactly when
+teardown is incomplete, so the safety of the whole claim path rests on an
+invariant of *teardown* (`ArmedTimersHaveLiveTokens`), not on the re-check.
+The re-check is necessary and insufficient, and only the model says so out
+loud.
+
 `Lease_DoubleBelief` shows that after a lease lapses and a peer reacquires,
 both workers believe they hold the item. That state is *reachable and fine*:
 every mutation is conditional on `lock_owner = $me AND lock_until > now()` in
@@ -44,7 +64,13 @@ preventing the confusion — it comes from the confusion not mattering.
 
 ## Scope
 
-Bounded models: 3 nodes / 2 instances, and 2 workers / TTL 2 / 4 ticks. That
+`LockOrder` is parameterised over the per-instance rows a step touches
+(`RowOrder`): since phase 6 that is tokens, work items, timers, subscriptions
+and scopes, so the claim checked is about *any* of them rather than a single
+"item" standing in for five tables.
+
+Bounded models: 3 nodes / 2 instances / 2 row kinds, 2 workers / TTL 2 / 4
+ticks, and 2 nodes / 2 tokens / 2 timers. That
 is enough for these properties — the interleavings that break lock ordering
 and lease authority need two participants, not many — but it is exhaustive
 only within those bounds, not a proof for all N.
@@ -57,3 +83,10 @@ these too.
 Not modelled yet: the event-stream safe horizon (xid8 visibility) and the
 deploy/undeclare race. Both are named in `docs/stress-testing.md` as
 candidates.
+
+A caution the phase-6 round earned: **these specs do not adapt themselves.**
+Phase 6 landed and `spec/` was not touched — the conclusion that scope rows
+change nothing here was an argument, later verified by checking that all four
+`rbpmn_scope` access sites sit under the instance row lock, but an argument
+nonetheless. When the locking or lease protocol changes, these files must be
+re-read; nothing will fail to tell you.

@@ -42,8 +42,10 @@ parity: wasm
 # on a developer's machine and would make past hold/fail verdicts
 # irreproducible. To move to a new TLA+ release, bump both constants — the
 # recipe refuses to run on a mismatch rather than trusting the download.
-# Two of the four configs are EXPECTED to fail — they are the
-# counterexamples that show the checks have teeth.
+# Three of the six configs are EXPECTED to fail — they are the
+# counterexamples that show the checks have teeth, and two of them
+# reproduce bugs that were real (the AB/BA timer-claim sketch, and the
+# phase-6 scope teardown that left a timer row behind).
 tla:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -66,9 +68,9 @@ tla:
         mv "$jar.part" "$jar"
     fi
     verify "$jar" || exit 1
-    check() { # name, config, module, expectation(hold|fail)
+    check() { # name, config, module, expectation(hold|fail), [extra TLC flags]
         local out
-        if out=$(java -cp "$jar" tlc2.TLC -config "$2" "$3" 2>&1); then
+        if out=$(java -cp "$jar" tlc2.TLC ${5:-} -config "$2" "$3" 2>&1); then
             if [ "$4" = "hold" ]; then
                 echo "  ok       $1"
             else
@@ -86,6 +88,11 @@ tla:
     check "lock order: rejected AB/BA sketch" LockOrderHistorical.cfg LockOrder.tla fail
     check "lease: safety"                     Lease.cfg               Lease.tla     hold
     check "lease: double belief is reachable" Lease_DoubleBelief.cfg  Lease.tla     fail
+    # -deadlock: a terminal state is legitimate here (everything torn down,
+    # nothing armed). Deadlock freedom is a property under test only for
+    # LockOrder, where the flag is deliberately absent.
+    check "timer claim vs scope teardown"     TimerTeardown.cfg       TimerTeardown.tla hold -deadlock
+    check "teardown leaving a timer behind"   TimerTeardown_Buggy.cfg TimerTeardown.tla fail -deadlock
 
 # Differential the FEEL subset against dsntk (the DMN-TCK-verified reference):
 # every condition we accept must evaluate identically there. Outside the
