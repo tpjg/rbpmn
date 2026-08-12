@@ -59,9 +59,11 @@ inclusive gateway, block structure, messages-only interaction, build order).
 - `just parity` — MUST stay green: byte-parity of native Rust vs WASM lint
   output over the corpus, plus the bpmnlint plugin's pipeline test.
 - `just tla` — TLA+ model checking of the concurrency protocol (`spec/`).
-  Six configs; three are *expected* to fail — they are the counterexamples
-  that prove the checks have teeth, and two of them reproduce bugs that were
-  real. Needs java; the jar is pinned and checksum-verified.
+  Eight configs; four are *expected* to fail, each matched against the
+  specific violation it demonstrates (a spec that stops parsing must not read
+  as "fails as expected"). Two reproduce bugs that were real. The lock order
+  is checked at two arities. Needs java; the jar is pinned and
+  checksum-verified.
 - `just fixtures-di` — fixtures carry baked-in BPMN DI so they render
   everywhere; new fixtures without a `bpmndi:BPMNDiagram` section get theirs
   from this (idempotent; two reject fixtures have hand-written DI — see the

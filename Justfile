@@ -68,33 +68,44 @@ tla:
         mv "$jar.part" "$jar"
     fi
     verify "$jar" || exit 1
-    check() { # name, config, module, expectation(hold|fail), [extra TLC flags]
+    # name, config, module, hold|fail, expected-error regex (fail only), [TLC flags]
+    #
+    # A non-zero exit is NOT enough to call a counterexample: TLC also exits
+    # non-zero when a spec or config fails to parse (151 on a semantic error).
+    # Treating that as "fails as expected" is how an expected-fail config rots
+    # silently while `just tla` stays green — so the failure must match the
+    # specific violation it is there to demonstrate.
+    check() {
         local out
-        if out=$(java -cp "$jar" tlc2.TLC ${5:-} -config "$2" "$3" 2>&1); then
+        if out=$(java -cp "$jar" tlc2.TLC ${6:-} -config "$2" "$3" 2>&1); then
             if [ "$4" = "hold" ]; then
                 echo "  ok       $1"
             else
                 echo "  MISSING  $1 — expected a counterexample, TLC found none"; return 1
             fi
-        else
-            if [ "$4" = "fail" ]; then
+        elif [ "$4" = "fail" ]; then
+            if grep -qE "$5" <<<"$out"; then
                 echo "  ok       $1 (counterexample found, as expected)"
             else
-                echo "  BROKEN   $1"; echo "$out" | tail -40; return 1
+                echo "  WRONG    $1 — TLC failed, but not with /$5/:"
+                echo "$out" | grep -E "^Error" | head -5
+                return 1
             fi
+        else
+            echo "  BROKEN   $1"; echo "$out" | tail -40; return 1
         fi
     }
-    check "lock order: shipped protocol"      LockOrder.cfg           LockOrder.tla hold
-    check "lock order: rejected AB/BA sketch" LockOrderHistorical.cfg LockOrder.tla fail
-    check "lock order: all five per-instance rows"  LockOrderAllRows.cfg           LockOrder.tla hold
-    check "lock order: five rows, wrong order"      LockOrderAllRowsHistorical.cfg LockOrder.tla fail
-    check "lease: safety"                     Lease.cfg               Lease.tla     hold
-    check "lease: double belief is reachable" Lease_DoubleBelief.cfg  Lease.tla     fail
+    check "lock order: shipped protocol"      LockOrder.cfg           LockOrder.tla hold ""
+    check "lock order: rejected AB/BA sketch" LockOrderHistorical.cfg LockOrder.tla fail "Error: Deadlock reached"
+    check "lock order: all five per-instance rows"  LockOrderAllRows.cfg           LockOrder.tla hold ""
+    check "lock order: five rows, wrong order"      LockOrderAllRowsHistorical.cfg LockOrder.tla fail "Error: Deadlock reached"
+    check "lease: safety"                     Lease.cfg               Lease.tla     hold ""
+    check "lease: double belief is reachable" Lease_DoubleBelief.cfg  Lease.tla     fail "Invariant DoubleBeliefIsReachable is violated"
     # -deadlock: a terminal state is legitimate here (everything torn down,
     # nothing armed). Deadlock freedom is a property under test only for
     # LockOrder, where the flag is deliberately absent.
-    check "timer claim vs scope teardown"     TimerTeardown.cfg       TimerTeardown.tla hold -deadlock
-    check "teardown leaving a timer behind"   TimerTeardown_Buggy.cfg TimerTeardown.tla fail -deadlock
+    check "timer claim vs scope teardown"     TimerTeardown.cfg       TimerTeardown.tla hold "" -deadlock
+    check "teardown leaving a timer behind"   TimerTeardown_Buggy.cfg TimerTeardown.tla fail "Invariant NeverFiredADanglingTimer is violated" -deadlock
 
 # Differential the FEEL subset against dsntk (the DMN-TCK-verified reference):
 # every condition we accept must evaluate identically there. Outside the

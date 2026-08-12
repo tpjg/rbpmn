@@ -66,11 +66,20 @@ VARIABLES
 vars == <<lock, pc, kind, target>>
 
 \* The order in which a node takes its locks. Shipped: the instance row
-\* first, then every per-instance row. Historical: one per-instance row
-\* first (the SKIP LOCKED timer claim), and only then the instance row.
+\* first, then every per-instance row. Historical: the TIMER row first (the
+\* rejected `DELETE ... FOR UPDATE SKIP LOCKED` claim), and only then the
+\* instance row.
+\*
+\* "timer" is named rather than taken as Head(RowOrder): while RowOrder was a
+\* single generic row that stood for the timer row, Head was faithful, but
+\* once it grew to five named rows Head became "item"/"token" and the
+\* counterexample deadlocked over a row the rejected design never touched
+\* first.
+OtherRows == SelectSeq(RowOrder, LAMBDA r : r # "timer")
+
 Order(n) ==
     IF kind[n] = "timer" /\ HistoricalTimerOrder
-        THEN <<Head(RowOrder), "inst">> \o Tail(RowOrder)
+        THEN <<"timer", "inst">> \o OtherRows
         ELSE <<"inst">> \o RowOrder
 
 Last == Len(RowOrder) + 1

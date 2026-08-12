@@ -8,7 +8,7 @@ Run with `just tla` (needs `java`; fetches `tla2tools.jar` on first use).
 
 | Spec | Models | Checks |
 |---|---|---|
-| `LockOrder.tla` | instance-row and item/timer-row locking across N nodes | one lock order engine-wide; no AB/BA deadlock; every transaction returns to idle |
+| `LockOrder.tla` | the instance row plus every per-instance row a step touches (`RowOrder`: tokens, work items, timers, subscriptions, scopes), across N nodes | one lock order for the *stepping* paths; no AB/BA deadlock; every transaction returns to idle |
 | `Lease.tla` | the work-item lease: TTL, renewal, expiry, completion | no double delivery; exactly-once completion under at-least-once delivery; nothing stranded |
 | `TimerTeardown.tla` | the scheduler's unlocked timer pick racing a scope teardown | no timer row outlives the token it is armed on; no timer ever fires with its token gone |
 
