@@ -149,6 +149,22 @@ fn generated_models_hold_the_invariants() {
             Block::Par(vec![Block::Loop(Box::new(Block::Task)), Block::Task]),
         ),
         (
+            "subprocess".into(),
+            Block::Sub(Box::new(Block::Par(vec![Block::Task, Block::Task]))),
+        ),
+        (
+            "nested subprocesses".into(),
+            Block::Sub(Box::new(Block::Sub(Box::new(Block::Task)))),
+        ),
+        (
+            "loop around a subprocess".into(),
+            Block::Loop(Box::new(Block::Sub(Box::new(Block::Task)))),
+        ),
+        (
+            "subprocess inside a parallel branch".into(),
+            Block::Par(vec![Block::Sub(Box::new(Block::Task)), Block::Task]),
+        ),
+        (
             "nested loops".into(),
             Block::Loop(Box::new(Block::Seq(vec![
                 Block::Loop(Box::new(Block::Task)),

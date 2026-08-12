@@ -132,6 +132,19 @@ async fn the_engine_converges_through_chaos() {
         )
         .await
         .unwrap();
+    // A service task failing *inside* a subprocess, caught by the boundary on
+    // the subprocess itself: scope teardown runs while backends are being
+    // killed, which is exactly where a half-torn-down scope would show up.
+    setup
+        .deploy(
+            &with_process_id(
+                &fixture("accept/20-subprocess-error-boundary.bpmn"),
+                "scoped",
+            ),
+            &rbpmn_core::Bindings::new().topic("reserve", "chaos"),
+        )
+        .await
+        .unwrap();
 
     let deadlocks_before = deadlocks(&db.pool).await;
     let rounds: u32 = std::env::var("RBPMN_CHAOS_ROUNDS")
@@ -219,7 +232,7 @@ async fn the_engine_converges_through_chaos() {
             while !stop.load(Ordering::Relaxed) {
                 let engine = slot.read().await.0.clone();
                 let mut idle = true;
-                for topic in ["ta", "tb", "ut", "t_esc"] {
+                for topic in ["ta", "tb", "ut", "t_esc", "pack", "backorder"] {
                     if let Ok(Some(task)) = engine.get_task(topic, &options).await {
                         idle = false;
                         // Outlive the lease deliberately.
@@ -283,7 +296,7 @@ async fn the_engine_converges_through_chaos() {
     // cannot lose a start we are counting on.
     let mut instances: Vec<(Uuid, serde_json::Value)> = Vec::new();
     for _ in 0..rounds {
-        for key in ["par", "timed", "svc"] {
+        for key in ["par", "timed", "svc", "scoped"] {
             let vars = serde_json::json!({});
             let id = setup.start(key, None, vars.clone()).await.unwrap().id;
             instances.push((id, vars));

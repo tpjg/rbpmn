@@ -149,6 +149,16 @@ async fn a_storm_holds_every_global_invariant() {
         )
         .await
         .unwrap();
+    // Two-level nesting: scopes open and close across separate transactions,
+    // so the scope projection is exercised under the same concurrency as
+    // everything else rather than only in quiet integration tests.
+    setup
+        .deploy(
+            &with_process_id(&fixture("accept/21-nested-subprocess.bpmn"), "nested"),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
 
     // Crank with RBPMN_STORM_ROUNDS when hunting; 20 keeps the suite quick.
     let rounds: u32 = std::env::var("RBPMN_STORM_ROUNDS")
@@ -192,7 +202,7 @@ async fn a_storm_holds_every_global_invariant() {
             let options = rbpmn_engine::GetTaskOptions::new(format!("worker-{w}"));
             while !stop.load(Ordering::Relaxed) {
                 let mut idle = true;
-                for topic in ["ta", "tb", "ut", "t_esc", "c"] {
+                for topic in ["ta", "tb", "ut", "t_esc", "c", "count", "ship"] {
                     if let Ok(Some(task)) = node.get_task(topic, &options).await {
                         idle = false;
                         // Completion may lose a race with a boundary timer;
@@ -249,7 +259,7 @@ async fn a_storm_holds_every_global_invariant() {
     for round in 0..rounds {
         let node = &nodes[round as usize % nodes.len()];
         let empty = serde_json::json!({});
-        for key in ["par", "timed"] {
+        for key in ["par", "timed", "nested"] {
             let id = node.start(key, None, empty.clone()).await.unwrap().id;
             instances.push((id, empty.clone()));
         }
@@ -370,6 +380,18 @@ async fn a_storm_holds_every_global_invariant() {
         "select count(*) from rbpmn_instance where status = 'active'",
     )
     .await;
+    // ...and that subprocesses really executed, or the scope invariants in the
+    // fsck are checking a table that stayed empty all run.
+    let scoped = count(
+        &db.pool,
+        "select count(*) from rbpmn_event \
+         where element_id in ('outer', 'inner') and kind = 'element-started'",
+    )
+    .await;
+    assert!(
+        scoped > 0,
+        "no subprocess was ever entered — the scope projection is untested here"
+    );
     assert_eq!(
         stuck, 0,
         "instances never drained; the storm proved nothing"

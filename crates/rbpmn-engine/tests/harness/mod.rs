@@ -82,9 +82,47 @@ const FSCK: &[(&str, &str)] = &[
          where k.token_no is null",
     ),
     (
-        "two tokens parked at one join via the same flow",
+        // Per *scope instance* since phase 6: joins count within their scope,
+        // so the same join element may legitimately hold tokens in two live
+        // scopes. Grouping without scope_no would be a false positive the day
+        // one subprocess node has two concurrent instances.
+        "two tokens parked at one join via the same flow in one scope",
         "select instance_id::text from rbpmn_token where wait_kind = 'join' \
-         group by instance_id, element_id, arrived_via having count(*) > 1",
+         group by instance_id, scope_no, element_id, arrived_via having count(*) > 1",
+    ),
+    (
+        "completed/terminated instances still hold scopes",
+        "select s.instance_id::text from rbpmn_scope s \
+         join rbpmn_instance i on i.id = s.instance_id \
+         where i.status in ('completed', 'terminated')",
+    ),
+    (
+        "a scope's parked parent token is missing or not waiting on it",
+        "select s.instance_id::text from rbpmn_scope s \
+         left join rbpmn_token t \
+           on t.instance_id = s.instance_id and t.token_no = s.token_no \
+         where t.token_no is null or t.wait_kind <> 'scope'",
+    ),
+    (
+        "a token waits on a subprocess with no scope open for it",
+        "select t.instance_id::text from rbpmn_token t \
+         left join rbpmn_scope s \
+           on s.instance_id = t.instance_id and s.token_no = t.token_no \
+         where t.wait_kind = 'scope' and s.scope_no is null",
+    ),
+    (
+        "a scope's parent scope does not exist",
+        "select s.instance_id::text from rbpmn_scope s \
+         left join rbpmn_scope p \
+           on p.instance_id = s.instance_id and p.scope_no = s.parent_scope_no \
+         where s.parent_scope_no <> 0 and p.scope_no is null",
+    ),
+    (
+        "a token lives in a scope that does not exist",
+        "select t.instance_id::text from rbpmn_token t \
+         left join rbpmn_scope s \
+           on s.instance_id = t.instance_id and s.scope_no = t.scope_no \
+         where t.scope_no <> 0 and s.scope_no is null",
     ),
     (
         "a failed instance is not frozen at exactly one incident token",

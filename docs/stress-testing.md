@@ -142,6 +142,14 @@ enough to cover everything `balanced-gateways` is actually about. `Loop` is
 emitted as the fixture-proven shape: exclusive join, body, a control task, an
 exclusive split whose back-edge is conditional and whose exit is the default.
 
+`Sub` was added when phase 6 made subprocesses executable. It is a *no-op* to
+the oracle — `Sub(B)` executes exactly what `B` does — which is what makes it
+sharp: any scope bookkeeping that leaks into execution shows up immediately as
+a task count that no longer matches the plain block. The emitter nests each
+subprocess's start, end, body and flows inside its element, so generated
+models are real scope trees, and mutating one can now produce a cross-scope
+flow — a rule the flat grammar could not reach at all.
+
 Not yet generated, and why: `WithBoundary` and `EventGateway` need care that
 the core grammar does not. In the accepted fixtures a boundary path runs its
 handler and then reaches **its own end event** rather than rejoining the main
@@ -162,7 +170,10 @@ block structure means"; any disagreement is a generator bug or a linter
 over-reach, and both are worth knowing. This is the only test of outcome 5
 that exists.
 
-> **Result: 100 000 generated models, zero false positives.** 50 000 on the
+> **Result: 100 000 generated models, zero false positives** (re-run after
+> phase 6 with `Sub` in the grammar; subprocesses, nested subprocesses, loops
+> around scopes and scopes inside parallel branches all lint clean and execute
+> as the oracle predicts). 50 000 on the
 > narrow grammar (depth 4, width ≤3) and 50 000 on the wide one (depth 6,
 > `Par` up to 6), each also driven to completion against the oracle. Every
 > composition the grammar reaches — loops inside parallel branches, parallel
@@ -270,6 +281,27 @@ however many you care to generate (§6).
 
 ---
 
+## 3-bis. What a new phase costs this tier
+
+Phase 6 (embedded subprocesses) is the first phase to land *after* this
+document, and it is a useful measurement of how much of the tier adapts by
+itself:
+
+| Piece | Adapted how |
+|---|---|
+| Explicit-state exploration (§7) | **For free.** It iterates the scenario corpus, so the four new subprocess scenarios were picked up automatically (22 → 26 starting points, 145 → 172 states). |
+| Replay verification (§4) | **For free.** Scopes added no new event kinds, so histories re-derive unchanged. |
+| Invariant set / fsck (§1) | **Needed work.** The fsck was blind to `rbpmn_scope` entirely, and join arity has to group by `scope_no` now that joins count within a scope instance. |
+| Storm and chaos (§4, §5) | **Needed work.** Their fixtures contained no subprocess, so the scope projection was never stressed, replayed or crashed — green, and meaningless for the newest code. |
+| Model generator (§3) | **Needed work.** No `Sub` in the grammar meant no generated coverage of the newest semantics at all. |
+| TLA+ specs (§7) | **Unaffected.** Scope rows are written under the same instance row lock, so the lock order the spec models is unchanged. |
+
+The lesson worth carrying: **the parts keyed on a corpus adapt themselves; the
+parts with a hand-written workload or grammar do not.** A green run after a
+new phase is not evidence that the phase is covered — it is evidence that
+nothing already covered broke. Check the workload actually reaches the new
+code before believing the result. Both storm and chaos now assert they do.
+
 ## 4. Tier 2 — the concurrency storm, made to prove something
 
 The naive storm ("N workers, M instances, did anything explode?") proves
@@ -339,7 +371,7 @@ rows*.
 - **Zero orphans.** No token / work item / timer / subscription belonging to
   a non-active instance.
 
-**`fsck` for rbpmn** — implemented as eleven SQL queries rather than
+**`fsck` for rbpmn** — implemented as SQL queries rather than
 "rehydrate and check", deliberately: that is what someone debugging a
 production database would actually run, and it does not depend on the loader
 being correct, which is part of what is under test. Factor these into

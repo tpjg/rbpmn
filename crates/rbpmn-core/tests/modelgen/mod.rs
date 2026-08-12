@@ -35,6 +35,11 @@ pub enum Block {
     /// A loop wrapping a whole block: exclusive join, body, control task,
     /// exclusive split with the back-edge.
     Loop(Box<Block>),
+    /// An embedded subprocess wrapping a whole block. Semantically a no-op —
+    /// `Sub(B)` executes exactly what `B` does — which is what makes it a
+    /// sharp oracle test: any scope bookkeeping that leaks into execution
+    /// shows up as a task count that no longer matches the plain block.
+    Sub(Box<Block>),
 }
 
 /// The same tree with element ids and decision variables assigned. The XML
@@ -57,6 +62,14 @@ pub enum Node {
         ctl: String,
         body: Box<Node>,
     },
+    Sub {
+        /// The `subProcess` element; also the scope's owner.
+        id: String,
+        /// The scope's own start and end events.
+        start: String,
+        end: String,
+        body: Box<Node>,
+    },
 }
 
 #[derive(Default)]
@@ -64,6 +77,7 @@ struct Ids {
     task: usize,
     xor: usize,
     loops: usize,
+    subs: usize,
 }
 
 fn number(block: &Block, ids: &mut Ids) -> Node {
@@ -82,6 +96,16 @@ fn number(block: &Block, ids: &mut Ids) -> Node {
             }
         }
         Block::Par(branches) => Node::Par(branches.iter().map(|b| number(b, ids)).collect()),
+        Block::Sub(body) => {
+            ids.subs += 1;
+            let n = ids.subs;
+            Node::Sub {
+                id: format!("sp{n}"),
+                start: format!("sp{n}_start"),
+                end: format!("sp{n}_end"),
+                body: Box::new(number(body, ids)),
+            }
+        }
         Block::Loop(body) => {
             ids.loops += 1;
             let n = ids.loops;
@@ -106,12 +130,15 @@ pub enum Kind {
     Parallel,
     /// Never generated — only reachable by mutation (tests/mutation.rs).
     Inclusive,
+    SubProcess,
 }
 
 #[derive(Clone, Debug)]
 pub struct Element {
     pub id: String,
     pub kind: Kind,
+    /// The `subProcess` element this lives inside; `None` is the process body.
+    pub container: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +147,9 @@ pub struct Flow {
     pub source: String,
     pub target: String,
     pub condition: Option<String>,
+    /// Flows are declared inside the scope they belong to; a flow that ends
+    /// up crossing scopes is exactly what `cross-scope-flow` rejects.
+    pub container: Option<String>,
 }
 
 /// Elements and flows are collected separately and stitched at the end: an
@@ -129,6 +159,8 @@ pub struct Flow {
 pub struct Builder {
     pub elements: Vec<Element>,
     pub flows: Vec<Flow>,
+    /// Scope currently being emitted into.
+    container: Option<String>,
 }
 
 impl Builder {
@@ -136,6 +168,7 @@ impl Builder {
         self.elements.push(Element {
             id: id.to_string(),
             kind,
+            container: self.container.clone(),
         });
     }
 
@@ -146,6 +179,7 @@ impl Builder {
             source: source.to_string(),
             target: target.to_string(),
             condition,
+            container: self.container.clone(),
         });
     }
 
@@ -197,6 +231,23 @@ impl Builder {
                 }
                 join
             }
+            Node::Sub {
+                id,
+                start,
+                end,
+                body,
+            } => {
+                self.element(id, Kind::SubProcess);
+                self.flow(from, id, cond);
+                // Everything below lives in the subprocess's own scope.
+                let outer = self.container.replace(id.clone());
+                self.element(start, Kind::Start);
+                let body_exit = self.add(body, start, None);
+                self.element(end, Kind::End);
+                self.flow(&body_exit, end, None);
+                self.container = outer;
+                id.clone()
+            }
             Node::Loop { var, ctl, body } => {
                 let n = self.elements.len();
                 let (entry, exit) = (format!("lj{n}"), format!("ls{n}"));
@@ -232,56 +283,7 @@ impl Builder {
     }
 
     pub fn to_xml(&self) -> String {
-        let mut body = String::new();
-        for e in &self.elements {
-            let inc: String = self
-                .incoming(&e.id)
-                .iter()
-                .map(|f| format!("<bpmn:incoming>{f}</bpmn:incoming>"))
-                .collect();
-            let out: String = self
-                .outgoing(&e.id)
-                .iter()
-                .map(|f| format!("<bpmn:outgoing>{f}</bpmn:outgoing>"))
-                .collect();
-            let (tag, attrs) = match e.kind {
-                Kind::Start => ("bpmn:startEvent", String::new()),
-                Kind::End => ("bpmn:endEvent", String::new()),
-                Kind::UserTask => ("bpmn:userTask", String::new()),
-                Kind::Parallel => ("bpmn:parallelGateway", String::new()),
-                Kind::Inclusive => ("bpmn:inclusiveGateway", String::new()),
-                Kind::Exclusive => {
-                    // An exclusive split needs a default flow; by construction
-                    // it is always the last outgoing one.
-                    let outs = self.outgoing(&e.id);
-                    match outs.len() {
-                        0 | 1 => ("bpmn:exclusiveGateway", String::new()),
-                        _ => (
-                            "bpmn:exclusiveGateway",
-                            format!(" default=\"{}\"", outs[outs.len() - 1]),
-                        ),
-                    }
-                }
-            };
-            body.push_str(&format!(
-                "    <{tag} id=\"{}\"{attrs}>{inc}{out}</{tag}>\n",
-                e.id
-            ));
-        }
-        for f in &self.flows {
-            match &f.condition {
-                None => body.push_str(&format!(
-                    "    <bpmn:sequenceFlow id=\"{}\" sourceRef=\"{}\" targetRef=\"{}\" />\n",
-                    f.id, f.source, f.target
-                )),
-                Some(c) => body.push_str(&format!(
-                    "    <bpmn:sequenceFlow id=\"{}\" sourceRef=\"{}\" targetRef=\"{}\">\
-                     <bpmn:conditionExpression>{c}</bpmn:conditionExpression>\
-                     </bpmn:sequenceFlow>\n",
-                    f.id, f.source, f.target
-                )),
-            }
-        }
+        let body = self.emit_container(None);
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" \
@@ -289,6 +291,79 @@ impl Builder {
              \x20 <bpmn:process id=\"p\" isExecutable=\"true\">\n{body}  </bpmn:process>\n\
              </bpmn:definitions>\n"
         )
+    }
+
+    /// Emit one scope. A subprocess's children are nested *inside* its
+    /// element, which is what makes the emitted document a real scope tree
+    /// rather than a flat graph with a label on it.
+    fn emit_container(&self, container: Option<&str>) -> String {
+        let mut out = String::new();
+        for e in self
+            .elements
+            .iter()
+            .filter(|e| e.container.as_deref() == container)
+        {
+            let inc: String = self
+                .incoming(&e.id)
+                .iter()
+                .map(|f| format!("<bpmn:incoming>{f}</bpmn:incoming>"))
+                .collect();
+            let outs_list = self.outgoing(&e.id);
+            let out_tags: String = outs_list
+                .iter()
+                .map(|f| format!("<bpmn:outgoing>{f}</bpmn:outgoing>"))
+                .collect();
+            if e.kind == Kind::SubProcess {
+                out.push_str(&format!(
+                    "    <bpmn:subProcess id=\"{}\">{inc}{out_tags}\n{}    </bpmn:subProcess>\n",
+                    e.id,
+                    self.emit_container(Some(&e.id))
+                ));
+                continue;
+            }
+            let (tag, attrs) = match e.kind {
+                Kind::Start => ("bpmn:startEvent", String::new()),
+                Kind::End => ("bpmn:endEvent", String::new()),
+                Kind::UserTask => ("bpmn:userTask", String::new()),
+                Kind::Parallel => ("bpmn:parallelGateway", String::new()),
+                Kind::Inclusive => ("bpmn:inclusiveGateway", String::new()),
+                Kind::SubProcess => unreachable!("handled above"),
+                Kind::Exclusive => {
+                    // An exclusive split needs a default flow; by construction
+                    // it is always the last outgoing one.
+                    match outs_list.len() {
+                        0 | 1 => ("bpmn:exclusiveGateway", String::new()),
+                        _ => (
+                            "bpmn:exclusiveGateway",
+                            format!(" default=\"{}\"", outs_list[outs_list.len() - 1]),
+                        ),
+                    }
+                }
+            };
+            out.push_str(&format!(
+                "    <{tag} id=\"{}\"{attrs}>{inc}{out_tags}</{tag}>\n",
+                e.id
+            ));
+        }
+        for f in self
+            .flows
+            .iter()
+            .filter(|f| f.container.as_deref() == container)
+        {
+            match &f.condition {
+                None => out.push_str(&format!(
+                    "    <bpmn:sequenceFlow id=\"{}\" sourceRef=\"{}\" targetRef=\"{}\" />\n",
+                    f.id, f.source, f.target
+                )),
+                Some(c) => out.push_str(&format!(
+                    "    <bpmn:sequenceFlow id=\"{}\" sourceRef=\"{}\" targetRef=\"{}\">\
+                     <bpmn:conditionExpression>{c}</bpmn:conditionExpression>\
+                     </bpmn:sequenceFlow>\n",
+                    f.id, f.source, f.target
+                )),
+            }
+        }
+        out
     }
 }
 
@@ -359,6 +434,7 @@ pub fn decide(root: &Node, rng: &mut Rng, max_iterations: usize) -> Decisions {
                 out.xor.insert(var.clone(), rng.below(branches.len()));
                 branches.iter().for_each(|b| walk(b, rng, max, out));
             }
+            Node::Sub { body, .. } => walk(body, rng, max, out),
             Node::Loop { var, body, .. } => {
                 out.loops.insert(var.clone(), 1 + rng.below(max));
                 walk(body, rng, max, out);
@@ -394,6 +470,9 @@ pub fn expected_executions(root: &Node, dec: &Decisions) -> BTreeMap<String, usi
                 let choice = dec.xor.get(var).copied().unwrap_or(branches.len() - 1);
                 walk(&branches[choice], dec, out);
             }
+            // A subprocess is transparent to the oracle: entering a scope
+            // executes its body, nothing more.
+            Node::Sub { body, .. } => walk(body, dec, out),
             Node::Loop { var, ctl, body } => {
                 for _ in 0..dec.loops.get(var).copied().unwrap_or(1) {
                     walk(body, dec, out);
@@ -416,6 +495,7 @@ fn control_tasks(root: &Node) -> BTreeMap<String, String> {
             Node::Task(_) => {}
             Node::Seq(parts) | Node::Par(parts) => parts.iter().for_each(|p| walk(p, out)),
             Node::Xor { branches, .. } => branches.iter().for_each(|b| walk(b, out)),
+            Node::Sub { body, .. } => walk(body, out),
             Node::Loop { var, ctl, body } => {
                 out.insert(ctl.clone(), var.clone());
                 walk(body, out);

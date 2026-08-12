@@ -30,7 +30,8 @@ fn any_block() -> impl Strategy<Value = Block> {
             2 => prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Seq),
             2 => prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Xor),
             2 => prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Par),
-            1 => inner.prop_map(|b| Block::Loop(Box::new(b))),
+            1 => inner.clone().prop_map(|b| Block::Loop(Box::new(b))),
+            1 => inner.prop_map(|b| Block::Sub(Box::new(b))),
         ]
     })
 }
@@ -44,7 +45,8 @@ fn any_block_wide() -> impl Strategy<Value = Block> {
             2 => prop::collection::vec(inner.clone(), 2..5).prop_map(Block::Seq),
             2 => prop::collection::vec(inner.clone(), 2..5).prop_map(Block::Xor),
             2 => prop::collection::vec(inner.clone(), 2..7).prop_map(Block::Par),
-            1 => inner.prop_map(|b| Block::Loop(Box::new(b))),
+            1 => inner.clone().prop_map(|b| Block::Loop(Box::new(b))),
+            1 => inner.prop_map(|b| Block::Sub(Box::new(b))),
         ]
     })
 }
@@ -171,6 +173,30 @@ fn known_shapes_lint_clean_and_match_the_oracle() {
         (
             "loop inside a parallel branch",
             Block::Par(vec![Block::Loop(Box::new(Block::Task)), Block::Task]),
+        ),
+        ("subprocess", Block::Sub(Box::new(Block::Task))),
+        (
+            "subprocess wrapping a parallel block",
+            Block::Sub(Box::new(Block::Par(vec![Block::Task, Block::Task]))),
+        ),
+        (
+            "nested subprocesses",
+            Block::Sub(Box::new(Block::Seq(vec![
+                Block::Sub(Box::new(Block::Task)),
+                Block::Task,
+            ]))),
+        ),
+        (
+            "subprocess inside a parallel branch",
+            Block::Par(vec![Block::Sub(Box::new(Block::Task)), Block::Task]),
+        ),
+        (
+            "loop around a subprocess",
+            Block::Loop(Box::new(Block::Sub(Box::new(Block::Task)))),
+        ),
+        (
+            "subprocess wrapping a loop",
+            Block::Sub(Box::new(Block::Loop(Box::new(Block::Task)))),
         ),
         (
             "three-way parallel of sequences",

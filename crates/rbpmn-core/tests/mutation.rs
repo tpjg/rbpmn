@@ -187,11 +187,19 @@ fn implicit_split(b: &mut Builder, rng: &mut Rng) -> bool {
     }
     let target = targets[rng.below(targets.len())].clone();
     let id = format!("fx{}", b.flows.len() + 1);
+    // Declared in the source element's scope — which is what makes this a
+    // cross-scope flow when the target lives somewhere else.
+    let container = b
+        .elements
+        .iter()
+        .find(|e| e.id == source)
+        .and_then(|e| e.container.clone());
     b.flows.push(modelgen::Flow {
         id,
         source,
         target,
         condition: None,
+        container,
     });
     true
 }
@@ -275,6 +283,7 @@ fn any_block() -> impl Strategy<Value = Block> {
             prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Seq),
             prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Xor),
             prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Par),
+            inner.prop_map(|b| Block::Sub(Box::new(b))),
         ]
     })
 }
@@ -335,6 +344,9 @@ fn mutation_fuzz_is_not_vacuous() {
             Block::Seq(vec![Block::Task, Block::Task]),
             Block::Xor(vec![Block::Task, Block::Task]),
         ]),
+        // Scoped: retargeting a flow here can produce a cross-scope flow,
+        // a rule the flat grammar cannot reach at all.
+        Block::Sub(Box::new(Block::Par(vec![Block::Task, Block::Task]))),
     ];
 
     let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
