@@ -40,6 +40,16 @@ create index rbpmn_instance_retire on rbpmn_instance (completed_at)
 -- implied by the foreign key.
 create index rbpmn_instance_by_definition on rbpmn_instance (definition_id);
 
+-- How many records of this definition retention has retired. Without it,
+-- `delete_definition`'s guard is accidentally void exactly when it matters:
+-- the guard counts live instance rows, retention exists to remove them, and
+-- an archived record carries element ids but no BPMN — so the definition
+-- that explains them becomes deletable the moment the history is exported.
+-- Definitions grow with deployments, not throughput (a handful of versions
+-- per process, a few KB each), so the answer is not to copy the XML into
+-- every archived record: it is to let the guard say *why* it refuses.
+alter table rbpmn_definition add column retired_instances bigint not null default 0;
+
 -- The truncation floor: the highest (txid, id) ever deleted, monotonic and
 -- never decreasing. Everything deleted is <= floor, so a cursor >= floor has
 -- provably lost nothing and a cursor < floor is told so — loudly — instead

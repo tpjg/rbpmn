@@ -139,16 +139,13 @@ const FSCK: &[(&str, &str)] = &[
          where state = 'locked' and (lock_owner is null or lock_until is null)",
     ),
     (
-        // Enforced by the 0007 foreign key, checked here anyway: this is the
-        // invariant that lets `delete_definition` prove "nothing references
-        // this" from an indexed instance lookup instead of scanning the
-        // largest table in the schema, and a schema that lost the constraint
-        // would be a schema where that proof quietly stopped holding.
-        "an event outlives the instance it belongs to",
-        "select distinct e.instance_id::text from rbpmn_event e \
-         where not exists (select 1 from rbpmn_instance i where i.id = e.instance_id)",
-    ),
-    (
+        // The constraint, not an anti-join over the largest table in the
+        // schema: the FK is *what makes* "no event outlives its instance"
+        // true, so scanning rbpmn_event to re-derive a constant answer buys
+        // nothing an O(1) catalogue lookup does not — and fsck is meant to be
+        // runnable against a production-sized database. This is the invariant
+        // `delete_definition` leans on when it proves "nothing references
+        // this" from an indexed instance lookup.
         "the event -> instance foreign key is missing",
         "select 'rbpmn_event_instance_fk'::text where not exists \
            (select 1 from pg_constraint where conname = 'rbpmn_event_instance_fk')",

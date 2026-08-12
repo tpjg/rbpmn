@@ -466,19 +466,20 @@ fn require_object(value: &serde_json::Value, what: &str) -> Result<(), EngineErr
     Ok(())
 }
 
-/// Text parameters bound into queries hit the same NUL limitation as jsonb;
-/// reject at the boundary so it is a 400, not a transaction-poisoning 500.
-/// The one timestamp rendering: RFC 3339, UTC, microsecond precision,
-/// database time. Shared by the event stream, the inspection view and the
-/// retention archive, which are documented as the same public contract —
-/// three hand-written copies of the format string were three chances for
-/// them to quietly diverge.
+/// The one rendering for a public timestamp: RFC 3339, UTC, microsecond
+/// precision, database time. Used by the event stream and the retention
+/// archive, which are documented as the same contract, so the format cannot
+/// drift between them. (`inspect.rs`'s `due_at` deliberately renders to the
+/// second — a timer's due time is a schedule, not a stream position — and is
+/// left alone rather than folded in here.)
 pub(crate) fn ts(column: &str, alias: &str) -> String {
     format!(
         "to_char({column} at time zone 'UTC', \'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"\') as {alias}"
     )
 }
 
+/// Text parameters bound into queries hit the same NUL limitation as jsonb;
+/// reject at the boundary so it is a 400, not a transaction-poisoning 500.
 pub(crate) fn reject_nul_text(value: &str, what: &str) -> Result<(), EngineError> {
     if value.contains('\u{0}') {
         return Err(EngineError::InvalidVariables(format!(

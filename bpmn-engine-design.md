@@ -715,18 +715,34 @@ nobody ever silently misses an event.
   only make truncation rarer, never change what a cursor means. The loud
   mechanism had to ship in v1 because it changes the contract; the
   optimisation did not.
-- **Two knobs, because there are two growth curves.** `retain_runtime`
-  deletes an instance's *children* (tokens, work items, timers,
-  subscriptions, scopes) and stamps `pruned_at` — that is the hot working
-  set, and it reclaims latency. `retain_history` then deletes the record and
-  its events together — that is the archive, and it reclaims storage. The
-  instance row deliberately survives stage one as the header of its own
-  history: inspection keeps working (with `prunedAt` distinguishing "retired"
-  from "finished cleanly"), business keys stay queryable, and **an event
-  never outlives its instance row** — which is also what keeps
-  "is this definition still referenced?" an indexed lookup rather than a scan
-  of the largest table in the schema.
-- **Three phases, and the middle one holds no transaction**, so that
+- **One knob, after measuring the two-knob version.** A record retires
+  whole: the instance row, its children and its events, in one transaction.
+  The first implementation split it — retire the children early
+  (`retain_runtime`), delete the record later (`retain_history`) — on the
+  theory that those are two growth curves. The post-phase review checked, and
+  they are not: the claim indexes (`rbpmn_work_item_pull`,
+  `rbpmn_work_item_claim`) are *partial* on `state in ('available','locked')`,
+  so closed work items were never in them, and a terminal instance's tokens,
+  timers, subscriptions and scopes are already gone. The early stage
+  reclaimed roughly a tenth of a record's footprint — events outnumber work
+  items by an order of magnitude — in exchange for a column, a partial index,
+  a guard on the hot step path, a second planner with dedup between the two,
+  two extra fsck invariants, and a narrowed `AlreadyClosed` contract. With
+  archive-before-delete in place, long histories belong in object storage
+  rather than in Postgres anyway, which removes the last reason to keep a
+  record behind after its children.
+- **`rbpmn_event.instance_id` became a real foreign key** (`on delete
+  cascade`) once one-stage retention made an orphan event impossible. It had
+  been an unenforced reference since phase 2, deliberately, so that history
+  *could* outlive its instance. Now "an event never outlives its instance" is
+  not an invariant this codebase asserts and tests — it is one the database
+  will not let it break, and it is what keeps "is this definition still
+  referenced?" an indexed lookup on `rbpmn_instance` rather than a scan of
+  the largest table in the schema. The referential-integrity check lands on
+  the highest-volume insert path, which is affordable for a specific reason:
+  a step already holds its instance row `FOR UPDATE`, so the check's KEY
+  SHARE lock is uncontended — an index probe per event row, nothing more.
+- **Two phases with no transaction across the gap**, so that
   export-before-delete (S3, a warehouse, a compliance log) is possible at
   all: `plan` → `archive` → `execute`. A sink call inside the deletion
   transaction would pin `pg_snapshot_xmin` — cluster-wide — for the duration
@@ -755,7 +771,26 @@ nobody ever silently misses an event.
   Definitions grow with deployments, not throughput, so there is no growth to
   justify the risk — only the risk of turning an archive into a pile of
   element ids. `prunable_definitions` is the dry run; `delete_definition`
-  refuses while anything references the version.
+  refuses while anything references the version. The second review round
+  found that guard accidentally void: it counts live instance rows, retention
+  exists to remove them, and an archived record carries element ids but no
+  BPMN — so exporting a definition's history was precisely what made the
+  definition deletable. Copying the model into every archived record would
+  fix it and dwarf a short record; a `retired_instances` counter on the
+  definition fixes it for eight bytes, and lets the refusal state its actual
+  reason.
+- **A record larger than one batch is skipped, loudly, not swallowed.**
+  `max_events` bounds a single record as well as the batch. The first version
+  always took the oldest candidate whole "so an oversized record cannot stall
+  retention", which achieved the exact opposite: the oversized record *is*
+  the oldest candidate, so every pass would load its entire history into
+  memory, die, and retry it forever — stalled and crash-looping at once. It
+  is now skipped with a warning naming it and a count in the report, its
+  neighbours retire normally (the same rule a wedged instance already gets),
+  and raising the ceiling retires it with no repair step. Event bodies are
+  also materialised only when a sink is registered: without one they would be
+  loaded solely to be deleted, which is what turned size into an
+  out-of-memory rather than a slow query.
 - **Retention is opt-in twice over**: no sweeper runs unless one is started,
   and starting one means naming the default policy (`forever()` is a valid
   and explicit choice). Per-definition overrides are keyed by definition

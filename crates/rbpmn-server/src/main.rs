@@ -17,6 +17,18 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Parsed here, beside the rest of the config and before anything touches
+    // the database: this is pure env validation, and a typo that only
+    // surfaced after migrations had run and workers had started would have
+    // mutated the schema on its way to exit(2).
+    let retention = match retention_options() {
+        Ok(options) => options,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::from(2);
+        }
+    };
+
     let engine = match build_engine().await {
         Ok(engine) => engine,
         Err(msg) => {
@@ -49,23 +61,16 @@ async fn main() -> ExitCode {
         });
     }
 
-    // Retention is opt-in twice over: no sweeper runs unless the operator
-    // names a policy, and the policy they name can still be "forever". A
-    // server started without RBPMN_RETAIN_* deletes nothing, ever.
-    match retention_options() {
-        Ok(Some(options)) => {
-            tracing::info!(
-                retain = ?options.default_policy.retain(),
-                "retention sweeper enabled"
-            );
-            let engine = engine.clone();
-            tokio::spawn(async move { engine.run_retention(options).await });
-        }
-        Ok(None) => {}
-        Err(msg) => {
-            eprintln!("{msg}");
-            return ExitCode::from(2);
-        }
+    // Retention is opt-in: no sweeper runs unless RBPMN_RETAIN names an age.
+    // A server started without it deletes nothing, ever — nothing is even
+    // scanned.
+    if let Some(options) = retention {
+        tracing::info!(
+            retain = ?options.default_policy.retain(),
+            "retention sweeper enabled"
+        );
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run_retention(options).await });
     }
 
     match rbpmn_server::serve(config, engine).await {
@@ -92,9 +97,16 @@ fn retention_options() -> Result<Option<rbpmn_engine::RetentionOptions>, String>
         .trim()
         .parse()
         .map_err(|_| format!("invalid RBPMN_RETAIN '{raw}' (expected days, e.g. 30)"))?;
-    if !days.is_finite() || days < 0.0 {
+    // `<= 0.0`, not `< 0.0`: zero reads naturally as "off", and `-0` slips
+    // past a strict test because IEEE 754 says -0.0 is not *less* than 0.0
+    // (it compares equal). Either would otherwise configure "delete every
+    // completed record the moment it completes" — the opposite of what an
+    // operator typing 0 means. NaN and the infinities are caught by
+    // is_finite() first, so the comparison never sees them.
+    if !days.is_finite() || days <= 0.0 {
         return Err(format!(
-            "invalid RBPMN_RETAIN '{raw}' (expected a positive number of days)"
+            "invalid RBPMN_RETAIN '{raw}' (expected a positive number of days; \
+             unset it entirely to run no sweeper at all)"
         ));
     }
     // try_, not the panicking form: this function's whole job is turning bad

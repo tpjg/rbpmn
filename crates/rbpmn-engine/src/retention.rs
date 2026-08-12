@@ -73,11 +73,15 @@ use std::pin::Pin;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Seconds are stored as `bigint`, so a duration must fit one. Rejected at
-/// construction rather than cast: `Duration::MAX.as_secs() as i64` is `-1`,
-/// which turns `now() - interval` into a cutoff in the *future* and deletes
-/// every terminal record on the next sweep. "Forever" is spelled `None`.
-const MAX_RETAIN_SECS: u64 = i64::MAX as u64;
+/// A century, which is the ceiling that actually exists. `i64::MAX` was the
+/// obvious bound and the wrong one twice over: `Duration::MAX.as_secs() as
+/// i64` is `-1`, turning `now() - interval` into a cutoff in the *future*
+/// that deletes every terminal record on the next sweep; and
+/// `make_interval(secs => ...)` overflows around 5.6e15 seconds, so an age
+/// that passed a type-shaped check would make every sweep fail forever
+/// behind a single warn line. "Forever" is spelled `None`, never a very
+/// large duration.
+const MAX_RETAIN_SECS: u64 = 100 * 365 * 24 * 3600;
 
 /// How long a completed record is kept, measured from `completed_at`.
 /// Constructed only through [`RetentionPolicy::new`] and
@@ -102,8 +106,9 @@ impl RetentionPolicy {
             && d.as_secs() > MAX_RETAIN_SECS
         {
             return Err(EngineError::InvalidRetentionPolicy(format!(
-                "retention age {d:?} is out of range (at most {MAX_RETAIN_SECS} seconds) — \
-                 spell 'keep forever' as None, never as a very large duration"
+                "retention age {d:?} is out of range (at most {MAX_RETAIN_SECS} seconds, \
+                 about a century) — spell 'keep forever' as None, never as a very large \
+                 duration"
             )));
         }
         Ok(RetentionPolicy { retain })
@@ -185,6 +190,11 @@ pub trait RetentionArchive: Send + Sync {
 #[serde(rename_all = "camelCase")]
 pub struct InstanceRecord {
     pub id: Uuid,
+    /// The exact definition this ran on. Carried so an archive can be joined
+    /// to a separately kept copy of the model: the record holds element ids,
+    /// not BPMN, and duplicating the XML into every record would dwarf the
+    /// record for a short instance.
+    pub definition_id: Uuid,
     pub definition_key: String,
     pub definition_version: i32,
     pub business_key: Option<String>,
@@ -222,6 +232,7 @@ impl ArchiveBatch {
 #[derive(Debug, Clone, Default)]
 pub struct RetentionBatch {
     records: ArchiveBatch,
+    oversized: u64,
 }
 
 impl RetentionBatch {
@@ -233,6 +244,13 @@ impl RetentionBatch {
     pub fn records(&self) -> &ArchiveBatch {
         &self.records
     }
+
+    /// Due records skipped because one of them carries more events than
+    /// [`RetentionOptions::max_events`] allows a whole batch to hold. Never
+    /// silent: each is logged, and this is the number to alarm on.
+    pub fn oversized_skipped(&self) -> u64 {
+        self.oversized
+    }
 }
 
 /// What a pass actually did (after row locks and re-checks).
@@ -241,6 +259,10 @@ impl RetentionBatch {
 pub struct RetentionReport {
     pub instances_deleted: u64,
     pub events_deleted: u64,
+    /// Due records this pass refused to carry because a single one exceeds
+    /// [`RetentionOptions::max_events`]. They stay until the ceiling is
+    /// raised; retention is not stalled by them, but it is not done either.
+    pub oversized_skipped: u64,
     /// The truncation floor after the pass.
     pub floor: EventCursor,
 }
@@ -264,12 +286,22 @@ pub struct PrunableDefinition {
     /// or a retained history record, and both need the definition to be
     /// intelligible.
     pub instances: i64,
+    /// Records retention has already retired. Their history lives in an
+    /// archive that references this model's element ids, so they block
+    /// deletion just as live rows do.
+    pub retired_instances: i64,
     /// `None` when the version is safe to delete.
     pub blocked_by: Option<String>,
 }
 
-/// The one eligibility predicate, shared by the planner and nothing else —
-/// but written once so the two places it is interpolated cannot drift.
+/// The one eligibility predicate, interpolated by the planner *and* by the
+/// deletion's re-check under the row lock, so the two cannot drift.
+///
+/// **Parameter contract: the default age is `$1`.** It is baked in, so any
+/// query interpolating this must bind the sweeper default there and number
+/// its own parameters from `$2`. Getting that wrong would silently bind
+/// something else as the cutoff, which decides how much history is deleted.
+///
 /// `case when p.definition_key is null` and **not** `coalesce`: a null column
 /// means *forever*, which is a policy, while a missing row means *no
 /// override*. Coalescing conflates them, and the key that asked to keep its
@@ -356,20 +388,23 @@ impl Engine {
     /// Phase one of a pass: read-only, bounded, and — because it only ever
     /// selects immutable data — stable until executed.
     ///
-    /// Records are materialised whole, event bodies included, whether or not
-    /// a sink is registered: a plan that reported different content depending
-    /// on hidden engine state would be a poor thing to hand an operator
-    /// driving `plan`/`execute` from their own job runner.
-    /// [`RetentionOptions::max_events`] is what keeps that affordable, and
-    /// the load is three set-based queries regardless of batch size.
+    /// Event bodies are materialised **only when an archive sink is
+    /// registered** — without one they would be loaded solely to be deleted,
+    /// and that waste is what turned a large record into an out-of-memory.
+    /// The set of records is identical either way, and since
+    /// [`Engine::execute_retention`] runs the sink itself, registering one is
+    /// the only way to archive: there is no path that needs bodies the plan
+    /// does not carry. The load is three set-based queries regardless of
+    /// batch size, and [`RetentionOptions::max_events`] bounds both the batch
+    /// and any single record in it.
     pub async fn plan_retention(
         &self,
         options: &RetentionOptions,
     ) -> Result<RetentionBatch, EngineError> {
         let mut conn = self.pool().acquire().await?;
-        Ok(RetentionBatch {
-            records: plan_due(&mut conn, options).await?,
-        })
+        let with_events = self.inner_archive().is_some();
+        let (records, oversized) = plan_due(&mut conn, options, with_events).await?;
+        Ok(RetentionBatch { records, oversized })
     }
 
     /// Phase two: archive, then the short transaction. Re-checks every
@@ -385,6 +420,7 @@ impl Engine {
     pub async fn execute_retention(
         &self,
         batch: &RetentionBatch,
+        options: &RetentionOptions,
     ) -> Result<RetentionReport, EngineError> {
         self.run_archive(batch.records()).await?;
 
@@ -392,11 +428,19 @@ impl Engine {
         let mut tx = self.pool().begin().await?;
         let mut report = RetentionReport::default();
         if !ids.is_empty() {
-            let locked: Vec<Uuid> = sqlx::query_scalar(
-                "select id from rbpmn_instance \
-                 where id = any($1) and status in ('completed', 'terminated') \
-                 for update skip locked",
-            )
+            // The whole `DUE` predicate is re-applied here, not just the
+            // status: the *instances* are immutable across the archive gap
+            // but the policy that made them due is not. An operator who
+            // notices a mis-set age and calls `set_retention_policy(...,
+            // forever())` while a sweep is blocked on an upload must have
+            // that stop the in-flight batch too, not only the next one.
+            let locked: Vec<Uuid> = sqlx::query_scalar(&format!(
+                "select i.id from rbpmn_instance i \
+                 left join rbpmn_retention_policy p on p.definition_key = i.definition_key \
+                 where i.id = any($2) and {DUE} \
+                 for update of i skip locked"
+            ))
+            .bind(options.default_policy.secs())
             .bind(&ids)
             .fetch_all(&mut *tx)
             .await?;
@@ -406,6 +450,7 @@ impl Engine {
                 report.instances_deleted = instances;
             }
         }
+        report.oversized_skipped = batch.oversized;
         report.floor = read_floor(&mut tx).await?;
         tx.commit().await?;
         Ok(report)
@@ -444,10 +489,11 @@ impl Engine {
         if batch.is_empty() {
             return self.idle_report().await;
         }
-        let report = self.execute_retention(&batch).await?;
+        let report = self.execute_retention(&batch, options).await?;
         tracing::info!(
             deleted = report.instances_deleted,
             events = report.events_deleted,
+            oversized = report.oversized_skipped,
             floor_txid = report.floor.txid,
             floor_id = report.floor.id,
             "retention pass"
@@ -538,13 +584,24 @@ impl Engine {
     /// Refuses an active instance; terminate it first.
     pub async fn delete_instance(&self, id: Uuid) -> Result<RetentionReport, EngineError> {
         let mut conn = self.pool().acquire().await?;
-        let record = load_records(&mut conn, &[id])
+        // Probe the status *before* materialising anything: loading a large
+        // instance's whole history only to refuse it would make the rejection
+        // path the expensive one. Terminal states are listed positively, so a
+        // status added later is refused rather than silently deletable.
+        let status: Option<String> =
+            sqlx::query_scalar("select status from rbpmn_instance where id = $1")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        match status.as_deref() {
+            None => return Err(EngineError::UnknownInstance(id)),
+            Some("completed") | Some("terminated") | Some("failed") => {}
+            Some(_) => return Err(EngineError::InstanceStillActive(id)),
+        }
+        let record = load_records(&mut conn, &[id], true)
             .await?
             .pop()
             .ok_or(EngineError::UnknownInstance(id))?;
-        if record.status == "active" {
-            return Err(EngineError::InstanceStillActive(id));
-        }
         drop(conn);
 
         self.run_archive(&ArchiveBatch {
@@ -576,7 +633,7 @@ impl Engine {
     /// the dry run you read before deleting anything.
     pub async fn prunable_definitions(&self) -> Result<Vec<PrunableDefinition>, EngineError> {
         let rows = sqlx::query(
-            "select d.id, d.key, d.version, \
+            "select d.id, d.key, d.version, d.retired_instances, \
                     (select count(*) from rbpmn_instance i where i.definition_id = d.id) \
                         as instances \
              from rbpmn_definition d order by d.key, d.version",
@@ -587,17 +644,25 @@ impl Engine {
             .into_iter()
             .map(|r| {
                 let instances: i64 = r.get("instances");
+                let retired: i64 = r.get("retired_instances");
                 PrunableDefinition {
                     definition_id: r.get("id"),
                     key: r.get("key"),
                     version: r.get("version"),
                     instances,
-                    blocked_by: (instances > 0).then(|| {
-                        format!(
-                            "{instances} instance(s) still reference it — live runtime state or \
-                             retained history, and both need the definition to be intelligible"
-                        )
-                    }),
+                    retired_instances: retired,
+                    blocked_by: match (instances, retired) {
+                        (0, 0) => None,
+                        (n, 0) => Some(format!("{n} instance(s) still reference it")),
+                        (0, r) => Some(format!(
+                            "retention has retired {r} record(s) of it; their archived history \
+                             needs this model to be intelligible"
+                        )),
+                        (n, r) => Some(format!(
+                            "{n} instance(s) still reference it, and retention has retired \
+                             {r} more"
+                        )),
+                    },
                 }
             })
             .collect())
@@ -608,10 +673,18 @@ impl Engine {
     /// — only the risk of turning an archive into a pile of element ids.
     /// Refuses while anything still references it.
     ///
-    /// Checking instance rows is sufficient to prove no events reference it:
-    /// `rbpmn_event.instance_id` is a foreign key with `on delete cascade`,
-    /// so an event cannot outlive its instance. That is what keeps this an
-    /// indexed lookup instead of a scan of the largest table in the schema.
+    /// Checking instance rows is sufficient to prove no *events* reference
+    /// it: `rbpmn_event.instance_id` is a foreign key with `on delete
+    /// cascade`, so an event cannot outlive its instance. That is what keeps
+    /// this an indexed lookup instead of a scan of the largest table.
+    ///
+    /// Live rows are not the whole story, though, and the gap is subtle:
+    /// retention exists to remove instance rows, and an archived record
+    /// carries element ids but no BPMN — so retiring a definition's history
+    /// is exactly what would make the definition look unreferenced. The
+    /// `retired_instances` counter closes it. Definitions are bounded (a few
+    /// versions per process, a few KB each), so the answer is to refuse with
+    /// a reason rather than to copy the model into every archived record.
     pub async fn delete_definition(&self, key: &str, version: i32) -> Result<(), EngineError> {
         let mut tx = self.pool().begin().await?;
         let row = sqlx::query("select id from rbpmn_definition where key = $1 and version = $2")
@@ -637,6 +710,22 @@ impl Engine {
                 key: key.to_string(),
                 version,
                 reason: format!("{instances} instance(s) still reference it"),
+            });
+        }
+        let retired: i64 =
+            sqlx::query_scalar("select retired_instances from rbpmn_definition where id = $1")
+                .bind(definition_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if retired > 0 {
+            return Err(EngineError::DefinitionInUse {
+                key: key.to_string(),
+                version,
+                reason: format!(
+                    "retention has retired {retired} record(s) of it — their archived \
+                     history references this model's element ids and nothing else \
+                     explains them"
+                ),
             });
         }
 
@@ -672,7 +761,8 @@ const ERROR_BACKOFF: Duration = Duration::from_secs(60);
 async fn plan_due(
     conn: &mut PgConnection,
     options: &RetentionOptions,
-) -> Result<ArchiveBatch, EngineError> {
+    with_events: bool,
+) -> Result<(ArchiveBatch, u64), EngineError> {
     let candidates: Vec<Uuid> = sqlx::query_scalar(&format!(
         "select i.id from rbpmn_instance i \
          left join rbpmn_retention_policy p on p.definition_key = i.definition_key \
@@ -683,7 +773,7 @@ async fn plan_due(
     .fetch_all(&mut *conn)
     .await?;
     if candidates.is_empty() {
-        return Ok(ArchiveBatch::default());
+        return Ok((ArchiveBatch::default(), 0));
     }
 
     // Size the batch before materialising it: an instance with a million
@@ -700,35 +790,62 @@ async fn plan_due(
         .map(|r| (r.get("instance_id"), r.get("n")))
         .collect();
 
+    let ceiling = i64::from(options.max_events);
     let mut chosen = Vec::new();
+    let mut oversized = 0u64;
     let mut budget: i64 = 0;
     for id in candidates {
         let n = by_instance.remove(&id).unwrap_or(0);
-        // Always take the first record whole, however large: otherwise a
-        // single oversized instance would stall retention forever.
-        if !chosen.is_empty() && budget + n > i64::from(options.max_events) {
+        // `max_events` is a ceiling on a single record too, not only on the
+        // batch. An earlier version always took the first candidate whole
+        // "so an oversized record cannot stall retention" — which achieved
+        // the opposite: the oversized record is by definition the *oldest*
+        // candidate, so every pass would load its whole history into memory,
+        // die, and retry it forever. Skipping it loudly keeps the rest
+        // retiring, which is the same rule a wedged instance already gets.
+        if n > ceiling {
+            oversized += 1;
+            tracing::warn!(
+                instance = %id,
+                events = n,
+                max_events = ceiling,
+                "instance has more events than one retention batch may carry; \
+                 skipping it — raise RetentionOptions::max_events to retire it"
+            );
+            continue;
+        }
+        if !chosen.is_empty() && budget + n > ceiling {
             break;
         }
         budget += n;
         chosen.push(id);
     }
 
-    Ok(ArchiveBatch {
-        instances: load_records(&mut *conn, &chosen).await?,
-    })
+    Ok((
+        ArchiveBatch {
+            instances: load_records(&mut *conn, &chosen, with_events).await?,
+        },
+        oversized,
+    ))
 }
 
 /// Headers and histories for a set of instances, in two queries rather than
 /// two per instance. Returned in the order given.
+///
+/// `with_events` is false when no archive sink is registered: the bodies
+/// would be loaded solely to be deleted, and that waste is what turns a large
+/// record into an out-of-memory instead of a slow query.
 async fn load_records(
     conn: &mut PgConnection,
     ids: &[Uuid],
+    with_events: bool,
 ) -> Result<Vec<InstanceRecord>, EngineError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     let headers = sqlx::query(&format!(
-        "select i.id, i.definition_key, d.version, i.business_key, i.status, i.variables, \
+        "select i.id, i.definition_id, i.definition_key, d.version, i.business_key, \
+                i.status, i.variables, \
                 {}, {} \
          from rbpmn_instance i join rbpmn_definition d on d.id = i.definition_id \
          where i.id = any($1)",
@@ -739,15 +856,19 @@ async fn load_records(
     .fetch_all(&mut *conn)
     .await?;
 
-    let event_rows = sqlx::query(&format!(
-        "select id, txid::text::bigint as txid, instance_id, definition_key, kind, \
-                element_id, payload, {} \
-         from rbpmn_event where instance_id = any($1) order by instance_id, id",
-        ts("at", "at"),
-    ))
-    .bind(ids)
-    .fetch_all(&mut *conn)
-    .await?;
+    let event_rows = if with_events {
+        sqlx::query(&format!(
+            "select id, txid::text::bigint as txid, instance_id, definition_key, kind, \
+                    element_id, payload, {} \
+             from rbpmn_event where instance_id = any($1) order by instance_id, id",
+            ts("at", "at"),
+        ))
+        .bind(ids)
+        .fetch_all(&mut *conn)
+        .await?
+    } else {
+        Vec::new()
+    };
 
     // Ascending `id` per instance is the semantic order (the stream
     // contract); the query's ORDER BY already delivers it that way.
@@ -775,6 +896,7 @@ async fn load_records(
                 id,
                 InstanceRecord {
                     id,
+                    definition_id: row.get("definition_id"),
                     definition_key: row.get("definition_key"),
                     definition_version: row.get("version"),
                     business_key: row.get("business_key"),
@@ -791,35 +913,56 @@ async fn load_records(
 }
 
 /// Delete records outright, floor advanced to the highest `(txid, id)`
-/// actually removed. Returns `(events, instances)`. Events go by cascade from
-/// the instance row — the foreign key added in 0007 is what makes that both
-/// automatic and impossible to get wrong.
+/// actually removed. Returns `(events, instances)`.
 async fn delete_records(conn: &mut PgConnection, ids: &[Uuid]) -> Result<(u64, u64), EngineError> {
+    // One aggregate, not a max-lookup plus a count: both walked the same rows
+    // inside the deletion transaction, which the design wants short. The
+    // ordering keys are the *raw* columns — `order by txid desc` on the
+    // `txid::text::bigint` output alias would bind to the cast and sort
+    // instead of walking `rbpmn_event_stream (txid, id)` backwards.
+    //
     // The floor comes from the rows being deleted *now*, not from the plan:
     // `skip locked` may have dropped instances between the two, and a floor
     // above anything actually deleted would truncate readers for nothing.
-    let high = sqlx::query(
-        "select txid::text::bigint as txid, id from rbpmn_event \
-         where instance_id = any($1) order by txid desc, id desc limit 1",
+    let summary = sqlx::query(
+        "select count(*) as n, \
+                (select txid::text::bigint from rbpmn_event \
+                 where instance_id = any($1) order by txid desc, id desc limit 1) as top_txid, \
+                (select id from rbpmn_event \
+                 where instance_id = any($1) order by txid desc, id desc limit 1) as top_id \
+         from rbpmn_event where instance_id = any($1)",
     )
     .bind(ids)
-    .fetch_optional(&mut *conn)
+    .fetch_one(&mut *conn)
     .await?;
-    let events: i64 =
-        sqlx::query_scalar("select count(*) from rbpmn_event where instance_id = any($1)")
-            .bind(ids)
-            .fetch_one(&mut *conn)
-            .await?;
+    let events: i64 = summary.get("n");
+    let top: Option<(i64, i64)> = summary
+        .get::<Option<i64>, _>("top_txid")
+        .zip(summary.get::<Option<i64>, _>("top_id"));
 
+    // Retiring a record is the only thing that can make a definition look
+    // unreferenced while its history lives on in someone's archive. Counting
+    // it here is what lets `delete_definition` refuse with a reason instead
+    // of succeeding because retention did its job.
+    sqlx::query(
+        "update rbpmn_definition d set retired_instances = d.retired_instances + x.n \
+         from (select definition_id, count(*) as n from rbpmn_instance \
+               where id = any($1) group by definition_id) x \
+         where d.id = x.definition_id",
+    )
+    .bind(ids)
+    .execute(&mut *conn)
+    .await?;
+
+    // Events go by cascade from the instance row — the foreign key added in
+    // 0007 is what makes that both automatic and impossible to get wrong.
     let instances = sqlx::query("delete from rbpmn_instance where id = any($1)")
         .bind(ids)
         .execute(&mut *conn)
         .await?
         .rows_affected();
 
-    if let Some(row) = high {
-        let txid: i64 = row.get("txid");
-        let id: i64 = row.get("id");
+    if let Some((txid, id)) = top {
         // Lexicographic and monotonic: comparing the pair, never the
         // components separately — a componentwise max could invent a floor
         // higher than anything ever deleted and truncate readers for free.

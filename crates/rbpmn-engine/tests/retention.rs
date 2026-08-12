@@ -126,6 +126,38 @@ async fn completed_instance(engine: &Engine, pool: &PgPool, order: &str) -> Uuid
     id
 }
 
+/// A deliberately shorter record than `completed_instance`: `01-minimal` is
+/// start -> one user task -> end, so it retires with a fraction of the
+/// events. Deployed under its own key so both fixtures can coexist.
+async fn deploy_short(engine: &Engine, key: &str) {
+    engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn")
+                .replace(r#"process id="p""#, &format!(r#"process id="{key}""#)),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn short_instance(engine: &Engine, pool: &PgPool, key: &str, business: &str) -> Uuid {
+    let id = engine
+        .start(key, Some(business), serde_json::json!({}))
+        .await
+        .unwrap()
+        .id;
+    let item: Uuid = sqlx::query_scalar("select id from rbpmn_work_item where instance_id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    engine
+        .complete_work_item(item, serde_json::json!({}))
+        .await
+        .unwrap();
+    id
+}
+
 async fn deploy_task_kinds(engine: &Engine) {
     engine.declare_topic("st").await.unwrap();
     let bindings = Bindings::new().correlation("rt", "order.id");
@@ -601,6 +633,10 @@ async fn a_policy_for_an_unknown_definition_is_refused() {
 
 // ---------------------------------------------------------------- definitions
 
+/// Definitions are bounded, so they are never swept — and once retention has
+/// retired a record, the definition that explains its archived element ids is
+/// pinned too. Without that counter the guard would be void exactly when it
+/// matters: retention removes the instance rows the guard counts.
 #[tokio::test]
 async fn definitions_go_only_by_hand() {
     let db = TestDb::create().await;
@@ -612,32 +648,47 @@ async fn definitions_go_only_by_hand() {
     // While the record exists, the definition that explains it is pinned.
     let listed = engine.prunable_definitions().await.unwrap();
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].instances, 1);
+    assert_eq!((listed[0].instances, listed[0].retired_instances), (1, 0));
     assert!(listed[0].blocked_by.is_some());
     assert!(matches!(
         engine.delete_definition("p", 1).await,
         Err(EngineError::DefinitionInUse { .. })
     ));
 
-    // The sweeper never takes it, however old.
+    // The sweeper never takes the definition, however old.
     engine
         .sweep_retention_once(&options(after(60)))
         .await
         .unwrap();
     assert_eq!(engine.prunable_definitions().await.unwrap().len(), 1);
 
-    // Once nothing references it, the explicit command works.
+    // The record is gone, but its history is in someone's archive keyed by
+    // this model's element ids — so the definition is still refused, now with
+    // a different reason.
     let listed = engine.prunable_definitions().await.unwrap();
-    assert_eq!(listed[0].instances, 0);
-    assert!(listed[0].blocked_by.is_none());
-    engine.set_retention_policy("p", after(60)).await.unwrap();
-    engine.delete_definition("p", 1).await.unwrap();
-    assert!(engine.prunable_definitions().await.unwrap().is_empty());
+    assert_eq!((listed[0].instances, listed[0].retired_instances), (0, 1));
+    let reason = listed[0].blocked_by.clone().unwrap();
+    assert!(reason.contains("retired"), "unhelpful reason: {reason}");
+    match engine.delete_definition("p", 1).await {
+        Err(EngineError::DefinitionInUse { reason, .. }) => {
+            assert!(reason.contains("retired"), "unhelpful reason: {reason}")
+        }
+        other => panic!("expected DefinitionInUse, got {other:?}"),
+    }
+
+    // A definition that never ran has nothing to explain, so it goes.
+    deploy_short(&engine, "unused").await;
+    engine
+        .set_retention_policy("unused", after(60))
+        .await
+        .unwrap();
+    engine.delete_definition("unused", 1).await.unwrap();
     // The last version took its now-dangling policy with it.
-    assert_eq!(engine.retention_policy("p").await.unwrap(), None);
+    assert_eq!(engine.retention_policy("unused").await.unwrap(), None);
+    assert_eq!(engine.prunable_definitions().await.unwrap().len(), 1);
 
     assert!(matches!(
-        engine.delete_definition("p", 1).await,
+        engine.delete_definition("unused", 1).await,
         Err(EngineError::UnknownDefinitionVersion { .. })
     ));
     db.drop().await;
@@ -779,20 +830,92 @@ async fn a_batch_never_splits_an_instance() {
     let per_instance = events_of(&db.pool, a).await;
 
     let mut opts = options(after(60));
-    // Room for well under one record: the first is still taken whole.
-    opts.max_events = 1;
+    // Room for exactly one record: the second does not get half-taken.
+    opts.max_events = per_instance as u32;
     let sink = Recorder::new(false);
     engine.register_archive(sink.clone());
 
     let report = engine.sweep_retention_once(&opts).await.unwrap();
     assert_eq!(report.instances_deleted, 1);
     assert_eq!(report.events_deleted, per_instance as u64);
+    assert_eq!(report.oversized_skipped, 0);
     let records = sink.records();
     assert_eq!(records.len(), 1);
     // Oldest first, and whole.
     assert_eq!(records[0].id, a);
     assert_eq!(records[0].events.len() as i64, per_instance);
     assert!(events_of(&db.pool, b).await > 0);
+    db.drop().await;
+}
+
+/// A record too large for one batch is skipped — loudly, and *without being
+/// loaded* — and its neighbours retire anyway. The earlier rule ("always take
+/// the first candidate whole, so an oversized record cannot stall retention")
+/// did the opposite: an oversized record is by definition the oldest
+/// candidate, so every pass would load its whole history, die, and retry it
+/// forever.
+#[tokio::test]
+async fn an_oversized_record_is_skipped_and_its_neighbours_still_retire() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    deploy_task_kinds(&engine).await;
+    deploy_short(&engine, "tiny").await;
+
+    let big = completed_instance(&engine, &db.pool, "o-big").await;
+    let small = short_instance(&engine, &db.pool, "tiny", "o-small").await;
+    let big_events = events_of(&db.pool, big).await;
+    let small_events = events_of(&db.pool, small).await;
+    assert!(small_events < big_events, "fixtures must differ in size");
+    // The oversized one is also the oldest — the position that used to jam
+    // the sweeper permanently.
+    backdate(&db.pool, big, 7200).await;
+    backdate(&db.pool, small, 3600).await;
+
+    let mut opts = options(after(60));
+    opts.max_events = (big_events - 1) as u32;
+    let sink = Recorder::new(false);
+    engine.register_archive(sink.clone());
+
+    let report = engine.sweep_retention_once(&opts).await.unwrap();
+    assert_eq!(report.oversized_skipped, 1);
+    assert_eq!(report.instances_deleted, 1);
+    assert_eq!(events_of(&db.pool, small).await, 0);
+    // Untouched, and never materialised: the sink only ever saw the small one.
+    assert_eq!(events_of(&db.pool, big).await, big_events);
+    let records = sink.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, small);
+
+    // Raising the ceiling retires it; nothing had to be repaired first.
+    opts.max_events = big_events as u32;
+    let report = engine.sweep_retention_once(&opts).await.unwrap();
+    assert_eq!((report.instances_deleted, report.oversized_skipped), (1, 0));
+    assert_eq!(events_of(&db.pool, big).await, 0);
+    db.drop().await;
+}
+
+/// Without a sink there is nothing to archive, so event bodies are never
+/// loaded — the plan still names exactly the same records.
+#[tokio::test]
+async fn no_sink_means_no_event_bodies_are_loaded() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    deploy_task_kinds(&engine).await;
+    let done = completed_instance(&engine, &db.pool, "o-1").await;
+    backdate(&db.pool, done, 3600).await;
+
+    let batch = engine.plan_retention(&options(after(60))).await.unwrap();
+    assert_eq!(batch.records().instances.len(), 1);
+    assert_eq!(batch.records().instances[0].id, done);
+    assert!(batch.records().instances[0].events.is_empty());
+
+    // With one registered, the same plan carries the whole history.
+    engine.register_archive(Recorder::new(false));
+    let batch = engine.plan_retention(&options(after(60))).await.unwrap();
+    assert_eq!(
+        batch.records().instances[0].events.len() as i64,
+        events_of(&db.pool, done).await
+    );
     db.drop().await;
 }
 

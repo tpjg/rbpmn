@@ -154,14 +154,23 @@ impl Engine {
         .await?;
 
         // Exactly one row always comes back (the floor); its event columns
-        // are NULL when the page is empty.
-        let floor = rows
-            .first()
-            .map(|r| EventCursor {
-                txid: r.get("floor_txid"),
-                id: r.get("floor_id"),
-            })
-            .unwrap_or_default();
+        // are NULL when the page is empty. Zero rows means the floor row
+        // itself is gone — a partial restore, a replication copy that missed
+        // the seed. Defaulting to (0,0) there would make every page look
+        // empty and every consumer poll forever on "nothing final yet",
+        // which the contract defines as normal: the whole stream silently
+        // dead. The lease upserts itself back for the same reason; a
+        // *consumer-facing* path has even less business guessing.
+        let Some(first) = rows.first() else {
+            return Err(EngineError::InvalidVariables(
+                "rbpmn_retention_floor has no row — the event stream cannot state its                  truncation floor, so no page can be released; restore the row (it is                  seeded by migration 0007) before tailing"
+                    .to_string(),
+            ));
+        };
+        let floor = EventCursor {
+            txid: first.get("floor_txid"),
+            id: first.get("floor_id"),
+        };
         // A *resume* below the floor is a truncation and must be loud. A
         // zero cursor is not a resume: it means "from the oldest retained".
         if after != EventCursor::default() && after < floor {
