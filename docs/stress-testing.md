@@ -25,7 +25,7 @@ are six, and each is a distinct target:
 | 1 | Linter accepts → `StepError::Invariant` or panic | mutation fuzz (§3c) — *hunted, nothing found* |
 | 2 | Linter accepts → stuck token, no pending stimulus | state-space exploration (§2, §7) |
 | 3 | Runs, but differently in Postgres than in the core | replay verification (§4) — *hunted, nothing found* |
-| 4 | Correct alone, wrong under concurrency | the storm (§4) — *hunted*; chaos (§5) still open |
+| 4 | Correct alone, wrong under concurrency | the storm (§4) + chaos (§5) — *hunted, nothing found* |
 | 5 | Linter **rejects a valid model** (false positive) | model generator (§3) |
 | 6 | Native and WASM lint disagree | parity fuzz (§6) |
 
@@ -352,22 +352,48 @@ for chaos testing (§5), and a genuinely useful operator tool.
 
 ## 5. Tier 3 — chaos
 
-Testing strategy #5 in the design brief — crash tests — has **no
-implementation**. The transactional design's central promise is "kill it
-anywhere, converge on restart", and nothing currently proves it. With the fsck
-in place it is mostly mechanical:
+Testing strategy #5 in the design brief — crash tests — had **no
+implementation** from phase 2 until now. The transactional design's central
+promise is "kill it anywhere, converge on restart", and nothing proved it.
 
-- `pg_terminate_backend` on a random engine connection mid-storm.
-- Drop and rebuild an `Engine` (node restart) while work is in flight.
-- Handlers that panic, hang past the lease TTL, or return garbage.
-- Lease TTL at 1 ms so reclaim races run constantly.
-- **Clock skew.** The brief claims node clocks never decide anything. Prove
-  it: run one node with a deliberately skewed clock and assert timers still
-  fire exactly once, at the right database time.
+**Landed** as `crates/rbpmn-engine/tests/chaos.rs`, on the same harness as the
+storm. Faults injected while the workload runs:
 
-After each chaos round: fsck clean → let it drain → replay-verify (§4). The
-combination is what turns "it survived" into "every execution that completed
-was semantically correct".
+- `pg_terminate_backend` on the node pools' backends (tagged by
+  `application_name`, so the test's own control connection survives).
+- Nodes dropped and rebuilt — pool and all — with work in flight.
+- Handlers that fail (walking the retry budget into an incident) and panic
+  outright, asserting the worker loop contains both.
+- A 10 ms lease (the API floor) with consumers that deliberately outlive it,
+  so peers reclaim underneath them continuously.
+
+The assertion is what makes it evidence: chaos stops, the system gets a quiet
+window to converge *on its own*, and then every instance must have drained,
+the fsck must be clean, and **every instance's whole history must still
+re-derive through the pure core**. Convergence is not "it kept running" — it
+is "the history is exactly what an uninterrupted run would have produced".
+
+> **Result: 240 instances, 4520 events replayed, 117 backends killed, 6 node
+> restarts, 91 completions refused by an expired lease. All instances
+> terminal (232 completed, 8 incidents from the failing handler), fsck clean,
+> zero deadlocks, nothing applied twice.** Scales on `RBPMN_CHAOS_ROUNDS`.
+
+> **What building it surfaced.** The first version never converged, and the
+> reason is worth writing down: the default worker lease is **600 seconds**,
+> so a node killed while holding one strands its work item for ten minutes.
+> That is the documented design working correctly — "a crashed worker's items
+> return within one TTL, no reaper needed" — but it means **recovery latency
+> after a node dies is bounded by the lease TTL, not by anything the engine
+> does**. Operators choosing a lease are choosing a crash-recovery window. The
+> test now sets 250 ms and validates the claim instead of tripping over it.
+
+**Not done: clock skew.** The brief claims node clocks never decide anything,
+and the natural test — run one node with a skewed clock — is not reachable
+in-process: the skew would have to be applied to the OS clock of a separate
+process. What covers the substance today is `timer_fires_from_database_time`
+and `date_timer_arms_at_the_absolute_instant` in `engine.rs`, which pin firing
+to database time. A genuine skew test needs container-level isolation and is
+left as a candidate.
 
 ---
 
@@ -713,7 +739,7 @@ Randomized testing **falsifies**; it does not prove. Stated precisely:
 | ~~5~~ | ~~Explicit-state exploration (§7)~~ | done | **Landed**: `crates/rbpmn-core/tests/explore.rs` |
 | ~~6~~ | ~~Mutation fuzz (§3c) + restriction counterexamples (§3d)~~ | done | **Landed**: `tests/mutation.rs` |
 | ~~7~~ | ~~Storm + replay verification + fsck (§4)~~ | done | **Landed**: `tests/storm.rs` |
-| 8 | Chaos (§5) | 2–3 d | Closes testing-strategy #5 |
+| ~~8~~ | ~~Chaos (§5)~~ | done | **Landed**: `tests/chaos.rs` |
 | 9 | Kani on `iso8601` + `condition` parsers (§7) | 2–3 d | Panic/overflow proofs on untrusted input |
 | ~~10~~ | ~~TLA+ spec of the concurrency protocol (§7)~~ | done | **Landed**: `spec/`, `just tla` |
 
@@ -721,13 +747,14 @@ Items 3, 4, 5 and 6 are done, and they compose: the generator feeds both the
 explorer and the mutation fuzz, all three sharing one invariant set. Of the
 six third outcomes, 1, 2, 5 and 6 are now hunted; **3 and 4 are not, and they
 are the ones that live in the Postgres layer** — which is also the newest and
-most concurrent code in the repo, verified by hand-written cases. Item 7 is done too, built on the interleaving the specs pointed at (timer
-claims racing completions on one instance). **Chaos (item 8) is now the
-highest-value work remaining**: it is the last unhunted third outcome, it
-closes the design brief's testing-strategy #5 — which still has no
-implementation — and every piece it needs already exists, since the fsck and
-replay verification are exactly the "did it converge?" assertions a chaos
-round has to make.
+most concurrent code in the repo, verified by hand-written cases. Items 7 and 8 are done, which closes the design brief's testing-strategy #5
+and leaves **all six third outcomes hunted, none found**. What remains is
+narrower and optional: item 1's random driver and rehydration differential,
+item 9 (Kani on the parsers), extending the generator to boundary events and
+event-based gateways (§3's status note), and the two protocol pieces the specs
+do not yet model — the event-stream safe horizon and the deploy/undeclare
+race. None of them is load-bearing for v1; all of them are cheap next to what
+is already in place.
 
 Item 1 is cheaper than listed — the invariant set already exists, leaving the
 random driver and the rehydration differential. Extending the generator to

@@ -493,7 +493,13 @@ current registration state** and fails loudly with the same rule id
    losing the lease is rejected — completion authority follows the current lease.
 5. **Crash tests**: kill mid-transaction between work-item completion and token
    advance; restart; assert convergence (this is what the transactional design buys —
-   make the test prove it).
+   make the test prove it). *Shipped:* `crates/rbpmn-engine/tests/chaos.rs`
+   terminates node backends and rebuilds whole nodes under load, then asserts
+   convergence the strong way — every instance drains, the fsck is clean, and
+   every history still re-derives through the pure core
+   (docs/stress-testing.md §5). Note the recovery bound it made explicit: a
+   node killed while holding a work-item lease strands that item for one lease
+   TTL, so the TTL *is* the crash-recovery window.
 6. Start every phase by writing its fixtures *first*.
 
 ## Build order — start small, but start with the hard parts
