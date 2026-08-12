@@ -951,6 +951,18 @@ impl<'a> Advancer<'a> {
     /// Cancel everything inside `scope` and its nested scopes: queued moves,
     /// parked tokens, open work items, armed timers and subscriptions. The
     /// scope entry itself survives for the caller to complete or discard.
+    ///
+    /// **Every reaped token's arms are withdrawn with it** — the
+    /// `withdraw_arms` call below must stay paired with the `tokens.remove`
+    /// beside it. That pairing is the invariant the projection's timer claim
+    /// depends on and cannot check for itself: the scheduler re-checks that a
+    /// timer *row* still exists under the instance lock, never that the row's
+    /// *token* does, so a timer outliving its token is fired against nothing
+    /// and wedges the instance on [`StepError::Invariant`]. It is model
+    /// checked as `ArmedTimersHaveLiveTokens` in `spec/TimerTeardown.tla`,
+    /// and `spec/TimerTeardown_Buggy.cfg` is the counterexample — this was a
+    /// real bug (a token removed *before* teardown ran escaped this loop).
+    /// Changing what teardown reaps means re-running `just tla`.
     fn tear_down_scope(&mut self, state: &mut InstanceState, scope: ScopeId) {
         let doomed = state.scope_subtree(scope);
         self.queue.retain(|m| !doomed.contains(&m.scope));

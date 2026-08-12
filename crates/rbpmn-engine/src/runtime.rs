@@ -520,11 +520,18 @@ pub(crate) fn compile_row(row: &PgRow, key: &str) -> Result<ExecutableProcess, E
 }
 
 /// The one lease gate: taken under the instance lock (every caller locks
-/// the instance first — a single lock order engine-wide), reading the item
-/// row FOR UPDATE so a concurrent claim cannot slip between check and
-/// mutation. Live foreign leases are refused; closed items pass through
-/// (the caller answers its idempotent AlreadyClosed). Returns the item's
-/// state.
+/// the instance first — a single lock order engine-wide, model checked in
+/// `spec/LockOrder.tla`), reading the item row FOR UPDATE so a concurrent
+/// claim cannot slip between check and mutation. Live foreign leases are
+/// refused; closed items pass through (the caller answers its idempotent
+/// AlreadyClosed). Returns the item's state.
+///
+/// This is where completion authority is decided, and `spec/Lease.tla`
+/// checks what that has to mean: a worker cannot observe its own expiry, so
+/// two workers really can both *believe* they hold one item
+/// (`Lease_DoubleBelief.cfg` proves that state is reachable). Safety comes
+/// from every mutation being conditional on owner-and-not-expired here —
+/// belief is never authority. Re-run `just tla` if this predicate changes.
 pub(crate) async fn guard_lease(
     tx: &mut PgConnection,
     instance_id: Uuid,

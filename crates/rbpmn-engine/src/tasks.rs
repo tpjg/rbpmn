@@ -12,6 +12,12 @@
 //!
 //! Filters compare fields of the owning instance's **live** variables — the
 //! single variable document, never a snapshot that could silently diverge.
+//!
+//! The lease protocol — claim, renew, expire, complete — is model checked in
+//! `spec/Lease.tla`: no double delivery, exactly-once completion under
+//! at-least-once delivery, completion authority following the current lease
+//! rather than the holder's belief, and nothing ever stranded. Changing the
+//! TTL/renewal/ownership rules here means re-running `just tla`.
 //! The filter compiler emits exactly the expression shape that
 //! [`Engine::declare_index`] indexes (`variables->>'field'` with a literal
 //! `definition_key` predicate), so declared indexes actually serve the

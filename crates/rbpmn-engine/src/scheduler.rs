@@ -209,6 +209,21 @@ impl Engine {
     }
 
     /// One firing attempt inside one transaction.
+    ///
+    /// The whole claim path is model checked; `just tla` must stay green if
+    /// its shape changes.
+    ///
+    /// * **Order, not NOWAIT, is what makes it deadlock-free**
+    ///   (`spec/LockOrder.tla`). Taking the instance row before any
+    ///   per-instance row means there is no cycle to find, whoever waits;
+    ///   `spec/LockOrderHistorical.cfg` restores the rejected timer-row-first
+    ///   sketch and TLC reports a deadlock. NOWAIT below buys throughput, not
+    ///   safety — see its comment.
+    /// * **The re-check under the lock is necessary and insufficient**
+    ///   (`spec/TimerTeardown.tla`). It confirms the timer row survived the
+    ///   unlocked pick; it cannot confirm the row's token survived. That
+    ///   second half is teardown's invariant, upheld in
+    ///   `Advancer::tear_down_scope`.
     async fn try_fire(&self, instance_id: Uuid, timer_no: i64) -> Result<Attempt, EngineError> {
         let mut tx = self.pool().begin().await?;
         // Advisory-first is deadlock-free: try-lock never waits, and every

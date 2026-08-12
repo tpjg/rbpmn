@@ -45,10 +45,38 @@ inclusive gateway, block structure, messages-only interaction, build order).
   (gitignored); runs the full inspection stack when Postgres is reachable.
 - `just parity` — MUST stay green: byte-parity of native Rust vs WASM lint
   output over the corpus, plus the bpmnlint plugin's pipeline test.
+- `just tla` — TLA+ model checking of the concurrency protocol (`spec/`).
+  Six configs; three are *expected* to fail — they are the counterexamples
+  that prove the checks have teeth, and two of them reproduce bugs that were
+  real. Needs java; the jar is pinned and checksum-verified.
 - `just fixtures-di` — fixtures carry baked-in BPMN DI so they render
   everywhere; new fixtures without a `bpmndi:BPMNDiagram` section get theirs
   from this (idempotent; two reject fixtures have hand-written DI — see the
   comments in them).
+
+## The specs are hand-written and will not tell you they drifted
+
+`spec/` models the concurrency protocol: the lock order, the work-item lease,
+and the scheduler's timer claim racing scope teardown. The corpus-driven
+tests adapt to a new phase by themselves; **a hand-written model does not**,
+and nothing fails when it goes stale. Phase 6 proved that — `spec/` was not
+touched, and the conclusion that scopes changed nothing was an argument, not
+a check.
+
+So: **touching any of these means re-reading `spec/` and re-running
+`just tla`**, not just keeping `cargo test` green.
+
+- lock acquisition order anywhere (`runtime.rs`, `scheduler.rs`, `tasks.rs`)
+- the work-item lease: TTL, renewal, ownership, the `guard_lease` predicate
+- the scheduler's claim path (`try_fire`) — pick, NOWAIT, re-check
+- what scope teardown reaps (`step.rs::tear_down_scope`) — specifically that
+  a reaped token's arms are withdrawn *with* it
+
+Each of those sites carries a comment naming the spec and the property. Two
+distinctions the models make that prose kept blurring, worth knowing before
+editing: deadlock freedom comes from the lock **order**, not from `NOWAIT`
+(which buys throughput); and the scheduler's re-check confirms a timer *row*
+survived, never that its *token* did — that half is teardown's invariant.
 
 ## Conventions
 
