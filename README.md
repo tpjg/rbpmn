@@ -21,10 +21,14 @@ Read it before touching the semantics.
 | `playground/` | Local linter playground (bpmn-js + WASM): fixture browser, live re-lint, diagnostics as diagram overlays. `just playground`. |
 | `bpmnlint-plugin-rbpmn/` | bpmnlint plugin backed by the same WASM — rbpmn's rules inside bpmn-io tooling, zero JS reimplementation. |
 
-Planned (per the design brief's build order): rounding out (phase 5).
-Cross-definition messaging (message start/throw routing between
-definitions) is designed after that; until then message start/throw events
-lint clean but refuse to compile.
+v1 is phases 0–7: everything below plus **embedded subprocesses** (phase 6,
+in progress) and **retention** (phase 7). Subprocesses were promoted out of
+the v2 roadmap deliberately — hierarchical modelling is the style this
+engine exists to serve, and it is unmodellable without them. Everything
+else, including cross-definition messaging (message start/throw between
+definitions, which lint clean today but refuse to compile) and the instance
+migration API, is listed with its status in the design brief's
+[open-items table](bpmn-engine-design.md#everything-still-open--one-visible-list).
 
 ## Status
 
@@ -68,7 +72,19 @@ lint clean but refuse to compile.
       deploy manifest; index usage verified by test against the real query
       path). Server: `POST /v1/tasks/{get,count}` and
       `/v1/tasks/{id}/{extend,complete,fail}`.
-- [ ] Phase 5 — rounding out.
+- [x] **Phase 5 — rounding out**: the event-stream tailing contract
+      (`read_events` / `GET /v1/events`, ordered and cursored by
+      `(txid, id)` behind a safe horizon so a cursor cannot miss an event),
+      MIT/Apache-2.0 dual licensing, and the stress/fuzz/chaos tier
+      ([docs/stress-testing.md](docs/stress-testing.md)) — model generation,
+      state-space exploration, replay verification, the storm, and chaos
+      runs that kill processes and sever database connections mid-flight,
+      reporting exactly-once and clean completion throughout. BPMN has no
+      execution TCK; this is the assurance in its place.
+- [ ] **Phase 6 — embedded subprocesses** (in progress): the live scope
+      tree, scoped joins and teardown, error boundaries on a subprocess,
+      scope-local terminate.
+- [ ] Phase 7 — retention.
 
 ## Rule catalogue
 

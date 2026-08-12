@@ -156,7 +156,7 @@ fn element_rules(
                     out.push(Diagnostic::error(
                         rule::NO_UNSUPPORTED_ELEMENT,
                         id,
-                        "event subprocesses are not supported (planned for v4)",
+                        "event subprocesses are not supported (planned for v3)",
                     ));
                 }
             }

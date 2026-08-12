@@ -629,10 +629,16 @@ correlation queries by instance status, never left to trip them.
 declare_index API → generated partial indexes. Dashboard counting.
 
 **Phase 5 — Rounding out**
-Event ordering guarantees in `event`, retention jobs, instance migration API
-(design only). Embedded subprocesses + non-interrupting boundary timers are the
-head of the post-v1 roadmap (v2, below) — the first release after v1, as
-hierarchical BPMN is the modeling style this engine exists to serve.
+Event ordering guarantees in `event` (shipped, below) and the dual license.
+Retention moved *into* v1 (phase 7) rather than shipping here; the instance
+migration API, cross-definition messaging and the upgrade escape hatch moved
+*out* to the roadmap, each needing a design round before code. Also here: the
+stress/fuzz/chaos tier (`docs/stress-testing.md`) — model generation,
+state-space exploration, replay verification, the storm, and chaos runs that
+kill processes and drop database connections mid-flight. It reports the
+engine behaving as designed: work completes, exactly-once holds, nothing is
+lost or double-executed. That is the assurance BPMN has no TCK for, and it is
+now empirical rather than argued.
 
 Event ordering (decided and shipped; cursor shape corrected in the
 post-phase-5 review, twice): two guarantees and one caveat. Per instance,
@@ -662,8 +668,32 @@ an `*_in_tx` call, delays the stream (late, never lost), which is one more
 reason the "commit promptly" rule is a rule. External API callers cannot
 delay it at all: a claimed task is a *lease* (a row value), never an open
 transaction.
-Retention jobs, the instance migration API, cross-definition messaging and
-the upgrade escape hatch remain open — each needs a design round first.
+**Phase 6 — Embedded subprocesses (v1-completing).** Promoted from the v2
+roadmap into v1, deliberately: the brief calls hierarchical BPMN "the
+modeling style this engine exists to serve", and Method-and-Style hierarchy
+(a top level of ~10 collapsed subprocesses, each expanding to its own plane)
+is *unmodellable* without them. A flat-only v1 could not express the style
+v1 advocates. It is also the largest remaining feature that needs **no new
+external contract**: pure internal semantics, where this codebase is
+strongest. Scope: the `scope` tree becomes live (it has been in the schema,
+unused, since phase 2); joins count within their scope; a subprocess is a
+wait state holding its children; interrupting teardown cancels everything in
+a cancelled scope (tokens, work items, timers, subscriptions) in one
+transaction; error boundaries on a subprocess (today a `NotYetExecutable`
+pointer) become the scoped error handler that is the point of the feature;
+terminate ends its own scope, not the instance. The linter already recurses
+into subprocess scopes and `13-subprocess.bpmn` already sits in the accept
+corpus — the groundwork was laid on purpose.
+
+**Phase 7 — Retention (v1-completing).** Small, and now urgent for a reason
+that did not exist before phase 5: `/v1/events` publishes a cursor contract,
+so a retention job that deletes events a tailing consumer has not read
+silently breaks it. Decide the interaction while the contract is fresh —
+minimum age, a read horizon, or both — plus what is deletable at all
+(completed instances' non-terminal events?) and whether `rbpmn_event` gets
+native partitioning by definition, which the Postgres notes above already
+flag as the place growth will hurt first.
+
 *(bpmnlint plugin packaging and the token-overlay debug view were pulled forward:
 plugin → phase 0-B, token overlay → phase 2 exit criterion.)*
 
@@ -712,45 +742,75 @@ Integration rules (either route):
   through the injected clock or be rejected at deploy — retries/replay require
   deterministic decisions.
 
+## Everything still open — one visible list
+
+Ordering rule: value first, then how much *design* (not code) it still needs.
+Anything with unanswered semantics stays behind anything without, because a
+design round is the expensive part and the codebase is at its best when the
+question is purely internal.
+
+| Item | Why it matters | Complexity | Status |
+|---|---|---|---|
+| **Embedded subprocesses** | The modelling style the engine exists to serve; unmodellable today | High | **v1, phase 6 — in progress** |
+| **Retention** | The failure mode that kills BPM installations; interacts with the new event cursor | Low | **v1, phase 7 — next** |
+| Non-interrupting boundary events | "Every 30 days while this runs"; rides on scope machinery | Medium | v2 — held out of v1 so it does not double phase 6's risk |
+| Link events | Diagram hygiene once big models are common | Trivial | v2 |
+| Event subprocesses | "Cancel my order at any point" without boundary spaghetti | Medium | v3 |
+| Conditional events | Wake a token when the variable document satisfies a predicate | Moderate | v4 |
+| Compensation + cancel + transaction subprocess | The real work; history becomes runtime state | High | v5 |
+| Cross-definition messaging (message start/throw) | Model fidelity for choreography; exactly-once emission for remote callers | Medium | **Needs a design round** — buffering, dead-lettering, message-start versioning |
+| Instance migration API | Long-lived instances pin their version forever; a five-year process can never get a fix | Very high | **Design only in v1**, needs its own round |
+| DMN / business-rule task via dsntk | Decisions as models rather than handler code | Medium-high | Spike in flight (`feel-parity`); see the dsntk section |
+| Upgrade escape hatch | Retroactively-stricter lint can refuse to boot with the deploy API unreachable | Low | Queued; matters at the first real upgrade |
+| Restricted inclusive gateway | More than the Camunda 7 lineage ever shipped | Moderate | Someday; revisit when fixture discipline is mature |
+
+Cross-definition messaging deserves one clarification, because it looks like a
+back door to the banned call activity — and in one sense it is. It unlocks the
+call-activity *use case* (decompose into another definition, wait for its
+answer) while refusing the *mechanism* that made call activities a correctness
+problem: no parent→child reference, no error propagating upward on its own, no
+cancellation cascading down, no version welding. The cost, accepted openly, is
+that request/reply, timeout and cancellation must be **modelled** — the
+timeout is a boundary event the author drew, not implicit engine behaviour.
+Referential independence between definitions survives; only the choreography
+becomes visible.
+
 ## Beyond v1 — roadmap (v2, v3, …)
 
 Nothing below is blocked by the architecture; that is by construction. The v1
 primitives (token-per-row, explicit `scope` tree, append-only `event`, pure `step`
-core) are the same substrate the full element set needs. Ordered easy → big, except
-subprocesses lead deliberately.
+core) are the same substrate the full element set needs. Ordered easy → big.
 
-**v2 — Embedded subprocesses: hierarchical BPMN (Bruce Silver, Method and Style).**
-First not because it is easiest but because it is the modeling style this engine
-exists to serve: a top level showing the happy path as a row of collapsed
-subprocesses, each expanding into its own level, recursively. This is a natural
-fit — Silver-style hierarchy demands exactly the block discipline `balanced-gateways`
-enforces (each level: one start, bounded ends, no flows crossing the boundary), so
-the linter and the style teach the same thing. Runtime cost is the `scope` machinery
-v1 already carries for boundary events and terminate: scope-per-subprocess, nested
-teardown, boundary events on the subprocess itself. Consider an optional
-"method-and-style" lint pack (warn-level: labeling conventions, one none-start per
-level, end-state naming) — cheap goodwill for modelers who learned from Silver.
-Non-interrupting boundary timers land here too (the "every 30 days while this runs"
-pattern).
+**v2 — Non-interrupting boundary events + link events (both small).**
+Non-interrupting boundaries spawn a *second* token while the host keeps
+running ("every 30 days while this runs") — a genuinely different concurrency
+shape from the interrupting boundaries v1 ships, which is exactly why they are
+held back rather than bundled into phase 6. Link events are pure control-flow
+goto: pair throw/catch by name at deploy, then it is an ordinary edge in the
+internal model. Zero runtime machinery, and worth shipping the moment
+hierarchical modelling makes big single-level models common.
 
-**v3 — Link events (trivial).** Pure control-flow goto: pair throw/catch by name at
-deploy time; becomes an ordinary edge in the internal model. Zero runtime machinery.
-Mostly a diagram-hygiene feature for large single-level models — worth shipping the
-moment v2 makes big models common.
+*(Embedded subprocesses were the original v2 and moved into v1 — see phase 6.
+The Method-and-Style hierarchy they enable is a natural fit for this engine:
+Silver-style levels demand exactly the block discipline `balanced-gateways`
+already enforces — one start, bounded ends, no flows crossing the boundary —
+so the linter and the style teach the same thing. An optional warn-level
+"method-and-style" lint pack, labeling conventions and end-state naming, stays
+on the table as cheap goodwill for modelers who learned from Silver.)*
 
-**v4 — Event subprocesses (cheap-ish).** Scope-attached event handlers with
+**v3 — Event subprocesses (cheap-ish).** Scope-attached event handlers with
 interrupting and non-interrupting starts. Reuses v2's scope/teardown machinery plus
 the existing subscription kinds (message, timer, later error). The clean way to model
 "cancel my order at any point" without boundary-event spaghetti.
 
-**v5 — Conditional events (moderate).** "Wake this token when the variable document
+**v4 — Conditional events (moderate).** "Wake this token when the variable document
 satisfies a predicate." Clean hook exists: every variable write is a merge patch in a
 known transaction — re-evaluate waiting `kind=condition` subscriptions there. The
 FEEL-subset condition grammar keeps evaluation cheap and deterministic; a `subscription`
 row fits as-is. Deploy rule: conditional predicates use the same grammar as
 sequence-flow conditions.
 
-**v6 — Compensation + cancel + transaction subprocess (the real work).**
+**v5 — Compensation + cancel + transaction subprocess (the real work).**
 Compensation needs "completed activities, in reverse completion order, per scope" —
 which is literally the `event` table; handlers attach per scope; execution is
 scope-local, so `balanced-gateways` is unthreatened. Required deploy rule:
