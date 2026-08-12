@@ -36,7 +36,7 @@ pub use events::{EventCursor, EventRecord};
 #[cfg(feature = "http")]
 pub use http_handler::HttpPostHandler;
 pub use inspect::{
-    EventView, InstanceInspection, SubscriptionView, TimerView, TokenView, WorkItemView,
+    EventView, InstanceInspection, ScopeView, SubscriptionView, TimerView, TokenView, WorkItemView,
 };
 pub use rbpmn_core::{Bindings, Event};
 pub use runtime::FailOptions;
@@ -80,6 +80,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         5,
         "event_stream",
         include_str!("../migrations/0005_event_stream.sql"),
+    ),
+    (
+        6,
+        "subprocess_scopes",
+        include_str!("../migrations/0006_subprocess_scopes.sql"),
     ),
 ];
 

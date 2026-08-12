@@ -1,0 +1,36 @@
+{
+  "fixture": "accept/13-subprocess.bpmn",
+  "actions": [
+    {
+      "complete": "ti"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started sp",
+      "timer-armed bt P2D",
+      "element-started s2",
+      "element-completed s2",
+      "flow-taken fi1",
+      "element-started ti",
+      "work-item-created ti user ti",
+      "work-item-completed ti",
+      "element-completed ti",
+      "flow-taken fi2",
+      "element-started e2",
+      "element-completed e2",
+      "timer-cancelled bt",
+      "element-completed sp",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

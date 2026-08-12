@@ -15,9 +15,9 @@
 
 use crate::{Completion, Correlation, Engine, EngineError, FailOutcome, StartedInstance};
 use rbpmn_core::{
-    Bindings, Command, Counters, Event, ExecutableProcess, InstanceState, InstanceStatus,
-    SubscriptionId, SubscriptionState, TimerDue, TimerId, TimerState, Token, TokenId, WaitKind,
-    WorkItemId, WorkItemState, WorkKind, step,
+    Bindings, Command, Counters, Event, ExecutableProcess, InstanceState, InstanceStatus, ScopeId,
+    ScopeState, SubscriptionId, SubscriptionState, TimerDue, TimerId, TimerState, Token, TokenId,
+    WaitKind, WorkItemId, WorkItemState, WorkKind, step,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
@@ -617,7 +617,8 @@ pub(crate) async fn load_instance_nowait(
 > {
     let sql = format!(
         "select i.definition_id, i.definition_key, i.status, i.variables, \
-                i.next_token, i.next_work_item, i.next_timer, i.next_subscription \
+                i.next_token, i.next_work_item, i.next_timer, i.next_subscription, \
+                i.next_scope \
          from rbpmn_instance i where i.id = $1 for update{}",
         if nowait { " nowait" } else { "" }
     );
@@ -695,9 +696,31 @@ pub(crate) async fn load_instance_nowait(
         ));
     }
 
+    let mut scopes = Vec::new();
+    for row in sqlx::query(
+        "select scope_no, parent_scope_no, element_id, token_no \
+         from rbpmn_scope where instance_id = $1 order by scope_no",
+    )
+    .bind(instance_id)
+    .fetch_all(&mut *tx)
+    .await?
+    {
+        let element_id: String = row.get("element_id");
+        scopes.push((
+            ScopeId(row.get::<i64, _>("scope_no") as u64),
+            ScopeState {
+                element: proc.node_by_id(&element_id).ok_or_else(|| {
+                    internal(format!("scope references unknown element '{element_id}'"))
+                })?,
+                parent: ScopeId(row.get::<i64, _>("parent_scope_no") as u64),
+                token: TokenId(row.get::<i64, _>("token_no") as u64),
+            },
+        ));
+    }
+
     let mut tokens = Vec::new();
     for row in sqlx::query(
-        "select token_no, element_id, wait_kind, arrived_via, work_item_no \
+        "select token_no, element_id, wait_kind, arrived_via, work_item_no, scope_no \
          from rbpmn_token where instance_id = $1 order by token_no",
     )
     .bind(instance_id)
@@ -745,9 +768,27 @@ pub(crate) async fn load_instance_nowait(
             ),
             "event_gateway" => WaitKind::EventGateway,
             "incident" => WaitKind::Incident,
+            // A token parked at a subprocess waits on the scope it opened —
+            // the one whose parked token is this one.
+            "scope" => WaitKind::Scope(
+                scopes
+                    .iter()
+                    .find(|(_, sc)| sc.token == token_no)
+                    .map(|(id, _)| *id)
+                    .ok_or_else(|| {
+                        internal(format!("token {token_no:?} waits on a scope with no row"))
+                    })?,
+            ),
             other => return Err(internal(format!("unknown token wait kind '{other}'"))),
         };
-        tokens.push((token_no, Token { node, wait }));
+        tokens.push((
+            token_no,
+            Token {
+                node,
+                scope: ScopeId(row.get::<i64, _>("scope_no") as u64),
+                wait,
+            },
+        ));
     }
 
     let mut work_items = Vec::new();
@@ -783,11 +824,13 @@ pub(crate) async fn load_instance_nowait(
         work_items,
         timers,
         subscriptions,
+        scopes,
         Counters {
             next_token: inst.get::<i64, _>("next_token") as u64,
             next_work_item: inst.get::<i64, _>("next_work_item") as u64,
             next_timer: inst.get::<i64, _>("next_timer") as u64,
             next_subscription: inst.get::<i64, _>("next_subscription") as u64,
+            next_scope: inst.get::<i64, _>("next_scope") as u64,
         },
     );
     Ok(Some((definition, proc, state)))
@@ -811,6 +854,7 @@ pub(crate) async fn persist_step(
     sqlx::query(
         "update rbpmn_instance set status = $2, variables = $3, next_token = $4, \
          next_work_item = $5, next_timer = $6, next_subscription = $7, \
+         next_scope = $8, \
          completed_at = case when $2 in ('completed', 'terminated') \
          then now() else completed_at end where id = $1",
     )
@@ -821,8 +865,30 @@ pub(crate) async fn persist_step(
     .bind(counters.next_work_item as i64)
     .bind(counters.next_timer as i64)
     .bind(counters.next_subscription as i64)
+    .bind(counters.next_scope as i64)
     .execute(&mut *tx)
     .await?;
+
+    // Scopes are a snapshot like tokens: few per instance, and wholesale
+    // replacement keeps the projection trivially correct under teardown.
+    sqlx::query("delete from rbpmn_scope where instance_id = $1")
+        .bind(instance_id)
+        .execute(&mut *tx)
+        .await?;
+    for (id, scope) in state.scopes() {
+        sqlx::query(
+            "insert into rbpmn_scope \
+             (instance_id, scope_no, parent_scope_no, element_id, token_no) \
+             values ($1, $2, $3, $4, $5)",
+        )
+        .bind(instance_id)
+        .bind(id.0 as i64)
+        .bind(scope.parent.0 as i64)
+        .bind(proc.node_id(scope.element))
+        .bind(scope.token.0 as i64)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     // Token rows are a snapshot of the quiescent state (small per instance;
     // wholesale replace keeps the projection trivially correct). One delete
@@ -833,6 +899,7 @@ pub(crate) async fn persist_step(
         .execute(&mut *tx)
         .await?;
     let mut token_nos: Vec<i64> = Vec::new();
+    let mut token_scopes: Vec<i64> = Vec::new();
     let mut token_elements: Vec<&str> = Vec::new();
     let mut wait_kinds: Vec<&str> = Vec::new();
     let mut arrived_vias: Vec<Option<String>> = Vec::new();
@@ -847,7 +914,9 @@ pub(crate) async fn persist_step(
             WaitKind::Message(_) => ("message", None, None),
             WaitKind::EventGateway => ("event_gateway", None, None),
             WaitKind::Incident => ("incident", None, None),
+            WaitKind::Scope(_) => ("scope", None, None),
         };
+        token_scopes.push(token.scope.0 as i64);
         token_nos.push(id.0 as i64);
         token_elements.push(proc.node_id(token.node));
         wait_kinds.push(wait_kind);
@@ -857,10 +926,10 @@ pub(crate) async fn persist_step(
     if !token_nos.is_empty() {
         sqlx::query(
             "insert into rbpmn_token \
-             (instance_id, token_no, element_id, wait_kind, arrived_via, work_item_no) \
-             select $1, t.no, t.el, t.wk, t.via, t.wi \
-             from unnest($2::bigint[], $3::text[], $4::text[], $5::text[], $6::bigint[]) \
-               as t(no, el, wk, via, wi)",
+             (instance_id, token_no, element_id, wait_kind, arrived_via, work_item_no, scope_no) \
+             select $1, t.no, t.el, t.wk, t.via, t.wi, t.sc \
+             from unnest($2::bigint[], $3::text[], $4::text[], $5::text[], $6::bigint[], \
+                         $7::bigint[]) as t(no, el, wk, via, wi, sc)",
         )
         .bind(instance_id)
         .bind(&token_nos)
@@ -868,6 +937,7 @@ pub(crate) async fn persist_step(
         .bind(&wait_kinds)
         .bind(&arrived_vias)
         .bind(&work_item_nos)
+        .bind(&token_scopes)
         .execute(&mut *tx)
         .await?;
     }

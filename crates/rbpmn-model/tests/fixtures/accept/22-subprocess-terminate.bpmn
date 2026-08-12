@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<!-- Terminate is scope-local (BPMN 2.0): a terminate end event inside a
+     subprocess ends *that subprocess*, tearing down its parallel sibling,
+     after which the parent token leaves the subprocess normally. The
+     instance itself keeps running. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:subProcess id="sp" name="Gather quotes">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:startEvent id="s2">
+        <bpmn:outgoing>fi1</bpmn:outgoing>
+      </bpmn:startEvent>
+      <bpmn:parallelGateway id="ps">
+        <bpmn:incoming>fi1</bpmn:incoming>
+        <bpmn:outgoing>fi2</bpmn:outgoing>
+        <bpmn:outgoing>fi4</bpmn:outgoing>
+      </bpmn:parallelGateway>
+      <bpmn:userTask id="quote_a" name="Quote A">
+        <bpmn:incoming>fi2</bpmn:incoming>
+        <bpmn:outgoing>fi3</bpmn:outgoing>
+      </bpmn:userTask>
+      <bpmn:userTask id="quote_b" name="Quote B">
+        <bpmn:incoming>fi4</bpmn:incoming>
+        <bpmn:outgoing>fi5</bpmn:outgoing>
+      </bpmn:userTask>
+      <bpmn:exclusiveGateway id="xs" default="fi_go">
+        <bpmn:incoming>fi5</bpmn:incoming>
+        <bpmn:outgoing>fi_stop</bpmn:outgoing>
+        <bpmn:outgoing>fi_go</bpmn:outgoing>
+      </bpmn:exclusiveGateway>
+      <bpmn:endEvent id="e_stop" name="Enough quotes">
+        <bpmn:incoming>fi_stop</bpmn:incoming>
+        <bpmn:terminateEventDefinition />
+      </bpmn:endEvent>
+      <bpmn:parallelGateway id="pj">
+        <bpmn:incoming>fi3</bpmn:incoming>
+        <bpmn:incoming>fi_go</bpmn:incoming>
+        <bpmn:outgoing>fi6</bpmn:outgoing>
+      </bpmn:parallelGateway>
+      <bpmn:endEvent id="e2" name="All quotes in">
+        <bpmn:incoming>fi6</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="fi1" sourceRef="s2" targetRef="ps" />
+      <bpmn:sequenceFlow id="fi2" sourceRef="ps" targetRef="quote_a" />
+      <bpmn:sequenceFlow id="fi3" sourceRef="quote_a" targetRef="pj" />
+      <bpmn:sequenceFlow id="fi4" sourceRef="ps" targetRef="quote_b" />
+      <bpmn:sequenceFlow id="fi5" sourceRef="quote_b" targetRef="xs" />
+      <bpmn:sequenceFlow id="fi_stop" sourceRef="xs" targetRef="e_stop">
+        <bpmn:conditionExpression>enough = true</bpmn:conditionExpression>
+      </bpmn:sequenceFlow>
+      <bpmn:sequenceFlow id="fi_go" sourceRef="xs" targetRef="pj" />
+      <bpmn:sequenceFlow id="fi6" sourceRef="pj" targetRef="e2" />
+    </bpmn:subProcess>
+    <bpmn:userTask id="decide" name="Decide">
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:endEvent id="end">
+      <bpmn:incoming>f3</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sp" />
+    <bpmn:sequenceFlow id="f2" sourceRef="sp" targetRef="decide" />
+    <bpmn:sequenceFlow id="f3" sourceRef="decide" targetRef="end" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_p">
+    <bpmndi:BPMNPlane id="BPMNPlane_p" bpmnElement="p">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="sp_di" bpmnElement="sp">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="decide_di" bpmnElement="decide">
+        <dc:Bounds x="325" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+        <dc:Bounds x="507" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="325" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
+        <di:waypoint x="425" y="70" />
+        <di:waypoint x="507" y="70" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_sp">
+    <bpmndi:BPMNPlane id="BPMNPlane_sp" bpmnElement="sp">
+      <bpmndi:BPMNShape id="s2_di" bpmnElement="s2">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ps_di" bpmnElement="ps">
+        <dc:Bounds x="200" y="45" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="quote_a_di" bpmnElement="quote_a">
+        <dc:Bounds x="325" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="pj_di" bpmnElement="pj">
+        <dc:Bounds x="650" y="45" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="e2_di" bpmnElement="e2">
+        <dc:Bounds x="807" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="quote_b_di" bpmnElement="quote_b">
+        <dc:Bounds x="325" y="170" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="xs_di" bpmnElement="xs" isMarkerVisible="true">
+        <dc:Bounds x="500" y="185" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="e_stop_di" bpmnElement="e_stop">
+        <dc:Bounds x="657" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="fi1_di" bpmnElement="fi1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="200" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fi2_di" bpmnElement="fi2">
+        <di:waypoint x="250" y="70" />
+        <di:waypoint x="325" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fi4_di" bpmnElement="fi4">
+        <di:waypoint x="225" y="95" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="325" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fi3_di" bpmnElement="fi3">
+        <di:waypoint x="425" y="70" />
+        <di:waypoint x="650" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fi6_di" bpmnElement="fi6">
+        <di:waypoint x="700" y="70" />
+        <di:waypoint x="807" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fi5_di" bpmnElement="fi5">
+        <di:waypoint x="425" y="210" />
+        <di:waypoint x="500" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fi_stop_di" bpmnElement="fi_stop">
+        <di:waypoint x="550" y="210" />
+        <di:waypoint x="657" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fi_go_di" bpmnElement="fi_go">
+        <di:waypoint x="550" y="210" />
+        <di:waypoint x="600" y="210" />
+        <di:waypoint x="600" y="140" />
+        <di:waypoint x="600" y="140" />
+        <di:waypoint x="600" y="70" />
+        <di:waypoint x="650" y="70" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

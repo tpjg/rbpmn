@@ -1,0 +1,40 @@
+{
+  "fixture": "accept/20-subprocess-error-boundary.bpmn",
+  "actions": [
+    {
+      "fail": "reserve",
+      "code": "OUT_OF_STOCK"
+    },
+    {
+      "complete": "backorder"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started sp",
+      "element-started s2",
+      "element-completed s2",
+      "flow-taken fi1",
+      "element-started reserve",
+      "work-item-created reserve service reserve",
+      "work-item-failed reserve OUT_OF_STOCK",
+      "element-started be",
+      "element-completed be",
+      "flow-taken f3",
+      "element-started backorder",
+      "work-item-created backorder user backorder",
+      "work-item-completed backorder",
+      "element-completed backorder",
+      "flow-taken f4",
+      "element-started e_back",
+      "element-completed e_back",
+      "instance-completed"
+    ]
+  }
+}

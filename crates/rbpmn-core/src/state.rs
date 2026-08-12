@@ -22,6 +22,16 @@ pub struct TimerId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SubscriptionId(pub u64);
 
+/// A **runtime** scope instance. `ScopeId(0)` is the instance root and is
+/// never stored; every entered subprocess allocates a fresh one, so a
+/// subprocess inside a loop gets a new scope per iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ScopeId(pub u64);
+
+impl ScopeId {
+    pub const ROOT: ScopeId = ScopeId(0);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InstanceStatus {
@@ -38,6 +48,10 @@ pub enum InstanceStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Token {
     pub node: NodeIx,
+    /// The runtime scope this token belongs to — what makes join counting
+    /// local ("one token per incoming flow *within its scope*") and
+    /// teardown precise.
+    pub scope: ScopeId,
     pub wait: WaitKind,
 }
 
@@ -59,6 +73,20 @@ pub enum WaitKind {
     /// so inspection always shows *where*, and a future repair API has one
     /// state to resume from.
     Incident,
+    /// Parked at a subprocess, waiting for the child scope it opened to
+    /// empty. Resumed when the last token inside that scope is consumed.
+    Scope(ScopeId),
+}
+
+/// An open subprocess scope instance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopeState {
+    /// The subprocess node that owns it.
+    pub element: NodeIx,
+    /// The enclosing runtime scope (`ScopeId::ROOT` for a top-level one).
+    pub parent: ScopeId,
+    /// The parked token that will resume when this scope completes.
+    pub token: TokenId,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,10 +130,12 @@ pub struct InstanceState {
     pub(crate) work_items: BTreeMap<WorkItemId, WorkItemState>,
     pub(crate) timers: BTreeMap<TimerId, TimerState>,
     pub(crate) subscriptions: BTreeMap<SubscriptionId, SubscriptionState>,
+    pub(crate) scopes: BTreeMap<ScopeId, ScopeState>,
     next_token: u64,
     next_work_item: u64,
     next_timer: u64,
     next_subscription: u64,
+    next_scope: u64,
 }
 
 impl InstanceState {
@@ -117,10 +147,12 @@ impl InstanceState {
             work_items: BTreeMap::new(),
             timers: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
+            scopes: BTreeMap::new(),
             next_token: 0,
             next_work_item: 0,
             next_timer: 0,
             next_subscription: 0,
+            next_scope: 1, // 0 is the implicit root
         }
     }
 
@@ -150,6 +182,29 @@ impl InstanceState {
 
     pub fn subscriptions(&self) -> impl Iterator<Item = (SubscriptionId, &SubscriptionState)> {
         self.subscriptions.iter().map(|(id, s)| (*id, s))
+    }
+
+    /// Open subprocess scope instances (the root is implicit, never listed).
+    pub fn scopes(&self) -> impl Iterator<Item = (ScopeId, &ScopeState)> {
+        self.scopes.iter().map(|(id, s)| (*id, s))
+    }
+
+    /// Every scope in `scope`'s subtree, itself included — the set a
+    /// cancelled subprocess tears down.
+    pub(crate) fn scope_subtree(&self, scope: ScopeId) -> Vec<ScopeId> {
+        let mut out = vec![scope];
+        let mut i = 0;
+        while i < out.len() {
+            let parent = out[i];
+            out.extend(
+                self.scopes
+                    .iter()
+                    .filter(|(_, s)| s.parent == parent)
+                    .map(|(id, _)| *id),
+            );
+            i += 1;
+        }
+        out
     }
 
     /// The armed timer sitting on `element`, if any (catch or boundary
@@ -188,6 +243,7 @@ impl InstanceState {
         work_items: impl IntoIterator<Item = (WorkItemId, WorkItemState)>,
         timers: impl IntoIterator<Item = (TimerId, TimerState)>,
         subscriptions: impl IntoIterator<Item = (SubscriptionId, SubscriptionState)>,
+        scopes: impl IntoIterator<Item = (ScopeId, ScopeState)>,
         counters: Counters,
     ) -> Self {
         InstanceState {
@@ -197,10 +253,12 @@ impl InstanceState {
             work_items: work_items.into_iter().collect(),
             timers: timers.into_iter().collect(),
             subscriptions: subscriptions.into_iter().collect(),
+            scopes: scopes.into_iter().collect(),
             next_token: counters.next_token,
             next_work_item: counters.next_work_item,
             next_timer: counters.next_timer,
             next_subscription: counters.next_subscription,
+            next_scope: counters.next_scope.max(1),
         }
     }
 
@@ -210,6 +268,7 @@ impl InstanceState {
             next_work_item: self.next_work_item,
             next_timer: self.next_timer,
             next_subscription: self.next_subscription,
+            next_scope: self.next_scope,
         }
     }
 
@@ -224,6 +283,13 @@ impl InstanceState {
         let id = TimerId(self.next_timer);
         self.next_timer += 1;
         self.timers.insert(id, timer);
+        id
+    }
+
+    pub(crate) fn alloc_scope(&mut self, scope: ScopeState) -> ScopeId {
+        let id = ScopeId(self.next_scope);
+        self.next_scope += 1;
+        self.scopes.insert(id, scope);
         id
     }
 
@@ -243,6 +309,7 @@ pub struct Counters {
     pub next_work_item: u64,
     pub next_timer: u64,
     pub next_subscription: u64,
+    pub next_scope: u64,
 }
 
 impl Default for InstanceState {

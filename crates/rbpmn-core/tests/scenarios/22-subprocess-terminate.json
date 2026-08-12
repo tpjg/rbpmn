@@ -1,0 +1,58 @@
+{
+  "fixture": "accept/22-subprocess-terminate.bpmn",
+  "actions": [
+    {
+      "complete": "quote_b",
+      "patch": {
+        "enough": true
+      }
+    },
+    {
+      "complete": "decide"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {
+      "enough": true
+    },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started sp",
+      "element-started s2",
+      "element-completed s2",
+      "flow-taken fi1",
+      "element-started ps",
+      "element-completed ps",
+      "flow-taken fi2",
+      "flow-taken fi4",
+      "element-started quote_a",
+      "work-item-created quote_a user quote_a",
+      "element-started quote_b",
+      "work-item-created quote_b user quote_b",
+      "work-item-completed quote_b",
+      "variables-patched",
+      "element-completed quote_b",
+      "flow-taken fi5",
+      "element-started xs",
+      "element-completed xs",
+      "flow-taken fi_stop",
+      "element-started e_stop",
+      "element-completed e_stop",
+      "work-item-cancelled quote_a",
+      "element-completed sp",
+      "flow-taken f2",
+      "element-started decide",
+      "work-item-created decide user decide",
+      "work-item-completed decide",
+      "element-completed decide",
+      "flow-taken f3",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

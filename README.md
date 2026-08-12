@@ -33,7 +33,7 @@ migration API, is listed with its status in the design brief's
 ## Status
 
 - [x] **Phase 0 — Parse & reject**: parser, full linter rule catalogue,
-      fixture corpus (19 accept / 34 reject today — every phase adds its
+      fixture corpus (22 accept / 34 reject today — every phase adds its
       own before its code), corpus runner.
 - [x] Server skeleton with the security spine and `POST /v1/definitions/lint`.
 - [x] **Phase 0-B — linter playground (WASM) + bpmnlint plugin**, with a
@@ -81,9 +81,14 @@ migration API, is listed with its status in the design brief's
       runs that kill processes and sever database connections mid-flight,
       reporting exactly-once and clean completion throughout. BPMN has no
       execution TCK; this is the assurance in its place.
-- [ ] **Phase 6 — embedded subprocesses** (in progress): the live scope
-      tree, scoped joins and teardown, error boundaries on a subprocess,
-      scope-local terminate.
+- [x] **Phase 6 — embedded subprocesses**: the live scope tree (one runtime
+      scope per entry, so two loop iterations never see each other's joins),
+      scope-local join counting, subprocess-as-wait-state, interrupting
+      teardown of a whole scope subtree in one transaction, **error
+      boundaries on a subprocess** — an error propagates outward to the
+      nearest enclosing handler — and scope-local terminate (ends the
+      subprocess, not the instance). Hierarchical modelling, the style the
+      engine exists to serve, is now executable.
 - [ ] Phase 7 — retention.
 
 ## Rule catalogue

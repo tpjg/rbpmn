@@ -1,0 +1,50 @@
+{
+  "fixture": "accept/21-nested-subprocess.bpmn",
+  "actions": [
+    {
+      "complete": "count"
+    },
+    {
+      "complete": "ship"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started outer",
+      "element-started s_outer",
+      "element-completed s_outer",
+      "flow-taken fo1",
+      "element-started inner",
+      "element-started s_inner",
+      "element-completed s_inner",
+      "flow-taken fn1",
+      "element-started count",
+      "work-item-created count user count",
+      "work-item-completed count",
+      "element-completed count",
+      "flow-taken fn2",
+      "element-started e_inner",
+      "element-completed e_inner",
+      "element-completed inner",
+      "flow-taken fo2",
+      "element-started ship",
+      "work-item-created ship user ship",
+      "work-item-completed ship",
+      "element-completed ship",
+      "flow-taken fo3",
+      "element-started e_outer",
+      "element-completed e_outer",
+      "element-completed outer",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

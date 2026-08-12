@@ -3197,3 +3197,194 @@ async fn a_starved_renewal_reruns_the_handler_but_applies_once() {
     );
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6: embedded subprocesses
+// ---------------------------------------------------------------------------
+
+async fn scope_rows(pool: &PgPool, instance: uuid::Uuid) -> Vec<(i64, i64, String)> {
+    sqlx::query(
+        "select scope_no, parent_scope_no, element_id from rbpmn_scope \
+         where instance_id = $1 order by scope_no",
+    )
+    .bind(instance)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| {
+        (
+            r.get::<i64, _>("scope_no"),
+            r.get::<i64, _>("parent_scope_no"),
+            r.get::<String, _>("element_id"),
+        )
+    })
+    .collect()
+}
+
+/// Nested scopes survive the round-trip through Postgres: every step
+/// rehydrates the scope tree from rows, so a two-level subprocess completes
+/// across three separate transactions.
+#[tokio::test]
+async fn nested_subprocess_scopes_rehydrate() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/21-nested-subprocess.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // Two open scopes: outer (root's child) and inner (outer's child).
+    let scopes = scope_rows(&db.pool, started.id).await;
+    assert_eq!(scopes.len(), 2, "{scopes:?}");
+    assert_eq!(scopes[0], (1, 0, "outer".to_string()));
+    assert_eq!(scopes[1], (2, 1, "inner".to_string()));
+    // The waiting work item lives in the inner scope.
+    let token_scope: i64 = sqlx::query(
+        "select t.scope_no from rbpmn_token t where t.instance_id = $1 and t.element_id = 'count'",
+    )
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+    .get("scope_no");
+    assert_eq!(token_scope, 2);
+
+    // Completing the inner task closes the inner scope only.
+    let (count_item, _) = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .find(|(_, el)| el == "count")
+        .unwrap();
+    engine
+        .complete_work_item(count_item, serde_json::json!({}))
+        .await
+        .unwrap();
+    let scopes = scope_rows(&db.pool, started.id).await;
+    assert_eq!(scopes, vec![(1, 0, "outer".to_string())]);
+
+    // Completing the outer task closes the outer scope and the instance.
+    let (ship_item, _) = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .find(|(_, el)| el == "ship")
+        .unwrap();
+    engine
+        .complete_work_item(ship_item, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert!(scope_rows(&db.pool, started.id).await.is_empty());
+    let tokens: i64 = sqlx::query("select count(*) from rbpmn_token where instance_id = $1")
+        .bind(started.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(tokens, 0);
+    db.drop().await;
+}
+
+/// An interrupting boundary tears the whole scope down in one transaction:
+/// the subprocess's work item is cancelled, its scope row is gone, and the
+/// timer that fired is consumed — all committed together.
+#[tokio::test]
+async fn boundary_timer_tears_down_a_subprocess_scope() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    // 13-subprocess has a P2D boundary timer on the subprocess; shorten it
+    // so the scheduler can fire it here.
+    let xml = fixture("accept/13-subprocess.bpmn").replace("P2D", "PT0S");
+    engine.deploy(&xml, &Bindings::default()).await.unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(scope_rows(&db.pool, started.id).await.len(), 1);
+    assert_eq!(
+        open_items(&db.pool, started.id).await[0].1,
+        "ti",
+        "the inner task is waiting"
+    );
+
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    // Scope gone, inner work item cancelled, escalation task waiting.
+    assert!(scope_rows(&db.pool, started.id).await.is_empty());
+    let inner_state: String = sqlx::query(
+        "select state from rbpmn_work_item where instance_id = $1 and element_id = 'ti'",
+    )
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+    .get("state");
+    assert_eq!(inner_state, "cancelled");
+    assert_eq!(timer_rows(&db.pool, started.id).await, 0);
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].1, "t_late");
+    db.drop().await;
+}
+
+/// The scoped error handler across a real transaction boundary: a service
+/// task failing deep inside a subprocess is caught by the boundary on the
+/// subprocess, which tears the scope down and takes the repair path.
+#[tokio::test]
+async fn subprocess_error_boundary_catches_from_within() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("reserve").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/20-subprocess-error-boundary.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let (item, _) = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .find(|(_, el)| el == "reserve")
+        .unwrap();
+
+    // Exhaust the retry budget with the matching error code.
+    let mut outcome = None;
+    for _ in 0..3 {
+        outcome = Some(
+            engine
+                .fail_work_item(item, &fail_code("OUT_OF_STOCK"))
+                .await
+                .unwrap(),
+        );
+    }
+    assert!(matches!(outcome, Some(FailOutcome::ErrorCaught(_))));
+
+    // The scope is gone and the repair task is open at the root.
+    assert!(scope_rows(&db.pool, started.id).await.is_empty());
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].1, "backorder");
+    let status: String = sqlx::query("select status from rbpmn_instance where id = $1")
+        .bind(started.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .get("status");
+    assert_eq!(
+        status, "active",
+        "a caught error must not freeze the instance"
+    );
+    db.drop().await;
+}

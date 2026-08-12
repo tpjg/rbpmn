@@ -25,12 +25,13 @@ mod state;
 mod step;
 
 pub use compile::{
-    Bindings, CompileError, ExecKind, ExecutableProcess, FlowIx, NodeIx, TimerDue, WorkKind,
+    Bindings, CompileError, ExecKind, ExecScope, ExecutableProcess, FlowIx, NodeIx, ScopeIx,
+    TimerDue, WorkKind,
 };
 pub use event::Event;
 pub use merge_patch::merge_patch;
 pub use state::{
-    Counters, InstanceState, InstanceStatus, SubscriptionId, SubscriptionState, TimerId,
-    TimerState, Token, TokenId, WaitKind, WorkItemId, WorkItemState,
+    Counters, InstanceState, InstanceStatus, ScopeId, ScopeState, SubscriptionId,
+    SubscriptionState, TimerId, TimerState, Token, TokenId, WaitKind, WorkItemId, WorkItemState,
 };
 pub use step::{Command, StepError, step};

@@ -236,15 +236,16 @@ fn compile_gates_later_phase_elements() {
         other => panic!("expected NotYetExecutable, got {other:?}"),
     }
 
-    let subprocess = ExecutableProcess::compile(
-        &load("accept/13-subprocess.bpmn"),
-        "p",
-        &Bindings::default(),
+    // Embedded subprocesses used to be gated here; they are executable as
+    // of phase 6, so what remains gated is only cross-definition messaging.
+    assert!(
+        ExecutableProcess::compile(
+            &load("accept/13-subprocess.bpmn"),
+            "p",
+            &Bindings::default(),
+        )
+        .is_ok()
     );
-    assert!(matches!(
-        subprocess,
-        Err(CompileError::NotYetExecutable { .. })
-    ));
 }
 
 #[test]

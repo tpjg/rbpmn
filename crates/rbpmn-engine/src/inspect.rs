@@ -14,6 +14,7 @@ pub struct InstanceInspection {
     pub variables: serde_json::Value,
     pub bpmn_xml: String,
     pub tokens: Vec<TokenView>,
+    pub scopes: Vec<ScopeView>,
     pub work_items: Vec<WorkItemView>,
     pub timers: Vec<TimerView>,
     pub subscriptions: Vec<SubscriptionView>,
@@ -43,6 +44,19 @@ pub struct SubscriptionView {
 pub struct TokenView {
     pub element_id: String,
     pub wait_kind: String,
+    /// Which runtime scope the token sits in; 0 is the instance root. The
+    /// overlay needs it to know *which plane* to draw the token on.
+    pub scope_no: i64,
+}
+
+/// An open subprocess scope instance — the drill-down planes that are
+/// currently live.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopeView {
+    pub scope_no: i64,
+    pub parent_scope_no: i64,
+    pub element_id: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -94,7 +108,8 @@ impl Engine {
         .ok_or(EngineError::UnknownInstance(id))?;
 
         let tokens = sqlx::query(
-            "select element_id, wait_kind from rbpmn_token where instance_id = $1 order by token_no",
+            "select element_id, wait_kind, scope_no from rbpmn_token \
+             where instance_id = $1 order by token_no",
         )
         .bind(id)
         .fetch_all(&mut *tx)
@@ -103,6 +118,22 @@ impl Engine {
         .map(|r| TokenView {
             element_id: r.get("element_id"),
             wait_kind: r.get("wait_kind"),
+            scope_no: r.get("scope_no"),
+        })
+        .collect();
+
+        let scopes = sqlx::query(
+            "select scope_no, parent_scope_no, element_id from rbpmn_scope \
+             where instance_id = $1 order by scope_no",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|r| ScopeView {
+            scope_no: r.get("scope_no"),
+            parent_scope_no: r.get("parent_scope_no"),
+            element_id: r.get("element_id"),
         })
         .collect();
 
@@ -187,6 +218,7 @@ impl Engine {
             variables: inst.get("variables"),
             bpmn_xml: inst.get("bpmn_xml"),
             tokens,
+            scopes,
             work_items,
             timers,
             subscriptions,

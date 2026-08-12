@@ -63,6 +63,11 @@ pub fn check(proc: &ExecutableProcess, s: &InstanceState) -> Result<(), String> 
                 Some(_) => return Err(format!("timer {ti:?} points at another token")),
                 None => return Err(format!("token {id:?} references missing timer {ti:?}")),
             },
+            WaitKind::Scope(sc) => match s.scopes().find(|(i, _)| *i == *sc) {
+                Some((_, scope)) if scope.token == id && scope.element == t.node => {}
+                Some(_) => return Err(format!("scope {sc:?} disagrees with token {id:?}")),
+                None => return Err(format!("token {id:?} references missing scope {sc:?}")),
+            },
             WaitKind::Message(si) => match s.subscriptions().find(|(i, _)| *i == *si) {
                 Some((_, sub)) if sub.token == id => {}
                 Some(_) => return Err(format!("subscription {si:?} points at another token")),
@@ -172,9 +177,25 @@ pub fn canonical(proc: &ExecutableProcess, s: &InstanceState) -> String {
             WaitKind::Message(_) => "message".into(),
             WaitKind::EventGateway => "gateway".into(),
             WaitKind::Incident => "incident".into(),
+            WaitKind::Scope(_) => "subprocess".into(),
         };
         let armed = arms.get(&id.0).map(|a| a.join(",")).unwrap_or_default();
-        tokens.push(format!("{}|{}|[{}]", proc.node_id(t.node), wait, armed));
+        // The scope's *depth* rather than its id: ids grow with every
+        // subprocess entry, so including them would make every loop
+        // iteration a fresh state and the exploration would never converge.
+        let mut depth = 0;
+        let mut at = t.scope;
+        while let Some((_, sc)) = s.scopes().find(|(i, _)| *i == at) {
+            depth += 1;
+            at = sc.parent;
+        }
+        tokens.push(format!(
+            "{}|{}|d{}|[{}]",
+            proc.node_id(t.node),
+            wait,
+            depth,
+            armed
+        ));
     }
     tokens.sort();
     format!("{:?}|{}|{}", s.status, s.variables, tokens.join(";"))

@@ -15,8 +15,8 @@ use crate::compile::{ExecKind, ExecutableProcess, FlowIx, NodeIx};
 use crate::event::Event;
 use crate::merge_patch::merge_patch;
 use crate::state::{
-    InstanceState, InstanceStatus, SubscriptionId, SubscriptionState, TimerId, TimerState, Token,
-    TokenId, WaitKind, WorkItemId, WorkItemState,
+    InstanceState, InstanceStatus, ScopeId, ScopeState, SubscriptionId, SubscriptionState, TimerId,
+    TimerState, Token, TokenId, WaitKind, WorkItemId, WorkItemState,
 };
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -85,7 +85,12 @@ pub fn step(
             let mut adv = Advancer::new(proc);
             adv.events.push(Event::InstanceStarted);
             let token = state.next_token_id();
-            adv.queue.push_back((token, proc.start(), None));
+            adv.queue.push_back(Move {
+                token,
+                node: proc.start(),
+                via: None,
+                scope: ScopeId::ROOT,
+            });
             adv.run(state)
         }
         Command::CompleteWorkItem { id, patch } => {
@@ -102,13 +107,14 @@ pub fn step(
             let (element, token_id) = (item.element, item.token);
 
             state.work_items.get_mut(&id).unwrap().open = false;
-            if state.tokens.remove(&token_id).is_none() {
+            let Some(parked) = state.tokens.remove(&token_id) else {
                 return Err(StepError::Invariant(format!(
                     "work item {id:?} referenced token {token_id:?} which does not exist"
                 )));
-            }
+            };
 
             let mut adv = Advancer::new(proc);
+            adv.scope = parked.scope;
             adv.events.push(Event::WorkItemCompleted {
                 id,
                 element: proc.node_id(element).to_string(),
@@ -146,12 +152,40 @@ pub fn step(
                 code: code.clone(),
             });
 
-            let boundary = code
-                .as_deref()
-                .and_then(|c| proc.error_boundary(element, c));
-            match boundary {
-                Some(boundary_ix) => {
-                    adv.interrupt_to_boundary(state, token_id, boundary_ix)?;
+            // An error is caught by a boundary on the failing task, or —
+            // failing that — by one on the nearest enclosing subprocess:
+            // the scoped error handler. Each step outward interrupts that
+            // subprocess's token, tearing its whole scope down.
+            let mut caught = None;
+            if let Some(c) = code.as_deref() {
+                let mut host = element;
+                let mut target = token_id;
+                let mut scope = state
+                    .tokens
+                    .get(&token_id)
+                    .map(|t| t.scope)
+                    .unwrap_or(ScopeId::ROOT);
+                loop {
+                    if let Some(boundary) = proc.error_boundary(host, c) {
+                        caught = Some((target, boundary));
+                        break;
+                    }
+                    let Some(enclosing) = state.scopes.get(&scope) else {
+                        break; // reached the instance root uncaught
+                    };
+                    host = enclosing.element;
+                    target = enclosing.token;
+                    scope = enclosing.parent;
+                }
+            }
+            match caught {
+                Some((target, boundary_ix)) => {
+                    // The failing task's own token dies with its scope when
+                    // the catcher is an enclosing subprocess.
+                    if target != token_id {
+                        state.tokens.remove(&token_id);
+                    }
+                    adv.interrupt_to_boundary(state, target, boundary_ix)?;
                     adv.run(state)
                 }
                 None => {
@@ -185,9 +219,16 @@ pub fn step(
             match token.wait {
                 // The token sits at the timer catch itself: resume it.
                 WaitKind::Timer(tid) if tid == id => {
+                    adv.scope = token.scope;
                     state.tokens.remove(&timer.token);
                     adv.element_completed(timer.element);
                     adv.leave_single(state, timer.token, timer.element)?;
+                    adv.run(state)
+                }
+                // Interrupting boundary on a subprocess: the timer kills the
+                // whole scope, recursively, and the boundary path is taken.
+                WaitKind::Scope(_) => {
+                    adv.interrupt_to_boundary(state, timer.token, timer.element)?;
                     adv.run(state)
                 }
                 // Interrupting boundary on a task: cancel the work item and
@@ -226,6 +267,7 @@ pub fn step(
                 // The race at an event-based gateway: this timer won, every
                 // other armed event on the token is withdrawn.
                 WaitKind::EventGateway => {
+                    adv.scope = token.scope;
                     adv.cancel_attachments(state, timer.token);
                     adv.take_gateway_path(state, timer.token, token.node, timer.element)?;
                     adv.run(state)
@@ -265,6 +307,7 @@ pub fn step(
                 // The token sits at the catch (or receive task): resume it,
                 // disarming any boundary timers on it.
                 WaitKind::Message(sid) if sid == id => {
+                    adv.scope = token.scope;
                     adv.cancel_attachments(state, sub.token);
                     state.tokens.remove(&sub.token);
                     adv.element_completed(sub.element);
@@ -273,6 +316,7 @@ pub fn step(
                 }
                 // The race at an event-based gateway: this message won.
                 WaitKind::EventGateway => {
+                    adv.scope = token.scope;
                     adv.cancel_attachments(state, sub.token);
                     adv.take_gateway_path(state, sub.token, token.node, sub.element)?;
                     adv.run(state)
@@ -285,10 +329,27 @@ pub fn step(
     }
 }
 
+/// A token in flight: not yet parked, so it lives in the queue rather than
+/// in the state.
+#[derive(Debug, Clone, Copy)]
+struct Move {
+    token: TokenId,
+    node: NodeIx,
+    via: Option<FlowIx>,
+    scope: ScopeId,
+}
+
 struct Advancer<'a> {
     proc: &'a ExecutableProcess,
     events: Vec<Event>,
-    queue: VecDeque<(TokenId, NodeIx, Option<FlowIx>)>,
+    queue: VecDeque<Move>,
+    /// The runtime scope of the move being processed. Sequence flows never
+    /// cross a scope boundary (`cross-scope-flow` rejects that), so a token
+    /// following a flow stays in this scope — which is why parking and
+    /// leaving can read it here instead of threading it through every
+    /// signature. The two places that *do* change scope — entering a
+    /// subprocess and resuming its parent — set it explicitly.
+    scope: ScopeId,
 }
 
 impl<'a> Advancer<'a> {
@@ -297,15 +358,17 @@ impl<'a> Advancer<'a> {
             proc,
             events: Vec::new(),
             queue: VecDeque::new(),
+            scope: ScopeId::ROOT,
         }
     }
 
     fn run(mut self, state: &mut InstanceState) -> Result<Vec<Event>, StepError> {
-        while let Some((token, node, via)) = self.queue.pop_front() {
+        while let Some(mv) = self.queue.pop_front() {
             if state.status != InstanceStatus::Active {
                 break;
             }
-            self.enter(state, token, node, via)?;
+            self.scope = mv.scope;
+            self.enter(state, mv.token, mv.node, mv.via)?;
         }
         if state.status == InstanceStatus::Active && state.tokens.is_empty() {
             state.status = InstanceStatus::Completed;
@@ -341,6 +404,7 @@ impl<'a> Advancer<'a> {
                     token,
                     Token {
                         node: node_ix,
+                        scope: self.scope,
                         wait: WaitKind::WorkItem(item),
                     },
                 );
@@ -360,6 +424,7 @@ impl<'a> Advancer<'a> {
                     token,
                     Token {
                         node: node_ix,
+                        scope: self.scope,
                         wait: WaitKind::Timer(id),
                     },
                 );
@@ -374,6 +439,7 @@ impl<'a> Advancer<'a> {
                     token,
                     Token {
                         node: node_ix,
+                        scope: self.scope,
                         wait: WaitKind::Message(id),
                     },
                 );
@@ -387,6 +453,7 @@ impl<'a> Advancer<'a> {
                     token,
                     Token {
                         node: node_ix,
+                        scope: self.scope,
                         wait: WaitKind::EventGateway,
                     },
                 );
@@ -412,6 +479,38 @@ impl<'a> Advancer<'a> {
                         }
                     }
                 }
+                Ok(())
+            }
+            ExecKind::SubProcess { scope } => {
+                let child_static = *scope;
+                self.element_started(node_ix);
+                // The parent token parks here; a fresh runtime scope opens
+                // and a token starts inside it. Entering twice (a loop)
+                // opens a *new* scope each time, which is what keeps two
+                // iterations' joins and teardowns from seeing each other.
+                let child = state.alloc_scope(ScopeState {
+                    element: node_ix,
+                    parent: self.scope,
+                    token,
+                });
+                state.tokens.insert(
+                    token,
+                    Token {
+                        node: node_ix,
+                        scope: self.scope,
+                        wait: WaitKind::Scope(child),
+                    },
+                );
+                // Boundary timers on the subprocess arm on the parent token,
+                // exactly as they do for a task.
+                self.arm_boundaries(state, token, node_ix);
+                let inner = state.next_token_id();
+                self.queue.push_back(Move {
+                    token: inner,
+                    node: self.proc.scope(child_static).start,
+                    via: None,
+                    scope: child,
+                });
                 Ok(())
             }
             ExecKind::TimerBoundary { .. } => Err(StepError::Invariant(format!(
@@ -468,12 +567,23 @@ impl<'a> Advancer<'a> {
             ExecKind::End => {
                 self.element_started(node_ix);
                 self.element_completed(node_ix);
-                // Token is consumed: it was never parked, simply not re-queued.
-                Ok(())
+                // Token is consumed: it was never parked, simply not
+                // re-queued. If it was the last one in a subprocess scope,
+                // that scope is finished and its parent resumes.
+                self.complete_scope_if_empty(state, self.scope)
             }
             ExecKind::TerminateEnd => {
                 self.element_started(node_ix);
                 self.element_completed(node_ix);
+                if self.scope != ScopeId::ROOT {
+                    // Scope-local (BPMN 2.0): a terminate inside a subprocess
+                    // ends *that subprocess*. Its siblings inside the scope
+                    // are torn down, then the parent token leaves the
+                    // subprocess normally — the instance keeps running.
+                    let scope = self.scope;
+                    self.tear_down_scope(state, scope);
+                    return self.complete_scope(state, scope);
+                }
                 let open: Vec<WorkItemId> = state
                     .work_items
                     .iter()
@@ -489,9 +599,10 @@ impl<'a> Advancer<'a> {
                     });
                 }
                 // Everything of the instance goes in one transaction:
-                // tokens, work items, timers, subscriptions.
+                // tokens, work items, timers, subscriptions, scopes.
                 self.withdraw_arms(state, None);
                 state.tokens.clear();
+                state.scopes.clear();
                 self.queue.clear();
                 state.status = InstanceStatus::Terminated;
                 self.events.push(Event::InstanceTerminated);
@@ -515,12 +626,17 @@ impl<'a> Advancer<'a> {
             StepError::Invariant(format!("join '{}' entered without a flow", node.id))
         })?;
 
+        // Scope-local counting: a join waits for one token per incoming flow
+        // *within its own scope instance*, so two iterations of a subprocess
+        // (or two sibling scopes) never satisfy each other's joins.
+        let scope = self.scope;
         let arrived = |state: &InstanceState, flow: FlowIx| {
             state
                 .tokens
                 .iter()
                 .find(|(_, t)| {
                     t.node == node_ix
+                        && t.scope == scope
                         && matches!(t.wait, WaitKind::Join { arrived_via } if arrived_via == flow)
                 })
                 .map(|(id, _)| *id)
@@ -538,6 +654,7 @@ impl<'a> Advancer<'a> {
             token,
             Token {
                 node: node_ix,
+                scope: self.scope,
                 wait: WaitKind::Join { arrived_via: via },
             },
         );
@@ -587,7 +704,12 @@ impl<'a> Advancer<'a> {
     ) -> Result<(), StepError> {
         let f = self.proc.flow(flow);
         self.events.push(Event::FlowTaken { flow: f.id.clone() });
-        self.queue.push_back((token, f.target, Some(flow)));
+        self.queue.push_back(Move {
+            token,
+            node: f.target,
+            via: Some(flow),
+            scope: self.scope,
+        });
         Ok(())
     }
 
@@ -645,11 +767,18 @@ impl<'a> Advancer<'a> {
         token: TokenId,
         boundary: NodeIx,
     ) -> Result<(), StepError> {
-        if state.tokens.remove(&token).is_none() {
+        let Some(parked) = state.tokens.remove(&token) else {
             return Err(StepError::Invariant(format!(
                 "token {token:?} vanished before its boundary interrupt"
             )));
+        };
+        // Interrupting a subprocess kills everything inside it, recursively.
+        if let WaitKind::Scope(child) = parked.wait {
+            self.tear_down_scope(state, child);
+            state.scopes.remove(&child);
         }
+        // The boundary path continues in the host's own scope.
+        self.scope = parked.scope;
         self.cancel_attachments(state, token);
         self.element_started(boundary);
         self.element_completed(boundary);
@@ -736,18 +865,25 @@ impl<'a> Advancer<'a> {
         code: Option<String>,
     ) {
         self.cancel_attachments(state, token);
+        let scope = state
+            .tokens
+            .get(&token)
+            .map(|t| t.scope)
+            .unwrap_or(self.scope);
         state.tokens.insert(
             token,
             Token {
                 node: element,
+                scope,
                 wait: WaitKind::Incident,
             },
         );
-        for (queued, node, _via) in std::mem::take(&mut self.queue) {
+        for mv in std::mem::take(&mut self.queue) {
             state.tokens.insert(
-                queued,
+                mv.token,
                 Token {
-                    node,
+                    node: mv.node,
+                    scope: mv.scope,
                     wait: WaitKind::Incident,
                 },
             );
@@ -757,6 +893,92 @@ impl<'a> Advancer<'a> {
             element: self.proc.node_id(element).to_string(),
             code,
         });
+    }
+
+    /// A scope finishes when its last token is consumed. Completing it
+    /// emits the subprocess's `element-completed`, withdraws the boundary
+    /// timers armed on the parent token, and resumes that token on the
+    /// subprocess's outgoing flow — in the *parent* scope.
+    fn complete_scope_if_empty(
+        &mut self,
+        state: &mut InstanceState,
+        scope: ScopeId,
+    ) -> Result<(), StepError> {
+        if scope == ScopeId::ROOT || !self.scope_is_empty(state, scope) {
+            return Ok(());
+        }
+        self.complete_scope(state, scope)
+    }
+
+    /// No token of `scope` remains — neither parked nor still in flight.
+    /// The queue matters: a sibling branch mid-advance is not "gone".
+    fn scope_is_empty(&self, state: &InstanceState, scope: ScopeId) -> bool {
+        !state.tokens.values().any(|t| t.scope == scope)
+            && !self.queue.iter().any(|m| m.scope == scope)
+            // A nested scope still open means its parent token is parked
+            // here, so the parent scope is not empty either.
+            && !state.scopes.values().any(|s| s.parent == scope)
+    }
+
+    fn complete_scope(
+        &mut self,
+        state: &mut InstanceState,
+        scope: ScopeId,
+    ) -> Result<(), StepError> {
+        let Some(closed) = state.scopes.remove(&scope) else {
+            return Err(StepError::Invariant(format!(
+                "scope {scope:?} completed twice"
+            )));
+        };
+        // Cancellation before completion, matching the task path's order
+        // (work-item-completed, timer-cancelled, element-completed).
+        self.cancel_attachments(state, closed.token);
+        self.element_completed(closed.element);
+        if state.tokens.remove(&closed.token).is_none() {
+            return Err(StepError::Invariant(format!(
+                "scope {scope:?} had no parked parent token"
+            )));
+        }
+        // The parent continues in ITS scope, not the one that just closed.
+        self.scope = closed.parent;
+        self.leave_single(state, closed.token, closed.element)
+    }
+
+    /// Cancel everything inside `scope` and its nested scopes: queued moves,
+    /// parked tokens, open work items, armed timers and subscriptions. The
+    /// scope entry itself survives for the caller to complete or discard.
+    fn tear_down_scope(&mut self, state: &mut InstanceState, scope: ScopeId) {
+        let doomed = state.scope_subtree(scope);
+        self.queue.retain(|m| !doomed.contains(&m.scope));
+        let tokens: Vec<TokenId> = state
+            .tokens
+            .iter()
+            .filter(|(_, t)| doomed.contains(&t.scope))
+            .map(|(id, _)| *id)
+            .collect();
+        for token in &tokens {
+            let open: Vec<WorkItemId> = state
+                .work_items
+                .iter()
+                .filter(|(_, w)| w.open && w.token == *token)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in open {
+                let item = state.work_items.get_mut(&id).unwrap();
+                item.open = false;
+                self.events.push(Event::WorkItemCancelled {
+                    id,
+                    element: self.proc.node_id(item.element).to_string(),
+                });
+            }
+            self.withdraw_arms(state, Some(*token));
+            state.tokens.remove(token);
+        }
+        // Nested scopes are gone with their tokens; `scope` itself is the
+        // caller's to close.
+        state
+            .scopes
+            .retain(|id, _| *id == scope || !doomed.contains(id));
     }
 
     /// Withdraw every remaining timer/subscription attached to `token` —

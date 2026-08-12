@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<!-- Two levels of hierarchy — the Method-and-Style shape: each level is a
+     small diagram, decomposition goes down. Exercises scope chains: the
+     inner scope completes, resuming a token in the outer scope, which
+     completes and resumes a token at the root. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:subProcess id="outer" name="Handle order">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:startEvent id="s_outer">
+        <bpmn:outgoing>fo1</bpmn:outgoing>
+      </bpmn:startEvent>
+      <bpmn:subProcess id="inner" name="Check stock">
+        <bpmn:incoming>fo1</bpmn:incoming>
+        <bpmn:outgoing>fo2</bpmn:outgoing>
+        <bpmn:startEvent id="s_inner">
+          <bpmn:outgoing>fn1</bpmn:outgoing>
+        </bpmn:startEvent>
+        <bpmn:userTask id="count" name="Count items">
+          <bpmn:incoming>fn1</bpmn:incoming>
+          <bpmn:outgoing>fn2</bpmn:outgoing>
+        </bpmn:userTask>
+        <bpmn:endEvent id="e_inner">
+          <bpmn:incoming>fn2</bpmn:incoming>
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="fn1" sourceRef="s_inner" targetRef="count" />
+        <bpmn:sequenceFlow id="fn2" sourceRef="count" targetRef="e_inner" />
+      </bpmn:subProcess>
+      <bpmn:userTask id="ship" name="Ship">
+        <bpmn:incoming>fo2</bpmn:incoming>
+        <bpmn:outgoing>fo3</bpmn:outgoing>
+      </bpmn:userTask>
+      <bpmn:endEvent id="e_outer">
+        <bpmn:incoming>fo3</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="fo1" sourceRef="s_outer" targetRef="inner" />
+      <bpmn:sequenceFlow id="fo2" sourceRef="inner" targetRef="ship" />
+      <bpmn:sequenceFlow id="fo3" sourceRef="ship" targetRef="e_outer" />
+    </bpmn:subProcess>
+    <bpmn:endEvent id="end">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="outer" />
+    <bpmn:sequenceFlow id="f2" sourceRef="outer" targetRef="end" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_p">
+    <bpmndi:BPMNPlane id="BPMNPlane_p" bpmnElement="p">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="outer_di" bpmnElement="outer">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+        <dc:Bounds x="357" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="357" y="70" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_outer">
+    <bpmndi:BPMNPlane id="BPMNPlane_outer" bpmnElement="outer">
+      <bpmndi:BPMNShape id="s_outer_di" bpmnElement="s_outer">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="inner_di" bpmnElement="inner">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ship_di" bpmnElement="ship">
+        <dc:Bounds x="325" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="e_outer_di" bpmnElement="e_outer">
+        <dc:Bounds x="507" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="fo1_di" bpmnElement="fo1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fo2_di" bpmnElement="fo2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="325" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fo3_di" bpmnElement="fo3">
+        <di:waypoint x="425" y="70" />
+        <di:waypoint x="507" y="70" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_inner">
+    <bpmndi:BPMNPlane id="BPMNPlane_inner" bpmnElement="inner">
+      <bpmndi:BPMNShape id="s_inner_di" bpmnElement="s_inner">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="count_di" bpmnElement="count">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="e_inner_di" bpmnElement="e_inner">
+        <dc:Bounds x="357" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="fn1_di" bpmnElement="fn1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fn2_di" bpmnElement="fn2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="357" y="70" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

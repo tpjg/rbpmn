@@ -14,6 +14,20 @@ use std::collections::BTreeMap;
 
 pub type NodeIx = usize;
 pub type FlowIx = usize;
+/// Index into [`ExecutableProcess`]'s scope table. `0` is the process root;
+/// every embedded subprocess adds one. Static structure — the *runtime*
+/// scope instances a token lives in are `ScopeId`s in the instance state.
+pub type ScopeIx = usize;
+
+/// One static scope: the process body, or an embedded subprocess's body.
+#[derive(Debug, Clone)]
+pub struct ExecScope {
+    /// The subprocess node owning this scope (`None` for the root).
+    pub owner: Option<NodeIx>,
+    pub parent: Option<ScopeIx>,
+    /// The scope's single start event (`single-start-event` guarantees it).
+    pub start: NodeIx,
+}
 
 /// The per-definition wiring from the deployment manifest: element ->
 /// work-item topic, and message element -> correlation key (a FEEL qualified
@@ -138,6 +152,12 @@ pub enum ExecKind {
     /// Parks its token and arms every target catch event; the first to fire
     /// wins and the rest are cancelled.
     EventBasedGateway,
+    /// An embedded subprocess: entering allocates a runtime scope, spawns a
+    /// token at `scope`'s start event, and parks the parent token here until
+    /// that scope empties. Boundary events on it interrupt the whole scope.
+    SubProcess {
+        scope: ScopeIx,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +187,10 @@ pub struct ExecutableProcess {
     /// host node -> its interrupting timer boundary nodes, armed on the
     /// host's token whenever the host starts waiting.
     timer_boundaries: BTreeMap<NodeIx, Vec<NodeIx>>,
+    /// The static scope tree; index 0 is the process root.
+    scopes: Vec<ExecScope>,
+    /// Which scope each node lives in (indexed by `NodeIx`).
+    node_scope: Vec<ScopeIx>,
     start: NodeIx,
 }
 
@@ -295,10 +319,43 @@ impl ExecutableProcess {
             }
         };
 
-        let mut nodes = Vec::with_capacity(scope.nodes.len());
+        // Flatten the scope tree into one node/flow array, remembering which
+        // scope each node came from. Ids are unique across scopes (the
+        // linter enforces it), so one global id map still resolves flows.
+        let mut scope_bodies: Vec<&FlowScope> = vec![scope];
+        let mut exec_scopes: Vec<ExecScope> = vec![ExecScope {
+            owner: None,
+            parent: None,
+            start: 0, // resolved once nodes exist
+        }];
+        let mut flat: Vec<(ScopeIx, &FlowNode)> = Vec::new();
+        let mut child_scope: BTreeMap<NodeIx, ScopeIx> = BTreeMap::new();
+        let mut si = 0;
+        while si < scope_bodies.len() {
+            for node in &scope_bodies[si].nodes {
+                let flat_ix = flat.len();
+                flat.push((si, node));
+                if let NodeKind::SubProcess(sp) = &node.kind {
+                    if sp.triggered_by_event {
+                        return Err(not_yet(node, "event subprocesses arrive in v3"));
+                    }
+                    child_scope.insert(flat_ix, scope_bodies.len());
+                    exec_scopes.push(ExecScope {
+                        owner: Some(flat_ix),
+                        parent: Some(si),
+                        start: 0,
+                    });
+                    scope_bodies.push(&sp.body);
+                }
+            }
+            si += 1;
+        }
+
+        let mut nodes: Vec<ExecNode> = Vec::with_capacity(flat.len());
+        let mut node_scope: Vec<ScopeIx> = Vec::with_capacity(flat.len());
         let mut node_ix: BTreeMap<&str, NodeIx> = BTreeMap::new();
         let mut boundary_hosts: Vec<(NodeIx, String)> = Vec::new();
-        for (ix, node) in scope.nodes.iter().enumerate() {
+        for (ix, (owning_scope, node)) in flat.iter().enumerate() {
             let kind = match &node.kind {
                 NodeKind::Start(StartTrigger::None) => ExecKind::Start,
                 NodeKind::End(EndKind::None) => ExecKind::End,
@@ -383,9 +440,9 @@ impl ExecutableProcess {
                         )));
                     }
                 },
-                NodeKind::SubProcess(_) => {
-                    return Err(not_yet(node, "embedded subprocesses arrive in v2"));
-                }
+                NodeKind::SubProcess(_) => ExecKind::SubProcess {
+                    scope: child_scope[&ix],
+                },
                 other => {
                     return Err(CompileError::Internal(format!(
                         "unexpected {} '{}' survived lint",
@@ -395,6 +452,7 @@ impl ExecutableProcess {
                 }
             };
             node_ix.insert(node.id.as_str(), ix);
+            node_scope.push(*owning_scope);
             nodes.push(ExecNode {
                 id: node.id.clone(),
                 kind,
@@ -406,33 +464,38 @@ impl ExecutableProcess {
             return Err(CompileError::MissingCorrelation(missing_correlations));
         }
 
-        let mut flows = Vec::with_capacity(scope.flows.len());
-        for (fi, flow) in scope.flows.iter().enumerate() {
-            let source = *node_ix
-                .get(flow.source.as_str())
-                .ok_or_else(|| CompileError::Internal(format!("dangling flow '{}'", flow.id)))?;
-            let target = *node_ix
-                .get(flow.target.as_str())
-                .ok_or_else(|| CompileError::Internal(format!("dangling flow '{}'", flow.id)))?;
-            let cond = flow
-                .condition
-                .as_deref()
-                .map(condition::parse)
-                .transpose()
-                .map_err(|e| CompileError::Internal(format!("condition on '{}': {e}", flow.id)))?;
-            nodes[source].outgoing.push(fi);
-            nodes[target].incoming.push(fi);
-            flows.push(ExecFlow {
-                id: flow.id.clone(),
-                source,
-                target,
-                condition: cond,
-            });
+        let mut flows: Vec<ExecFlow> = Vec::new();
+        for body in &scope_bodies {
+            for flow in &body.flows {
+                let fi = flows.len();
+                let source = *node_ix.get(flow.source.as_str()).ok_or_else(|| {
+                    CompileError::Internal(format!("dangling flow '{}'", flow.id))
+                })?;
+                let target = *node_ix.get(flow.target.as_str()).ok_or_else(|| {
+                    CompileError::Internal(format!("dangling flow '{}'", flow.id))
+                })?;
+                let cond = flow
+                    .condition
+                    .as_deref()
+                    .map(condition::parse)
+                    .transpose()
+                    .map_err(|e| {
+                        CompileError::Internal(format!("condition on '{}': {e}", flow.id))
+                    })?;
+                nodes[source].outgoing.push(fi);
+                nodes[target].incoming.push(fi);
+                flows.push(ExecFlow {
+                    id: flow.id.clone(),
+                    source,
+                    target,
+                    condition: cond,
+                });
+            }
         }
 
         for node in &mut nodes {
             if let ExecKind::ExclusiveGateway { default_flow } = &mut node.kind {
-                let model_node = scope.nodes.iter().find(|n| n.id == node.id).unwrap();
+                let model_node = flat.iter().find(|(_, n)| n.id == node.id).unwrap().1;
                 if let NodeKind::ExclusiveGateway {
                     default_flow: Some(id),
                 } = &model_node.kind
@@ -450,21 +513,21 @@ impl ExecutableProcess {
             })?;
             match &nodes[boundary_ix].kind {
                 ExecKind::ErrorBoundary { code } => {
-                    // v1: errors originate from failing service tasks; a
-                    // boundary on anything else (subprocesses are v2) is not
-                    // executable yet.
+                    // Errors originate from failing service tasks, and
+                    // propagate outward to the nearest enclosing scope whose
+                    // subprocess carries a matching boundary — the scoped
+                    // error handler embedded subprocesses exist for.
                     if !matches!(
                         nodes[host].kind,
                         ExecKind::Task {
                             kind: WorkKind::Service,
                             ..
-                        }
+                        } | ExecKind::SubProcess { .. }
                     ) {
-                        return Err(CompileError::NotYetExecutable {
-                            element: nodes[boundary_ix].id.clone(),
-                            what: "error boundary event".to_string(),
-                            phase: "error boundaries on subprocesses arrive in v2",
-                        });
+                        return Err(CompileError::Internal(format!(
+                            "error boundary '{}' on unsupported host survived lint",
+                            nodes[boundary_ix].id
+                        )));
                     }
                     error_boundaries
                         .entry(host)
@@ -473,12 +536,13 @@ impl ExecutableProcess {
                 }
                 ExecKind::TimerBoundary { .. } => {
                     // Timer boundaries arm on any waiting host token: tasks
-                    // (work items) and receive tasks (subscriptions).
-                    // Subprocess hosts cannot reach here — a subprocess in
-                    // the model already failed compilation above.
+                    // (work items), receive tasks (subscriptions), and
+                    // subprocesses (the whole scope).
                     if !matches!(
                         nodes[host].kind,
-                        ExecKind::Task { .. } | ExecKind::MessageCatch { .. }
+                        ExecKind::Task { .. }
+                            | ExecKind::MessageCatch { .. }
+                            | ExecKind::SubProcess { .. }
                     ) {
                         return Err(CompileError::Internal(format!(
                             "timer boundary '{}' on unsupported host survived lint",
@@ -491,10 +555,15 @@ impl ExecutableProcess {
             }
         }
 
-        let start = nodes
-            .iter()
-            .position(|n| n.kind == ExecKind::Start)
-            .ok_or_else(|| CompileError::Internal("no start event".to_string()))?;
+        // Each scope has exactly one start event (`single-start-event`).
+        for (s, exec_scope) in exec_scopes.iter_mut().enumerate() {
+            exec_scope.start = nodes
+                .iter()
+                .enumerate()
+                .position(|(ix, n)| node_scope[ix] == s && n.kind == ExecKind::Start)
+                .ok_or_else(|| CompileError::Internal(format!("scope {s} has no start event")))?;
+        }
+        let start = exec_scopes[0].start;
 
         let ids = nodes
             .iter()
@@ -508,6 +577,8 @@ impl ExecutableProcess {
             ids,
             error_boundaries,
             timer_boundaries,
+            scopes: exec_scopes,
+            node_scope,
             start,
         })
     }
@@ -539,6 +610,15 @@ impl ExecutableProcess {
             .iter()
             .find(|(c, _)| c == code)
             .map(|(_, b)| *b)
+    }
+
+    /// The static scope a node lives in.
+    pub fn scope_of(&self, node: NodeIx) -> ScopeIx {
+        self.node_scope[node]
+    }
+
+    pub fn scope(&self, scope: ScopeIx) -> &ExecScope {
+        &self.scopes[scope]
     }
 
     /// The interrupting timer boundaries armed whenever `host` starts
