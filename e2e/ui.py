@@ -244,6 +244,15 @@ def check_condition_repair(page):
     pane = page.inner_text(".properties")
     check("branch conditions" in pane.lower(), "the gateway lists its branch conditions")
     check("default branch" in pane, "the default branch is shown as such, with no input")
+    for flow in ("f_fn", "f_arith", "f_range", "f_def"):
+        check(flow in pane, f"the gateway offers branch {flow}")
+
+    # Branch conditions make this pane tall; it must scroll in place rather
+    # than pushing the wiring and manifest panes out of reach.
+    overflows = page.evaluate(
+        "() => getComputedStyle(document.querySelector('.properties')).overflowY"
+    )
+    check(overflows in ("auto", "scroll"), f"the element pane scrolls on its own ({overflows})")
 
     # Repair one branch from the gateway and watch that error clear.
     before = page.locator(".diagnostic", has_text="conditions-feel-subset").count()
@@ -289,12 +298,7 @@ def check_served(browser):
         "RBPMN_API_TOKEN": demo.TOKEN,
         "RBPMN_TOPICS": "payments",
     }
-    server = subprocess.Popen(
-        ["cargo", "run", "-q", "-p", "rbpmn-server"],
-        cwd=REPO,
-        env=env,
-        stdout=subprocess.DEVNULL,
-    )
+    server = demo.start_server(env)
     proxy = None
     try:
         demo.wait_port(7420)

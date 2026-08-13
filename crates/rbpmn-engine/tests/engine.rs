@@ -2966,19 +2966,39 @@ async fn per_instance_order_is_id_not_stream_position() {
         .unwrap();
     held.commit().await.unwrap();
 
+    // Wait for every event this test asserts on, not merely the first to
+    // surface — which is the trap this very test documents, sprung on the
+    // test itself. H holds the *older* txid, so its events (the join and
+    // `instance-completed`) cross the safe horizon before ta's younger
+    // autocommit events do. Breaking the loop on `instance-completed` could
+    // therefore leave ta's completion still above the horizon: `mine` is
+    // non-empty, the emptiness check passes, and the lookup below fails with
+    // "no work-item-completed ta". Rare when the machine is quiet, reliable
+    // under a loaded cluster, because the horizon is cluster-wide and any
+    // concurrent transaction holds it back.
     let mut all = Vec::new();
     for _ in 0..100 {
         all = engine
             .read_events(rbpmn_engine::EventCursor::default(), 200)
             .await
             .unwrap();
-        if all.iter().any(|e| e.kind == "instance-completed") {
+        let mine: Vec<_> = all.iter().filter(|e| e.instance_id == started.id).collect();
+        let complete = mine.iter().any(|e| e.kind == "instance-completed")
+            && ["ta", "tb"].iter().all(|element| {
+                mine.iter().any(|e| {
+                    e.kind == "work-item-completed" && e.element_id.as_deref() == Some(*element)
+                })
+            });
+        if complete {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let mine: Vec<_> = all.iter().filter(|e| e.instance_id == started.id).collect();
-    assert!(!mine.is_empty());
+    assert!(
+        mine.len() >= 3,
+        "horizon never released this instance's events: {mine:?}"
+    );
 
     // Guarantee: ids ascend in semantic order — ta's completion precedes
     // tb's, which precedes the join and the instance completing.

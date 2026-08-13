@@ -165,6 +165,14 @@ body {
   padding: 8px 10px;
 }
 
+/* Same reasoning as the diagnostics list: a gateway with several branches
+   makes this pane tall, and everything below it — the wiring, the manifest —
+   would be pushed out of reach. Scroll it in place instead. */
+.properties {
+  max-height: 45vh;
+  overflow-y: auto;
+}
+
 .prop {
   display: block;
   margin-bottom: 10px;

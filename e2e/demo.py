@@ -93,6 +93,23 @@ def require_port_free(port):
     )
 
 
+def start_server(env, quiet=True):
+    """Build, then exec the binary directly — never through `cargo run`.
+
+    `cargo run` makes cargo the child process and the server its grandchild,
+    so terminating the handle kills cargo and orphans the server, which keeps
+    the port. Every "port already in use" in this repo's history traces back
+    to that.
+    """
+    subprocess.run(["cargo", "build", "-q", "-p", "rbpmn-server"], cwd=REPO, check=True)
+    return subprocess.Popen(
+        [str(REPO / "target/debug/rbpmn-server")],
+        cwd=REPO,
+        env=env,
+        stdout=subprocess.DEVNULL if quiet else None,
+    )
+
+
 class AuthInjectingProxy(http.server.BaseHTTPRequestHandler):
     """Forwards to rbpmn-server, adding the bearer the browser cannot send.
 
@@ -217,12 +234,7 @@ def main():
         "RBPMN_TOPICS": "payments",
     }
     print("building and starting rbpmn-server ...")
-    server = subprocess.Popen(
-        ["cargo", "run", "-q", "-p", "rbpmn-server"],
-        cwd=REPO,
-        env=env,
-        stdout=subprocess.DEVNULL,
-    )
+    server = start_server(env)
     try:
         wait_port(7420)
         print("creating a stuck instance ...")
