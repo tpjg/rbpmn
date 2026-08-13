@@ -1109,6 +1109,7 @@ question is purely internal.
 | Event-stream read horizon | Hold history for a registered slow consumer *beyond* the nominal retention age | Low | Roadmap — purely additive over the phase-7 floor; see phase 7 for why the age subsumes it otherwise |
 | `rbpmn_event` time partitioning | Turns retention into `DROP PARTITION` at very large scale | Medium | Roadmap — physical only, no contract change; see phase 7 |
 | Non-interrupting boundary events | "Every 30 days while this runs"; rides on scope machinery | Medium | v2 — held out of v1 so it does not double phase 6's risk |
+| Expression-valued timers | Deadlines from the variable document; standard `tFormalExpression`, no extension needed | Small | Roadmap, pairs with v2 — needs two rulings (deploy validation weakens; trace stability) |
 | Link events | Diagram hygiene once big models are common | Trivial | v2 |
 | Event subprocesses | "Cancel my order at any point" without boundary spaghetti | Medium | v3 |
 | Conditional events | Wake a token when the variable document satisfies a predicate | Moderate | v4 |
@@ -1152,6 +1153,70 @@ already enforces — one start, bounded ends, no flows crossing the boundary —
 so the linter and the style teach the same thing. An optional warn-level
 "method-and-style" lint pack, labeling conventions and end-state naming, stays
 on the table as cheap goodwill for modelers who learned from Silver.)*
+
+**Expression-valued timers (small; pairs with v2).** `timeDate`,
+`timeDuration` and `timeCycle` are typed `tExpression` in the BPMN XSD, not
+string literals — so reading a deadline from the variable document is
+*standard* BPMN, needing no vendor extension:
+
+```xml
+<bpmn:timeDuration xsi:type="bpmn:tFormalExpression">order.slaDuration</bpmn:timeDuration>
+```
+
+That is the same `tFormalExpression` mechanism `conditionExpression` already
+uses, evaluated by the same FEEL-subset evaluator against the same variable
+document, so the machinery is largely present. It pairs naturally with v2's
+non-interrupting boundaries: "remind every N days, where N comes from the
+contract" is the use case that makes both worth having. Today the spec is
+literal-only — validated as ISO-8601 by the linter, resolved against database
+time by the projection.
+
+*The failure mode is the whole design, and the naive version is worse than
+"never fires".* The projection resolves the spec by casting it in SQL
+(`clock_timestamp() + $6::interval`). Passing an unvalidated expression result
+into that means Postgres rejects the cast and **aborts the step transaction**:
+the token never leaves the *previous* wait state, its work item stays open,
+and the worker retries into the same failure forever — a poison pill
+surfacing as a generic 500. The other classic outcome, in engines that swallow
+the error instead, is a token parked at the catch event with no timer row and
+nothing that will ever wake it: silent, permanent, and invisible. Both are
+unacceptable here. The requirement is therefore: **resolve and validate inside
+the pure core, before any SQL**, and on failure raise it the way a service
+task failure is raised — an incident the instance freezes at, diagnosable by
+inspection, with a repair API's single resume point. Better still if it is
+*catchable* by an error boundary, so a modeller can handle "no SLA configured"
+in the diagram rather than in an operator's runbook.
+
+Two rulings to take before building it:
+
+1. **Deploy-time validation genuinely weakens, permanently.** Today a bad
+   timer spec cannot reach runtime — the compiler-validates-types property
+   this engine leans on. "Is `order.slaDuration` a valid ISO-8601 duration?"
+   is unknowable at deploy, because variables are one opaque JSONB document
+   with no declarations. This moves a class of error from deploy to runtime,
+   which is the trade the brief refuses elsewhere; it should be accepted
+   explicitly, not drift in with the feature.
+2. **`timer-armed`'s `Display` is stable API.** A trace presumably wants both
+   the source expression and the resolved instant — but the resolved instant
+   is input-dependent, which makes scenario fixtures depend on variable data
+   in a way they currently do not.
+
+*The lint becomes a warning, not an error* (Timo's call): a non-literal timer
+spec is valid BPMN, and the standalone linter also serves models targeting
+other engines, so erroring on it is wrong. The warning says what it can
+honestly say — *this deadline is computed at runtime; rbpmn cannot tell you
+ahead of time whether it will resolve to a valid duration, and if it does not,
+the instance raises an incident there.* **Ordering matters:** the warning ships
+*with* the runtime support, never before it. Relaxing the lint while the
+compile step still refuses expression timers would only move a clear rejection
+somewhere less clear, and relaxing both before the core can resolve them is
+exactly the "seems to run" this project refuses. Until then the existing
+`NotYetExecutable` phase pointer stands.
+
+One case no lint can catch, worth documenting when it lands: a *valid but
+nonsensical* value — a `timeDate` in the past, a negative duration — fires
+immediately. That may be exactly right ("the deadline already passed") or a
+bug, and nothing but the model's author can tell which.
 
 **v3 — Event subprocesses (cheap-ish).** Scope-attached event handlers with
 interrupting and non-interrupting starts. Reuses v2's scope/teardown machinery plus
