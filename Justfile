@@ -42,7 +42,11 @@ ui-test:
 
 # Write both documents to disk so they can be opened directly — the editor is
 # usable with no server at all, and this is how you check that.
-ui-dist:
+#
+# Depends on `ui` so what lands in ui/dist is built from the sources as they
+# are now. Writing the documents without rebuilding is how you end up
+# debugging a fix that was never in the file you opened.
+ui-dist: ui
     cargo run -p rbpmn-ui --example write-documents
 
 # Live demo: a real engine, a real instance frozen on an incident, and two

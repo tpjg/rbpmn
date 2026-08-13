@@ -140,6 +140,7 @@ export function renderProperties(container, modeler, element) {
           { hint: 'an exclusive split needs one, or conditions-feel-subset rejects it' }
         )
       );
+      renderBranchConditions(container, modeler, bo, outgoing);
     }
   }
 
@@ -149,6 +150,53 @@ export function renderProperties(container, modeler, element) {
 
   if (bo.$type === 'bpmn:ReceiveTask') {
     renderMessageRef(container, modeler, element, bo, 'messageRef');
+  }
+}
+
+/// Every branch condition, editable from the gateway.
+///
+/// A condition lives on the sequence flow, so strictly it is editable by
+/// selecting the flow. In practice a split with a broken grammar produces one
+/// `conditions-feel-subset` error per branch, and fixing them one selection
+/// at a time — on edges that are fiddly to click — is miserable. The gateway
+/// is where you are already looking, so the whole split is editable here.
+function renderBranchConditions(container, modeler, gateway, outgoing) {
+  const registry = modeler.get('elementRegistry');
+  const modeling = modeler.get('modeling');
+  const moddle = modeler.get('moddle');
+
+  container.append(el('div', 'prop-group', 'branch conditions'));
+  for (const flow of outgoing) {
+    const label = flow.name ? `${flow.id} — ${flow.name}` : flow.id;
+    const target = flow.targetRef?.id ? ` → ${flow.targetRef.id}` : '';
+
+    // The default branch is the one taken when nothing matched, so it
+    // must not carry a condition of its own. Showing a disabled note
+    // rather than an input keeps the editor from inviting a model the
+    // linter will reject.
+    if (gateway.default?.id === flow.id) {
+      const row = el('div', 'prop');
+      row.append(el('span', 'prop-label', `${label}${target}`));
+      row.append(el('span', 'prop-hint', 'default branch — taken when no condition matches'));
+      container.append(row);
+      continue;
+    }
+
+    const flowElement = registry.get(flow.id);
+    container.append(
+      textRow(
+        `${label}${target}`,
+        flow.conditionExpression?.body,
+        (body) => {
+          if (!flowElement) return;
+          const expression = body.trim()
+            ? moddle.create('bpmn:FormalExpression', { body: body.trim() })
+            : undefined;
+          modeling.updateProperties(flowElement, { conditionExpression: expression });
+        },
+        { placeholder: 'amount > 100' }
+      )
+    );
   }
 }
 

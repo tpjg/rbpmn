@@ -119,7 +119,9 @@ function buildLayout(root) {
   const side = el('aside', 'side');
 
   ui.diagnostics = el('ul', 'diagnostics');
-  side.append(pane('Diagnostics', ui.diagnostics));
+  const diagnosticsPane = pane('Diagnostics', ui.diagnostics);
+  ui.diagnosticsTitle = diagnosticsPane.querySelector('summary');
+  side.append(diagnosticsPane);
 
   ui.properties = el('div', 'properties');
   side.append(pane('Element', ui.properties));
@@ -240,8 +242,28 @@ function setVerdict(kind, text) {
   ui.verdict.textContent = text;
 }
 
+/// Show an element *and* select it, so the panes below follow.
+///
+/// `focus` only marks and scrolls (it is shared with the read-only
+/// inspector, which has nothing to select into). In an editor that is half
+/// the job: clicking a `conditions-feel-subset` diagnostic has to put the
+/// offending sequence flow in the Element pane, or the diagnostic tells you
+/// what is wrong and then gives you no way to fix it.
+function reveal(elementId) {
+  const element = modeler.get('elementRegistry').get(elementId);
+  if (!element) return;
+  focus(modeler, elementId);
+  modeler.get('selection').select(element);
+}
+
 function renderDiagnostics(diagnostics) {
   ui.diagnostics.replaceChildren();
+  const errors = diagnostics.filter((d) => d.severity === 'error').length;
+  const warnings = diagnostics.length - errors;
+  ui.diagnosticsTitle.textContent = diagnostics.length
+    ? `Diagnostics — ${errors} error${errors === 1 ? '' : 's'}` +
+      (warnings ? `, ${warnings} warning${warnings === 1 ? '' : 's'}` : '')
+    : 'Diagnostics';
   if (!diagnostics.length) {
     ui.diagnostics.append(el('li', 'empty', 'no diagnostics — the model and manifest agree'));
     return;
@@ -254,7 +276,7 @@ function renderDiagnostics(diagnostics) {
     item.append(head, el('div', 'message', d.message));
     if (d.element) {
       item.classList.add('clickable');
-      item.addEventListener('click', () => focus(modeler, d.element));
+      item.addEventListener('click', () => reveal(d.element));
     }
     ui.diagnostics.append(item);
   }

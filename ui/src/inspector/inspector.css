@@ -187,6 +187,10 @@ body {
   flex-direction: column;
   gap: 14px;
   min-width: 0;
+  /* Without this the column never scrolls. A grid item defaults to
+     `min-height: auto`, which refuses to shrink below its content, so the row
+     grows past the viewport and `overflow-y` never engages. */
+  min-height: 0;
 }
 
 .pane h2 {
@@ -282,6 +286,10 @@ body {
   padding-left: 20px;
   font-family: var(--mono);
   font-size: 12px;
+  /* A long-lived instance can carry hundreds of events; scroll them inside
+     their own pane rather than making the whole column enormous. */
+  max-height: 45vh;
+  overflow-y: auto;
 }
 
 .trace li {

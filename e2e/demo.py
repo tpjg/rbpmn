@@ -71,6 +71,28 @@ def wait_port(port, timeout=60):
     raise RuntimeError(f"port {port} never came up")
 
 
+def require_port_free(port):
+    """Refuse to run against somebody else's server.
+
+    Both this and the e2e recreate the demo schema before starting, so a
+    leftover server still bound to the port answers every call with a 500
+    against a database it no longer matches. `wait_port` cannot tell the
+    difference — it sees an open socket and proceeds — and the resulting
+    failure looks like a bug in the code under test rather than a stale
+    process.
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            pass
+    except OSError:
+        return
+    raise SystemExit(
+        f"port {port} is already in use — something is still running there.\n"
+        f"That is almost always a leftover rbpmn-server from an interrupted run:\n"
+        f"    kill $(lsof -ti :{port})"
+    )
+
+
 class AuthInjectingProxy(http.server.BaseHTTPRequestHandler):
     """Forwards to rbpmn-server, adding the bearer the browser cannot send.
 
@@ -180,6 +202,8 @@ def build_stuck_instance():
 def main():
     if psql("select 1").returncode != 0:
         sys.exit("no local Postgres on localhost — start one and retry")
+    require_port_free(7420)
+    require_port_free(PROXY_PORT)
     if psql(f"select 1 from pg_database where datname = '{DB}'").stdout.count("1 row") == 0:
         psql(f"create database {DB}")
     # A demo should start from nothing every time, or the second run inspects

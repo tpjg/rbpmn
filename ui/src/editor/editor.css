@@ -137,6 +137,10 @@ body {
   flex-direction: column;
   gap: 8px;
   min-width: 0;
+  /* Without this the column never scrolls. A grid item defaults to
+     `min-height: auto`, which refuses to shrink below its content, so the row
+     grows past the viewport and `overflow-y` never engages. */
+  min-height: 0;
 }
 
 .pane {
@@ -202,6 +206,17 @@ textarea.prop-input {
   margin-top: 2px;
 }
 
+.prop-group {
+  margin: 14px 0 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-soft);
+}
+
 .wiring-state {
   display: block;
   font-size: 11px;
@@ -257,6 +272,11 @@ textarea.prop-input {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  /* Capped on purpose rather than left to the column's own scrollbar: a
+     model with fifty condition errors would otherwise push the Element pane
+     — the thing you need in order to *fix* them — off the bottom. */
+  max-height: 38vh;
+  overflow-y: auto;
 }
 
 .diagnostic {

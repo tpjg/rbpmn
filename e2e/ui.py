@@ -107,6 +107,16 @@ def check_inspector(browser):
     side = page.inner_text(".side")
     check("o-4711" in side, "variables are shown")
 
+    # The detail column scrolls rather than growing past the viewport. Same
+    # grid `min-height: auto` trap as the editor's, and just as invisible
+    # until an instance carries a long trace or a big variable document.
+    page.evaluate("() => document.querySelectorAll('details').forEach(d => d.open = true)")
+    fits = page.evaluate(
+        "() => { const s = document.querySelector('.side');"
+        " return s.clientHeight <= window.innerHeight + 1 && s.scrollHeight >= s.clientHeight; }"
+    )
+    check(fits, "the detail column stays inside the viewport and scrolls")
+
     SHOTS.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(SHOTS / "ui_inspector.png"), full_page=False)
     check(not problems, f"no console errors or network requests: {problems}")
@@ -179,7 +189,76 @@ def check_editor(browser):
     SHOTS.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(SHOTS / "ui_editor.png"), full_page=False)
     check(not problems, f"no console errors or network requests: {problems}")
+    check_condition_repair(page)
     page.close()
+
+
+def check_condition_repair(page):
+    """The loop a modeler with a broken split actually walks.
+
+    A gateway whose branches use full FEEL produces one
+    `conditions-feel-subset` error per branch. Reading them is useless unless
+    clicking one puts the offending flow in the Element pane — `focus` alone
+    marks and scrolls without selecting, which left the diagnostics pointing
+    at something the panes never showed.
+    """
+    print("editor.html — repairing a broken split")
+    xml = page.locator("textarea.code").nth(1)
+    xml.fill(
+        (REPO / "crates/rbpmn-model/tests/fixtures/reject/condition-full-feel.bpmn").read_text()
+    )
+    page.wait_for_function(
+        "() => (document.querySelectorAll('.diagnostic .rule').length "
+        "&& [...document.querySelectorAll('.diagnostic .rule')]"
+        ".filter(r => r.textContent === 'conditions-feel-subset').length >= 3)",
+        timeout=15000,
+    )
+    check(True, "three broken branches report three condition errors")
+
+    # Long diagnostic lists must not bury the pane you fix them in.
+    overflows = page.evaluate(
+        "() => { const d = document.querySelector('.diagnostics');"
+        " return getComputedStyle(d).overflowY; }"
+    )
+    check(overflows in ("auto", "scroll"), f"the diagnostics list scrolls on its own ({overflows})")
+
+    # The side column itself must scroll rather than growing past the viewport
+    # (a grid item defaults to min-height:auto, which silently defeats
+    # overflow-y).
+    fits = page.evaluate(
+        "() => { const s = document.querySelector('.side');"
+        " return s.clientHeight <= window.innerHeight + 1; }"
+    )
+    check(fits, "the side column stays inside the viewport instead of growing")
+
+    # Click the first condition diagnostic: the flow must land in the pane,
+    # with an editable condition.
+    page.locator(".diagnostic", has_text="conditions-feel-subset").first.click()
+    pane = page.inner_text(".properties")
+    check("SequenceFlow" in pane, f"clicking a diagnostic selects the flow ({pane[:60]!r})")
+    check("condition" in pane, "the selected flow exposes its condition")
+
+    # And the gateway offers every branch at once, which is how you fix a
+    # split without hunting for edges.
+    page.click('.djs-element[data-element-id="xs"]')
+    pane = page.inner_text(".properties")
+    check("branch conditions" in pane.lower(), "the gateway lists its branch conditions")
+    check("default branch" in pane, "the default branch is shown as such, with no input")
+
+    # Repair one branch from the gateway and watch that error clear.
+    before = page.locator(".diagnostic", has_text="conditions-feel-subset").count()
+    field = page.locator(".properties input").filter(has_not_text="").nth(0)
+    boxes = page.locator(".properties .prop", has_text="f_fn").locator("input")
+    boxes.first.fill("amount > 100")
+    boxes.first.blur()
+    page.wait_for_function(
+        f"() => [...document.querySelectorAll('.diagnostic .rule')]"
+        f".filter(r => r.textContent === 'conditions-feel-subset').length < {before}",
+        timeout=15000,
+    )
+    check(True, "fixing a branch from the gateway clears its diagnostic")
+    _ = field
+    page.screenshot(path=str(SHOTS / "ui_editor_conditions.png"), full_page=False)
 
 
 def check_served(browser):
@@ -198,6 +277,8 @@ def check_served(browser):
         return
 
     print("served stack (real engine, auth-injecting proxy)")
+    demo.require_port_free(7420)
+    demo.require_port_free(demo.PROXY_PORT)
     if demo.psql(f"select 1 from pg_database where datname = '{demo.DB}'").stdout.count("1 row") == 0:
         demo.psql(f"create database {demo.DB}")
     demo.psql("drop schema public cascade; create schema public", db=demo.DB)
@@ -257,7 +338,11 @@ def check_served(browser):
         page.close()
     finally:
         if proxy:
+            # shutdown() only stops serve_forever; without server_close() the
+            # listening socket stays bound for the life of the process and the
+            # next run trips the port guard.
             proxy.shutdown()
+            proxy.server_close()
         server.terminate()
         try:
             server.wait(timeout=10)
