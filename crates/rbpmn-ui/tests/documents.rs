@@ -49,7 +49,9 @@ fn scripts(html: &str) -> Vec<(String, bool)> {
     out
 }
 
-fn assert_structure(html: &str, wasm: bool) {
+/// `wasm` and `fetches` are the two capabilities a document may hold; every
+/// other directive is identical for both, and locked.
+fn assert_structure(html: &str, wasm: bool, fetches: bool) {
     let found = scripts(html);
     assert_eq!(
         found.iter().filter(|(_, executable)| *executable).count(),
@@ -60,7 +62,6 @@ fn assert_structure(html: &str, wasm: bool) {
     let csp = extract_csp(html);
     for directive in [
         "default-src 'none'",
-        "connect-src 'none'",
         "base-uri 'none'",
         "form-action 'none'",
         "img-src data:",
@@ -75,6 +76,20 @@ fn assert_structure(html: &str, wasm: bool) {
         csp.contains("'wasm-unsafe-eval'"),
         wasm,
         "WebAssembly permission must be granted only where it is used: {csp}"
+    );
+    // Both directions matter. A document that never fetches must not be
+    // allowed to, and one that does must actually be able to: a policy that
+    // blocks the page's own feature is not stricter, it is broken — which is
+    // how the editor shipped with `connect-src 'none'` until a browser tried
+    // the button.
+    assert!(
+        csp.contains(if fetches {
+            "connect-src 'self'"
+        } else {
+            "connect-src 'none'"
+        }),
+        "wrong connect-src for a document that {} fetch: {csp}",
+        if fetches { "does" } else { "does not" }
     );
 
     // Every script the document carries is pinned by the policy it carries.
@@ -100,12 +115,12 @@ fn assert_structure(html: &str, wasm: bool) {
 
 #[test]
 fn inspector_document_structure() {
-    assert_structure(&render_inspection(&empty_inspection()), false);
+    assert_structure(&render_inspection(&empty_inspection()), false, false);
 }
 
 #[test]
 fn editor_document_structure() {
-    assert_structure(&render_editor(), true);
+    assert_structure(&render_editor(), true, true);
 }
 
 /// The editor carries no instance data — which is what lets it be mounted
@@ -174,7 +189,7 @@ fn hostile_data_cannot_escape_the_data_block() {
                 "hostile payload {hostile:?} left {forbidden:?} unescaped in the data block"
             );
         }
-        assert_structure(&html, false);
+        assert_structure(&html, false, false);
 
         // ... and the operator still sees the real value.
         let parsed = data_block(&html);
@@ -205,7 +220,7 @@ fn hostile_definition_key_cannot_break_the_title() {
         title.contains("&lt;/title&gt;"),
         "the real value is still shown: {title}"
     );
-    assert_structure(&html, false);
+    assert_structure(&html, false, false);
 }
 
 /// The whole value, unmodified — the round-trip that proves the escaping is

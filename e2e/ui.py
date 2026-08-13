@@ -16,11 +16,15 @@ Requires python3 with playwright; run via `just e2e-ui` (or e2e/run.py, which
 calls in here).
 """
 
+import http.server
 import os
+import subprocess
 import sys
+import threading
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 DIST = REPO / "ui" / "dist"
 SHOTS = Path(os.environ.get("RBPMN_SCREENSHOT_DIR", REPO / "e2e" / "screenshots"))
 
@@ -85,10 +89,19 @@ def check_inspector(browser):
     check("handler answered 502" in pane, "element pane shows the last failure")
 
     # An element the token never reached still shows its wiring — the reason
-    # the manifest travels with the inspection at all.
-    page.click('.djs-element[data-element-id="ut"]')
+    # the manifest travels with the inspection at all. `t_fix` is on the
+    # recovery path that was never taken, so no work item ever carried its
+    # topic and the manifest is the only source for it.
+    page.click('.djs-element[data-element-id="t_fix"]')
     pane = page.inner_text(".element-pane")
-    check("review-queue" in pane, "unreached element still shows its bound topic")
+    check("payment-recovery" in pane, "unreached element still shows its bound topic")
+
+    # The error boundary's code is the reason this instance froze rather than
+    # recovering, so the pane must show it.
+    page.click('.djs-element[data-element-id="be"]')
+    pane = page.inner_text(".element-pane")
+    check("PAYMENT_FAILED" in pane, "the boundary's error code is visible")
+    check("attached to" in pane and "st" in pane, "the boundary shows its host")
 
     # Variables render as a tree.
     side = page.inner_text(".side")
@@ -169,6 +182,89 @@ def check_editor(browser):
     page.close()
 
 
+def check_served(browser):
+    """The half `file://` cannot reach: a real server behind a real proxy.
+
+    The editor's environment call is same-origin, so it simply does not happen
+    from a file, and its CSP is never exercised there. That gap shipped a
+    `connect-src 'none'` editor whose own button was blocked by its own
+    policy, and a URL that resolved a path segment short — neither of which
+    any other test could see. Hence this.
+    """
+    import demo
+
+    if demo.psql("select 1").returncode != 0:
+        print("served stack: no local Postgres — skipping")
+        return
+
+    print("served stack (real engine, auth-injecting proxy)")
+    if demo.psql(f"select 1 from pg_database where datname = '{demo.DB}'").stdout.count("1 row") == 0:
+        demo.psql(f"create database {demo.DB}")
+    demo.psql("drop schema public cascade; create schema public", db=demo.DB)
+
+    env = {
+        **os.environ,
+        "RBPMN_DATABASE_URL": f"postgres://{os.environ.get('USER')}@localhost:5432/{demo.DB}",
+        "RBPMN_API_TOKEN": demo.TOKEN,
+        "RBPMN_TOPICS": "payments",
+    }
+    server = subprocess.Popen(
+        ["cargo", "run", "-q", "-p", "rbpmn-server"],
+        cwd=REPO,
+        env=env,
+        stdout=subprocess.DEVNULL,
+    )
+    proxy = None
+    try:
+        demo.wait_port(7420)
+        instance = demo.build_stuck_instance()
+        proxy = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", demo.PROXY_PORT), demo.AuthInjectingProxy
+        )
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        base = f"http://localhost:{demo.PROXY_PORT}"
+
+        page = browser.new_page()
+        problems: list[str] = []
+        page.on("pageerror", lambda e: problems.append(f"pageerror: {e}"))
+        page.on(
+            "console",
+            lambda m: problems.append(m.text) if m.type == "error" else None,
+        )
+
+        page.goto(f"{base}/ui/inspect/{instance}")
+        page.wait_for_selector(".djs-container", timeout=20000)
+        diagnosis = page.inner_text(".diagnosis")
+        check("Incident at st" in diagnosis, f"a real frozen instance diagnoses itself ({diagnosis[:60]!r})")
+        # Opens on the problem rather than an empty pane.
+        pane = page.inner_text(".element-pane")
+        check("ServiceTask" in pane and "payments" in pane, "the element pane opens on the incident")
+
+        # The editor's one call, under its real CSP, through a real mount
+        # prefix. Both spellings, because both serve the document.
+        for suffix in ("", "/"):
+            page.goto(f"{base}/ui/editor{suffix}")
+            page.wait_for_selector(".djs-container", timeout=20000)
+            page.click("text=Check against server")
+            page.wait_for_function(
+                "() => document.querySelector('.environment').textContent.includes('covered by the server')",
+                timeout=15000,
+            )
+            environment = page.inner_text(".environment")
+            check("payments" in environment, f"/ui/editor{suffix} reached its API and listed topics")
+
+        check(not problems, f"no console errors on the served pages: {problems}")
+        page.close()
+    finally:
+        if proxy:
+            proxy.shutdown()
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+
 def main():
     from playwright.sync_api import sync_playwright
 
@@ -181,6 +277,7 @@ def main():
         browser = p.chromium.launch()
         check_inspector(browser)
         check_editor(browser)
+        check_served(browser)
         browser.close()
 
     print()

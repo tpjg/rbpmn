@@ -11,32 +11,53 @@
 
 use sha2::{Digest, Sha256};
 
-/// `connect-src 'none'` is the guarantee worth stating: no fetch, no XHR, no
-/// WebSocket, no beacon. Together with every other fetch directive pinned to
-/// `'none'` or `data:`, a document containing business data cannot phone
-/// home.
+/// Each document gets the narrowest policy that lets it do its job, and the
+/// two jobs differ in exactly the ways that matter.
 ///
-/// `style-src 'unsafe-inline'` is deliberate and does not weaken that.
+/// **`connect-src`.** The inspector gets `'none'`: it holds business data and
+/// never fetches anything, so it provably cannot phone home — no fetch, no
+/// XHR, no WebSocket, no beacon. The editor gets `'self'`, because it has one
+/// legitimate call (the covered-topic set) and holds no instance data to
+/// leak. The document with the sensitive payload is the locked-down one,
+/// which is the right way round.
+///
+/// **`'wasm-unsafe-eval'`.** CSP3 requires it to compile WebAssembly. Only the
+/// editor runs the linter, so only the editor gets it.
+///
+/// **`style-src 'unsafe-inline'`** is deliberate and weakens neither.
 /// diagram-js styles elements at runtime, and CSS is not an exfiltration
-/// channel here: `url()` loads resolve under `img-src`/`font-src`, both of
-/// which are `data:`-only, so injected CSS has nowhere to send anything.
-/// Script execution — the thing that would matter — stays hash-pinned.
-fn policy(script_hashes: &[String], wasm: bool) -> String {
+/// channel here: `url()` loads resolve under `img-src`/`font-src`, both
+/// `data:`-only, so injected CSS has nowhere to send anything. Script
+/// execution — the part that would matter — stays hash-pinned.
+fn policy(script_hashes: &[String], capabilities: Capabilities) -> String {
     let mut script_src = script_hashes
         .iter()
         .map(|h| format!("'sha256-{h}'"))
         .collect::<Vec<_>>()
         .join(" ");
-    if wasm {
-        // CSP3 requires this for WebAssembly compilation. The inspector does
-        // not carry a validator and so does not get it.
+    if capabilities.wasm {
         script_src.push_str(" 'wasm-unsafe-eval'");
     }
+    let connect_src = if capabilities.same_origin_fetch {
+        "'self'"
+    } else {
+        "'none'"
+    };
     format!(
         "default-src 'none'; script-src {script_src}; style-src 'unsafe-inline'; \
-         img-src data:; font-src data:; connect-src 'none'; base-uri 'none'; \
+         img-src data:; font-src data:; connect-src {connect_src}; base-uri 'none'; \
          form-action 'none'"
     )
+}
+
+/// What a document is allowed to do beyond rendering itself. Both default to
+/// off, so a new document is locked down until someone states otherwise.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Capabilities {
+    /// Compile WebAssembly (the embedded linter).
+    pub wasm: bool,
+    /// Call back to the origin it was served from.
+    pub same_origin_fetch: bool,
 }
 
 pub(crate) fn sha256_base64(content: &str) -> String {
@@ -141,7 +162,7 @@ pub(crate) struct Document<'a> {
     pub js: &'a str,
     /// Serialized JSON, already escaped by [`escape_json_for_html`].
     pub data: Option<String>,
-    pub wasm: bool,
+    pub capabilities: Capabilities,
 }
 
 impl Document<'_> {
@@ -150,7 +171,7 @@ impl Document<'_> {
         if let Some(data) = &self.data {
             hashes.push(sha256_base64(data));
         }
-        let csp = policy(&hashes, self.wasm);
+        let csp = policy(&hashes, self.capabilities);
 
         let mut out = String::with_capacity(self.js.len() + self.css.len() + 4096);
         out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n");

@@ -9,9 +9,7 @@
 //! one needs a database. It is enough to see the layout, the diagnosis line
 //! and the manifest pane.
 
-use rbpmn_engine::{
-    Bindings, EventView, InstanceInspection, SubscriptionView, TimerView, TokenView, WorkItemView,
-};
+use rbpmn_engine::{Bindings, EventView, InstanceInspection, TokenView, WorkItemView};
 use std::path::PathBuf;
 
 fn main() -> std::io::Result<()> {
@@ -28,24 +26,42 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-/// A frozen instance: the case the inspector exists for.
+/// A frozen instance — the case the inspector exists for, and the same one
+/// `just demo` produces against a real engine: 'Charge card' kept answering
+/// 502 and raised `GATEWAY_TIMEOUT`, which the error boundary (listening for
+/// `PAYMENT_FAILED`) does not catch, so the retry budget ran out and the
+/// instance froze instead of taking the recovery path.
+///
+/// Kept in step with `e2e/demo.py` by hand. For the live version with a real
+/// engine and a clickable link, run `just demo`.
 fn sample() -> InstanceInspection {
     InstanceInspection {
         id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
             .parse()
             .expect("uuid"),
-        definition_key: "orders".to_string(),
-        status: "active".to_string(),
+        definition_key: "p".to_string(),
+        status: "failed".to_string(),
         variables: serde_json::json!({
-            "order": { "id": "o-4711", "total": 129.95, "currency": "EUR" },
-            "customer": { "tier": "gold" },
+            "order": {
+                "id": "o-4711",
+                "total": 129.95,
+                "currency": "EUR",
+                "lines": [
+                    { "sku": "RB-100", "qty": 2, "price": 49.95 },
+                    { "sku": "RB-205", "qty": 1, "price": 30.05 },
+                ],
+            },
+            "customer": { "id": "c-88", "tier": "gold", "email": "ada@example.com" },
+            "payment": { "method": "card", "last4": "4242", "attempts": 3 },
         }),
-        bpmn_xml: include_str!("../../rbpmn-model/tests/fixtures/accept/07-task-kinds.bpmn")
+        bpmn_xml: include_str!("../../rbpmn-model/tests/fixtures/accept/10-error-boundary.bpmn")
             .to_string(),
+        // `t_fix` is on the recovery path the token never took, so its queue
+        // is visible here and nowhere else — the manifest is not in the XML,
+        // and no work item was ever created to carry it.
         bindings: Bindings::new()
             .topic("st", "payments")
-            .topic("ut", "review-queue")
-            .correlation("rt", "order.id"),
+            .topic("t_fix", "payment-recovery"),
         tokens: vec![TokenView {
             element_id: "st".to_string(),
             wait_kind: "incident".to_string(),
@@ -61,18 +77,10 @@ fn sample() -> InstanceInspection {
             topic: "payments".to_string(),
             kind: "service".to_string(),
             retries: 0,
-            last_failure: "handler answered 502".to_string().into(),
+            last_failure: Some("handler answered 502 (Bad Gateway), attempt 3".to_string()),
         }],
-        timers: vec![TimerView {
-            element_id: "rt".to_string(),
-            due_spec: "P3D".to_string(),
-            due_at: "2026-08-16T09:00:00Z".to_string(),
-        }],
-        subscriptions: vec![SubscriptionView {
-            element_id: "rt".to_string(),
-            message_name: "ShipmentConfirmed".to_string(),
-            correlation_key: "o-4711".to_string(),
-        }],
+        timers: Vec::new(),
+        subscriptions: Vec::new(),
         events: vec![
             EventView {
                 kind: "instance-started".to_string(),
@@ -85,9 +93,25 @@ fn sample() -> InstanceInspection {
                 display: "work-item-created st (payments)".to_string(),
             },
             EventView {
+                kind: "work-item-retrying".to_string(),
+                element_id: Some("st".to_string()),
+                display: "work-item-retrying st (2 left) \u{2014} attempt 1".to_string(),
+            },
+            EventView {
+                kind: "work-item-retrying".to_string(),
+                element_id: Some("st".to_string()),
+                display: "work-item-retrying st (1 left) \u{2014} attempt 2".to_string(),
+            },
+            EventView {
                 kind: "work-item-failed".to_string(),
                 element_id: Some("st".to_string()),
-                display: "work-item-failed st — handler answered 502".to_string(),
+                display: "work-item-failed st GATEWAY_TIMEOUT".to_string(),
+            },
+            EventView {
+                kind: "incident-raised".to_string(),
+                element_id: Some("st".to_string()),
+                display: "incident-raised st \u{2014} no boundary matches GATEWAY_TIMEOUT"
+                    .to_string(),
             },
         ],
     }

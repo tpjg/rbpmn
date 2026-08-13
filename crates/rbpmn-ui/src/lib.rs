@@ -39,7 +39,7 @@ mod document;
 #[cfg(feature = "axum")]
 mod routes;
 
-use document::{Document, escape_json_for_html};
+use document::{Capabilities, Document, escape_json_for_html};
 use rbpmn_engine::InstanceInspection;
 
 #[cfg(feature = "axum")]
@@ -64,10 +64,12 @@ pub fn render_inspection(inspection: &InstanceInspection) -> String {
         css: INSPECTOR_CSS,
         js: INSPECTOR_JS,
         data: Some(escape_json_for_html(&json)),
-        // No validator in this document: it renders a model that already
-        // deployed, and half a megabyte of linter would be dead weight in a
-        // file that gets emailed around.
-        wasm: false,
+        // Nothing. No validator — it renders a model that already deployed,
+        // and half a megabyte of linter would be dead weight in a file that
+        // gets emailed around. And no network: this is the document holding
+        // business data, so `connect-src 'none'` makes "it cannot phone home"
+        // a property of the file rather than a promise about the code.
+        capabilities: Capabilities::default(),
     }
     .render()
 }
@@ -84,8 +86,15 @@ pub fn render_editor() -> String {
         css: EDITOR_CSS,
         js: EDITOR_JS,
         data: None,
-        // The editor runs the real linter, compiled to wasm32.
-        wasm: true,
+        capabilities: Capabilities {
+            // Runs the real linter, compiled to wasm32.
+            wasm: true,
+            // One call, to the origin it was served from: the covered-topic
+            // set for `unresolved-topic`. Affordable here precisely because
+            // this document holds no instance data — there is nothing in it
+            // that leaking a connection could disclose.
+            same_origin_fetch: true,
+        },
     }
     .render()
 }

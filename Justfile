@@ -45,6 +45,16 @@ ui-test:
 ui-dist:
     cargo run -p rbpmn-ui --example write-documents
 
+# Live demo: a real engine, a real instance frozen on an incident, and two
+# clickable links. Stays up until Ctrl-C. Needs a local Postgres.
+#
+# It runs a tiny auth-injecting reverse proxy in front, because that is the
+# documented posture: rbpmn's UI routes are behind the bearer, a browser
+# cannot send that on a navigation, and supplying it is the embedding
+# application's job.
+demo: ui
+    python3 e2e/demo.py
+
 # Browser checks for the two documents, driven from file://. The Rust tests
 # pin their structure and escaping; none of that notices a blank canvas, so
 # this opens the real files and drives them. Also the only place the CSP is

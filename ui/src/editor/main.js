@@ -393,8 +393,13 @@ function syncManifestBox() {
 
 function environmentUrl() {
   // Relative to this document, so the page never needs to know the prefix an
-  // application mounted it under.
-  return new URL('api/environment', document.baseURI).href;
+  // application mounted it under — but relative to it *as a directory*.
+  // Plain `new URL('api/…', baseURI)` resolves against the parent when the
+  // path has no trailing slash, so a document at /ui/editor asked for
+  // /ui/api/… and got a 404. Both spellings of the mount serve the document,
+  // so both have to resolve the same way.
+  const path = location.pathname.endsWith('/') ? location.pathname : `${location.pathname}/`;
+  return new URL(`${path}api/environment`, location.origin).href;
 }
 
 async function loadEnvironment() {

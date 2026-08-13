@@ -91,9 +91,16 @@ inclusive gateway, block structure, messages-only interaction, build order).
   rbpmn-{model,core,wasm}, so **touching a rule owes a `just ui`** or the
   document you serve carries a stale validator. Nothing checks that for you.
 - `just ui-test` — the UI's pure modules under node, no browser, no build
-  artifacts. `just e2e-ui` opens both documents in a real browser from
-  `file://` and drives them; it is the only place the CSP is actually
-  enforced, and the only thing that would notice a blank canvas.
+  artifacts. `just e2e-ui` drives both documents in a real browser: from
+  `file://`, and then — when Postgres is up — against a real server behind an
+  auth-injecting proxy. Both halves earn their keep. The CSP is only actually
+  enforced in a browser, and the served half is the only place the editor's
+  own fetch happens: it caught a `connect-src 'none'` policy that blocked the
+  editor's own button, and a URL that resolved one path segment short.
+- `just demo` — the same served stack, left running with two clickable links
+  and an instance deliberately frozen on an incident. The proxy is part of the
+  demonstration: UI routes are behind the bearer, browsers cannot send it on a
+  navigation, and supplying it is the embedding application's job.
 - `just tla` — TLA+ model checking of the concurrency protocol (`spec/`).
   Eleven configs; six are *expected* to fail, each matched against the
   specific violation it demonstrates (a spec that stops parsing must not read

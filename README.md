@@ -254,8 +254,27 @@ To use the rules in your own bpmn-io tooling:
 ## The editor and the inspector
 
 Two self-contained HTML documents — one stylesheet, one script, no
-subresources, no network. `just ui-dist` writes both to `ui/dist/`; open
-`editor.html` straight from disk and it works, which is the point.
+subresources. `just ui-dist` writes both to `ui/dist/`; open `editor.html`
+straight from disk and it works, which is the point.
+
+**To see them running for real: `just demo`.** It brings up Postgres and
+`rbpmn-server`, deploys a model, starts an instance, and drives it into an
+incident — `Charge card` kept answering 502 and raised `GATEWAY_TIMEOUT`,
+which the error boundary (listening for `PAYMENT_FAILED`) does not catch, so
+the retry budget ran out and the instance froze. Then it prints two links and
+waits:
+
+```
+inspector   http://localhost:8099/ui/inspect/<uuid>
+editor      http://localhost:8099/ui/editor
+```
+
+The proxy on 8099 is part of the demonstration, not scaffolding. rbpmn's UI
+routes sit behind the same bearer as `/v1`, and a browser cannot send that
+header on a top-level navigation — so the demo runs the smallest honest
+version of the embedding application: forty lines that add the header. A real
+one would authenticate the user first and decide whether they may see that
+instance at all.
 
 **The editor** authors a deployment, meaning the pair: the `.bpmn` and its
 bindings manifest. rbpmn keeps every runtime binding out of the XML, so a
@@ -317,7 +336,8 @@ just feel-parity      # FEEL subset differentialled against dsntk (own lockfile)
 just tla              # TLA+ model check of the locking + lease protocol
 just ui               # build the UI documents — run once after cloning
 just ui-test          # the UI's pure modules, no browser needed
-just e2e-ui           # drive both documents in a real browser, from file://
+just demo             # a real stuck instance + two clickable links
+just e2e-ui           # drive both documents in a real browser
 ```
 
 **Bootstrap:** `just ui` before the first `cargo build`, because the UI

@@ -248,8 +248,6 @@ async function main() {
   varsSection.append(traceWrap);
   side.append(varsSection);
 
-  renderElement(elementPane, data, viewer, null);
-
   try {
     const renderable = await ensureDi(data.bpmnXml);
     const { warnings } = await viewer.importXML(renderable);
@@ -275,6 +273,14 @@ async function main() {
   }
 
   renderDiagnosis(diagnosisBox, data, viewer);
+
+  // Open on the problem. Whoever followed a link here was sent because
+  // something is wrong with this instance, so making them hunt for the
+  // element the headline already names is a wasted click. Falls back to the
+  // empty pane when there is nothing to point at.
+  const { elementId } = diagnose(data);
+  renderElement(elementPane, data, viewer, elementId);
+  if (elementId) focus(viewer, elementId);
 }
 
 if (document.readyState === 'loading') {
