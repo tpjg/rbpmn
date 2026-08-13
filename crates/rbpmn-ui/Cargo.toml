@@ -1,0 +1,27 @@
+[package]
+name = "rbpmn-ui"
+description = "The two rbpmn UI documents: a read-only instance inspector rendered from an InstanceInspection, and the model+manifest editor. Self-contained HTML — no API, no credentials in the browser."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# For `InstanceInspection`. Anyone rendering an inspection already holds an
+# Engine to have produced one, so this costs the consumer nothing new.
+rbpmn-engine = { path = "../rbpmn-engine" }
+serde_json.workspace = true
+sha2 = "0.10"
+uuid = { version = "1", features = ["serde"] }
+axum = { version = "0.8", optional = true }
+tracing = { version = "0.1", optional = true }
+
+[features]
+default = ["axum"]
+# The routers. Turn this off (`default-features = false`) for the pure
+# renderer — a value in, a document out, no web framework involved.
+axum = ["dep:axum", "dep:tracing"]
+
+[dev-dependencies]
+rbpmn-engine = { path = "../rbpmn-engine", features = ["test-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

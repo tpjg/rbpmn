@@ -16,9 +16,11 @@ Read it before touching the semantics.
 | `crates/rbpmn-model` | BPMN XML → internal model + the linter + the FEEL-subset parser/evaluator. Dependency-light (no IO, no async, no DB) so it compiles to WASM for the linter playground and the bpmnlint plugin. |
 | `crates/rbpmn-core` | The pure semantic core: `compile` → executable model, tokens, and the `step` function. No IO — the Postgres layer projects it. |
 | `crates/rbpmn-engine` | The PostgreSQL projection: transactional stepping over the core (with `*_in_tx` variants sharing the caller's transaction — process transitions commit atomically with business writes), atomic idempotent deploys, the growing persistent environment, leases, retries with backoff, incidents. |
-| `crates/rbpmn-wasm` | Thin wasm-bindgen surface over rbpmn-model: `lint(xml) -> JSON`, `catalogue()`. |
+| `crates/rbpmn-wasm` | Thin wasm-bindgen surface: `lint(xml)` (model only), `check_deployable(xml, bindings)` (model **and** manifest — everything deploy decides without a database), `catalogue()`. |
 | `crates/rbpmn-server` | Small standalone HTTP server wrapping the engine. Bearer-token auth, loopback-only by default. See [docs/http-security.md](docs/http-security.md). |
+| `crates/rbpmn-ui` | The two UI documents as self-contained HTML: a read-only instance inspector (`render_inspection`, a pure function over an `InstanceInspection`) and the model+manifest editor. No API, no credentials in the browser. |
 | `playground/` | Local linter playground (bpmn-js + WASM): fixture browser, live re-lint, diagnostics as diagram overlays. `just playground`. |
+| `ui/` | Source for the two documents; `just ui` builds them into `crates/rbpmn-ui/assets/` (build output, gitignored — a one-time bootstrap after cloning). |
 | `bpmnlint-plugin-rbpmn/` | bpmnlint plugin backed by the same WASM — rbpmn's rules inside bpmn-io tooling, zero JS reimplementation. |
 
 v1 is phases 0–7: everything below plus **embedded subprocesses** (phase 6)
@@ -105,6 +107,26 @@ migration API, is listed with its status in the design brief's
       age) and definitions are never swept — the last only ever by hand, via
       `delete_definition`. Opt-in twice over: no sweeper unless you start one,
       and `RetentionPolicy::forever()` is a valid choice.
+- [x] Phase 8 — **authoring & inspection surfaces**. Two self-contained HTML
+      documents, neither of which is a cockpit. The **inspector** renders one
+      instance read-only, with its data inlined rather than fetched — so
+      there is no API to protect and the embedding application's
+      authorization check is the only gate. It fuses static model facts,
+      runtime rows and each element's slice of the trace, opens with a
+      *diagnosis* rather than a diagram ("Incident at `charge` — retry budget
+      exhausted — handler answered 502"), and shows the deployed **bindings
+      manifest**, which is the only place the wiring of an element the token
+      never reached can be recovered from. The **editor** authors the
+      model+manifest pair together: bpmn-js for the diagram, a hand-written
+      properties pane restricted to standard BPMN (no vendor providers, so
+      XML purity holds by construction), a wiring pane for the manifest, and
+      live L1+L2 validation from the same code deploy runs, compiled to
+      wasm32. Its one optional server call fetches the **covered topic set**
+      for `unresolved-topic` — a list of names, so the model never leaves the
+      browser. Each document carries its own CSP with `connect-src 'none'`:
+      it cannot phone home. See
+      [docs/http-security.md](docs/http-security.md) for what the embedding
+      application still owes its users.
 
 ## Rule catalogue
 
@@ -229,6 +251,60 @@ To use the rules in your own bpmn-io tooling:
 { "extends": ["bpmnlint:recommended", "plugin:rbpmn/recommended"] }
 ```
 
+## The editor and the inspector
+
+Two self-contained HTML documents — one stylesheet, one script, no
+subresources, no network. `just ui-dist` writes both to `ui/dist/`; open
+`editor.html` straight from disk and it works, which is the point.
+
+**The editor** authors a deployment, meaning the pair: the `.bpmn` and its
+bindings manifest. rbpmn keeps every runtime binding out of the XML, so a
+model on its own is half a deployment and no bpmn-io tool knows the other half
+exists. Open either file, edit the diagram and the wiring side by side, save
+both back to disk. Validation is live and is the engine's own code compiled to
+wasm32 — the linter (L1) *and* compile-against-manifest (L2), so a missing
+correlation binding is caught here rather than at deploy. The remaining check,
+`unresolved-topic`, needs a running environment: press **Check against
+server** and the editor fetches the covered topic **names** and does the
+comparison locally. Your model is never uploaded, so a confidential process
+can be validated against production.
+
+**The inspector** shows one instance, read-only, addressed by UUID. Its data
+is baked into the document rather than fetched, so it has no API to secure,
+works with the database unreachable, and can be attached to a support ticket.
+It opens with a diagnosis line, marks tokens and parked work on the diagram,
+and its element pane fuses the model, the deployed manifest and the runtime
+rows — including for elements the token has not reached, whose wiring exists
+nowhere else the reader can see.
+
+Finding *which* instance is the application's job: it called `start` and holds
+the mapping from its own order or ticket to the id it was given. There are
+deliberately no lists, no search and no buttons that change anything.
+
+Mount them in your own axum app behind your own middleware:
+
+```rust
+Router::new()
+    .nest("/bpmn-editor", rbpmn_ui::editor_router())
+    .merge(rbpmn_ui::editor_slash_redirect("/bpmn-editor"))
+    .nest("/bpmn-editor/api", rbpmn_ui::environment_router().with_state(engine.clone()))
+    .nest("/bpmn-inspector", rbpmn_ui::inspector_router().with_state(engine))
+    .layer(your_authentication)
+```
+
+Or skip the routers entirely — the primitive is a pure function, and an
+application that must redact something edits the value first:
+
+```rust
+let inspection = engine.inspect_instance(id).await?;
+let html = rbpmn_ui::render_inspection(&inspection);
+```
+
+**rbpmn authenticates nobody.** Read
+[docs/http-security.md](docs/http-security.md) before exposing either document
+to a human: the sandboxed iframe, `frame-ancestors` and never proxying `/v1`
+to a browser audience are all the application's job.
+
 ## Developing
 
 ```sh
@@ -239,7 +315,19 @@ just playground       # linter playground (builds WASM first)
 just parity           # Rust-vs-WASM byte parity + bpmnlint plugin test
 just feel-parity      # FEEL subset differentialled against dsntk (own lockfile)
 just tla              # TLA+ model check of the locking + lease protocol
+just ui               # build the UI documents — run once after cloning
+just ui-test          # the UI's pure modules, no browser needed
+just e2e-ui           # drive both documents in a real browser, from file://
 ```
+
+**Bootstrap:** `just ui` before the first `cargo build`, because the UI
+bundles are compile output and are gitignored like every other artifact here.
+`rbpmn-ui`'s build.rs says so if you forget. It needs node and wasm-pack —
+already prerequisites for `just playground` and `just parity`.
+
+The editor embeds the linter compiled from `rbpmn-model`/`rbpmn-core`, so
+changing a rule means running `just ui` again; otherwise the document you
+serve validates against yesterday's rules.
 
 ## HTTP server (optional)
 

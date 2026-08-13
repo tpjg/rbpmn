@@ -10,6 +10,11 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# rbpmn-core is as WASM-clean as rbpmn-model (rbpmn-model + serde + thiserror,
+# nothing else) and carries the compile-against-manifest check the editor
+# needs. Keeping it that way is now load-bearing for this crate too — see the
+# dsntk note in CLAUDE.md.
+rbpmn-core = { path = "../rbpmn-core" }
 rbpmn-model = { path = "../rbpmn-model" }
 wasm-bindgen = "0.2"
 serde_json.workspace = true

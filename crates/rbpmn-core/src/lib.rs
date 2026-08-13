@@ -18,12 +18,14 @@
 
 #![forbid(unsafe_code)]
 
+mod check;
 mod compile;
 mod event;
 mod merge_patch;
 mod state;
 mod step;
 
+pub use check::{Checked, DeployCheck, check_deployable};
 pub use compile::{
     Bindings, CompileError, ExecKind, ExecutableProcess, FlowIx, NodeIx, ScopeIx, TimerDue,
     WorkKind,

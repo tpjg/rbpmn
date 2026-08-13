@@ -225,6 +225,14 @@ type SharedState = Arc<AppState>;
 pub fn app(tokens: Tokens, engine: rbpmn_engine::Engine) -> Router {
     let state: SharedState = Arc::new(AppState { tokens });
 
+    // Built before the engine is moved into /v1's state. Behind the same
+    // bearer as everything else: a browser cannot send that header on a
+    // top-level navigation, which is the point — the standalone server stays
+    // browser-hostile, and an application that wants humans to reach these
+    // pages puts them behind its own auth (see docs/http-security.md).
+    #[cfg(feature = "ui")]
+    let ui = ui_routes(engine.clone(), state.clone());
+
     // Auth is structural, not conventional: the layer wraps the whole nested
     // /v1 router including its fallback, so any future /v1 route — and any
     // unknown /v1 path — hits require_bearer first. Unauthenticated callers
@@ -252,9 +260,14 @@ pub fn app(tokens: Tokens, engine: rbpmn_engine::Engine) -> Router {
         .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(state, require_bearer));
 
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
-        .nest("/v1", v1)
+        .nest("/v1", v1);
+
+    #[cfg(feature = "ui")]
+    let router = router.merge(ui);
+
+    router
         .layer(
             // ServiceBuilder: first layer is outermost. Sensitive-headers must
             // wrap TraceLayer so the Authorization value never reaches logs.
@@ -271,6 +284,28 @@ pub fn app(tokens: Tokens, engine: rbpmn_engine::Engine) -> Router {
                 .layer(PropagateRequestIdLayer::x_request_id()),
         )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+}
+
+/// The two UI documents, plus the one read the editor can make.
+///
+/// The editor's covered-topic endpoint is nested *under* the editor's own
+/// path on purpose: the page resolves it relative to where it was served, so
+/// mounting the pair together is what makes the prefix a non-question.
+#[cfg(feature = "ui")]
+fn ui_routes(engine: rbpmn_engine::Engine, state: SharedState) -> Router {
+    const EDITOR: &str = "/ui/editor";
+    Router::new()
+        .nest(EDITOR, rbpmn_ui::editor_router())
+        .merge(rbpmn_ui::editor_slash_redirect(EDITOR))
+        .nest(
+            &format!("{EDITOR}/{}", rbpmn_ui::EDITOR_API_PREFIX),
+            rbpmn_ui::environment_router().with_state(engine.clone()),
+        )
+        .nest(
+            "/ui/inspect",
+            rbpmn_ui::inspector_router().with_state(engine),
+        )
+        .layer(middleware::from_fn_with_state(state, require_bearer))
 }
 
 /// RFC 7235: the auth scheme is case-insensitive.

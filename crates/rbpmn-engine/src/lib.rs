@@ -464,7 +464,12 @@ impl Engine {
     /// Topics the environment covers right now: registered handlers plus
     /// declared topics from memory *and* the persisted set (so replicas see
     /// each other's API declarations without a restart).
-    pub(crate) async fn covered_topics(&self) -> Result<BTreeSet<String>, sqlx::Error> {
+    ///
+    /// Public because it is the whole of the `unresolved-topic` check that
+    /// needs a database: a caller holding this set and a compiled model's
+    /// `service_topics()` can reach deploy's verdict itself. That is what
+    /// lets the editor validate wiring without uploading the model.
+    pub async fn covered_topics(&self) -> Result<BTreeSet<String>, sqlx::Error> {
         let mut covered: BTreeSet<String> = {
             let env = self.inner.env.read().unwrap();
             env.handlers

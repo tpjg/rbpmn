@@ -426,6 +426,15 @@ fn engine_error(e: EngineError) -> Response {
                 "internal error".to_string(),
             )
         }
+        // Corrupt stored wiring is an operator problem, not a caller one, and
+        // the detail names internal structure — log it, answer generically.
+        EngineError::CorruptManifest { .. } => {
+            tracing::error!(error = %e, "stored bindings manifest is corrupt");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
+        }
         EngineError::ItemLeased(_) => (StatusCode::CONFLICT, e.to_string()),
         EngineError::TopicInUse { .. } => (StatusCode::CONFLICT, e.to_string()),
         EngineError::NoSubscription { .. } => (StatusCode::NOT_FOUND, e.to_string()),

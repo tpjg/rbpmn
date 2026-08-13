@@ -29,6 +29,29 @@ wasm:
 playground: wasm
     cd playground && npm install && npm run dev
 
+# Build the two UI documents into crates/rbpmn-ui/assets/. Build output, so
+# gitignored: run this once after cloning, and again after touching ui/ or the
+# linter crates the editor embeds. rbpmn-ui's build.rs says so if you forget.
+ui:
+    cd ui && npm install && npm run build
+
+# The UI's own unit tests: the pure modules (diagnosis, manifest parsing,
+# model facts, the L3 subtraction), no browser and no build artifacts needed.
+ui-test:
+    cd ui && npm install && npm test
+
+# Write both documents to disk so they can be opened directly — the editor is
+# usable with no server at all, and this is how you check that.
+ui-dist:
+    cargo run -p rbpmn-ui --example write-documents
+
+# Browser checks for the two documents, driven from file://. The Rust tests
+# pin their structure and escaping; none of that notices a blank canvas, so
+# this opens the real files and drives them. Also the only place the CSP is
+# enforced for real. Needs python3 + playwright.
+e2e-ui: ui-dist
+    python3 e2e/ui.py
+
 # The playground-never-lies check (Rust vs WASM byte parity) + the bpmnlint
 # plugin's corpus test. Run before releasing anything WASM-facing.
 parity: wasm

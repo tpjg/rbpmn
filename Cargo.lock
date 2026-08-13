@@ -1344,6 +1344,7 @@ dependencies = [
  "axum",
  "rbpmn-engine",
  "rbpmn-model",
+ "rbpmn-ui",
  "serde",
  "serde_json",
  "sha2",
@@ -1357,9 +1358,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rbpmn-ui"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "rbpmn-engine",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rbpmn-wasm"
 version = "0.1.0"
 dependencies = [
+ "rbpmn-core",
  "rbpmn-model",
  "serde_json",
  "wasm-bindgen",

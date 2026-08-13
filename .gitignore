@@ -8,6 +8,13 @@ playground/dist/
 playground/src/wasm/
 playground/src/fixtures.generated.js
 bpmnlint-plugin-rbpmn/wasm/
+# The UI bundles are compile output like every other artifact here — minified,
+# reproducible, edited by nobody. `just ui` builds them; rbpmn-ui's build.rs
+# says so out loud if you forgot.
+crates/rbpmn-ui/assets/
+ui/dist/
+ui/wasm/
+ui/src/generated/
 e2e/screenshots/
 __pycache__/
 # TLA+: fetched by `just tla`, plus TLC's scratch output.

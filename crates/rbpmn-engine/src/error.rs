@@ -76,6 +76,14 @@ pub enum EngineError {
     IncidentOpen(Uuid),
     #[error("instance {0} is still active; terminate it before deleting it")]
     InstanceStillActive(Uuid),
+    /// A stored bindings manifest no longer deserializes. Startup
+    /// re-validation refuses to boot on this, so reaching it means the row
+    /// was written by something other than `deploy`.
+    #[error("stored bindings manifest of definition '{definition_key}' is corrupt: {detail}")]
+    CorruptManifest {
+        definition_key: String,
+        detail: String,
+    },
     #[error("definition no longer compiles: {0}")]
     Compile(#[from] rbpmn_core::CompileError),
     #[error("semantic core rejected the step: {0}")]

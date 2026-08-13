@@ -2065,6 +2065,53 @@ async fn inspection_shows_timers_and_subscriptions() {
     db.drop().await;
 }
 
+/// The deployed wiring travels with the inspection. The runtime rows only
+/// ever reveal a topic for work items that were actually instantiated, and
+/// the manifest is deliberately absent from the XML — so without this the
+/// wiring of everything the token has not reached yet is unrecoverable from
+/// the view.
+#[tokio::test]
+async fn inspection_carries_the_bindings_manifest() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("payments").await.unwrap();
+    let bindings = Bindings::new()
+        .topic("st", "payments")
+        .topic("ut", "review-queue")
+        .correlation("rt", "order.id");
+    engine
+        .deploy(&fixture("accept/07-task-kinds.bpmn"), &bindings)
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({"order": {"id": "o-1"}}))
+        .await
+        .unwrap();
+
+    let view = engine.inspect_instance(started.id).await.unwrap();
+    assert_eq!(view.bindings, bindings);
+
+    // Only the service task has been reached, so the runtime rows account for
+    // exactly one element ...
+    let instantiated: Vec<&str> = view
+        .work_items
+        .iter()
+        .map(|w| w.element_id.as_str())
+        .collect();
+    assert_eq!(instantiated, vec!["st"]);
+    // ... while the still-unreached user task's queue and the receive task's
+    // correlation path exist nowhere else the view can see.
+    assert_eq!(
+        view.bindings.topics.get("ut").map(String::as_str),
+        Some("review-queue")
+    );
+    assert_eq!(
+        view.bindings.correlations.get("rt").map(String::as_str),
+        Some("order.id")
+    );
+    db.drop().await;
+}
+
 // ---------------------------------------------------------------------------
 // Phase 4: the pull-mode task API
 // ---------------------------------------------------------------------------

@@ -12,11 +12,18 @@ use uuid::Uuid;
 
 impl Engine {
     pub async fn deploy(&self, xml: &str, bindings: &Bindings) -> Result<Deployment, DeployError> {
-        let defs = rbpmn_model::parse(xml)?;
-        if defs.processes.len() != 1 {
-            return Err(DeployError::NotExactlyOneProcess(defs.processes.len()));
-        }
-        let key = defs.processes[0].id.clone();
+        // Parse, the one-process rule, lint and compile-against-manifest, all
+        // of it shared with the editor's WASM path (rbpmn_core::check) so the
+        // two surfaces can never reach different verdicts. Only the
+        // environment link below needs this process's registration state.
+        let checked = match rbpmn_core::check_deployable(xml, bindings) {
+            rbpmn_core::DeployCheck::Unparseable(e) => return Err(DeployError::Xml(e)),
+            rbpmn_core::DeployCheck::NotExactlyOneProcess(n) => {
+                return Err(DeployError::NotExactlyOneProcess(n));
+            }
+            rbpmn_core::DeployCheck::Checked(checked) => checked,
+        };
+        let key = checked.key.clone();
 
         // Manifest index declarations are validated up front (fail early,
         // before anything persists) and applied after the commit — a
@@ -26,68 +33,18 @@ impl Engine {
                 .map_err(|e| DeployError::InvalidManifest(e.to_string()))?;
         }
 
-        let diagnostics = rbpmn_model::lint(&defs);
-        if rbpmn_model::has_errors(&diagnostics) {
-            return Err(DeployError::Rejected(diagnostics));
+        if !checked.ok() {
+            return Err(DeployError::Rejected(checked.diagnostics));
         }
-        let warnings = diagnostics;
-
-        // Phase gating + condition/topic/correlation resolution — a
-        // definition that deploys is guaranteed executable and fully wired.
-        let proc = match ExecutableProcess::compile(&defs, &key, bindings) {
-            Ok(proc) => proc,
-            Err(rbpmn_core::CompileError::MissingCorrelation(elements)) => {
-                return Err(DeployError::Rejected(
-                    elements
-                        .iter()
-                        .map(|el| {
-                            Diagnostic::error(
-                                rule::MESSAGE_HAS_CORRELATION,
-                                el,
-                                "message element has no correlation binding — bind it \
-                                 with Bindings::correlation(element_id, feel_qualified_name)",
-                            )
-                        })
-                        .collect(),
-                ));
-            }
-            Err(rbpmn_core::CompileError::InvalidCorrelation { element, reason }) => {
-                return Err(DeployError::Rejected(vec![Diagnostic::error(
-                    rule::MESSAGE_HAS_CORRELATION,
-                    element,
-                    format!("correlation binding is not a FEEL qualified name: {reason}"),
-                )]));
-            }
-            Err(e) => {
-                return Err(DeployError::Rejected(vec![Diagnostic::error(
-                    rule::NO_UNSUPPORTED_ELEMENT,
-                    &key,
-                    e.to_string(),
-                )]));
-            }
-        };
 
         // The link step: every service-task topic must be covered by the
         // environment as registered *right now*.
         let covered = self.covered_topics().await?;
-        let gaps: Vec<Diagnostic> = proc
-            .service_topics()
-            .filter(|(_, topic)| !covered.contains(*topic))
-            .map(|(element, topic)| {
-                Diagnostic::error(
-                    rule::UNRESOLVED_TOPIC,
-                    element,
-                    format!(
-                        "topic '{topic}' has no registered handler and no declared \
-                         external-worker topic — register it before deploying \
-                         (the environment can grow at any time)"
-                    ),
-                )
-            })
-            .collect();
+        let gaps = checked.unresolved_topics(|topic| covered.contains(topic));
         if !gaps.is_empty() {
             return Err(DeployError::Rejected(gaps));
         }
+        let warnings = checked.diagnostics;
 
         let bindings_json = serde_json::to_value(bindings).expect("bindings serialize");
         let mut hasher = Sha256::new();

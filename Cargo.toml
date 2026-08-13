@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rbpmn-core", "crates/rbpmn-engine", "crates/rbpmn-model", "crates/rbpmn-server", "crates/rbpmn-wasm"]
+members = ["crates/rbpmn-core", "crates/rbpmn-engine", "crates/rbpmn-model", "crates/rbpmn-server", "crates/rbpmn-ui", "crates/rbpmn-wasm"]
 # feel-parity carries its own lockfile: dsntk pulls ~170 crates and a C
 # library, and none of that may reach the workspace. Run: `just feel-parity`.
 exclude = ["feel-parity"]

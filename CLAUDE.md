@@ -16,8 +16,20 @@ inclusive gateway, block structure, messages-only interaction, build order).
   is `tests/fixtures.rs`. Execution scenarios (golden event traces) live in
   `crates/rbpmn-core/tests/scenarios/*.json` — the `Display` format of
   `Event` is stable API, like rule IDs.
-- `rbpmn-model` stays dependency-light (no IO/async/DB) — it must compile to
-  WASM for the phase 0-B playground and the bpmnlint plugin.
+- `rbpmn-model` **and now `rbpmn-core`** stay dependency-light (no IO/async/DB)
+  — both must compile to wasm32. model powers the playground and the bpmnlint
+  plugin; core powers the editor's L2 check (`check_deployable`). This makes
+  the dsntk prohibition below apply to `rbpmn-core` too, which is a live
+  collision: the post-v1 business-rule task would naturally put DMN compile
+  support exactly there. Decide that before the spike, not during.
+- **One verdict, one implementation.** `rbpmn_core::check_deployable` is
+  everything `deploy` decides without a database (parse, one-process, lint,
+  compile-against-manifest, resolved topics); `Engine::deploy` calls it and
+  then does the environment link, and the editor calls it through WASM and
+  does the link against a fetched topic set. Don't grow a second copy of any
+  of those steps — `just parity` compares both WASM exports against native
+  over the whole corpus precisely so a surface cannot drift into reporting a
+  different verdict than deploy will.
 - The engine advances tokens inside the caller's DB transaction; wait states
   are the transaction boundaries. The pure `step` core (rbpmn-core) is
   IO-free and deterministic — keep it that way; time enters as command data
@@ -40,10 +52,21 @@ inclusive gateway, block structure, messages-only interaction, build order).
   missing row means *no override* — never `coalesce` the two; that was the
   bug. Durations are stored as bigint seconds, so "forever" is `None`, never
   a huge `Duration` (`as i64` wraps negative → a cutoff in the future).
-- dsntk must never become a dependency of `rbpmn-model`: its number crate
-  binds a C library (`dfp-number-sys`), which kills wasm32 and the whole
-  playground/bpmnlint chain. `feel-parity` is outside the workspace for this
-  reason.
+- dsntk must never become a dependency of `rbpmn-model` **or `rbpmn-core`**:
+  its number crate binds a C library (`dfp-number-sys`), which kills wasm32
+  and with it the playground, the bpmnlint plugin and the editor.
+  `feel-parity` is outside the workspace for this reason.
+- The UI documents inline business data into HTML, which makes **escaping our
+  problem** — one mistake ships to every embedder at once. The rule:
+  `escape_json_for_html` for the data block, `textContent` (never
+  `innerHTML`) everywhere in the JS. Escaping is not sanitization and rbpmn
+  does none: the inspector shows the whole variable document by design, and
+  who may see it is the application's call. The hostile-payload corpus is in
+  `crates/rbpmn-ui/tests/documents.rs`.
+- The inspector is **read-only, forever**. No retry, no cancel, no variable
+  edit, no migration, no lists, no search. Every one of those is a designed
+  API first; a UI is never the reason one ships early. The pressure to add a
+  button will come from the element pane — that is the spot to hold.
 
 ## Commands
 
@@ -56,8 +79,21 @@ inclusive gateway, block structure, messages-only interaction, build order).
 - `just playground` — linter playground (builds WASM, needs node + wasm-pack).
 - `just e2e` — browser end-to-end with screenshots into `e2e/screenshots/`
   (gitignored); runs the full inspection stack when Postgres is reachable.
-- `just parity` — MUST stay green: byte-parity of native Rust vs WASM lint
-  output over the corpus, plus the bpmnlint plugin's pipeline test.
+- `just parity` — MUST stay green: byte-parity of native Rust vs WASM over the
+  corpus for **both** exports (`lint` and `check_deployable`), plus the
+  bpmnlint plugin's pipeline test.
+- `just ui` — build the two UI documents into `crates/rbpmn-ui/assets/`.
+  **Bootstrap step: run it once after cloning**, or `cargo build` fails with a
+  build.rs message telling you to. The bundles are compile output and are
+  gitignored like every other artifact here (`playground/src/wasm/`,
+  `bpmnlint-plugin-rbpmn/wasm/`) — committing build results was tried and
+  reverted; don't reintroduce it. The editor embeds the linter compiled from
+  rbpmn-{model,core,wasm}, so **touching a rule owes a `just ui`** or the
+  document you serve carries a stale validator. Nothing checks that for you.
+- `just ui-test` — the UI's pure modules under node, no browser, no build
+  artifacts. `just e2e-ui` opens both documents in a real browser from
+  `file://` and drives them; it is the only place the CSP is actually
+  enforced, and the only thing that would notice a blank canvas.
 - `just tla` — TLA+ model checking of the concurrency protocol (`spec/`).
   Eleven configs; six are *expected* to fail, each matched against the
   specific violation it demonstrates (a spec that stops parsing must not read

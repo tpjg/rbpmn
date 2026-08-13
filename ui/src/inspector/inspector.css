@@ -1,0 +1,416 @@
+/* The inspector's own styling. Bundled into the document, so the CSP can
+   pin it by hash and the page needs no network at all. */
+
+:root {
+  --bg: #f7f7f8;
+  --panel: #ffffff;
+  --ink: #16181d;
+  --ink-soft: #5d6470;
+  --line: #dfe1e6;
+  --accent: #2b6cb0;
+  --error: #c0392b;
+  --error-bg: #fdecea;
+  --warn: #9a6700;
+  --warn-bg: #fff8e1;
+  --ok: #1f7a4d;
+  --ok-bg: #e8f6ee;
+  --info-bg: #eef2f8;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181d;
+    --panel: #1d2026;
+    --ink: #e7e9ee;
+    --ink-soft: #9aa2b1;
+    --line: #2e323b;
+    --accent: #6aa9e9;
+    --error: #ff8a80;
+    --error-bg: #3a1f1d;
+    --warn: #ffce7a;
+    --warn-bg: #38301b;
+    --ok: #7fd6a5;
+    --ok-bg: #1b3329;
+    --info-bg: #212734;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.layout {
+  display: grid;
+  grid-template-areas: "top top" "diag diag" "canvas side";
+  grid-template-rows: auto auto 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
+  height: 100vh;
+}
+
+.topbar {
+  grid-area: top;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.status {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--info-bg);
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+
+.status-active {
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+
+.status-failed {
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+.status-terminated {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.instance-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.diagnosis {
+  grid-area: diag;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--info-bg);
+}
+
+.diagnosis-error {
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+.diagnosis-warn {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.diagnosis-ok {
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+
+.diagnosis-text {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.diagnosis-detail {
+  color: inherit;
+  opacity: 0.85;
+  overflow-wrap: anywhere;
+}
+
+.canvas-wrap {
+  grid-area: canvas;
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+}
+
+.canvas {
+  position: absolute;
+  inset: 0;
+  background: var(--panel);
+}
+
+.canvas-note {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  max-width: calc(100% - 24px);
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: 12px;
+}
+
+.side {
+  grid-area: side;
+  overflow-y: auto;
+  border-left: 1px solid var(--line);
+  background: var(--panel);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+.pane h2 {
+  margin: 0 0 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);
+}
+
+.section {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+
+.section > summary {
+  cursor: pointer;
+  padding: 6px 10px;
+  font-weight: 600;
+  font-size: 12px;
+  background: var(--bg);
+  user-select: none;
+}
+
+.section-body {
+  padding: 8px 10px;
+}
+
+.element-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.element-type {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--info-bg);
+  color: var(--accent);
+}
+
+.element-id {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.element-name {
+  flex-basis: 100%;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.field {
+  display: grid;
+  grid-template-columns: minmax(90px, 38%) 1fr;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px dotted var(--line);
+}
+
+.field:last-child {
+  border-bottom: none;
+}
+
+.field-label {
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.field-value {
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.empty {
+  margin: 0;
+  color: var(--ink-soft);
+  font-style: italic;
+  font-size: 12px;
+}
+
+.trace {
+  margin: 0;
+  padding-left: 20px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.trace li {
+  padding: 1px 0;
+  overflow-wrap: anywhere;
+}
+
+.trace li.clickable {
+  cursor: pointer;
+}
+
+.trace li.clickable:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.json-children {
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
+  margin-left: 4px;
+}
+
+.json-branch > summary {
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.json-leaf {
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.json-key {
+  color: var(--ink-soft);
+}
+
+.json-string {
+  color: var(--ok);
+}
+
+.json-number,
+.json-boolean {
+  color: var(--accent);
+}
+
+.json-null {
+  color: var(--ink-soft);
+  font-style: italic;
+}
+
+.link {
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  border-radius: 5px;
+  padding: 3px 9px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  margin-left: auto;
+}
+
+.link:hover {
+  filter: brightness(1.15);
+}
+
+/* --- diagram markers, shared vocabulary with the playground overlay ------ */
+
+.rbpmn-badge {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  color: #fff;
+  font: 600 11px/18px system-ui, sans-serif;
+  text-align: center;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 35%);
+}
+
+.rbpmn-badge-token {
+  background: #2b6cb0;
+}
+
+.rbpmn-badge-work {
+  background: #6b46c1;
+}
+
+.rbpmn-badge-timer {
+  background: #b7791f;
+}
+
+.rbpmn-badge-message {
+  background: #2c7a7b;
+}
+
+.rbpmn-badge-error {
+  background: #c0392b;
+}
+
+.rbpmn-mark-token .djs-visual > :nth-child(1) {
+  stroke: #2b6cb0 !important;
+  stroke-width: 3px !important;
+}
+
+.rbpmn-mark-work .djs-visual > :nth-child(1) {
+  stroke: #6b46c1 !important;
+  stroke-width: 3px !important;
+}
+
+.rbpmn-mark-timer .djs-visual > :nth-child(1) {
+  stroke: #b7791f !important;
+  stroke-width: 3px !important;
+}
+
+.rbpmn-mark-message .djs-visual > :nth-child(1) {
+  stroke: #2c7a7b !important;
+  stroke-width: 3px !important;
+}
+
+.rbpmn-mark-error .djs-visual > :nth-child(1) {
+  stroke: #c0392b !important;
+  stroke-width: 3px !important;
+}
+
+.rbpmn-mark-selected .djs-visual > :nth-child(1) {
+  stroke: #d69e2e !important;
+  stroke-width: 4px !important;
+}

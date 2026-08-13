@@ -2,6 +2,7 @@
 //! debug view (phase-2 exit criterion) and any dashboard. Read-only.
 
 use crate::{Engine, EngineError};
+use rbpmn_core::Bindings;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -13,6 +14,12 @@ pub struct InstanceInspection {
     pub status: String,
     pub variables: serde_json::Value,
     pub bpmn_xml: String,
+    /// The wiring this instance's definition version was deployed with.
+    /// Without it the view can only reveal a topic for work items that were
+    /// actually instantiated, so an unreached service task shows nothing —
+    /// and since the manifest is deliberately absent from the XML, there is
+    /// nowhere else a reader could recover it from.
+    pub bindings: Bindings,
     pub tokens: Vec<TokenView>,
     pub scopes: Vec<ScopeView>,
     pub work_items: Vec<WorkItemView>,
@@ -99,13 +106,27 @@ impl Engine {
         id: Uuid,
     ) -> Result<InstanceInspection, EngineError> {
         let inst = sqlx::query(
-            "select i.definition_key, i.status, i.variables, d.bpmn_xml \
+            "select i.definition_key, i.status, i.variables, d.bpmn_xml, d.bindings \
              from rbpmn_instance i join rbpmn_definition d on d.id = i.definition_id where i.id = $1",
         )
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(EngineError::UnknownInstance(id))?;
+
+        let definition_key: String = inst.get("definition_key");
+        // Unparseable stored wiring is corruption, not drift: `deploy` wrote
+        // this from a `Bindings`, and `check_active_definitions` refuses to
+        // boot a replica whose stored manifests no longer deserialize. So it
+        // is raised rather than defaulted — a debug view that quietly reports
+        // "no wiring" would be worse than one that refuses. (The event
+        // fallback below is a different case: those payloads span versions.)
+        let bindings: Bindings = serde_json::from_value(inst.get("bindings")).map_err(|e| {
+            EngineError::CorruptManifest {
+                definition_key: definition_key.clone(),
+                detail: e.to_string(),
+            }
+        })?;
 
         let tokens = sqlx::query(
             "select element_id, wait_kind, scope_no from rbpmn_token \
@@ -213,10 +234,11 @@ impl Engine {
 
         Ok(InstanceInspection {
             id,
-            definition_key: inst.get("definition_key"),
+            definition_key,
             status: inst.get("status"),
             variables: inst.get("variables"),
             bpmn_xml: inst.get("bpmn_xml"),
+            bindings,
             tokens,
             scopes,
             work_items,

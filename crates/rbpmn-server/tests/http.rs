@@ -728,3 +728,172 @@ async fn event_stream_over_http() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// The UI documents (feature `ui`)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ui")]
+mod ui {
+    use super::*;
+
+    async fn body_text(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn authed_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// The documents sit behind the same bearer as everything else. A browser
+    /// cannot set that header on a navigation, which is deliberate: reaching
+    /// these pages goes through an application that authenticated somebody.
+    #[tokio::test]
+    async fn ui_routes_require_the_bearer() {
+        let (app, db) = test_app().await;
+        for uri in [
+            "/ui/editor",
+            "/ui/editor/api/environment",
+            "/ui/inspect/00000000-0000-0000-0000-000000000000",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri} was reachable"
+            );
+        }
+        db.drop().await;
+    }
+
+    /// Both spellings of the mount serve the document, because the editor
+    /// resolves its API call relative to its own location and a user who
+    /// omitted the slash should not get a 404.
+    #[tokio::test]
+    async fn editor_is_served_with_or_without_the_trailing_slash() {
+        let (app, db) = test_app().await;
+        for uri in ["/ui/editor", "/ui/editor/"] {
+            let resp = app.clone().oneshot(authed_get(uri)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "text/html; charset=utf-8"
+            );
+            assert_eq!(
+                resp.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store, max-age=0"
+            );
+            assert_eq!(
+                resp.headers().get("x-content-type-options").unwrap(),
+                "nosniff"
+            );
+            let html = body_text(resp).await;
+            assert!(html.starts_with("<!doctype html>"));
+            assert!(html.contains("Content-Security-Policy"));
+        }
+        db.drop().await;
+    }
+
+    /// L3: a list of topic names, not a validation endpoint. The editor does
+    /// the subtraction itself, so the model never leaves the browser.
+    #[tokio::test]
+    async fn environment_returns_the_covered_topic_set() {
+        let (app, db) = test_app().await;
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                "/v1/topics",
+                serde_json::json!({ "name": "payments" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/ui/editor/api/environment"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["topics"], serde_json::json!(["payments"]));
+        db.drop().await;
+    }
+
+    /// The whole chain: deploy, start, render. The document must actually
+    /// carry this instance's state — that is the difference between a page
+    /// and a debug tool.
+    #[tokio::test]
+    async fn inspector_renders_a_real_instance() {
+        let (app, db) = test_app().await;
+        app.clone()
+            .oneshot(authed(
+                "POST",
+                "/v1/definitions",
+                serde_json::json!({ "bpmn": MINIMAL_XML }),
+            ))
+            .await
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                "/v1/instances",
+                serde_json::json!({ "definitionKey": "p", "variables": { "orderId": 42 } }),
+            ))
+            .await
+            .unwrap();
+        let instance_id = body_json(resp).await["instanceId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(authed_get(&format!("/ui/inspect/{instance_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = body_text(resp).await;
+
+        // The data block is the document's whole payload; parse it back and
+        // check it is this instance rather than merely "some HTML".
+        let start = html.find("id=\"rbpmn-data\">").unwrap() + "id=\"rbpmn-data\">".len();
+        let end = start + html[start..].find("</script>").unwrap();
+        let data: serde_json::Value = serde_json::from_str(&html[start..end]).unwrap();
+        assert_eq!(data["id"], instance_id);
+        assert_eq!(data["status"], "active");
+        assert_eq!(data["tokens"][0]["elementId"], "review");
+        assert_eq!(data["variables"]["orderId"], 42);
+        // The manifest travels with it, even when empty.
+        assert!(data["bindings"].is_object());
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_instance_is_a_404_not_a_blank_page() {
+        let (app, db) = test_app().await;
+        let resp = app
+            .clone()
+            .oneshot(authed_get(
+                "/ui/inspect/00000000-0000-0000-0000-000000000000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        db.drop().await;
+    }
+}

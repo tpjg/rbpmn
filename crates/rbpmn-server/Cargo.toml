@@ -6,9 +6,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["ui"]
+# The two UI documents. Opt-out rather than opt-in because they are static
+# and behind the same bearer as everything else; turn it off to drop ~2 MiB
+# of embedded assets from the binary.
+ui = ["dep:rbpmn-ui"]
+
 [dependencies]
 rbpmn-model = { path = "../rbpmn-model" }
 rbpmn-engine = { path = "../rbpmn-engine", features = ["http"] }
+rbpmn-ui = { path = "../rbpmn-ui", optional = true }
 uuid = { version = "1", features = ["serde"] }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
