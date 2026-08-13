@@ -133,3 +133,18 @@ test('an empty covered set is a checked environment, not an unchecked one', () =
   assert.equal(wiringState('payments', []), 'missing');
   assert.equal(environmentGaps({ topics: { st: 'payments' } }, []).length, 1);
 });
+
+// The failure this message has to survive: a modeler binds a topic to a
+// plausible name of their own invention, the diagnostic re-renders reading
+// almost identically, and it looks like the editor never re-checked.
+test('an unresolved topic names what the server does cover', () => {
+  const gaps = environmentGaps({ topics: { st: 'ApplyPenaltiesSvc' } }, ['payments', 'shipping']);
+  assert.equal(gaps.length, 1);
+  assert.match(gaps[0].message, /ApplyPenaltiesSvc/);
+  assert.match(gaps[0].message, /payments, shipping/);
+});
+
+test('an environment covering nothing says so rather than listing nothing', () => {
+  const gaps = environmentGaps({ topics: { st: 'anything' } }, []);
+  assert.match(gaps[0].message, /no topics at all/);
+});

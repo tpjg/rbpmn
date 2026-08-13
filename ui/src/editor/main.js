@@ -27,6 +27,7 @@ import {
 import { checkModel, initValidator } from './validate.js';
 import { environmentGaps, wiringState } from './environment.js';
 import { download, manifestNameFor, openFile } from './files.js';
+import { onThemeChange, rendererColors } from '../shared/theme.js';
 
 /// A *deployable* starting point, not the usual lone start event.
 ///
@@ -155,6 +156,39 @@ function pane(title, body, extra, { open = true } = {}) {
   if (extra) inner.append(extra);
   wrap.append(inner);
   return wrap;
+}
+
+/// The listeners a fresh Modeler needs. Extracted because a theme flip has to
+/// rebuild the modeler — renderer colours are construction-time — and a
+/// rebuilt one with no listeners is an editor whose panes never update again.
+function wireModeler() {
+  modeler.on('selection.changed', ({ newSelection }) => {
+    state.selection = newSelection.length === 1 ? newSelection[0] : null;
+    renderProperties(ui.properties, modeler, state.selection);
+    renderWiring();
+  });
+  modeler.on('commandStack.changed', () => {
+    renderProperties(ui.properties, modeler, state.selection);
+    scheduleCheck();
+  });
+}
+
+/// Rebuild the modeler for the new theme, keeping the work.
+///
+/// The model survives (re-imported), the manifest survives (it lives in
+/// `state`); the undo history does not, which is the price of a diagram you
+/// can still read. This fires when the OS flips at sunset, not on a keystroke.
+async function remountForTheme() {
+  let xml;
+  try {
+    ({ xml } = await modeler.saveXML({ format: true }));
+  } catch {
+    return;
+  }
+  modeler.destroy();
+  modeler = new Modeler({ container: ui.canvas, bpmnRenderer: rendererColors() });
+  wireModeler();
+  await importXml(xml);
 }
 
 // ---------------------------------------------------------------- validation
@@ -326,7 +360,8 @@ function renderWiring() {
         syncManifestBox();
         scheduleCheck();
       },
-      'empty means the default: the topic is the element id'
+      'empty means the default: the topic is the element id',
+      state.covered ?? []
     );
     const status = wiringState(effective, state.covered);
     row.append(
@@ -337,7 +372,8 @@ function renderWiring() {
           ? 'unknown to this editor — no server checked'
           : status === 'covered'
             ? `covered by the server as '${effective}'`
-            : `no handler or declared topic named '${effective}'`
+            : `no handler or declared topic named '${effective}' — the server covers: ` +
+              `${state.covered.join(', ') || 'nothing'}`
       )
     );
     ui.wiring.append(row);
@@ -361,12 +397,32 @@ function renderWiring() {
   renderIndexes();
 }
 
-function bindingRow(label, value, placeholder, commit, hint) {
+function bindingRow(label, value, placeholder, commit, hint, options) {
   const row = el('div', 'prop');
   row.append(el('span', 'prop-label', label));
   const input = el('input', 'prop-input');
   input.value = value;
   input.placeholder = placeholder;
+  // The covered set is the list of names that can possibly work, and the
+  // editor has it. Offering it turns "invent a topic and wonder why the
+  // error stayed" into a pick from what exists.
+  if (options?.length) {
+    const listId = 'rbpmn-covered-topics';
+    let list = document.getElementById(listId);
+    if (!list) {
+      list = el('datalist');
+      list.id = listId;
+      document.body.append(list);
+    }
+    list.replaceChildren(
+      ...options.map((option) => {
+        const node = el('option');
+        node.value = option;
+        return node;
+      })
+    );
+    input.setAttribute('list', listId);
+  }
   const fire = () => {
     if (value !== input.value) commit(input.value);
   };
@@ -555,17 +611,9 @@ async function main() {
   buildLayout(root);
   renderEnvironment(null, null);
 
-  modeler = new Modeler({ container: ui.canvas });
+  modeler = new Modeler({ container: ui.canvas, bpmnRenderer: rendererColors() });
+  wireModeler();
 
-  modeler.on('selection.changed', ({ newSelection }) => {
-    state.selection = newSelection.length === 1 ? newSelection[0] : null;
-    renderProperties(ui.properties, modeler, state.selection);
-    renderWiring();
-  });
-  modeler.on('commandStack.changed', () => {
-    renderProperties(ui.properties, modeler, state.selection);
-    scheduleCheck();
-  });
 
   ui.manifestText.addEventListener('input', () => {
     try {
@@ -585,6 +633,8 @@ async function main() {
     clearTimeout(xmlTimer);
     xmlTimer = setTimeout(() => importXml(ui.xmlText.value), 400);
   });
+
+  onThemeChange(remountForTheme);
 
   await initValidator();
   syncManifestBox();

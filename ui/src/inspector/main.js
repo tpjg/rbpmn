@@ -17,6 +17,7 @@ import { ensureDi } from '../shared/layout.js';
 import { clear, el, field, jsonTree, section } from '../shared/dom.js';
 import { describeElement } from '../shared/model-facts.js';
 import { diagnose } from './diagnosis.js';
+import { onThemeChange, rendererColors } from '../shared/theme.js';
 
 /// One trace line. `display` is the golden-trace format and therefore stable
 /// API, so a reason that may still be reworded lives in `detail` instead —
@@ -226,7 +227,13 @@ async function main() {
   const root = document.getElementById('rbpmn-root');
   const { canvas, canvasNote, diagnosisBox, side } = build(root, data);
 
-  const viewer = new NavigatedViewer({ container: canvas });
+  const viewer = new NavigatedViewer({ container: canvas, bpmnRenderer: rendererColors() });
+
+  // Renderer colours are fixed at construction, so a theme flip needs a fresh
+  // render. Reloading is the honest way to get one here: this document is
+  // read-only and carries its own data, so there is nothing to lose — no
+  // edits, no undo stack, no unsaved anything.
+  onThemeChange(() => location.reload());
 
   const elementPane = el('div', 'element-pane');
   const paneSection = el('section', 'pane');

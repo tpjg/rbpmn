@@ -21,9 +21,18 @@ export function environmentGaps(verdict, covered) {
       rule: 'unresolved-topic',
       element,
       severity: 'error',
+      // Naming what *is* covered, because the failure this message has to
+      // survive is a modeler binding a topic to a plausible name of their own
+      // invention. Then the diagnostic re-renders reading almost identically
+      // — only the quoted name changed — and looks like the editor simply did
+      // not re-check. Deploy's wording cannot help here; it does not know the
+      // set. This does.
       message:
-        `topic '${topic}' has no registered handler and no declared ` +
-        `external-worker topic on the server you checked against`,
+        `topic '${topic}' is not covered by the server you checked against. ` +
+        (covered.length
+          ? `It declares: ${covered.join(', ')}. Bind this task to one of those, ` +
+            `or declare '${topic}' on the server.`
+          : 'It declares no topics at all, and has no registered handlers.'),
     }));
 }
 

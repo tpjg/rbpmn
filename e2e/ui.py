@@ -272,6 +272,46 @@ def check_condition_repair(page):
     page.screenshot(path=str(SHOTS / "ui_editor_conditions.png"), full_page=False)
 
 
+def check_dark_mode(browser):
+    """Legible on a dark desktop.
+
+    bpmn-js paints strokes, label text and arrowhead markers from options
+    given at construction, as SVG attributes — CSS cannot reach them. So a
+    dark canvas kept black labels and black arrows and the diagram became
+    unreadable in place, which is exactly what happens when a laptop switches
+    theme at sunset with the document open.
+    """
+    print("dark mode")
+    for name in ("inspector", "editor"):
+        page = browser.new_page(color_scheme="dark")
+        problems = collect_problems(page)
+        page.goto((DIST / f"{name}.html").as_uri())
+        page.wait_for_selector(".djs-container", timeout=20000)
+        page.wait_for_timeout(1500)
+
+        # The stroke a shape was actually painted with, not what CSS wishes.
+        stroke = page.evaluate(
+            "() => { const v = document.querySelector('.djs-visual > :not(text)');"
+            " return v && (v.getAttribute('stroke') || getComputedStyle(v).stroke); }"
+        )
+        check(
+            stroke is not None and stroke.lower() not in ("#000", "#000000", "black", "rgb(0, 0, 0)"),
+            f"{name}: shapes are not painted black on dark ({stroke})",
+        )
+        label = page.evaluate(
+            "() => { const t = document.querySelector('.djs-label text, .djs-visual text');"
+            " return t && (t.getAttribute('fill') || getComputedStyle(t).fill); }"
+        )
+        check(
+            label is None or label.lower() not in ("#000", "#000000", "black", "rgb(0, 0, 0)"),
+            f"{name}: labels are not painted black on dark ({label})",
+        )
+        SHOTS.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(SHOTS / f"dark_{name}.png"))
+        check(not problems, f"{name}: no console errors in dark mode: {problems}")
+        page.close()
+
+
 def check_served(browser):
     """The half `file://` cannot reach: a real server behind a real proxy.
 
@@ -287,9 +327,16 @@ def check_served(browser):
         print("served stack: no local Postgres — skipping")
         return
 
+    # Skipped rather than failed when the ports are taken: `just demo` runs
+    # on exactly these, and a developer with the demo open in another terminal
+    # should not have the test suite abort on them. demo.py keeps the hard
+    # guard, because there it is the demo's own correctness at stake.
+    for port in (7420, demo.PROXY_PORT):
+        if demo.port_in_use(port):
+            print(f"served stack: port {port} is busy (is `just demo` running?) — skipping")
+            return
+
     print("served stack (real engine, auth-injecting proxy)")
-    demo.require_port_free(7420)
-    demo.require_port_free(demo.PROXY_PORT)
     if demo.psql(f"select 1 from pg_database where datname = '{demo.DB}'").stdout.count("1 row") == 0:
         demo.psql(f"create database {demo.DB}")
     demo.psql("drop schema public cascade; create schema public", db=demo.DB)
@@ -368,6 +415,7 @@ def main():
         browser = p.chromium.launch()
         check_inspector(browser)
         check_editor(browser)
+        check_dark_mode(browser)
         check_served(browser)
         browser.close()
 

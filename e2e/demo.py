@@ -71,6 +71,14 @@ def wait_port(port, timeout=60):
     raise RuntimeError(f"port {port} never came up")
 
 
+def port_in_use(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
 def require_port_free(port):
     """Refuse to run against somebody else's server.
 
@@ -81,10 +89,7 @@ def require_port_free(port):
     failure looks like a bug in the code under test rather than a stale
     process.
     """
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=1):
-            pass
-    except OSError:
+    if not port_in_use(port):
         return
     raise SystemExit(
         f"port {port} is already in use — something is still running there.\n"
