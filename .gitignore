@@ -20,3 +20,9 @@ __pycache__/
 # TLA+: fetched by `just tla`, plus TLC's scratch output.
 /spec/.tla2tools-*.jar
 /spec/states/
+# Micro-benchmark baselines are per machine, by construction: the gate adds
+# that machine's own measured noise to its threshold. Committing one would
+# invite comparing against another machine's numbers, which is the single
+# mistake the whole benchmark track exists to prevent. Everyone records their
+# own with `just bench-baseline`.
+/benchmarks/.baselines/

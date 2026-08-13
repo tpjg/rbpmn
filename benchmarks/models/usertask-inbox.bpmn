@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One service task and one user task. The user task exists so the
+     measured path can include the *query* step: an inbox is found before it
+     is worked, and `count_tasks` + a filtered `get_task` are what a task
+     frontend actually costs. The scenario declares an index on `region`
+     (manifest `indexes`), so the filter runs against the partial index
+     `declare_index` creates on rbpmn_instance. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/benchmarks">
+  <bpmn:process id="usertask-inbox" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="PrepareCase" name="Prepare case">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:userTask id="ReviewCase" name="Review case">
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f3</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="PrepareCase" />
+    <bpmn:sequenceFlow id="f2" sourceRef="PrepareCase" targetRef="ReviewCase" />
+    <bpmn:sequenceFlow id="f3" sourceRef="ReviewCase" targetRef="End" />
+  </bpmn:process>
+</bpmn:definitions>

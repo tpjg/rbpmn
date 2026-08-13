@@ -1,0 +1,55 @@
+name = "usertask-inbox"
+model = "usertask-inbox.bpmn"
+summary = "One service task and one user task, with the inbox query inside the measured path."
+
+measures = [
+  "the full task-API round trip: count_tasks for the dashboard indication, a filtered get_task claim (FOR UPDATE SKIP LOCKED, lease set), complete_task with the lease identity",
+  "filtering on a declared field — the manifest declares an index on `region`, so the filter runs against the partial index declare_index creates on rbpmn_instance",
+  "querying as a first-class cost: leaving the query out is how a task-list benchmark flatters itself",
+]
+excludes = [
+  "human think time: the 'user' completes immediately",
+  "lease renewal (extend_lock): claims here are short, so no heartbeat is ever due",
+  "the unindexed comparison — to measure that, remove `region` from bindings.indexes and re-run; the filter stays correct and goes back to a sequential scan",
+  "history levels: every event is written",
+]
+
+[bindings]
+service_topic = "bench-service"
+user_topic = "bench-user"
+indexes = ["region"]
+
+[workload]
+warmup = 100
+instances = 1000
+seed = 20260813
+history = "full"
+
+[[workload.fields]]
+path = "region"
+kind = "pick"
+values = ["emea", "amer", "apac"]
+
+[[workload.fields]]
+path = "order.id"
+kind = "unique"
+prefix = "order-"
+
+[execute]
+service_workers = 6
+user_workers = 6
+db_pool = 32
+
+[execute.patch]
+handled = true
+
+[execute.user_query]
+filter_field = "region"
+# The inbox workers partition themselves across these, so the whole inbox
+# drains rather than one region's slice of it.
+filter_values = ["emea", "amer", "apac"]
+count_first = true
+
+[steady]
+arrival_rate = 80.0
+duration_secs = 20

@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One parallel split into four branches and one join. Same number of
+     service tasks as a four-step sequence, so the difference against
+     linear-5-service is the split/join machinery and the concurrency it
+     creates: four work items open at once on one instance, four completions
+     serializing on that instance's row lock, one join firing. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/benchmarks">
+  <bpmn:process id="parallel-4" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:parallelGateway id="Split">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>fa1</bpmn:outgoing>
+      <bpmn:outgoing>fb1</bpmn:outgoing>
+      <bpmn:outgoing>fc1</bpmn:outgoing>
+      <bpmn:outgoing>fd1</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="BranchA" name="Branch A">
+      <bpmn:incoming>fa1</bpmn:incoming>
+      <bpmn:outgoing>fa2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="BranchB" name="Branch B">
+      <bpmn:incoming>fb1</bpmn:incoming>
+      <bpmn:outgoing>fb2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="BranchC" name="Branch C">
+      <bpmn:incoming>fc1</bpmn:incoming>
+      <bpmn:outgoing>fc2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="BranchD" name="Branch D">
+      <bpmn:incoming>fd1</bpmn:incoming>
+      <bpmn:outgoing>fd2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:parallelGateway id="Join">
+      <bpmn:incoming>fa2</bpmn:incoming>
+      <bpmn:incoming>fb2</bpmn:incoming>
+      <bpmn:incoming>fc2</bpmn:incoming>
+      <bpmn:incoming>fd2</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Split" />
+    <bpmn:sequenceFlow id="fa1" sourceRef="Split" targetRef="BranchA" />
+    <bpmn:sequenceFlow id="fb1" sourceRef="Split" targetRef="BranchB" />
+    <bpmn:sequenceFlow id="fc1" sourceRef="Split" targetRef="BranchC" />
+    <bpmn:sequenceFlow id="fd1" sourceRef="Split" targetRef="BranchD" />
+    <bpmn:sequenceFlow id="fa2" sourceRef="BranchA" targetRef="Join" />
+    <bpmn:sequenceFlow id="fb2" sourceRef="BranchB" targetRef="Join" />
+    <bpmn:sequenceFlow id="fc2" sourceRef="BranchC" targetRef="Join" />
+    <bpmn:sequenceFlow id="fd2" sourceRef="BranchD" targetRef="Join" />
+    <bpmn:sequenceFlow id="f2" sourceRef="Join" targetRef="End" />
+  </bpmn:process>
+</bpmn:definitions>

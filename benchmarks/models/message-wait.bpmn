@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A service task, a wait on a correlated message, another service task.
+     The catch is deliberately *not* the first element: the subscription is
+     armed by a step that had to run first, which is the ordering a real
+     correlator meets (and why the harness retries `correlate` until the
+     subscription exists rather than assuming it does).
+
+     The correlation key is `order.id`, bound in the manifest — never in this
+     XML. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/benchmarks">
+  <bpmn:message id="m_ack" name="PaymentConfirmed" />
+  <bpmn:process id="message-wait" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="PrepareOrder" name="Prepare order">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:intermediateCatchEvent id="AwaitPayment" name="Await payment">
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+      <bpmn:messageEventDefinition messageRef="m_ack" />
+    </bpmn:intermediateCatchEvent>
+    <bpmn:serviceTask id="ShipOrder" name="Ship order">
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f4</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="PrepareOrder" />
+    <bpmn:sequenceFlow id="f2" sourceRef="PrepareOrder" targetRef="AwaitPayment" />
+    <bpmn:sequenceFlow id="f3" sourceRef="AwaitPayment" targetRef="ShipOrder" />
+    <bpmn:sequenceFlow id="f4" sourceRef="ShipOrder" targetRef="End" />
+  </bpmn:process>
+</bpmn:definitions>

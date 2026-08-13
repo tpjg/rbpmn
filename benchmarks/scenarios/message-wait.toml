@@ -1,0 +1,48 @@
+name = "message-wait"
+model = "message-wait.bpmn"
+summary = "An instance waiting on a correlated message, delivered by the harness."
+
+measures = [
+  "arming a subscription and the indexed (message_name, correlation_key) lookup correlate() performs",
+  "delivery as a step: the message's merge patch and the token's advance commit in one transaction",
+  "the correlator's retry loop — the catch is not the first element, so a key whose subscription is not armed yet is the ordinary case, and the retries are counted in the result file",
+]
+excludes = [
+  "message transport: correlate() is called in-process, so there is no broker, no HTTP and no queue in these numbers",
+  "the no-match and ambiguous-match paths (404 and 409), which are error handling rather than throughput",
+  "history levels: every event is written",
+]
+
+[bindings]
+service_topic = "bench-service"
+
+[bindings.correlation]
+element = "AwaitPayment"
+message = "PaymentConfirmed"
+key = "order.id"
+
+[workload]
+warmup = 100
+instances = 1000
+seed = 20260813
+history = "full"
+
+# The correlation key. `unique` is what makes it derivable from (run id,
+# index): the correlator knows what to deliver without reading the database,
+# exactly as the application that started the instance would.
+[[workload.fields]]
+path = "order.id"
+kind = "unique"
+prefix = "order-"
+
+[execute]
+service_workers = 6
+correlators = 4
+db_pool = 28
+
+[execute.patch]
+handled = true
+
+[steady]
+arrival_rate = 80.0
+duration_secs = 20

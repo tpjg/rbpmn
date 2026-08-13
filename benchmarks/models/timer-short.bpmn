@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A 100 ms timer between two service tasks. Short on purpose: the point is
+     the scheduler's claim path (pick the due candidate off the due_at index,
+     lock the instance, re-check, fire and delete in one transaction), not
+     the wait. Every instance therefore costs one armed timer row, one
+     NOTIFY, and one scheduler transaction — and the instance latency this
+     scenario reports has 100 ms of deliberate floor in it. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/benchmarks">
+  <bpmn:process id="timer-short" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="PrepareBatch" name="Prepare batch">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:intermediateCatchEvent id="SettleWindow" name="Settle window">
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration>PT0.1S</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:serviceTask id="PostBatch" name="Post batch">
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f4</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="PrepareBatch" />
+    <bpmn:sequenceFlow id="f2" sourceRef="PrepareBatch" targetRef="SettleWindow" />
+    <bpmn:sequenceFlow id="f3" sourceRef="SettleWindow" targetRef="PostBatch" />
+    <bpmn:sequenceFlow id="f4" sourceRef="PostBatch" targetRef="End" />
+  </bpmn:process>
+</bpmn:definitions>

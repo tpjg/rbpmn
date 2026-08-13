@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Five sequential service tasks, no gateways: the floor cost of an
+     instance. Every element on the path is a wait state, so this measures
+     five claim/handle/complete round trips plus start and end. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/benchmarks">
+  <bpmn:process id="linear-5-service" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="StepOne" name="Step one">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="StepTwo" name="Step two">
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="StepThree" name="Step three">
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="StepFour" name="Step four">
+      <bpmn:incoming>f4</bpmn:incoming>
+      <bpmn:outgoing>f5</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="StepFive" name="Step five">
+      <bpmn:incoming>f5</bpmn:incoming>
+      <bpmn:outgoing>f6</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f6</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="StepOne" />
+    <bpmn:sequenceFlow id="f2" sourceRef="StepOne" targetRef="StepTwo" />
+    <bpmn:sequenceFlow id="f3" sourceRef="StepTwo" targetRef="StepThree" />
+    <bpmn:sequenceFlow id="f4" sourceRef="StepThree" targetRef="StepFour" />
+    <bpmn:sequenceFlow id="f5" sourceRef="StepFour" targetRef="StepFive" />
+    <bpmn:sequenceFlow id="f6" sourceRef="StepFive" targetRef="End" />
+  </bpmn:process>
+</bpmn:definitions>

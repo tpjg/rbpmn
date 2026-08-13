@@ -1,0 +1,118 @@
+# OPTIONAL. `just bench` does not use this file and does not need Docker: it
+# runs against the local Postgres this repository already assumes everywhere
+# else (`just serve`, the engine's integration tests). This is `just
+# bench-compose`, for when you want the server itself pinned rather than
+# whatever the machine happens to run.
+#
+# What it buys, and it is the whole reason it exists: a *pinned, explicitly
+# tuned* server. Every setting below is captured into each result file, and
+# the catch-all in `pg.rs` sweeps up anything added here that the curated
+# list forgot — so nothing is a hidden default. Against a local server the
+# same capture happens, but the settings are your machine's, which makes
+# results reproducible on that machine rather than between machines.
+#
+# The image tag carries a digest on purpose. A floating `postgres:18` would
+# quietly change what the numbers were measured on, and two results a month
+# apart would differ for a reason nothing in the repository recorded.
+#
+# Port 55432, not 5432: the local Postgres is already there, and a container
+# that stole its port would be a confusing way to find that out.
+
+services:
+  postgres:
+    image: postgres:18.0-bookworm@sha256:3f55f8895c4ed50603e2fbdfc72fffeeaba3173321fee5cb825bbbeb30d9d854
+    container_name: rbpmn-bench-postgres
+    environment:
+      POSTGRES_USER: rbpmn
+      POSTGRES_PASSWORD: rbpmn
+      POSTGRES_DB: rbpmn_bench
+      # Deterministic collation: index ordering, and therefore claim
+      # ordering, must not depend on the host's locale.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      - "55432:5432"
+    # A tmpfs data directory is deliberately NOT used. Postgres on a ramdisk
+    # measures a machine nobody deploys on, and fsync is a large part of what
+    # a transactional engine costs. The volume is anonymous so `down -v`
+    # gives a clean slate; `just bench` does exactly that.
+    command:
+      - postgres
+      # --- memory ---------------------------------------------------------
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - effective_cache_size=3GB
+      # --- connections ----------------------------------------------------
+      # Comfortably above the largest scenario's db_pool (32) plus the
+      # monitor's 2 and psql. A benchmark starved of connections measures its
+      # own pool.
+      - -c
+      - max_connections=200
+      # --- durability -----------------------------------------------------
+      # Left at the safe defaults on purpose: synchronous_commit=off would
+      # roughly double every number here and describe a system nobody should
+      # run a process engine on. If you want that comparison, change it here
+      # and the result file will say you did.
+      - -c
+      - synchronous_commit=on
+      - -c
+      - fsync=on
+      - -c
+      - full_page_writes=on
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - min_wal_size=1GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_buffers=16MB
+      # --- planner --------------------------------------------------------
+      # SSD/NVMe assumptions. Declare the disk in hardware.md; if it is
+      # network-attached, raise random_page_cost and say so in the notes.
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      # JIT off: these queries are small and repeated, so JIT compilation is
+      # pure overhead and its threshold behaviour adds variance between runs.
+      - -c
+      - jit=off
+      # --- autovacuum -----------------------------------------------------
+      # Server-wide floor. The churn-heavy tables get per-table settings from
+      # `tuning.sql`, applied by the harness and recorded in the result.
+      - -c
+      - autovacuum=on
+      - -c
+      - autovacuum_naptime=10s
+      - -c
+      - autovacuum_max_workers=4
+      - -c
+      - autovacuum_vacuum_cost_delay=0
+      # --- observation ----------------------------------------------------
+      # The monitor reads pg_stat_*; track_io_timing is what makes the block
+      # numbers mean anything. It costs a clock read per block access, which
+      # is part of the measured system and is recorded as such.
+      - -c
+      - track_io_timing=on
+      - -c
+      - track_activities=on
+      - -c
+      - track_counts=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rbpmn -d rbpmn_bench"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+    # Shared memory: the default 64 MB is not enough for a 1 GB
+    # shared_buffers, and Postgres fails at startup in a way that reads like
+    # a benchmark bug.
+    shm_size: 1gb

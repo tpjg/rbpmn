@@ -75,6 +75,20 @@ inclusive gateway, block structure, messages-only interaction, build order).
   edit, no migration, no lists, no search. Every one of those is a designed
   API first; a UI is never the reason one ships early. The pressure to add a
   button will come from the element pane — that is the spot to hold.
+- **Benchmarks are a separate track and never gate on absolute numbers**
+  (`benchmarks/`). Two rules with teeth. (a) A feature must not land because a
+  benchmark axis wanted it: the three-history-level matrix is *wired and
+  loudly refused* because per-definition event-kind filtering is a roadmap
+  item, and shipping it here would invert "linter rules first, with fixtures".
+  (b) The only gate is the IO-free core suite, against a baseline recorded on
+  **that same machine**, with that machine's measured noise added to the
+  threshold — a flat threshold fired twice on identical code before the noise
+  term existed. Those baselines live in gitignored `benchmarks/.baselines/`
+  and are **never committed**: a baseline describes one machine, and a
+  committed one invites comparing against another's. Also load-bearing: `just bench` starts from an empty database
+  and runs `ANALYZE` before measuring, because without it the claim path's
+  plan flips (measured 20 vs 175 instances/sec) and the suite measures when
+  autovacuum last ran instead of the engine.
 
 ## Commands
 
@@ -119,6 +133,14 @@ inclusive gateway, block structure, messages-only interaction, build order).
   everywhere; new fixtures without a `bpmndi:BPMNDiagram` section get theirs
   from this (idempotent; two reject fixtures have hand-written DI — see the
   comments in them).
+- `just bench` — the benchmark suite (`benchmarks/README.md`). Needs the local
+  Postgres, **not** Docker; `just bench-compose` is the opt-in pinned-server
+  variant. `just bench-micro` is the pure-core criterion suite plus the only
+  benchmark permitted to fail a build; `just bench-baseline` re-records that
+  machine's baseline; `just bench-report` renders `results/*.json`.
+  `rbpmn-bench` is a workspace member but **not a default member**, so
+  `cargo test` never builds it — `just lint` uses `--workspace` precisely so
+  it is still linted.
 
 ## The specs are hand-written and will not tell you they drifted
 

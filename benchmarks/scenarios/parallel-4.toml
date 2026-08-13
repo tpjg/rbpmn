@@ -1,0 +1,39 @@
+name = "parallel-4"
+model = "parallel-4.bpmn"
+summary = "A parallel split into four branches and a join — four work items open on one instance at once."
+
+measures = [
+  "the parallel split's fan-out and the join's local token counting",
+  "concurrent completions on a single instance serializing on its row lock — four workers can claim this instance's branches simultaneously and exactly one of them fires the join",
+  "the merge-patch path under concurrency: four branch completions patching one variable document without clobbering each other",
+]
+excludes = [
+  "network latency: the handler is in-process",
+  "any parallelism *between* instances beyond what the worker pool provides",
+  "history levels: every event is written",
+]
+
+[bindings]
+service_topic = "bench-service"
+
+[workload]
+warmup = 100
+instances = 1000
+seed = 20260813
+history = "full"
+
+[[workload.fields]]
+path = "order.id"
+kind = "unique"
+prefix = "order-"
+
+[execute]
+service_workers = 8
+db_pool = 24
+
+[execute.patch]
+handled = true
+
+[steady]
+arrival_rate = 100.0
+duration_secs = 20

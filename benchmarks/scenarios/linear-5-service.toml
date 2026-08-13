@@ -1,0 +1,44 @@
+name = "linear-5-service"
+model = "linear-5-service.bpmn"
+summary = "Five sequential service tasks, no gateways — the floor cost of an instance."
+
+measures = [
+  "the whole instance lifecycle: start, five work items created, claimed by push-mode handlers, completed with a merge patch, terminal state reached",
+  "five transactional steps per instance, each serialized on the instance row lock",
+  "the work-item claim path (FOR UPDATE SKIP LOCKED) under contention between service workers",
+]
+excludes = [
+  "network latency: the handler is in-process and returns immediately",
+  "handler work: the handler does nothing but return its merge patch, so this is engine cost with the business logic set to zero",
+  "history levels: every event is written (see 'The history axis' in the README)",
+]
+
+[bindings]
+service_topic = "bench-service"
+
+[workload]
+warmup = 100
+instances = 1000
+seed = 20260813
+history = "full"
+
+[[workload.fields]]
+path = "order.id"
+kind = "unique"
+prefix = "order-"
+
+[[workload.fields]]
+path = "order.total"
+kind = "pick"
+values = [19, 249, 1099]
+
+[execute]
+service_workers = 8
+db_pool = 24
+
+[execute.patch]
+handled = true
+
+[steady]
+arrival_rate = 100.0
+duration_secs = 20

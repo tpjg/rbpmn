@@ -1,0 +1,207 @@
+{
+  "schema": "rbpmn-bench-persisted/1",
+  "started_at": "2026-08-13T22:32:06Z",
+  "iterations": 200,
+  "checkout": {
+    "git_sha": "7745fa310c0c69a2aa837a5c221c8b5fd1346e54",
+    "dirty": true
+  },
+  "hardware": {
+    "host_id": "a11a098b",
+    "detected": {
+      "os": "macos",
+      "arch": "aarch64",
+      "cpu_model": "Apple M2",
+      "physical_cores": 8,
+      "logical_cores": 8,
+      "ram_gb": 24.0
+    },
+    "declared": {
+      "cpu_model": null,
+      "physical_cores": null,
+      "ram_gb": null,
+      "disk": "unknown",
+      "postgres_location": "local",
+      "postgres_provisioning": "local",
+      "notes": "Anything a reader needs in order to interpret the numbers: virtualization,\na shared host, thermal limits, a laptop on battery, an unusual filesystem,\na Docker storage driver that is not overlay2.\n"
+    },
+    "declaration_mismatches": [
+      "hardware.md does not say what the disk is — fill in `disk` (nvme | ssd | network) before publishing these numbers"
+    ]
+  },
+  "postgres": {
+    "version": "PostgreSQL 18.4 (Postgres.app) on aarch64-apple-darwin23.6.0, compiled by Apple clang version 15.0.0 (clang-1500.3.9.4), 64-bit",
+    "local": true,
+    "connection_host": "localhost",
+    "provisioned_by": "local",
+    "settings": {
+      "autovacuum": "on",
+      "autovacuum_max_workers": "3",
+      "autovacuum_naptime": "60s",
+      "autovacuum_vacuum_cost_delay": "2ms",
+      "autovacuum_vacuum_cost_limit": "-1",
+      "autovacuum_vacuum_scale_factor": "0.2",
+      "autovacuum_vacuum_threshold": "50",
+      "checkpoint_completion_target": "0.9",
+      "checkpoint_timeout": "300s",
+      "default_transaction_isolation": "read committed",
+      "effective_cache_size": "5242888kB",
+      "effective_io_concurrency": "16",
+      "fsync": "on",
+      "full_page_writes": "on",
+      "jit": "on",
+      "maintenance_work_mem": "65536kB",
+      "max_connections": "100",
+      "max_locks_per_transaction": "64",
+      "max_wal_size": "1024MB",
+      "max_worker_processes": "8",
+      "min_wal_size": "80MB",
+      "random_page_cost": "4",
+      "seq_page_cost": "1",
+      "server_version": "18.4 (Postgres.app)",
+      "shared_buffers": "163848kB",
+      "synchronous_commit": "on",
+      "track_io_timing": "off",
+      "wal_buffers": "5128kB",
+      "wal_level": "replica",
+      "work_mem": "4096kB"
+    },
+    "non_default_settings": {
+      "auth_permission_dialog.dialog_executable_path": "/Applications/Postgres.app/Contents/MacOS/PostgresPermissionDialog (command line)",
+      "autovacuum_worker_slots": "16 (configuration file)",
+      "config_file": "/Users/timo/Library/Application Support/Postgres/var-18/postgresql.conf (override)",
+      "data_directory": "/Users/timo/Library/Application Support/Postgres/var-18 (override)",
+      "default_text_search_config": "pg_catalog.english (configuration file)",
+      "dynamic_shared_memory_type": "posix (configuration file)",
+      "hba_file": "/Users/timo/Library/Application Support/Postgres/var-18/pg_hba.conf (override)",
+      "ident_file": "/Users/timo/Library/Application Support/Postgres/var-18/pg_ident.conf (override)",
+      "lc_messages": "en_US.UTF-8 (configuration file)",
+      "lc_monetary": "en_US.UTF-8 (configuration file)",
+      "lc_numeric": "en_US.UTF-8 (configuration file)",
+      "lc_time": "en_US.UTF-8 (configuration file)",
+      "log_timezone": "Europe/Madrid (configuration file)",
+      "max_connections": "100 (configuration file)",
+      "max_wal_size": "1024 (configuration file)",
+      "min_wal_size": "80 (configuration file)",
+      "port": "5432 (command line)",
+      "shared_buffers": "16384 (configuration file)",
+      "shared_preload_libraries": "auth_permission_dialog (command line)",
+      "transaction_deferrable": "off (override)",
+      "transaction_isolation": "read committed (override)",
+      "transaction_read_only": "off (override)"
+    },
+    "table_options": {
+      "rbpmn_definition": [],
+      "rbpmn_environment_topic": [],
+      "rbpmn_event": [
+        "autovacuum_vacuum_scale_factor=0.1",
+        "autovacuum_analyze_scale_factor=0.02",
+        "fillfactor=100"
+      ],
+      "rbpmn_instance": [
+        "autovacuum_vacuum_scale_factor=0.05",
+        "autovacuum_analyze_scale_factor=0.02",
+        "fillfactor=85"
+      ],
+      "rbpmn_migrations": [],
+      "rbpmn_retention_floor": [],
+      "rbpmn_retention_lease": [],
+      "rbpmn_retention_policy": [],
+      "rbpmn_scope": [],
+      "rbpmn_subscription": [],
+      "rbpmn_timer": [],
+      "rbpmn_token": [
+        "autovacuum_vacuum_scale_factor=0.02",
+        "autovacuum_vacuum_threshold=200",
+        "autovacuum_analyze_scale_factor=0.02",
+        "autovacuum_vacuum_cost_delay=0"
+      ],
+      "rbpmn_work_item": [
+        "autovacuum_vacuum_scale_factor=0.02",
+        "autovacuum_vacuum_threshold=200",
+        "autovacuum_analyze_scale_factor=0.02",
+        "autovacuum_vacuum_cost_delay=0",
+        "fillfactor=85"
+      ]
+    }
+  },
+  "constructs": [
+    {
+      "name": "single-task",
+      "steps_per_instance": 2.0,
+      "micros_per_instance": 1048.9025,
+      "micros_per_step": 524.45125,
+      "marginal_micros_vs_baseline": 0.0,
+      "events_per_instance": 12.0,
+      "bytes_per_instance": 4177.92
+    },
+    {
+      "name": "sequence-2",
+      "steps_per_instance": 3.0,
+      "micros_per_instance": 1638.779585,
+      "micros_per_step": 546.2598616666667,
+      "marginal_micros_vs_baseline": 589.8770850000001,
+      "events_per_instance": 17.0,
+      "bytes_per_instance": 5775.36
+    },
+    {
+      "name": "exclusive-2",
+      "steps_per_instance": 3.0,
+      "micros_per_instance": 1710.845835,
+      "micros_per_step": 570.2819450000001,
+      "marginal_micros_vs_baseline": 661.9433350000002,
+      "events_per_instance": 23.0,
+      "bytes_per_instance": 8396.8
+    },
+    {
+      "name": "parallel-2",
+      "steps_per_instance": 3.0,
+      "micros_per_instance": 1738.236875,
+      "micros_per_step": 579.4122916666666,
+      "marginal_micros_vs_baseline": 689.3343750000001,
+      "events_per_instance": 24.0,
+      "bytes_per_instance": 8232.96
+    },
+    {
+      "name": "parallel-4",
+      "steps_per_instance": 5.0,
+      "micros_per_instance": 2958.85271,
+      "micros_per_step": 591.770542,
+      "marginal_micros_vs_baseline": 1909.9502100000002,
+      "events_per_instance": 36.0,
+      "bytes_per_instance": 12820.48
+    },
+    {
+      "name": "parallel-8",
+      "steps_per_instance": 9.0,
+      "micros_per_instance": 5563.10875,
+      "micros_per_step": 618.1231944444445,
+      "marginal_micros_vs_baseline": 4514.20625,
+      "events_per_instance": 60.0,
+      "bytes_per_instance": 24248.32
+    },
+    {
+      "name": "subprocess",
+      "steps_per_instance": 3.0,
+      "micros_per_instance": 1690.31125,
+      "micros_per_step": 563.4370833333334,
+      "marginal_micros_vs_baseline": 641.40875,
+      "events_per_instance": 25.0,
+      "bytes_per_instance": 8847.36
+    },
+    {
+      "name": "loop-3",
+      "steps_per_instance": 5.0,
+      "micros_per_instance": 2991.56458,
+      "micros_per_step": 598.3129160000001,
+      "marginal_micros_vs_baseline": 1942.6620800000003,
+      "events_per_instance": 43.0,
+      "bytes_per_instance": 15073.28
+    }
+  ],
+  "warnings": [
+    "hardware.md does not say what the disk is — fill in `disk` (nvme | ssd | network) before publishing these numbers",
+    "persisted micro-benchmarks are reported, never gated: they share a machine with a database, a checkpointer and autovacuum. Only the pure-core suite (`just bench-micro`) is deterministic enough to fail a build.",
+    "the checkout has uncommitted changes"
+  ]
+}

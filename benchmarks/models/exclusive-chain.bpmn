@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Five exclusive split/join stages in sequence, each routing on one
+     FEEL-subset condition (`route.stageN = true`) with the slow path as the
+     required default flow. Both branches of every stage carry a service
+     task, so the number of tasks executed is constant (five) whatever the
+     routing decides: what varies between instances is the gateway
+     evaluation, not the amount of work, which is what isolates the cost of
+     condition evaluation against the variable document. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/benchmarks">
+  <bpmn:process id="exclusive-chain" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:outgoing>f_start</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:exclusiveGateway id="StageOneSplit" name="Stage 1?" default="f1_slow">
+      <bpmn:incoming>f_start</bpmn:incoming>
+      <bpmn:outgoing>f1_fast</bpmn:outgoing>
+      <bpmn:outgoing>f1_slow</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="StageOneFast" name="Stage 1 fast path">
+      <bpmn:incoming>f1_fast</bpmn:incoming>
+      <bpmn:outgoing>f1_fast_j</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="StageOneSlow" name="Stage 1 slow path">
+      <bpmn:incoming>f1_slow</bpmn:incoming>
+      <bpmn:outgoing>f1_slow_j</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="StageOneJoin">
+      <bpmn:incoming>f1_fast_j</bpmn:incoming>
+      <bpmn:incoming>f1_slow_j</bpmn:incoming>
+      <bpmn:outgoing>f1_out</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:exclusiveGateway id="StageTwoSplit" name="Stage 2?" default="f2_slow">
+      <bpmn:incoming>f1_out</bpmn:incoming>
+      <bpmn:outgoing>f2_fast</bpmn:outgoing>
+      <bpmn:outgoing>f2_slow</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="StageTwoFast" name="Stage 2 fast path">
+      <bpmn:incoming>f2_fast</bpmn:incoming>
+      <bpmn:outgoing>f2_fast_j</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="StageTwoSlow" name="Stage 2 slow path">
+      <bpmn:incoming>f2_slow</bpmn:incoming>
+      <bpmn:outgoing>f2_slow_j</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="StageTwoJoin">
+      <bpmn:incoming>f2_fast_j</bpmn:incoming>
+      <bpmn:incoming>f2_slow_j</bpmn:incoming>
+      <bpmn:outgoing>f2_out</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:exclusiveGateway id="StageThreeSplit" name="Stage 3?" default="f3_slow">
+      <bpmn:incoming>f2_out</bpmn:incoming>
+      <bpmn:outgoing>f3_fast</bpmn:outgoing>
+      <bpmn:outgoing>f3_slow</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="StageThreeFast" name="Stage 3 fast path">
+      <bpmn:incoming>f3_fast</bpmn:incoming>
+      <bpmn:outgoing>f3_fast_j</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="StageThreeSlow" name="Stage 3 slow path">
+      <bpmn:incoming>f3_slow</bpmn:incoming>
+      <bpmn:outgoing>f3_slow_j</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="StageThreeJoin">
+      <bpmn:incoming>f3_fast_j</bpmn:incoming>
+      <bpmn:incoming>f3_slow_j</bpmn:incoming>
+      <bpmn:outgoing>f3_out</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:exclusiveGateway id="StageFourSplit" name="Stage 4?" default="f4_slow">
+      <bpmn:incoming>f3_out</bpmn:incoming>
+      <bpmn:outgoing>f4_fast</bpmn:outgoing>
+      <bpmn:outgoing>f4_slow</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="StageFourFast" name="Stage 4 fast path">
+      <bpmn:incoming>f4_fast</bpmn:incoming>
+      <bpmn:outgoing>f4_fast_j</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="StageFourSlow" name="Stage 4 slow path">
+      <bpmn:incoming>f4_slow</bpmn:incoming>
+      <bpmn:outgoing>f4_slow_j</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="StageFourJoin">
+      <bpmn:incoming>f4_fast_j</bpmn:incoming>
+      <bpmn:incoming>f4_slow_j</bpmn:incoming>
+      <bpmn:outgoing>f4_out</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:exclusiveGateway id="StageFiveSplit" name="Stage 5?" default="f5_slow">
+      <bpmn:incoming>f4_out</bpmn:incoming>
+      <bpmn:outgoing>f5_fast</bpmn:outgoing>
+      <bpmn:outgoing>f5_slow</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="StageFiveFast" name="Stage 5 fast path">
+      <bpmn:incoming>f5_fast</bpmn:incoming>
+      <bpmn:outgoing>f5_fast_j</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="StageFiveSlow" name="Stage 5 slow path">
+      <bpmn:incoming>f5_slow</bpmn:incoming>
+      <bpmn:outgoing>f5_slow_j</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="StageFiveJoin">
+      <bpmn:incoming>f5_fast_j</bpmn:incoming>
+      <bpmn:incoming>f5_slow_j</bpmn:incoming>
+      <bpmn:outgoing>f5_out</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f5_out</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f_start" sourceRef="Start" targetRef="StageOneSplit" />
+    <bpmn:sequenceFlow id="f1_fast" sourceRef="StageOneSplit" targetRef="StageOneFast"><bpmn:conditionExpression>route.stage1 = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f1_slow" sourceRef="StageOneSplit" targetRef="StageOneSlow" />
+    <bpmn:sequenceFlow id="f1_fast_j" sourceRef="StageOneFast" targetRef="StageOneJoin" />
+    <bpmn:sequenceFlow id="f1_slow_j" sourceRef="StageOneSlow" targetRef="StageOneJoin" />
+    <bpmn:sequenceFlow id="f1_out" sourceRef="StageOneJoin" targetRef="StageTwoSplit" />
+    <bpmn:sequenceFlow id="f2_fast" sourceRef="StageTwoSplit" targetRef="StageTwoFast"><bpmn:conditionExpression>route.stage2 = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f2_slow" sourceRef="StageTwoSplit" targetRef="StageTwoSlow" />
+    <bpmn:sequenceFlow id="f2_fast_j" sourceRef="StageTwoFast" targetRef="StageTwoJoin" />
+    <bpmn:sequenceFlow id="f2_slow_j" sourceRef="StageTwoSlow" targetRef="StageTwoJoin" />
+    <bpmn:sequenceFlow id="f2_out" sourceRef="StageTwoJoin" targetRef="StageThreeSplit" />
+    <bpmn:sequenceFlow id="f3_fast" sourceRef="StageThreeSplit" targetRef="StageThreeFast"><bpmn:conditionExpression>route.stage3 = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f3_slow" sourceRef="StageThreeSplit" targetRef="StageThreeSlow" />
+    <bpmn:sequenceFlow id="f3_fast_j" sourceRef="StageThreeFast" targetRef="StageThreeJoin" />
+    <bpmn:sequenceFlow id="f3_slow_j" sourceRef="StageThreeSlow" targetRef="StageThreeJoin" />
+    <bpmn:sequenceFlow id="f3_out" sourceRef="StageThreeJoin" targetRef="StageFourSplit" />
+    <bpmn:sequenceFlow id="f4_fast" sourceRef="StageFourSplit" targetRef="StageFourFast"><bpmn:conditionExpression>route.stage4 = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f4_slow" sourceRef="StageFourSplit" targetRef="StageFourSlow" />
+    <bpmn:sequenceFlow id="f4_fast_j" sourceRef="StageFourFast" targetRef="StageFourJoin" />
+    <bpmn:sequenceFlow id="f4_slow_j" sourceRef="StageFourSlow" targetRef="StageFourJoin" />
+    <bpmn:sequenceFlow id="f4_out" sourceRef="StageFourJoin" targetRef="StageFiveSplit" />
+    <bpmn:sequenceFlow id="f5_fast" sourceRef="StageFiveSplit" targetRef="StageFiveFast"><bpmn:conditionExpression>route.stage5 = true</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f5_slow" sourceRef="StageFiveSplit" targetRef="StageFiveSlow" />
+    <bpmn:sequenceFlow id="f5_fast_j" sourceRef="StageFiveFast" targetRef="StageFiveJoin" />
+    <bpmn:sequenceFlow id="f5_slow_j" sourceRef="StageFiveSlow" targetRef="StageFiveJoin" />
+    <bpmn:sequenceFlow id="f5_out" sourceRef="StageFiveJoin" targetRef="End" />
+  </bpmn:process>
+</bpmn:definitions>

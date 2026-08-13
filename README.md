@@ -217,6 +217,31 @@ One runner (`tests/fixtures.rs`) executes the corpus and compares exact
 (severity, rule, element) sets. Start every phase by writing its fixtures
 first.
 
+## Benchmarks
+
+`benchmarks/` is a separate track from the tests: models, data, a hardware
+spec and one command, in the repository, so a number can be reproduced rather
+than believed. `just bench` runs the lifecycle suite against the local
+Postgres — no Docker — and writes a result file carrying the git sha, the
+seed, every Postgres setting, the hardware, the deployed manifest and the
+scenario's own statement of what it does *not* measure.
+
+```sh
+just bench            # the lifecycle suite (7 scenarios), writes results/
+just bench-micro      # pure-core criterion suite + this machine's regression gate
+just bench-report     # render results/*.json into a markdown table, grouped by host
+```
+
+Nothing here gates CI on an absolute number, and `cargo test` never builds the
+harness. The one exception is `bench-micro`, which compares the IO-free core
+against a baseline recorded on the same machine — never committed, because it
+describes that machine — with its own measured noise folded into the
+threshold — and prints the smallest slowdown it
+can actually detect, rather than implying it is watching more closely than it
+is. Details, and an explicit list of what these numbers exclude (no network,
+no handler work, no cross-engine comparison), in
+[benchmarks/README.md](benchmarks/README.md).
+
 ## Playground & bpmnlint plugin
 
 `just playground` opens a local page (no server-side component) with the whole
@@ -341,6 +366,8 @@ just ui               # build the UI documents — run once after cloning
 just ui-test          # the UI's pure modules, no browser needed
 just demo             # a real stuck instance + two clickable links
 just e2e-ui           # drive both documents in a real browser
+just bench            # the benchmark suite (separate track — see benchmarks/)
+just bench-micro      # pure-core micro-benchmarks + the regression gate
 ```
 
 **Bootstrap:** `just ui` before the first `cargo build`, because the UI

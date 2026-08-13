@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Seventeen elements in the shape a real order process tends to take: a
+     validation, an exclusive routing decision, a hierarchical subprocess
+     doing two things at once, a human approval carrying an SLA timer, and an
+     archival step. Nothing here is exotic — it is the closest thing in this
+     corpus to a customer-shaped workload, and it is the only scenario that
+     costs a scope, a boundary timer armed and cancelled, and a filtered
+     inbox query on one instance.
+
+     The SLA timer is an hour and the benchmark never runs that long, so it
+     measures arming and cancellation, never firing. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/benchmarks">
+  <bpmn:process id="mixed-typical" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="ValidateOrder" name="Validate order">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="RouteByPriority" name="Priority?" default="f_standard">
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f_expedite</bpmn:outgoing>
+      <bpmn:outgoing>f_standard</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="ExpediteOrder" name="Expedite order">
+      <bpmn:incoming>f_expedite</bpmn:incoming>
+      <bpmn:outgoing>f_expedite_j</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="ScheduleOrder" name="Schedule order">
+      <bpmn:incoming>f_standard</bpmn:incoming>
+      <bpmn:outgoing>f_standard_j</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="RoutesMerge">
+      <bpmn:incoming>f_expedite_j</bpmn:incoming>
+      <bpmn:incoming>f_standard_j</bpmn:incoming>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:subProcess id="FulfilOrder" name="Fulfil order">
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+      <bpmn:startEvent id="FulfilStart">
+        <bpmn:outgoing>g1</bpmn:outgoing>
+      </bpmn:startEvent>
+      <bpmn:parallelGateway id="FulfilSplit">
+        <bpmn:incoming>g1</bpmn:incoming>
+        <bpmn:outgoing>g_charge</bpmn:outgoing>
+        <bpmn:outgoing>g_notify</bpmn:outgoing>
+      </bpmn:parallelGateway>
+      <bpmn:serviceTask id="ChargeCustomer" name="Charge customer">
+        <bpmn:incoming>g_charge</bpmn:incoming>
+        <bpmn:outgoing>g_charge_j</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:serviceTask id="NotifyWarehouse" name="Notify warehouse">
+        <bpmn:incoming>g_notify</bpmn:incoming>
+        <bpmn:outgoing>g_notify_j</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:parallelGateway id="FulfilJoin">
+        <bpmn:incoming>g_charge_j</bpmn:incoming>
+        <bpmn:incoming>g_notify_j</bpmn:incoming>
+        <bpmn:outgoing>g2</bpmn:outgoing>
+      </bpmn:parallelGateway>
+      <bpmn:endEvent id="FulfilEnd">
+        <bpmn:incoming>g2</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="g1" sourceRef="FulfilStart" targetRef="FulfilSplit" />
+      <bpmn:sequenceFlow id="g_charge" sourceRef="FulfilSplit" targetRef="ChargeCustomer" />
+      <bpmn:sequenceFlow id="g_notify" sourceRef="FulfilSplit" targetRef="NotifyWarehouse" />
+      <bpmn:sequenceFlow id="g_charge_j" sourceRef="ChargeCustomer" targetRef="FulfilJoin" />
+      <bpmn:sequenceFlow id="g_notify_j" sourceRef="NotifyWarehouse" targetRef="FulfilJoin" />
+      <bpmn:sequenceFlow id="g2" sourceRef="FulfilJoin" targetRef="FulfilEnd" />
+    </bpmn:subProcess>
+    <bpmn:userTask id="ApproveShipment" name="Approve shipment">
+      <bpmn:incoming>f4</bpmn:incoming>
+      <bpmn:outgoing>f5</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:boundaryEvent id="ApprovalOverdue" attachedToRef="ApproveShipment">
+      <bpmn:outgoing>f_overdue</bpmn:outgoing>
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration>PT1H</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="EscalateApproval" name="Escalate approval">
+      <bpmn:incoming>f_overdue</bpmn:incoming>
+      <bpmn:outgoing>f_escalated</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="ArchiveOrder" name="Archive order">
+      <bpmn:incoming>f5</bpmn:incoming>
+      <bpmn:outgoing>f6</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="Shipped">
+      <bpmn:incoming>f6</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="Escalated">
+      <bpmn:incoming>f_escalated</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="ValidateOrder" />
+    <bpmn:sequenceFlow id="f2" sourceRef="ValidateOrder" targetRef="RouteByPriority" />
+    <bpmn:sequenceFlow id="f_expedite" sourceRef="RouteByPriority" targetRef="ExpediteOrder">
+      <bpmn:conditionExpression>order.priority = "high"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_standard" sourceRef="RouteByPriority" targetRef="ScheduleOrder" />
+    <bpmn:sequenceFlow id="f_expedite_j" sourceRef="ExpediteOrder" targetRef="RoutesMerge" />
+    <bpmn:sequenceFlow id="f_standard_j" sourceRef="ScheduleOrder" targetRef="RoutesMerge" />
+    <bpmn:sequenceFlow id="f3" sourceRef="RoutesMerge" targetRef="FulfilOrder" />
+    <bpmn:sequenceFlow id="f4" sourceRef="FulfilOrder" targetRef="ApproveShipment" />
+    <bpmn:sequenceFlow id="f5" sourceRef="ApproveShipment" targetRef="ArchiveOrder" />
+    <bpmn:sequenceFlow id="f6" sourceRef="ArchiveOrder" targetRef="Shipped" />
+    <bpmn:sequenceFlow id="f_overdue" sourceRef="ApprovalOverdue" targetRef="EscalateApproval" />
+    <bpmn:sequenceFlow id="f_escalated" sourceRef="EscalateApproval" targetRef="Escalated" />
+  </bpmn:process>
+</bpmn:definitions>

@@ -1,0 +1,55 @@
+name = "exclusive-chain"
+model = "exclusive-chain.bpmn"
+summary = "Five exclusive split/join stages, each routing on one FEEL-subset condition."
+
+measures = [
+  "condition evaluation against the instance's variable document, ten times per instance (five splits, each with a conditional flow and a default)",
+  "the same five-work-item lifecycle as linear-5-service, so the difference between the two scenarios is the gateway cost",
+]
+excludes = [
+  "condition *parsing*: conditions are compiled once at deploy, not per evaluation",
+  "network latency: the handler is in-process",
+  "history levels: every event is written",
+]
+
+[bindings]
+service_topic = "bench-service"
+
+[workload]
+warmup = 100
+instances = 1000
+seed = 20260813
+history = "full"
+
+# Routing is seeded, so which branch each stage takes is reproducible — but
+# both branches carry a task, so the amount of work is identical either way.
+[[workload.fields]]
+path = "route.stage1"
+kind = "pick-bool"
+
+[[workload.fields]]
+path = "route.stage2"
+kind = "pick-bool"
+
+[[workload.fields]]
+path = "route.stage3"
+kind = "pick-bool"
+
+[[workload.fields]]
+path = "route.stage4"
+kind = "pick-bool"
+
+[[workload.fields]]
+path = "route.stage5"
+kind = "pick-bool"
+
+[execute]
+service_workers = 8
+db_pool = 24
+
+[execute.patch]
+handled = true
+
+[steady]
+arrival_rate = 100.0
+duration_secs = 20

@@ -1,0 +1,39 @@
+name = "timer-short"
+model = "timer-short.bpmn"
+summary = "A 100 ms timer between two service tasks — the scheduler's claim path under load."
+
+measures = [
+  "arming a timer row from database time (clock_timestamp() + interval) and the NOTIFY that wakes sleeping schedulers",
+  "the scheduler's claim: pick the due candidate off the due_at index without a lock, take the instance row lock, re-check, fire and delete the row in one transaction",
+  "how far past due_at a timer actually fires when many are due at once — that gap is the p50 latency minus the 100 ms floor",
+]
+excludes = [
+  "long waits: a sleeping timer is a passive row and costs nothing, which is precisely why the model uses 100 ms rather than a realistic deadline",
+  "timer cycles, which this engine does not support",
+  "history levels: every event is written",
+]
+
+[bindings]
+service_topic = "bench-service"
+
+[workload]
+warmup = 50
+instances = 500
+seed = 20260813
+history = "full"
+
+[[workload.fields]]
+path = "order.id"
+kind = "unique"
+prefix = "order-"
+
+[execute]
+service_workers = 6
+db_pool = 24
+
+[execute.patch]
+handled = true
+
+[steady]
+arrival_rate = 50.0
+duration_secs = 20

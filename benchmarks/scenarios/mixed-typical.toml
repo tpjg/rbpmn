@@ -1,0 +1,66 @@
+name = "mixed-typical"
+model = "mixed-typical.bpmn"
+summary = "Seventeen elements in the shape a real order process takes — the closest thing here to a customer workload."
+
+measures = [
+  "everything the other scenarios isolate, on one instance: a routing decision, a subprocess scope opened and torn down, a parallel split and join inside it, a human approval claimed through the task API, and an SLA timer armed and cancelled",
+  "scope machinery under load: entering a subprocess allocates a scope row, and leaving it reaps the scope in the same transaction as the token's advance",
+  "the cost of a boundary timer that never fires — arming and cancelling, which is what most SLA timers in production actually do",
+]
+excludes = [
+  "the escalation path: the SLA timer is an hour and the benchmark never runs that long, so the boundary is armed and cancelled but never taken",
+  "network latency: handlers are in-process",
+  "any claim that this shape is *typical* of your process — it is typical of the examples vendors benchmark, which is a different thing",
+  "history levels: every event is written",
+]
+
+[bindings]
+service_topic = "bench-service"
+user_topic = "bench-user"
+indexes = ["region"]
+
+[workload]
+warmup = 50
+instances = 500
+seed = 20260813
+history = "full"
+
+[[workload.fields]]
+path = "order.id"
+kind = "unique"
+prefix = "order-"
+
+[[workload.fields]]
+path = "order.priority"
+kind = "pick"
+values = ["high", "normal", "normal"]
+
+[[workload.fields]]
+path = "region"
+kind = "pick"
+values = ["emea", "amer", "apac"]
+
+# A realistic variable document is not three scalars. Every step reads and
+# rewrites this document, so its size is a real cost and this is the knob
+# that exposes it.
+[[workload.fields]]
+path = "order.payload"
+kind = "filler"
+bytes = 2048
+
+[execute]
+service_workers = 8
+user_workers = 4
+db_pool = 32
+
+[execute.patch]
+handled = true
+
+[execute.user_query]
+filter_field = "region"
+filter_values = ["emea", "amer", "apac"]
+count_first = true
+
+[steady]
+arrival_rate = 50.0
+duration_secs = 20

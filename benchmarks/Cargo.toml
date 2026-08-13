@@ -1,0 +1,33 @@
+[package]
+name = "rbpmn-bench"
+description = "The rbpmn benchmark harness: models, data, hardware spec and one command. A separate track from the correctness tests — it never gates CI on absolute numbers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# A workspace member, but deliberately not a *default* member (see the root
+# Cargo.toml): `cargo test` and `cargo build` must never pay for criterion or
+# for a benchmark harness nobody asked to run. `just lint` still covers it —
+# zero warnings is a ground rule, and an unlinted crate drifts.
+[dependencies]
+rbpmn-core = { path = "../crates/rbpmn-core" }
+rbpmn-engine = { path = "../crates/rbpmn-engine" }
+rbpmn-model = { path = "../crates/rbpmn-model" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "chrono"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "process"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+toml = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "core_constructs"
+harness = false

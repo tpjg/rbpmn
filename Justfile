@@ -3,8 +3,11 @@ default: test
 test:
     cargo test
 
+# `--workspace` rather than the default members, so the benchmark harness is
+# linted too: it is kept out of `cargo test` deliberately, and a crate nobody
+# lints is a crate that drifts.
 lint:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
     cargo fmt --check
 
 fmt:
@@ -164,3 +167,123 @@ fixtures-di:
 e2e:
     cd playground && npm install
     python3 e2e/run.py
+
+# ---------------------------------------------------------------- benchmarks
+#
+# A separate track from the correctness tests (benchmarks/README.md). Nothing
+# here runs in `cargo test` — `rbpmn-bench` is a workspace member but not a
+# default one — and nothing here gates CI on an absolute number. The single
+# exception is `bench-micro`, which compares the pure-core suite against a
+# baseline recorded on *this* machine.
+#
+# Needs the local Postgres, the same one `just serve` and the integration
+# tests use. No Docker: `bench-compose` is the opt-in variant for a pinned,
+# explicitly tuned server.
+
+# Provision the benchmark database (idempotent). Separate from rbpmn_dev on
+# purpose: a benchmark leaves hundreds of thousands of rows behind, and it
+# rewrites per-table autovacuum settings.
+
+# Create the rbpmn_bench database if it does not exist (idempotent).
+bench-db:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    psql -h localhost postgres -tc "select 1 from pg_database where datname = 'rbpmn_bench'" | grep -q 1 \
+        || psql -h localhost postgres -c "create database rbpmn_bench"
+
+# The full lifecycle suite (or one scenario: `just bench linear-5-service`).
+# Writes benchmarks/results/<scenario>-<date>-<host-id>.json, one per
+# scenario, each carrying the git sha, the seed, every Postgres setting, the
+# hardware and the scenario's own statement of what it does not measure.
+#
+# Release mode is not optional: a debug-build benchmark measures the debug
+# build, and someone will quote the number anyway.
+
+# The lifecycle suite, or one scenario: `just bench linear-5-service`.
+bench SCENARIO='': bench-db
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{SCENARIO}}" ]; then
+        cargo run --release -p rbpmn-bench -- run --all
+    else
+        cargo run --release -p rbpmn-bench -- run "{{SCENARIO}}"
+    fi
+
+# Latency under a fixed arrival rate rather than drain-the-backlog
+# throughput. Records whether the arrival tap fell behind — an open loop that
+# quietly slowed down would be reporting a rate it never ran at.
+
+# The same scenarios at a fixed arrival rate: latency under load.
+bench-steady SCENARIO='': bench-db
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{SCENARIO}}" ]; then
+        cargo run --release -p rbpmn-bench -- run --all --mode steady
+    else
+        cargo run --release -p rbpmn-bench -- run "{{SCENARIO}}" --mode steady
+    fi
+
+# The pure-core criterion suite (no database, no IO, no clock) plus the
+# regression gate against this machine's committed baseline. Fast, and the
+# one benchmark that may fail a build — see benchmarks/src/gate.rs for the
+# fences on that. A machine with no baseline yet reports and passes.
+
+# Pure-core micro-benchmarks + the regression gate (fast, no database).
+bench-micro:
+    cargo bench -p rbpmn-bench --bench core_constructs
+    cargo run --release -p rbpmn-bench -- gate --criterion-dir "${CARGO_TARGET_DIR:-target}/criterion"
+
+# Re-record this machine's micro baseline, into the gitignored
+# benchmarks/.baselines/. Never committed — a baseline describes one machine,
+# and the gate folds that machine's noise into its threshold. Explicit and
+# manual: a baseline that re-recorded itself would ratchet regressions in one
+# accepted percent at a time.
+
+# Re-record this machine's (gitignored, local) micro baseline.
+bench-baseline:
+    cargo bench -p rbpmn-bench --bench core_constructs
+    cargo run --release -p rbpmn-bench -- record-baseline --criterion-dir "${CARGO_TARGET_DIR:-target}/criterion"
+
+# The persisted half of the pattern micro-benchmarks: per-construct cost
+# including the rows it writes. Reported, never gated.
+
+# Per-construct cost including its row writes. Reported, never gated.
+bench-micro-persisted: bench-db
+    cargo run --release -p rbpmn-bench -- micro-persisted
+
+# Render the committed results into a markdown comparison table, grouped by
+# host — two machines' numbers are not comparable and a table that put them
+# adjacent would imply they were.
+
+# Render benchmarks/results/*.json into a markdown table, grouped by host.
+bench-report:
+    cargo run --release -p rbpmn-bench -- report
+
+# Lint and compile every benchmark model against its manifest. No database,
+# no Docker: the fast check that a benchmark model is still a model this
+# engine would deploy.
+
+# Lint and compile every benchmark model against its manifest (no database).
+bench-check:
+    cargo run -p rbpmn-bench -- check
+
+# The same suite against the pinned, explicitly tuned Postgres in
+# benchmarks/compose.yml instead of the machine's own server. Optional, and
+# the only recipe here that needs Docker. `down -v` at the end: the volume is
+# anonymous, so every compose run starts from an empty database — which is
+# the point of using it.
+
+# The suite against the pinned Postgres in compose.yml. Optional; needs Docker.
+bench-compose SCENARIO='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd benchmarks
+    trap 'docker compose -f compose.yml down -v' EXIT
+    docker compose -f compose.yml up -d --wait
+    export RBPMN_BENCH_DATABASE_URL="postgres://rbpmn:rbpmn@localhost:55432/rbpmn_bench"
+    cd ..
+    if [ -z "{{SCENARIO}}" ]; then
+        cargo run --release -p rbpmn-bench -- run --all --provisioned-by compose
+    else
+        cargo run --release -p rbpmn-bench -- run "{{SCENARIO}}" --provisioned-by compose
+    fi
