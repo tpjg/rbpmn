@@ -35,7 +35,7 @@ migration API, is listed with its status in the design brief's
 ## Status
 
 - [x] **Phase 0 — Parse & reject**: parser, full linter rule catalogue,
-      fixture corpus (22 accept / 34 reject today — every phase adds its
+      fixture corpus (23 accept / 35 reject today — every phase adds its
       own before its code), corpus runner.
 - [x] Server skeleton with the security spine and `POST /v1/definitions/lint`.
 - [x] **Phase 0-B — linter playground (WASM) + bpmnlint plugin**, with a
@@ -143,7 +143,8 @@ graphs that pass them).
 | `balanced-gateways` | error | Every parallel split has a matching join; branches stay disjoint; nothing enters/escapes the region; each branch delivers exactly one token; no plain end events inside (terminate allowed). |
 | `single-start-event` | error | Exactly one start event per process and per subprocess. |
 | `conditions-feel-subset` | error | Conditions only on exclusive-split flows, in the strict FEEL subset (`name op literal`, `and`/`or`, parentheses); default flow required. Full-FEEL constructs (functions, arithmetic, ranges) are rejected. |
-| `timer-iso8601` | error | Timer definitions must be valid ISO-8601; dates require an explicit UTC offset; component magnitudes bounded. |
+| `timer-iso8601` | error | Timer definitions must be valid ISO-8601; dates require an explicit UTC offset; component magnitudes bounded. Content marked `xsi:type="bpmn:tFormalExpression"` must instead be a FEEL qualified name. |
+| `timer-expression` | warn | A timer whose deadline is read from the variable document cannot be validated ahead of time — if it does not resolve to a valid ISO-8601 value at arm time, that element raises an incident rather than firing. |
 | `message-has-correlation` | error | Message start/catch/throw must reference a *named* message. The correlation binding itself (a FEEL qualified name) is registered via `map_correlation` and checked at deploy. |
 | `no-foreign-implementation` | warn | Service task carries vendor attributes (`camunda:`, `zeebe:`, …), which rbpmn ignores — topics are bound at registration. |
 | `unresolved-topic` | error | Every service task's topic (via `map_topic`, default: element id) must have a registered handler or a declared external-worker topic. Checked at deploy against registration state — ID reserved now, enforced from phase 2. |

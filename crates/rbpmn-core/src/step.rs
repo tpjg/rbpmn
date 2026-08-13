@@ -418,12 +418,17 @@ impl<'a> Advancer<'a> {
                     work_kind: *kind,
                     topic: topic.clone(),
                 });
-                self.arm_boundaries(state, token, node_ix);
+                // A boundary with an unresolvable deadline freezes here; the
+                // work item is already recorded, and the freeze cancels it
+                // along with everything else attached to the token.
+                let _ = self.arm_boundaries(state, token, node_ix);
                 Ok(())
             }
             ExecKind::TimerCatch { due } => {
                 self.element_started(node_ix);
-                let id = self.arm_timer(state, token, node_ix, due.clone());
+                let Some(id) = self.arm_timer(state, token, node_ix, &due.clone()) else {
+                    return Ok(()); // unresolvable deadline: frozen at an incident
+                };
                 state.tokens.insert(
                     token,
                     Token {
@@ -448,7 +453,7 @@ impl<'a> Advancer<'a> {
                     },
                 );
                 // A receive task can carry interrupting timer boundaries.
-                self.arm_boundaries(state, token, node_ix);
+                let _ = self.arm_boundaries(state, token, node_ix);
                 Ok(())
             }
             ExecKind::EventBasedGateway => {
@@ -467,7 +472,9 @@ impl<'a> Advancer<'a> {
                     let target = self.proc.flow(flow).target;
                     match &self.proc.node(target).kind {
                         ExecKind::TimerCatch { due } => {
-                            self.arm_timer(state, token, target, due.clone());
+                            if self.arm_timer(state, token, target, &due.clone()).is_none() {
+                                return Ok(()); // unresolvable deadline incident
+                            }
                         }
                         ExecKind::MessageCatch { .. } => {
                             if self.subscribe(state, token, target).is_none() {
@@ -506,8 +513,13 @@ impl<'a> Advancer<'a> {
                     },
                 );
                 // Boundary timers on the subprocess arm on the parent token,
-                // exactly as they do for a task.
-                self.arm_boundaries(state, token, node_ix);
+                // exactly as they do for a task. If one cannot resolve, the
+                // parent is frozen and the body must not start: entering it
+                // would leave live tokens inside a scope whose owner is an
+                // incident.
+                if !self.arm_boundaries(state, token, node_ix) {
+                    return Ok(());
+                }
                 let inner = state.next_token_id();
                 self.queue.push_back(Move {
                     token: inner,
@@ -730,25 +742,52 @@ impl<'a> Advancer<'a> {
     }
 
     /// Arm the host's interrupting timer boundaries on its parked token.
-    fn arm_boundaries(&mut self, state: &mut InstanceState, token: TokenId, host: NodeIx) {
+    /// `false` means one of them had an unresolvable deadline and the
+    /// instance is frozen at an incident — the caller must not continue, and
+    /// `freeze` has already withdrawn whatever this loop armed first.
+    #[must_use]
+    fn arm_boundaries(&mut self, state: &mut InstanceState, token: TokenId, host: NodeIx) -> bool {
         for b in self.proc.timer_boundaries(host).to_vec() {
             let ExecKind::TimerBoundary { due } = &self.proc.node(b).kind else {
                 unreachable!("timer_boundaries only holds timer boundary nodes");
             };
             let due = due.clone();
-            self.arm_timer(state, token, b, due);
+            if self.arm_timer(state, token, b, &due).is_none() {
+                return false;
+            }
         }
+        true
     }
 
-    /// The single timer-arming chokepoint (mirror of `subscribe`): allocate,
-    /// record, emit — every armed timer goes through here.
+    /// The single timer-arming chokepoint (mirror of `subscribe`): resolve,
+    /// allocate, record, emit — every armed timer goes through here.
+    ///
+    /// A deadline read from the variable document is resolved **now**, at arm
+    /// time, exactly as a correlation key is, and validated before it can
+    /// reach the projection's SQL cast. `None` means it could not be: the
+    /// instance is already frozen at an incident carrying the reason, and the
+    /// caller must stop. Freezing rather than guessing is the whole point —
+    /// firing at an invented time, or parking a token no timer will ever
+    /// wake, are the two failure modes this exists to avoid.
     fn arm_timer(
         &mut self,
         state: &mut InstanceState,
         token: TokenId,
         element: NodeIx,
-        due: crate::compile::TimerDue,
-    ) -> TimerId {
+        source: &crate::compile::TimerSource,
+    ) -> Option<TimerId> {
+        let due = match source.resolve(&state.variables) {
+            Ok(due) => due,
+            Err(reason) => {
+                self.events.push(Event::TimerResolveFailed {
+                    element: self.proc.node_id(element).to_string(),
+                    name: source.name(),
+                    reason,
+                });
+                self.freeze(state, token, element, None);
+                return None;
+            }
+        };
         let id = state.alloc_timer(TimerState {
             element,
             token,
@@ -760,7 +799,7 @@ impl<'a> Advancer<'a> {
             due,
             token,
         });
-        id
+        Some(id)
     }
 
     /// Interrupting boundary taken: the host's token leaves on the boundary

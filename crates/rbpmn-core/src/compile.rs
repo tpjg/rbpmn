@@ -81,6 +81,81 @@ pub enum TimerDue {
     Date(String),
 }
 
+/// Which ISO-8601 shape a variable-sourced timer must resolve to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimerKind {
+    Duration,
+    Date,
+}
+
+/// A compiled timer spec: a literal validated at deploy, or a FEEL qualified
+/// name read from the variable document when the timer is armed.
+///
+/// The two are deliberately different *types* rather than one enum with a
+/// "maybe resolved" flag: [`TimerDue`] is what the core emits and the
+/// projection stores, so making the resolved form unrepresentable-until-
+/// resolved means no arming path can accidentally hand an unresolved
+/// expression to the SQL cast. That cast is where an invalid value would
+/// abort the whole step transaction — leaving the token at its *previous*
+/// wait state and a worker retrying into the same failure forever.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TimerSource {
+    Literal(TimerDue),
+    Variable { kind: TimerKind, path: Vec<String> },
+}
+
+impl TimerSource {
+    /// Resolve against the variable document. `Err` carries a message fit for
+    /// an operator reading an incident: what was looked up, what was found,
+    /// and why it cannot be a deadline.
+    pub fn resolve(&self, variables: &serde_json::Value) -> Result<TimerDue, String> {
+        let (kind, path) = match self {
+            TimerSource::Literal(due) => return Ok(due.clone()),
+            TimerSource::Variable { kind, path } => (kind, path),
+        };
+        let name = path.join(".");
+        let value = rbpmn_model::condition::resolve_path(variables, path);
+        let serde_json::Value::String(text) = value else {
+            return Err(format!(
+                "'{name}' is {}, and a timer needs an ISO-8601 string",
+                describe(value)
+            ));
+        };
+        let checked = match kind {
+            TimerKind::Duration => rbpmn_model::iso8601::validate_duration(text),
+            TimerKind::Date => rbpmn_model::iso8601::validate_datetime(text),
+        };
+        match checked {
+            Ok(()) => Ok(match kind {
+                TimerKind::Duration => TimerDue::Duration(text.clone()),
+                TimerKind::Date => TimerDue::Date(text.clone()),
+            }),
+            Err(why) => Err(format!("'{name}' is \"{text}\", which is not valid: {why}")),
+        }
+    }
+
+    /// The source text as written in the model, for diagnostics.
+    pub fn name(&self) -> String {
+        match self {
+            TimerSource::Literal(due) => due.to_string(),
+            TimerSource::Variable { path, .. } => path.join("."),
+        }
+    }
+}
+
+/// How a JSON value reads in an incident message.
+fn describe(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "missing (or null)",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "a list",
+        serde_json::Value::Object(_) => "a context",
+    }
+}
+
 impl std::fmt::Display for TimerDue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -125,7 +200,7 @@ pub enum ExecKind {
     },
     /// Timer intermediate catch: parks its token behind an armed timer.
     TimerCatch {
-        due: TimerDue,
+        due: TimerSource,
     },
     /// Message catch — an `intermediateCatchEvent` or a `receiveTask` (same
     /// semantics): parks its token behind a subscription. `key` is the
@@ -137,7 +212,7 @@ pub enum ExecKind {
     /// Interrupting timer boundary: armed on the host's token, entered only
     /// by its timer firing — never via a sequence flow.
     TimerBoundary {
-        due: TimerDue,
+        due: TimerSource,
     },
     /// Parks its token and arms every target catch event; the first to fire
     /// wins and the rest are cancelled.
@@ -298,10 +373,27 @@ impl ExecutableProcess {
                 reason: e.to_string(),
             })
         };
-        let timer_due = |node: &FlowNode, spec: &TimerSpec| -> Result<TimerDue, CompileError> {
+        // The marker decides, never a guess: `P30X` is both a mistyped
+        // duration and a valid qualified name, so inferring would silently
+        // turn a typo into a variable lookup. Lint has already accepted one
+        // of the two forms (or rejected the element).
+        let timer_due = |node: &FlowNode, spec: &TimerSpec| -> Result<TimerSource, CompileError> {
+            let from_variable = |kind: TimerKind, text: &str| {
+                rbpmn_model::condition::parse_qname(text)
+                    .map(|path| TimerSource::Variable { kind, path })
+                    .map_err(|e| {
+                        CompileError::Internal(format!(
+                            "timer '{}' is marked a formal expression but is not a \
+                             qualified name ({e}) — lint should have rejected it",
+                            node.id
+                        ))
+                    })
+            };
             match spec {
-                TimerSpec::Duration(s) => Ok(TimerDue::Duration(s.clone())),
-                TimerSpec::Date(s) => Ok(TimerDue::Date(s.clone())),
+                TimerSpec::Duration(s) => Ok(TimerSource::Literal(TimerDue::Duration(s.clone()))),
+                TimerSpec::Date(s) => Ok(TimerSource::Literal(TimerDue::Date(s.clone()))),
+                TimerSpec::DurationExpr(s) => from_variable(TimerKind::Duration, s),
+                TimerSpec::DateExpr(s) => from_variable(TimerKind::Date, s),
                 TimerSpec::Cycle(_) | TimerSpec::Missing => Err(CompileError::Internal(format!(
                     "timer '{}' with a cycle/missing definition survived lint",
                     node.id

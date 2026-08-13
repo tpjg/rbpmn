@@ -1103,6 +1103,9 @@ pub(crate) async fn persist_step(
             | Event::VariablesPatched { .. }
             | Event::IncidentRaised { .. }
             | Event::CorrelationFailed { .. }
+            // Recorded, never projected: the freeze that follows is what
+            // changes rows. These carry the *reason* an operator needs.
+            | Event::TimerResolveFailed { .. }
             | Event::DuplicateSubscription { .. }
             | Event::InstanceCompleted
             | Event::InstanceTerminated => {}

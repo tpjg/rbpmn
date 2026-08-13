@@ -302,24 +302,66 @@ fn unsupported_message(tag: &str) -> String {
     format!("'{tag}' is not in the supported BPMN subset{hint}")
 }
 
+/// A timer spec is either a literal ISO-8601 value — validated here, before
+/// anything runs — or, marked `xsi:type="bpmn:tFormalExpression"`, a FEEL
+/// qualified name naming one in the variable document. BPMN types
+/// `timeDate`/`timeDuration` as `tExpression`, not as a string, so the second
+/// form is standard BPMN needing no extension: the same mechanism
+/// `conditionExpression` uses.
+///
+/// The marker is required rather than inferred. `P30X` is a mistyped duration
+/// *and* a syntactically valid qualified name, so guessing would turn a typo
+/// into a silent variable lookup that fails at runtime — a deploy-time error
+/// naming the real problem is strictly better.
+///
+/// The expression form can only be a **warning**. Whether `order.sla` holds a
+/// valid duration is unknowable at deploy — variables are one opaque document
+/// with no declarations — so the honest thing to say is what the consequence
+/// will be, not that something is wrong. Erroring would also be wrong for the
+/// standalone linter, which lints models targeting other engines, where this
+/// is ordinary valid BPMN.
 fn check_timer(id: &str, spec: &TimerSpec, out: &mut Vec<Diagnostic>) {
-    match spec {
-        TimerSpec::Date(s) => {
-            if let Err(msg) = iso8601::validate_datetime(s) {
-                out.push(Diagnostic::error(
-                    rule::TIMER_ISO8601,
-                    id,
-                    format!("invalid timeDate: {msg}"),
-                ));
-            }
+    let mut literal = |what: &str, text: &str, ok: Result<(), String>| {
+        if let Err(msg) = ok {
+            out.push(Diagnostic::error(
+                rule::TIMER_ISO8601,
+                id,
+                format!(
+                    "invalid {what}: {msg} — write a literal ISO-8601 value, or mark it \
+                     xsi:type=\"bpmn:tFormalExpression\" and name a variable holding one \
+                     (got \"{text}\")"
+                ),
+            ));
         }
-        TimerSpec::Duration(s) => {
-            if let Err(msg) = iso8601::validate_duration(s) {
-                out.push(Diagnostic::error(
+    };
+    match spec {
+        TimerSpec::Date(s) => literal("timeDate", s, iso8601::validate_datetime(s)),
+        TimerSpec::Duration(s) => literal("timeDuration", s, iso8601::validate_duration(s)),
+        TimerSpec::DateExpr(s) | TimerSpec::DurationExpr(s) => {
+            let what = match spec {
+                TimerSpec::DateExpr(_) => "timeDate",
+                _ => "timeDuration",
+            };
+            match condition::parse_qname(s) {
+                Ok(path) => out.push(Diagnostic::warn(
+                    rule::TIMER_EXPRESSION,
+                    id,
+                    format!(
+                        "{what} is read from the variable document at runtime \
+                         ('{}'), not a literal — rbpmn cannot check ahead of time that it \
+                         holds a valid ISO-8601 value, and if it does not, this element \
+                         raises an incident rather than firing",
+                        path.join(".")
+                    ),
+                )),
+                Err(e) => out.push(Diagnostic::error(
                     rule::TIMER_ISO8601,
                     id,
-                    format!("invalid timeDuration: {msg}"),
-                ));
+                    format!(
+                        "{what} is marked as a formal expression but '{s}' is not a FEEL \
+                         qualified name: {e}"
+                    ),
+                )),
             }
         }
         TimerSpec::Cycle(_) => out.push(Diagnostic::error(

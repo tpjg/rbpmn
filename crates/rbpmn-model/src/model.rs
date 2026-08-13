@@ -195,6 +195,12 @@ pub enum BoundaryTrigger {
 pub enum TimerSpec {
     Date(String),
     Duration(String),
+    /// Marked `xsi:type="bpmn:tFormalExpression"`: the content names a value
+    /// in the variable document rather than being one. Standard BPMN — the
+    /// same mechanism `conditionExpression` uses — and the marker is required
+    /// so that a mistyped literal can never be read as a variable name.
+    DateExpr(String),
+    DurationExpr(String),
     Cycle(String),
     Missing,
 }

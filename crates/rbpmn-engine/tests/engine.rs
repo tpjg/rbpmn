@@ -1041,6 +1041,7 @@ fn timer_catch_xml(spec: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                   id="defs" targetNamespace="urn:test">
   <bpmn:process id="pt" isExecutable="true">
     <bpmn:startEvent id="start"/>
@@ -1106,6 +1107,142 @@ async fn timer_fires_from_database_time() {
     assert_eq!(event_count(&db.pool, started.id, "timer-fired").await, 1);
     // Nothing left to fire.
     assert!(!engine.fire_due_timer().await.unwrap());
+    db.drop().await;
+}
+
+/// A deadline read from the variable document: standard BPMN (`timeDuration`
+/// is typed `tExpression`), resolved at arm time, and stored as the resolved
+/// literal so the projection's SQL cast only ever sees a validated value.
+#[tokio::test]
+async fn timer_deadline_comes_from_the_variable_document() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml(
+                r#"<bpmn:timeDuration xsi:type="bpmn:tFormalExpression">sla.wait</bpmn:timeDuration>"#,
+            ),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pt", None, serde_json::json!({ "sla": { "wait": "PT0S" } }))
+        .await
+        .unwrap();
+
+    // The row carries what was resolved, not the expression: rehydration and
+    // the scheduler never see a name they would have to look up again.
+    let spec: String =
+        sqlx::query_scalar("select due_spec from rbpmn_timer where instance_id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(spec, "PT0S");
+
+    assert!(engine.fire_due_timer().await.unwrap());
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(event_count(&db.pool, started.id, "timer-fired").await, 1);
+    db.drop().await;
+}
+
+/// The failure mode the feature exists to get right. An unresolvable deadline
+/// must not reach the projection's `$1::interval` cast: that would abort the
+/// step transaction, stranding the token at its *previous* wait state with a
+/// worker retrying into the same failure forever. Nor may it be swallowed,
+/// which parks a token no timer will ever wake. It freezes at an incident
+/// carrying the reason — the same way a correlation key that cannot resolve
+/// does.
+#[tokio::test]
+async fn an_unresolvable_deadline_freezes_at_an_incident() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml(
+                r#"<bpmn:timeDuration xsi:type="bpmn:tFormalExpression">sla.wait</bpmn:timeDuration>"#,
+            ),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+
+    for (variables, expected) in [
+        (serde_json::json!({}), "missing"),
+        (serde_json::json!({ "sla": { "wait": 5 } }), "a number"),
+        (
+            serde_json::json!({ "sla": { "wait": "5 minutes" } }),
+            "not valid",
+        ),
+    ] {
+        let started = engine.start("pt", None, variables).await.unwrap();
+        wait_for_status(&db.pool, started.id, "failed").await;
+        // No timer row: nothing to fire, and nothing for the scheduler to
+        // trip over later.
+        assert_eq!(timer_rows(&db.pool, started.id).await, 0);
+        assert!(!engine.fire_due_timer().await.unwrap());
+
+        let reason: String = sqlx::query_scalar(
+            "select payload->>'reason' from rbpmn_event \
+             where instance_id = $1 and kind = 'timer-resolve-failed'",
+        )
+        .bind(started.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            reason.contains("sla.wait") && reason.contains(expected),
+            "unhelpful incident reason: {reason}"
+        );
+
+        // Frozen where it failed, and inspectable — the repair API's single
+        // resume point.
+        let view = engine.inspect_instance(started.id).await.unwrap();
+        assert_eq!(view.status, "failed");
+        assert_eq!(view.tokens.len(), 1);
+        assert_eq!(view.tokens[0].element_id, "c");
+        assert_eq!(view.tokens[0].wait_kind, "incident");
+    }
+    db.drop().await;
+}
+
+/// The marker is what disambiguates, and it is required in both directions:
+/// unmarked content is always a literal, so a mistyped duration stays a
+/// deploy-time error instead of becoming a silent variable lookup.
+#[tokio::test]
+async fn an_unmarked_timer_is_always_a_literal() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    // `P30X` is a mistyped duration *and* a valid FEEL qualified name.
+    match engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>P30X</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+    {
+        Err(DeployError::Rejected(diags)) => {
+            assert!(diags.iter().any(|d| d.rule == "timer-iso8601"));
+        }
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+    // Marked, it deploys — with the warning that says what may happen.
+    let deployed = engine
+        .deploy(
+            &timer_catch_xml(
+                r#"<bpmn:timeDuration xsi:type="bpmn:tFormalExpression">P30X</bpmn:timeDuration>"#,
+            ),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        deployed
+            .warnings
+            .iter()
+            .any(|d| d.rule == "timer-expression")
+    );
     db.drop().await;
 }
 

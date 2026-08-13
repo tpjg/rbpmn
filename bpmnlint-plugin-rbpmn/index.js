@@ -18,6 +18,7 @@ export default {
         'rbpmn/single-start-event': 'error',
         'rbpmn/conditions-feel-subset': 'error',
         'rbpmn/timer-iso8601': 'error',
+        'rbpmn/timer-expression': 'warn',
         'rbpmn/message-has-correlation': 'error',
         'rbpmn/no-foreign-implementation': 'warn',
         'rbpmn/boundary-on-supported-host': 'error',

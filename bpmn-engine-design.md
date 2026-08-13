@@ -1109,7 +1109,7 @@ question is purely internal.
 | Event-stream read horizon | Hold history for a registered slow consumer *beyond* the nominal retention age | Low | Roadmap — purely additive over the phase-7 floor; see phase 7 for why the age subsumes it otherwise |
 | `rbpmn_event` time partitioning | Turns retention into `DROP PARTITION` at very large scale | Medium | Roadmap — physical only, no contract change; see phase 7 |
 | Non-interrupting boundary events | "Every 30 days while this runs"; rides on scope machinery | Medium | v2 — held out of v1 so it does not double phase 6's risk |
-| Expression-valued timers | Deadlines from the variable document; standard `tFormalExpression`, no extension needed | Small | Roadmap, pairs with v2 — needs two rulings (deploy validation weakens; trace stability) |
+| Expression-valued timers | Deadlines from the variable document; standard `tFormalExpression`, no extension needed | Small | **Shipped** — see the roadmap entry for the rulings taken |
 | Link events | Diagram hygiene once big models are common | Trivial | v2 |
 | Event subprocesses | "Cancel my order at any point" without boundary spaghetti | Medium | v3 |
 | Conditional events | Wake a token when the variable document satisfies a predicate | Moderate | v4 |
@@ -1154,10 +1154,10 @@ so the linter and the style teach the same thing. An optional warn-level
 "method-and-style" lint pack, labeling conventions and end-state naming, stays
 on the table as cheap goodwill for modelers who learned from Silver.)*
 
-**Expression-valued timers (small; pairs with v2).** `timeDate`,
-`timeDuration` and `timeCycle` are typed `tExpression` in the BPMN XSD, not
-string literals — so reading a deadline from the variable document is
-*standard* BPMN, needing no vendor extension:
+**Expression-valued timers (shipped).** `timeDate`, `timeDuration` and
+`timeCycle` are typed `tExpression` in the BPMN XSD, not string literals — so
+reading a deadline from the variable document is *standard* BPMN, needing no
+vendor extension:
 
 ```xml
 <bpmn:timeDuration xsi:type="bpmn:tFormalExpression">order.slaDuration</bpmn:timeDuration>
@@ -1213,10 +1213,32 @@ somewhere less clear, and relaxing both before the core can resolve them is
 exactly the "seems to run" this project refuses. Until then the existing
 `NotYetExecutable` phase pointer stands.
 
-One case no lint can catch, worth documenting when it lands: a *valid but
-nonsensical* value — a `timeDate` in the past, a negative duration — fires
-immediately. That may be exactly right ("the deadline already passed") or a
-bug, and nothing but the model's author can tell which.
+One case no lint can catch: a *valid but nonsensical* value — a `timeDate` in
+the past, a negative duration — fires immediately. That may be exactly right
+("the deadline already passed") or a bug, and nothing but the model's author
+can tell which.
+
+*What building it changed.* One assumption in the plan above was wrong, and
+the corpus caught it immediately: the two grammars are **not** disjoint.
+`P30X` is a mistyped duration *and* a syntactically valid FEEL qualified
+name, so inferring the form from the text would turn a typo into a silent
+variable lookup that fails at runtime — precisely the reinterpretation this
+engine refuses. The disambiguator is the spec's own: `xsi:type=
+"bpmn:tFormalExpression"` is **required** for the expression form, and
+unmarked content is always a literal. Two existing reject fixtures
+(`timer-invalid`, `timer-overflow`) kept erroring unchanged, which is the
+evidence that the relaxation did not leak.
+
+The subset is a FEEL **qualified name** (`order.slaDuration`), not general
+FEEL — the same strict subset correlation keys already use, so it stays
+syntactically and semantically valid when dsntk lands. `TimerSource` and
+`TimerDue` are deliberately distinct types rather than one enum with a
+"resolved" flag: the resolved form is what the projection stores, so an
+unresolved expression cannot reach the SQL cast by construction rather than
+by care. And `Event::TimerArmed`'s `Display` did not change — it shows the
+resolved value, so the golden format stayed stable while the traces gained a
+new sibling event, `timer-resolve-failed`, whose prose reason is deliberately
+*outside* the Display format so improving the message cannot break a trace.
 
 **v3 — Event subprocesses (cheap-ish).** Scope-attached event handlers with
 interrupting and non-interrupting starts. Reuses v2's scope/teardown machinery plus

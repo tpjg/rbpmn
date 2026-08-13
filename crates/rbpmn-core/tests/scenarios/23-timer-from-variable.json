@@ -1,0 +1,26 @@
+{
+  "fixture": "accept/23-timer-from-variable.bpmn",
+  "variables": { "order": { "slaDuration": "P2D" } },
+  "actions": [{ "fire": "sla" }],
+  "expect": {
+    "status": "completed",
+    "variables": { "order": { "slaDuration": "P2D" } },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started review",
+      "work-item-created review user review",
+      "timer-armed sla P2D",
+      "timer-fired sla",
+      "work-item-cancelled review",
+      "element-started sla",
+      "element-completed sla",
+      "flow-taken f3",
+      "element-started escalated",
+      "element-completed escalated",
+      "instance-completed"
+    ]
+  }
+}

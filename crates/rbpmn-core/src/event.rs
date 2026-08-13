@@ -104,6 +104,18 @@ pub enum Event {
         element: String,
         name: String,
     },
+    /// A timer whose deadline is read from the variable document could not be
+    /// resolved: the name is missing, holds a non-string, or holds a string
+    /// that is not a valid ISO-8601 value. Arming freezes the instance as an
+    /// incident rather than firing at a guessed time or waiting forever —
+    /// `reason` is what an operator reads to fix it. Sibling of
+    /// [`Event::CorrelationFailed`], which fails the same way for the same
+    /// reason: both resolve a qualified name at arm time.
+    TimerResolveFailed {
+        element: String,
+        name: String,
+        reason: String,
+    },
     /// A second open subscription for the same (message, key) in one
     /// instance: every delivery would be permanently ambiguous, so arming
     /// freezes the instance as an incident.
@@ -161,6 +173,12 @@ impl fmt::Display for Event {
             } => write!(f, "subscription-cancelled {element} {message}"),
             Event::CorrelationFailed { element, name } => {
                 write!(f, "correlation-failed {element} {name}")
+            }
+            Event::TimerResolveFailed { element, name, .. } => {
+                // The reason stays out of the golden format: it is prose, it
+                // will improve, and a trace should not break when it does.
+                // Inspection shows it in full from the stored payload.
+                write!(f, "timer-resolve-failed {element} {name}")
             }
             Event::DuplicateSubscription {
                 element,

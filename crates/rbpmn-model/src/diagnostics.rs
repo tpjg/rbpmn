@@ -73,6 +73,7 @@ pub mod rule {
     pub const SINGLE_START_EVENT: &str = "single-start-event";
     pub const CONDITIONS_FEEL_SUBSET: &str = "conditions-feel-subset";
     pub const TIMER_ISO8601: &str = "timer-iso8601";
+    pub const TIMER_EXPRESSION: &str = "timer-expression";
     pub const MESSAGE_HAS_CORRELATION: &str = "message-has-correlation";
     pub const NO_FOREIGN_IMPLEMENTATION: &str = "no-foreign-implementation";
     /// Deploy-time rule checked against *registration state* (map_topic /
@@ -130,7 +131,12 @@ pub const CATALOGUE: &[RuleInfo] = &[
     RuleInfo {
         id: rule::TIMER_ISO8601,
         severity: Severity::Error,
-        summary: "Timer definitions must be valid ISO-8601 dates or durations.",
+        summary: "Timer definitions must be a valid ISO-8601 date or duration, or a FEEL qualified name naming one in the variable document.",
+    },
+    RuleInfo {
+        id: rule::TIMER_EXPRESSION,
+        severity: Severity::Warn,
+        summary: "A timer read from the variable document cannot be validated ahead of time; if it does not resolve to a valid ISO-8601 value the instance raises an incident there.",
     },
     RuleInfo {
         id: rule::MESSAGE_HAS_CORRELATION,
