@@ -50,6 +50,22 @@ function selectRow(label, value, options, commit, { hint } = {}) {
   return row;
 }
 
+/// Writing a condition is the same operation from either pane — the flow's
+/// own, or the gateway's list of branches. Kept in one place so the empty
+/// case (clear the expression rather than store an empty one) cannot drift
+/// between them.
+function conditionWriter(modeler, flowElement) {
+  const modeling = modeler.get('modeling');
+  const moddle = modeler.get('moddle');
+  return (body) => {
+    if (!flowElement) return;
+    const expression = body.trim()
+      ? moddle.create('bpmn:FormalExpression', { body: body.trim() })
+      : undefined;
+    modeling.updateProperties(flowElement, { conditionExpression: expression });
+  };
+}
+
 /// Renders the editable standard-BPMN properties of `element`.
 export function renderProperties(container, modeler, element) {
   container.replaceChildren();
@@ -108,20 +124,10 @@ export function renderProperties(container, modeler, element) {
 
   if (bo.$type === 'bpmn:SequenceFlow') {
     container.append(
-      textRow(
-        'condition',
-        bo.conditionExpression?.body,
-        (body) => {
-          const expression = body.trim()
-            ? moddle.create('bpmn:FormalExpression', { body: body.trim() })
-            : undefined;
-          update({ conditionExpression: expression });
-        },
-        {
-          placeholder: 'amount > 100',
-          hint: 'FEEL subset: name op literal, and/or, parentheses',
-        }
-      )
+      textRow('condition', bo.conditionExpression?.body, conditionWriter(modeler, element), {
+        placeholder: 'amount > 100',
+        hint: 'FEEL subset: name op literal, and/or, parentheses',
+      })
     );
   }
 
@@ -162,8 +168,6 @@ export function renderProperties(container, modeler, element) {
 /// is where you are already looking, so the whole split is editable here.
 function renderBranchConditions(container, modeler, gateway, outgoing) {
   const registry = modeler.get('elementRegistry');
-  const modeling = modeler.get('modeling');
-  const moddle = modeler.get('moddle');
 
   container.append(el('div', 'prop-group', 'branch conditions'));
   for (const flow of outgoing) {
@@ -182,18 +186,11 @@ function renderBranchConditions(container, modeler, gateway, outgoing) {
       continue;
     }
 
-    const flowElement = registry.get(flow.id);
     container.append(
       textRow(
         `${label}${target}`,
         flow.conditionExpression?.body,
-        (body) => {
-          if (!flowElement) return;
-          const expression = body.trim()
-            ? moddle.create('bpmn:FormalExpression', { body: body.trim() })
-            : undefined;
-          modeling.updateProperties(flowElement, { conditionExpression: expression });
-        },
+        conditionWriter(modeler, registry.get(flow.id)),
         { placeholder: 'amount > 100' }
       )
     );

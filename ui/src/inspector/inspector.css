@@ -422,3 +422,15 @@ body {
   stroke: #d69e2e !important;
   stroke-width: 4px !important;
 }
+
+/* Prose an operator needs that `display` cannot carry: `display` is the
+   golden-trace format and therefore stable API, so a reason that may be
+   reworded lives in the event's `detail` instead. */
+.trace-detail {
+  margin: 1px 0 3px;
+  padding-left: 8px;
+  border-left: 2px solid var(--line);
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

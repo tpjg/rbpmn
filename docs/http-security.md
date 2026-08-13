@@ -111,23 +111,42 @@ can be literally true.
     inspector shows the whole variable document by design. Deciding *who may
     see it* is the application's call — see redaction below.
 - **A policy the document carries.** Each document emits its own
-  `<meta http-equiv="Content-Security-Policy">`:
+  `<meta http-equiv="Content-Security-Policy">`. The two differ, and the
+  difference is the point — each gets the narrowest policy that lets it do
+  its job:
 
   ```
-  default-src 'none'; script-src 'sha256-…'; style-src 'unsafe-inline';
-  img-src data:; font-src data:; connect-src 'none'; base-uri 'none';
-  form-action 'none'
+  inspector:  default-src 'none'; script-src 'sha256-…';
+              style-src 'unsafe-inline'; img-src data:; font-src data:;
+              connect-src 'none'; base-uri 'none'; form-action 'none'
+
+  editor:     default-src 'none'; script-src 'sha256-…' 'wasm-unsafe-eval';
+              style-src 'unsafe-inline'; img-src data:; font-src data:;
+              connect-src 'self'; base-uri 'none'; form-action 'none'
   ```
 
-  `connect-src 'none'` is the one worth reading twice: the document **cannot
-  phone home** — no fetch, no XHR, no WebSocket, no beacon. Every other fetch
-  directive is `'none'` or `data:`, so `style-src 'unsafe-inline'` (which
-  diagram-js needs) is not an exfiltration channel either: CSS `url()` loads
-  resolve under `img-src`/`font-src` and have nowhere to go. Script execution,
-  the part that would matter, stays hash-pinned.
-  - Only the **editor** carries `'wasm-unsafe-eval'`, because only the editor
-    compiles the linter. The inspector renders an already-deployed model and
-    ships no validator.
+  **`connect-src`.** The inspector gets `'none'`, and that is the guarantee
+  worth reading twice: the document holding business data **cannot phone
+  home** — no fetch, no XHR, no WebSocket, no beacon. The editor gets
+  `'self'`, because it has one legitimate call (the covered-topic set) and
+  carries no instance data to leak. The document with the sensitive payload
+  is the locked-down one, which is the right way round; an editor pinned to
+  `'none'` would merely be an editor whose own button its own policy blocks,
+  which is how this shipped for one commit.
+
+  Everything else is `'none'` or `data:` in both, so `style-src
+  'unsafe-inline'` (which diagram-js needs) is not an exfiltration channel
+  either: CSS `url()` loads resolve under `img-src`/`font-src` and have
+  nowhere to go. Script execution, the part that would matter, stays
+  hash-pinned in both.
+
+  **`'wasm-unsafe-eval'`** is the editor's alone, because only the editor
+  compiles the linter. The inspector renders an already-deployed model and
+  ships no validator.
+
+  Both directions are asserted in `crates/rbpmn-ui/tests/documents.rs`: the
+  inspector must not be allowed a connection, and the editor must be — a
+  policy that blocks the page's own feature is not stricter, it is broken.
 - **Response headers**, when served through `rbpmn-ui`'s routers:
   `Cache-Control: no-store, max-age=0`, `X-Content-Type-Options: nosniff`.
 - **No credentials in the browser.** Neither document reads, stores or sends a

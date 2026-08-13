@@ -131,3 +131,49 @@ test('an incident outranks a terminal status', () => {
   );
   assert.match(result.headline, /Incident/);
 });
+
+// `display` is the golden-trace format and therefore stable API, so a reason
+// that may still be reworded lives in the event's `detail`. An incident with
+// no failed work item — a timer that would not resolve, say — has its cause
+// only there, and dropping it leaves the headline saying merely *that* the
+// instance froze.
+test('an incident with no work item takes its reason from an event detail', () => {
+  const result = diagnose(
+    inspection({
+      tokens: [{ elementId: 't1', waitKind: 'incident', scopeNo: 0 }],
+      events: [
+        { kind: 'timer-resolve-failed', elementId: 't1', display: 'timer-resolve-failed t1',
+          detail: "'due' is not an ISO-8601 duration and no variable of that name is set" },
+      ],
+    })
+  );
+  assert.equal(result.severity, 'error');
+  assert.match(result.detail, /not an ISO-8601 duration/);
+});
+
+test('an event detail for a different element is not borrowed', () => {
+  const result = diagnose(
+    inspection({
+      tokens: [{ elementId: 't1', waitKind: 'incident', scopeNo: 0 }],
+      events: [
+        { kind: 'timer-resolve-failed', elementId: 'elsewhere', display: 'x', detail: 'unrelated' },
+      ],
+    })
+  );
+  assert.match(result.detail, /no failed work item/);
+});
+
+// A failed work item already carries its own reason; the detail path is the
+// fallback for incidents that have none, not a replacement.
+test('a failed work item still explains itself', () => {
+  const result = diagnose(
+    inspection({
+      tokens: [{ elementId: 'charge', waitKind: 'incident', scopeNo: 0 }],
+      workItems: [{ elementId: 'charge', state: 'failed', topic: 'payments', kind: 'service',
+                    retries: 0, lastFailure: 'handler answered 502' }],
+      events: [{ kind: 'x', elementId: 'charge', display: 'x', detail: 'should not win' }],
+    })
+  );
+  assert.match(result.detail, /handler answered 502/);
+  assert.doesNotMatch(result.detail, /should not win/);
+});

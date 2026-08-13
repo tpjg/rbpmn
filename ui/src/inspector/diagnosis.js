@@ -19,8 +19,17 @@ export function diagnose(data) {
       if (failed.lastFailure) parts.push(failed.lastFailure);
     } else {
       // An incident without a failed work item: a correlation or timer
-      // problem froze the instance. Say that rather than inventing a cause.
-      parts.push('the instance froze here; no failed work item — check the trace');
+      // problem froze the instance. The reason, when there is one, lives in
+      // an event's `detail` — `display` is the stable golden-trace format and
+      // cannot carry prose that may be reworded. Without this the headline
+      // could only say *that* it froze.
+      const reason = data.events
+        .filter((e) => e.elementId === incidentToken.elementId && e.detail)
+        .map((e) => e.detail)
+        .pop();
+      parts.push(
+        reason ?? 'the instance froze here; no failed work item — check the trace'
+      );
     }
     return {
       severity: 'error',

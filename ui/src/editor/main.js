@@ -420,8 +420,16 @@ function environmentUrl() {
   // path has no trailing slash, so a document at /ui/editor asked for
   // /ui/api/… and got a 404. Both spellings of the mount serve the document,
   // so both have to resolve the same way.
-  const path = location.pathname.endsWith('/') ? location.pathname : `${location.pathname}/`;
-  return new URL(`${path}api/environment`, location.origin).href;
+  //
+  // Built from `document.baseURI`, never `location.origin`: on file:// the
+  // origin is the string "null", and `new URL(path, "null")` throws — which
+  // reached the user as "cannot reach the server: Invalid URL" rather than
+  // the truth, which is that a document opened from disk has no server.
+  const base = new URL(document.baseURI);
+  base.search = '';
+  base.hash = '';
+  if (!base.pathname.endsWith('/')) base.pathname += '/';
+  return new URL('api/environment', base).href;
 }
 
 async function loadEnvironment() {
@@ -430,6 +438,18 @@ async function loadEnvironment() {
     const response = await fetch(environmentUrl(), { headers: { accept: 'application/json' } });
     if (!response.ok) {
       renderEnvironment(null, `server answered ${response.status}`);
+      return;
+    }
+    // A 200 that is not JSON means this document was served from a path whose
+    // API sibling does not exist, and something upstream answered with a page
+    // instead. Say that, rather than letting JSON.parse fail on markup.
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!contentType.includes('json')) {
+      renderEnvironment(
+        null,
+        `expected JSON at ${environmentUrl()} but got ${contentType || 'no content type'} — ` +
+          'is the environment API mounted beside this document?'
+      );
       return;
     }
     const body = await response.json();

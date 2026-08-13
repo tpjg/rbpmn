@@ -18,6 +18,16 @@ import { clear, el, field, jsonTree, section } from '../shared/dom.js';
 import { describeElement } from '../shared/model-facts.js';
 import { diagnose } from './diagnosis.js';
 
+/// One trace line. `display` is the golden-trace format and therefore stable
+/// API, so a reason that may still be reworded lives in `detail` instead —
+/// which means dropping `detail` makes an incident say only *that* it failed.
+/// A `timer-resolve-failed` reads as "timer-resolve-failed t1" without it.
+function traceLine(event) {
+  const item = el('li', null, event.display);
+  if (event.detail) item.append(el('div', 'trace-detail', event.detail));
+  return item;
+}
+
 function readData() {
   const node = document.getElementById('rbpmn-data');
   if (!node) throw new Error('no inspection data in this document');
@@ -53,6 +63,8 @@ function build(root, data) {
 
 /// The line an operator actually arrived for: not "where is the token" but
 /// "what went wrong". Everything it needs is already in the payload.
+/// Returns the element the headline names, so the caller can open on it
+/// without running the whole diagnosis a second time.
 function renderDiagnosis(box, data, viewer) {
   clear(box);
   const { severity, headline, detail, elementId } = diagnose(data);
@@ -66,6 +78,7 @@ function renderDiagnosis(box, data, viewer) {
     link.addEventListener('click', () => focus(viewer, elementId));
     box.append(link);
   }
+  return elementId;
 }
 
 /// Every annotation the diagram carries, derived from runtime rows only.
@@ -179,7 +192,7 @@ function renderElement(container, data, viewer, elementId) {
   });
   if (slice.length) {
     const list = el('ol', 'trace');
-    for (const event of slice) list.append(el('li', null, event.display));
+    for (const event of slice) list.append(traceLine(event));
     traceBody.append(list);
   } else {
     traceBody.append(el('p', 'empty', 'no events for this element'));
@@ -234,7 +247,7 @@ async function main() {
   });
   const traceList = el('ol', 'trace');
   for (const event of data.events) {
-    const item = el('li', null, event.display);
+    const item = traceLine(event);
     if (event.elementId) {
       item.classList.add('clickable');
       item.addEventListener('click', () => {
@@ -272,13 +285,11 @@ async function main() {
     canvasNote.textContent = `diagram cannot be rendered: ${e.message}`;
   }
 
-  renderDiagnosis(diagnosisBox, data, viewer);
-
   // Open on the problem. Whoever followed a link here was sent because
   // something is wrong with this instance, so making them hunt for the
   // element the headline already names is a wasted click. Falls back to the
   // empty pane when there is nothing to point at.
-  const { elementId } = diagnose(data);
+  const elementId = renderDiagnosis(diagnosisBox, data, viewer);
   renderElement(elementPane, data, viewer, elementId);
   if (elementId) focus(viewer, elementId);
 }

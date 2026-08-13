@@ -113,7 +113,7 @@ def check_inspector(browser):
     page.evaluate("() => document.querySelectorAll('details').forEach(d => d.open = true)")
     fits = page.evaluate(
         "() => { const s = document.querySelector('.side');"
-        " return s.clientHeight <= window.innerHeight + 1 && s.scrollHeight >= s.clientHeight; }"
+        " return s.clientHeight <= window.innerHeight + 1 && s.scrollHeight > s.clientHeight; }"
     )
     check(fits, "the detail column stays inside the viewport and scrolls")
 
@@ -188,8 +188,12 @@ def check_editor(browser):
 
     SHOTS.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(SHOTS / "ui_editor.png"), full_page=False)
-    check(not problems, f"no console errors or network requests: {problems}")
     check_condition_repair(page)
+    # Asserted last: check_condition_repair drives the whole condition-editing
+    # flow, and anything it throws — a JS exception in reveal(), a
+    # CSP-blocked request — lands in this same list. Checking before it ran
+    # meant those passed silently.
+    check(not problems, f"no console errors or network requests: {problems}")
     page.close()
 
 
@@ -256,7 +260,6 @@ def check_condition_repair(page):
 
     # Repair one branch from the gateway and watch that error clear.
     before = page.locator(".diagnostic", has_text="conditions-feel-subset").count()
-    field = page.locator(".properties input").filter(has_not_text="").nth(0)
     boxes = page.locator(".properties .prop", has_text="f_fn").locator("input")
     boxes.first.fill("amount > 100")
     boxes.first.blur()
@@ -266,7 +269,6 @@ def check_condition_repair(page):
         timeout=15000,
     )
     check(True, "fixing a branch from the gateway clears its diagnostic")
-    _ = field
     page.screenshot(path=str(SHOTS / "ui_editor_conditions.png"), full_page=False)
 
 

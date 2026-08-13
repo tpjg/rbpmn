@@ -803,6 +803,18 @@ mod ui {
             assert!(html.starts_with("<!doctype html>"));
             assert!(html.contains("Content-Security-Policy"));
         }
+
+        // ... but only those two. Serving the editor from an arbitrary
+        // subpath would hand it a location whose API sibling does not exist:
+        // the page resolves `api/environment` relative to itself, and a
+        // catch-all would answer that with more HTML and a 200, failing
+        // inside JSON.parse. A 404 is the honest answer.
+        let resp = app
+            .clone()
+            .oneshot(authed_get("/ui/editor/not-a-page"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         db.drop().await;
     }
 

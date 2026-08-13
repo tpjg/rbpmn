@@ -123,10 +123,12 @@ migration API, is listed with its status in the design brief's
       live L1+L2 validation from the same code deploy runs, compiled to
       wasm32. Its one optional server call fetches the **covered topic set**
       for `unresolved-topic` — a list of names, so the model never leaves the
-      browser. Each document carries its own CSP with `connect-src 'none'`:
-      it cannot phone home. See
-      [docs/http-security.md](docs/http-security.md) for what the embedding
-      application still owes its users.
+      browser. Each document carries its own CSP, narrowed to what it
+      actually does: the inspector — the one holding business data — gets
+      `connect-src 'none'` and so cannot phone home at all, while the editor
+      gets `'self'` for that single call and carries no instance data to
+      leak. See [docs/http-security.md](docs/http-security.md) for what the
+      embedding application still owes its users.
 
 ## Rule catalogue
 

@@ -36,14 +36,15 @@ pub const EDITOR_API_PREFIX: &str = "api";
 /// and a wildcard will not cover the gap because a wildcard needs at least
 /// one character to match.
 ///
-/// The catch-all here handles everything *below* the mount: a single-document
-/// app has no second page, so showing the tool beats showing an error. A
-/// sibling router nested deeper (the API, at [`EDITOR_API_PREFIX`]) still
-/// wins — static segments outrank a wildcard.
+/// Deliberately *not* a catch-all over everything below the mount. Serving
+/// the editor from an arbitrary subpath looks generous and is a trap: the
+/// document resolves its API call relative to its own location, so a page
+/// served at `/editor/anything` asks for `/editor/anything/api/environment`,
+/// which the same catch-all answers with more HTML and a 200. The button
+/// then fails inside `JSON.parse`. A 404 for a path that does not exist is
+/// the honest answer, and the two real spellings are both served.
 pub fn editor_router() -> Router {
-    Router::new()
-        .route("/", get(editor))
-        .route("/{*rest}", get(editor))
+    Router::new().route("/", get(editor))
 }
 
 /// The trailing-slash companion to [`editor_router`]. `mount` is the same
