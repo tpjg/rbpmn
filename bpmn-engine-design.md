@@ -1218,16 +1218,42 @@ the past, a negative duration — fires immediately. That may be exactly right
 ("the deadline already passed") or a bug, and nothing but the model's author
 can tell which.
 
-*What building it changed.* One assumption in the plan above was wrong, and
-the corpus caught it immediately: the two grammars are **not** disjoint.
-`P30X` is a mistyped duration *and* a syntactically valid FEEL qualified
-name, so inferring the form from the text would turn a typo into a silent
-variable lookup that fails at runtime — precisely the reinterpretation this
-engine refuses. The disambiguator is the spec's own: `xsi:type=
-"bpmn:tFormalExpression"` is **required** for the expression form, and
-unmarked content is always a literal. Two existing reject fixtures
-(`timer-invalid`, `timer-overflow`) kept erroring unchanged, which is the
-evidence that the relaxation did not leak.
+*What building it changed, and then changed back.* One assumption in the plan
+above was wrong, and the corpus caught it immediately: the two grammars are
+**not** disjoint. `P30X` is a mistyped duration *and* a syntactically valid
+FEEL qualified name. The first fix was to require the spec's own marker,
+`xsi:type="bpmn:tFormalExpression"`, to opt into the reference form.
+
+That was wrong for a reason no amount of reading the XSD would have revealed:
+**bpmn-moddle emits the marker for any expression object**, so every bpmn-js
+modeler — this repo's own editor, Camunda Modeler — stamps it on ordinary
+literal durations. Verified by round-tripping through the repo's own
+bpmn-moddle: `moddle.create('bpmn:FormalExpression', {body: 'P3D'})`
+serialises `<bpmn:timeDuration xsi:type="bpmn:tFormalExpression">P3D</...>`,
+while a literal read from XML stays `bpmn:Expression` and round-trips clean.
+Keying off the marker therefore turned `P3D` typed into a properties panel
+into a variable lookup named `P3D`. A marker that tooling writes
+unconditionally carries no authorial intent.
+
+**The rule is parse order** (Timo's call): a spec that parses as ISO-8601 is a
+literal; one that does not is read as a qualified name. Intuitive, and it is
+what a modeller expects. The cost is accepted deliberately: a mistyped
+duration shaped like a name (`P30X`, `P999999999W`) now falls through to a
+warning rather than erroring, so two fixtures moved from `reject/` to
+`accept/24-timer-typo-reads-as-variable.bpmn`. What keeps that honest is the
+warning text — it carries the ISO-8601 complaint that *made* it fall through
+("duration needs at least one component"), so an author reads why it is not a
+duration and what it will be treated as instead, on one line. Component
+bounds keep their error coverage through a `timeDate`, whose `-` and `:`
+cannot be a qualified name.
+
+A freeze mid-entry has to close what the entry had already opened — the
+host's work item, and a subprocess's just-allocated scope. Neither was
+obvious: `cancel_attachments` withdraws timers and subscriptions only, so the
+first version left an `available` work item on a failed instance and a scope
+row with no members whose owner had become an incident. Harmless only while
+claimability requires `status = 'active'`; a repair API clearing the incident
+would have handed a worker an item whose token was parked at one.
 
 The subset is a FEEL **qualified name** (`order.slaDuration`), not general
 FEEL — the same strict subset correlation keys already use, so it stays
@@ -1238,7 +1264,9 @@ unresolved expression cannot reach the SQL cast by construction rather than
 by care. And `Event::TimerArmed`'s `Display` did not change — it shows the
 resolved value, so the golden format stayed stable while the traces gained a
 new sibling event, `timer-resolve-failed`, whose prose reason is deliberately
-*outside* the Display format so improving the message cannot break a trace.
+*outside* the Display format so improving the message cannot break a trace —
+and therefore carried separately on `EventView::detail`, because a reason
+that no read path can reach is a reason that does not exist.
 
 **v3 — Event subprocesses (cheap-ish).** Scope-attached event handlers with
 interrupting and non-interrupting starts. Reuses v2's scope/teardown machinery plus

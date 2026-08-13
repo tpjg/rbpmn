@@ -1,7 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
-  error timer-iso8601 @ c
+  warn timer-expression @ c
 -->
+<!-- The cost of literal-first parsing, pinned deliberately: 'P30X' is a
+     mistyped duration *and* a syntactically valid FEEL qualified name, so it
+     falls through to the reference form instead of erroring as it did before
+     timers could read variables. It is not silent — the warning carries the
+     ISO-8601 complaint that made it fall through ("duration needs at least
+     one component"), so an author reads why it is not a duration and what it
+     will be treated as instead, on one line. The alternative, requiring
+     xsi:type="bpmn:tFormalExpression" to opt in, was tried and reverted:
+     bpmn-moddle stamps that marker on every expression object, so every
+     bpmn-js modeler writes it on ordinary literals. -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
   <bpmn:process id="p" isExecutable="true">
     <bpmn:startEvent id="start">

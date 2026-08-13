@@ -5,6 +5,9 @@
 <!-- A duration that is syntactically valid ISO-8601 but overflows
      PostgreSQL's int32 interval fields at timer-arm time: lint must reject
      at deploy exactly what would fail at runtime. -->
+<!-- Component bounds, still an error: a date carries '-' and ':', which are
+     not legal in a FEEL qualified name, so it cannot fall through to the
+     reference form the way a mistyped *duration* now can (see accept/24). -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
   <bpmn:process id="p" isExecutable="true">
     <bpmn:startEvent id="start">
@@ -14,7 +17,7 @@
       <bpmn:incoming>f1</bpmn:incoming>
       <bpmn:outgoing>f2</bpmn:outgoing>
       <bpmn:timerEventDefinition>
-        <bpmn:timeDuration>P999999999W</bpmn:timeDuration>
+        <bpmn:timeDate>2026-13-45T99:00:00Z</bpmn:timeDate>
       </bpmn:timerEventDefinition>
     </bpmn:intermediateCatchEvent>
     <bpmn:endEvent id="end">

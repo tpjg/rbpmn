@@ -8,7 +8,6 @@ use crate::model::*;
 use roxmltree::{Document, Node};
 
 pub const BPMN_NS: &str = "http://www.omg.org/spec/BPMN/20100524/MODEL";
-pub const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
 /// Vendor namespaces whose attributes/extension elements we detect (to warn
 /// that rbpmn ignores them — wiring is bound at registration time, never in
@@ -292,27 +291,11 @@ fn message_ref(def: Node) -> Option<String> {
     attr_string(def, "messageRef")
 }
 
-/// `xsi:type="bpmn:tFormalExpression"` is the spec's own marker for "this
-/// content is an expression, not a value", and it is what disambiguates a
-/// timer read from the variable document from a literal.
-///
-/// The marker is **required**, not inferred, and that is the whole point:
-/// `P30X` is a mistyped duration *and* a syntactically valid FEEL qualified
-/// name. Guessing would turn a typo into a silent variable lookup that fails
-/// at runtime instead of a deploy-time error naming the real problem.
-fn is_formal_expression(c: Node) -> bool {
-    c.attribute((XSI_NS, "type"))
-        .is_some_and(|t| t.rsplit(':').next() == Some("tFormalExpression"))
-}
-
 fn timer_spec(def: Node) -> TimerSpec {
     for c in elements(def) {
         let text = || c.text().unwrap_or("").trim().to_string();
-        let formal = is_formal_expression(c);
         match bpmn_tag(c) {
-            Some("timeDate") if formal => return TimerSpec::DateExpr(text()),
             Some("timeDate") => return TimerSpec::Date(text()),
-            Some("timeDuration") if formal => return TimerSpec::DurationExpr(text()),
             Some("timeDuration") => return TimerSpec::Duration(text()),
             Some("timeCycle") => return TimerSpec::Cycle(text()),
             _ => {}

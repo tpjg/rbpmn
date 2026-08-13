@@ -373,27 +373,39 @@ impl ExecutableProcess {
                 reason: e.to_string(),
             })
         };
-        // The marker decides, never a guess: `P30X` is both a mistyped
-        // duration and a valid qualified name, so inferring would silently
-        // turn a typo into a variable lookup. Lint has already accepted one
-        // of the two forms (or rejected the element).
+        // Literal first, always — the same order the linter used to accept
+        // this element. The `xsi:type="bpmn:tFormalExpression"` marker is
+        // deliberately *not* consulted: bpmn-moddle writes it for any
+        // expression object, so every bpmn-js modeler stamps it on ordinary
+        // literal durations, and keying off it turned `P3D` into a variable
+        // named `P3D`.
         let timer_due = |node: &FlowNode, spec: &TimerSpec| -> Result<TimerSource, CompileError> {
             let from_variable = |kind: TimerKind, text: &str| {
                 rbpmn_model::condition::parse_qname(text)
                     .map(|path| TimerSource::Variable { kind, path })
                     .map_err(|e| {
                         CompileError::Internal(format!(
-                            "timer '{}' is marked a formal expression but is not a \
-                             qualified name ({e}) — lint should have rejected it",
+                            "timer '{}' is neither an ISO-8601 literal nor a qualified \
+                             name ({e}) — lint should have rejected it",
                             node.id
                         ))
                     })
             };
             match spec {
-                TimerSpec::Duration(s) => Ok(TimerSource::Literal(TimerDue::Duration(s.clone()))),
-                TimerSpec::Date(s) => Ok(TimerSource::Literal(TimerDue::Date(s.clone()))),
-                TimerSpec::DurationExpr(s) => from_variable(TimerKind::Duration, s),
-                TimerSpec::DateExpr(s) => from_variable(TimerKind::Date, s),
+                TimerSpec::Duration(s) => {
+                    if rbpmn_model::iso8601::validate_duration(s).is_ok() {
+                        Ok(TimerSource::Literal(TimerDue::Duration(s.clone())))
+                    } else {
+                        from_variable(TimerKind::Duration, s)
+                    }
+                }
+                TimerSpec::Date(s) => {
+                    if rbpmn_model::iso8601::validate_datetime(s).is_ok() {
+                        Ok(TimerSource::Literal(TimerDue::Date(s.clone())))
+                    } else {
+                        from_variable(TimerKind::Date, s)
+                    }
+                }
                 TimerSpec::Cycle(_) | TimerSpec::Missing => Err(CompileError::Internal(format!(
                     "timer '{}' with a cycle/missing definition survived lint",
                     node.id

@@ -1183,22 +1183,22 @@ async fn an_unresolvable_deadline_freezes_at_an_incident() {
         assert_eq!(timer_rows(&db.pool, started.id).await, 0);
         assert!(!engine.fire_due_timer().await.unwrap());
 
-        let reason: String = sqlx::query_scalar(
-            "select payload->>'reason' from rbpmn_event \
-             where instance_id = $1 and kind = 'timer-resolve-failed'",
-        )
-        .bind(started.id)
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+        // Frozen where it failed, and inspectable — the repair API's single
+        // resume point. The reason must be reachable *through inspection*:
+        // it is deliberately absent from the Display format (that is the
+        // stable golden trace), so if it were not carried separately an
+        // operator would see only that the arm failed, never why.
+        let view = engine.inspect_instance(started.id).await.unwrap();
+        let failure = view
+            .events
+            .iter()
+            .find(|e| e.kind == "timer-resolve-failed")
+            .expect("the incident records why it could not resolve");
+        let reason = failure.detail.clone().unwrap_or_default();
         assert!(
             reason.contains("sla.wait") && reason.contains(expected),
             "unhelpful incident reason: {reason}"
         );
-
-        // Frozen where it failed, and inspectable — the repair API's single
-        // resume point.
-        let view = engine.inspect_instance(started.id).await.unwrap();
         assert_eq!(view.status, "failed");
         assert_eq!(view.tokens.len(), 1);
         assert_eq!(view.tokens[0].element_id, "c");
@@ -1207,41 +1207,120 @@ async fn an_unresolvable_deadline_freezes_at_an_incident() {
     db.drop().await;
 }
 
-/// The marker is what disambiguates, and it is required in both directions:
-/// unmarked content is always a literal, so a mistyped duration stays a
-/// deploy-time error instead of becoming a silent variable lookup.
+/// Freezing mid-entry must leave nothing half-open. The failing arm happens
+/// *after* the host's work item exists and, for a subprocess, after its scope
+/// is allocated — so the freeze has to close both. Latent while claimability
+/// requires `status = 'active'`, but a repair API clearing the incident would
+/// otherwise hand a worker an item whose token is parked at an incident, and
+/// completing it would advance straight past that incident.
 #[tokio::test]
-async fn an_unmarked_timer_is_always_a_literal() {
+async fn a_freeze_mid_entry_leaves_nothing_open() {
     let db = TestDb::create().await;
     let engine = engine(&db).await;
-    // `P30X` is a mistyped duration *and* a valid FEEL qualified name.
-    match engine
-        .deploy(
-            &timer_catch_xml("<bpmn:timeDuration>P30X</bpmn:timeDuration>"),
-            &Bindings::default(),
-        )
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:process id="pb" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:subProcess id="sub">
+      <bpmn:startEvent id="s2"/>
+      <bpmn:userTask id="inner"/>
+      <bpmn:endEvent id="e2"/>
+      <bpmn:sequenceFlow id="g1" sourceRef="s2" targetRef="inner"/>
+      <bpmn:sequenceFlow id="g2" sourceRef="inner" targetRef="e2"/>
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="bt" attachedToRef="sub">
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration>sla.wait</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="end"/>
+    <bpmn:endEvent id="timeout"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sub"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="end"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="bt" targetRef="timeout"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    engine.deploy(xml, &Bindings::default()).await.unwrap();
+    let started = engine
+        .start("pb", None, serde_json::json!({}))
         .await
-    {
-        Err(DeployError::Rejected(diags)) => {
-            assert!(diags.iter().any(|d| d.rule == "timer-iso8601"));
-        }
-        other => panic!("expected a rejection, got {other:?}"),
-    }
-    // Marked, it deploys — with the warning that says what may happen.
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "failed").await;
+
+    // The subprocess body never started, so its scope must not survive: a
+    // scope row with no members whose owner is an incident is exactly what a
+    // resume would trip on.
+    let scopes: i64 = sqlx::query_scalar("select count(*) from rbpmn_scope where instance_id = $1")
+        .bind(started.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(scopes, 0, "the unopened scope outlived its owner");
+    // And no work item is left claimable on a failed instance.
+    let open: i64 = sqlx::query_scalar(
+        "select count(*) from rbpmn_work_item \
+         where instance_id = $1 and state in ('available', 'locked')",
+    )
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(open, 0);
+    db.drop().await;
+}
+
+/// Parse order is the signal, not the `xsi:type` marker. bpmn-moddle stamps
+/// `xsi:type="bpmn:tFormalExpression"` on every expression object, so every
+/// bpmn-js modeler writes it on ordinary literals — an earlier version keyed
+/// off it and turned `P5D` typed into a properties panel into a variable
+/// named `P5D`.
+#[tokio::test]
+async fn a_literal_is_a_literal_however_it_is_marked() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    // Marked, but a valid duration: still a literal, and no warning.
     let deployed = engine
         .deploy(
             &timer_catch_xml(
-                r#"<bpmn:timeDuration xsi:type="bpmn:tFormalExpression">P30X</bpmn:timeDuration>"#,
+                r#"<bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT0S</bpmn:timeDuration>"#,
             ),
             &Bindings::default(),
         )
         .await
         .unwrap();
     assert!(
-        deployed
+        !deployed
             .warnings
             .iter()
             .any(|d| d.rule == "timer-expression")
+    );
+    let started = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(engine.fire_due_timer().await.unwrap());
+    wait_for_status(&db.pool, started.id, "completed").await;
+
+    // Unmarked, and not a duration: read as a variable, with the warning.
+    let deployed = engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>sla.wait</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let warning = deployed
+        .warnings
+        .iter()
+        .find(|d| d.rule == "timer-expression")
+        .expect("expected a timer-expression warning");
+    // The warning carries the ISO-8601 complaint that made it fall through,
+    // which is what keeps a mistyped duration legible rather than silent.
+    assert!(
+        warning.message.contains("sla.wait") && warning.message.contains("not a literal"),
+        "unhelpful warning: {}",
+        warning.message
     );
     db.drop().await;
 }

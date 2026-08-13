@@ -13,6 +13,7 @@
       "element-started review",
       "work-item-created review user review",
       "timer-resolve-failed sla order.slaDuration",
+      "work-item-cancelled review",
       "incident-raised sla"
     ]
   }

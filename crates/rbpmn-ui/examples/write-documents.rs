@@ -86,32 +86,38 @@ fn sample() -> InstanceInspection {
                 kind: "instance-started".to_string(),
                 element_id: None,
                 display: "instance-started".to_string(),
+                detail: None,
             },
             EventView {
                 kind: "work-item-created".to_string(),
                 element_id: Some("st".to_string()),
                 display: "work-item-created st (payments)".to_string(),
+                detail: None,
             },
             EventView {
                 kind: "work-item-retrying".to_string(),
                 element_id: Some("st".to_string()),
                 display: "work-item-retrying st (2 left) \u{2014} attempt 1".to_string(),
+                detail: None,
             },
             EventView {
                 kind: "work-item-retrying".to_string(),
                 element_id: Some("st".to_string()),
                 display: "work-item-retrying st (1 left) \u{2014} attempt 2".to_string(),
+                detail: None,
             },
             EventView {
                 kind: "work-item-failed".to_string(),
                 element_id: Some("st".to_string()),
                 display: "work-item-failed st GATEWAY_TIMEOUT".to_string(),
+                detail: None,
             },
             EventView {
                 kind: "incident-raised".to_string(),
                 element_id: Some("st".to_string()),
                 display: "incident-raised st \u{2014} no boundary matches GATEWAY_TIMEOUT"
                     .to_string(),
+                detail: None,
             },
         ],
     }

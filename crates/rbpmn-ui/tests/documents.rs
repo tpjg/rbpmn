@@ -168,6 +168,9 @@ fn hostile_data_cannot_escape_the_data_block() {
             kind: (*hostile).to_string(),
             element_id: Some((*hostile).to_string()),
             display: (*hostile).to_string(),
+            // The new incident-reason field is hostile input here too: it
+            // reaches the document the same way `display` does.
+            detail: Some((*hostile).to_string()),
         }];
 
         let html = render_inspection(&inspection);

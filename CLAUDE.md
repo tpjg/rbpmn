@@ -8,8 +8,8 @@ inclusive gateway, block structure, messages-only interaction, build order).
 
 - **Loudly reject, never silently reinterpret.** New capabilities land as
   linter rules first, with fixtures, then execution.
-- **Rule IDs are stable public API.** Never rename one; add new ones. The four
-  rules beyond the brief's list are documented in README.md.
+- **Rule IDs are stable public API.** Never rename one; add new ones. The
+  rules beyond the brief's list are marked ⁺ in README.md's catalogue.
 - **Fixtures first.** Every phase starts with fixtures in
   `crates/rbpmn-model/tests/fixtures/{accept,reject}/`. Expected diagnostics
   are embedded in each `.bpmn` as an `expect-diagnostics:` comment; the runner
@@ -52,6 +52,14 @@ inclusive gateway, block structure, messages-only interaction, build order).
   missing row means *no override* — never `coalesce` the two; that was the
   bug. Durations are stored as bigint seconds, so "forever" is `None`, never
   a huge `Duration` (`as i64` wraps negative → a cutoff in the future).
+- Timer specs parse **literal first**: valid ISO-8601 is a literal, anything
+  else is read as a FEEL qualified name from the variable document. Do *not*
+  reintroduce `xsi:type="bpmn:tFormalExpression"` as the discriminator —
+  bpmn-moddle stamps it on every expression object, so every bpmn-js modeler
+  writes it on ordinary literals, and keying off it turns `P3D` into a
+  variable named `P3D`. That was the bug. The cost (a mistyped duration
+  shaped like a name warns instead of erroring) is paid by the warning text,
+  which carries the ISO-8601 complaint that made it fall through.
 - dsntk must never become a dependency of `rbpmn-model` **or `rbpmn-core`**:
   its number crate binds a C library (`dfp-number-sys`), which kills wasm32
   and with it the playground, the bpmnlint plugin and the editor.

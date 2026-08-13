@@ -84,6 +84,12 @@ pub struct EventView {
     pub kind: String,
     pub element_id: Option<String>,
     pub display: String,
+    /// Prose an operator needs that is deliberately *not* in `display`.
+    /// `Display` is the golden trace format and therefore stable API, so a
+    /// reason that will be reworded cannot live there — but it still has to
+    /// be reachable, or an incident says only *that* it failed. Today this
+    /// carries `timer-resolve-failed`'s reason; anything else has none.
+    pub detail: Option<String>,
 }
 
 impl Engine {
@@ -218,7 +224,12 @@ impl Engine {
         .map(|r| {
             let kind: String = r.get("kind");
             let element_id: Option<String> = r.get("element_id");
-            let display = serde_json::from_value::<rbpmn_core::Event>(r.get("payload"))
+            let payload: serde_json::Value = r.get("payload");
+            let detail = payload
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let display = serde_json::from_value::<rbpmn_core::Event>(payload)
                 .map(|e| e.to_string())
                 .unwrap_or_else(|_| match &element_id {
                     Some(el) => format!("{kind} {el}"),
@@ -228,6 +239,7 @@ impl Engine {
                 kind,
                 element_id,
                 display,
+                detail,
             }
         })
         .collect();

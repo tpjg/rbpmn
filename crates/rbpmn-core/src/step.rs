@@ -426,7 +426,7 @@ impl<'a> Advancer<'a> {
             }
             ExecKind::TimerCatch { due } => {
                 self.element_started(node_ix);
-                let Some(id) = self.arm_timer(state, token, node_ix, &due.clone()) else {
+                let Some(id) = self.arm_timer(state, token, node_ix, due) else {
                     return Ok(()); // unresolvable deadline: frozen at an incident
                 };
                 state.tokens.insert(
@@ -472,7 +472,7 @@ impl<'a> Advancer<'a> {
                     let target = self.proc.flow(flow).target;
                     match &self.proc.node(target).kind {
                         ExecKind::TimerCatch { due } => {
-                            if self.arm_timer(state, token, target, &due.clone()).is_none() {
+                            if self.arm_timer(state, token, target, due).is_none() {
                                 return Ok(()); // unresolvable deadline incident
                             }
                         }
@@ -751,8 +751,7 @@ impl<'a> Advancer<'a> {
             let ExecKind::TimerBoundary { due } = &self.proc.node(b).kind else {
                 unreachable!("timer_boundaries only holds timer boundary nodes");
             };
-            let due = due.clone();
-            if self.arm_timer(state, token, b, &due).is_none() {
+            if self.arm_timer(state, token, b, due).is_none() {
                 return false;
             }
         }
@@ -908,6 +907,42 @@ impl<'a> Advancer<'a> {
         code: Option<String>,
     ) {
         self.cancel_attachments(state, token);
+        // Close whatever work this token had open, exactly as the other
+        // incident paths do (`RaiseError` closes the failing item; a boundary
+        // timer cancels its host's). `cancel_attachments` only withdraws
+        // timers and subscriptions, so without this a freeze *during* an
+        // entry — a boundary whose deadline will not resolve — leaves an
+        // `available` work item on a failed instance. Harmless only for as
+        // long as claimability requires `status = 'active'`: a repair API
+        // that clears the incident would hand a worker an item whose token
+        // is parked at `WaitKind::Incident`, and completing it would advance
+        // straight past the incident.
+        let open: Vec<WorkItemId> = state
+            .work_items
+            .iter()
+            .filter(|(_, w)| w.open && w.token == token)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in open {
+            let item = state.work_items.get_mut(&id).unwrap();
+            item.open = false;
+            self.events.push(Event::WorkItemCancelled {
+                id,
+                element: self.proc.node_id(item.element).to_string(),
+            });
+        }
+        // A scope this token owns has no members and no owner left once the
+        // freeze parks it as an incident; leaving it behind would project a
+        // `rbpmn_scope` row whose token_no points at a token in another wait
+        // state, which is precisely what a resume would trip on.
+        let owned_scope = match state.tokens.get(&token).map(|t| &t.wait) {
+            Some(WaitKind::Scope(child)) => Some(*child),
+            _ => None,
+        };
+        if let Some(child) = owned_scope {
+            self.tear_down_scope(state, child);
+            state.scopes.remove(&child);
+        }
         let scope = state
             .tokens
             .get(&token)
