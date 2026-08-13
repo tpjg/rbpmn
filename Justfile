@@ -287,3 +287,16 @@ bench-compose SCENARIO='':
     else
         cargo run --release -p rbpmn-bench -- run "{{SCENARIO}}" --provisioned-by compose
     fi
+
+# Population-scale measurement: park a large cohort, then probe what
+# everything still costs at rest. Standing cost, not throughput — the
+# question a long-running deployment actually has, and the one every other
+# scenario here is blind to.
+#
+# Slow by nature: building a million parked instances takes on the order of
+# fifteen minutes and a few GB. Pass a smaller ladder for a quick look:
+#   just bench-population population-timer '--sizes 10000,100000'
+
+# Park a large cohort and probe standing cost (slow; builds to 1M by default).
+bench-population SCENARIO='population-timer' *ARGS: bench-db
+    cargo run --release -p rbpmn-bench -- population "{{SCENARIO}}" {{ARGS}}

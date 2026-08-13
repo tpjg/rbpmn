@@ -143,14 +143,22 @@ async fn analyze_before_execute(pool: &PgPool) -> Result<(), String> {
     Ok(())
 }
 
-/// Empty every rbpmn table except the migration ledger and the environment
-/// declarations. Enumerated from the catalogue rather than listed, so a table
-/// added by a future migration cannot silently survive a "fresh" run.
-async fn truncate_all(pool: &PgPool) -> Result<u64, String> {
+/// Empty every rbpmn table except the ones holding **seeded singleton state**
+/// rather than data. Enumerated from the catalogue rather than listed, so a
+/// table added by a future migration cannot silently survive a "fresh" run.
+///
+/// `rbpmn_retention_floor` is on the exclusion list because migration 0007
+/// seeds exactly one row into it and the event stream refuses to release any
+/// page without it — truncating it broke `read_events` with a loud and
+/// entirely correct error, which is how the omission was found. Its *value*
+/// is still reset below: a fresh database has deleted nothing, so its
+/// truncation floor is zero.
+pub(crate) async fn truncate_all(pool: &PgPool) -> Result<u64, String> {
     let tables: Vec<String> = sqlx::query_scalar(
         "select relname from pg_class \
          where relname like 'rbpmn\\_%' and relkind = 'r' \
-           and relname not in ('rbpmn_migrations', 'rbpmn_environment_topic') \
+           and relname not in ('rbpmn_migrations', 'rbpmn_environment_topic', \
+                               'rbpmn_retention_floor') \
          order by relname",
     )
     .fetch_all(pool)
@@ -169,6 +177,13 @@ async fn truncate_all(pool: &PgPool) -> Result<u64, String> {
     .execute(pool)
     .await
     .map_err(|e| format!("truncating for a fresh run: {e}"))?;
+    // Nothing has been deleted from an empty database, so the floor is zero
+    // — but the row itself must survive, or the event stream cannot state a
+    // floor and correctly refuses to serve a page at all.
+    sqlx::query("update rbpmn_retention_floor set txid = '0'::xid8, id = 0")
+        .execute(pool)
+        .await
+        .map_err(|e| format!("resetting the truncation floor: {e}"))?;
     Ok(tables.len() as u64)
 }
 
@@ -1105,7 +1120,7 @@ async fn latencies_ms(
 /// Per-table storage parameters the engine's own migrations deliberately do
 /// not set. Applying them here — rather than assuming a default — is why the
 /// result file can name them.
-async fn apply_tuning(pool: &PgPool, root: &Path) -> Result<Option<String>, String> {
+pub(crate) async fn apply_tuning(pool: &PgPool, root: &Path) -> Result<Option<String>, String> {
     use sha2::{Digest, Sha256};
     let path = root.join("tuning.sql");
     let Ok(sql) = std::fs::read_to_string(&path) else {

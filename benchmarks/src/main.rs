@@ -21,6 +21,7 @@ mod micro;
 mod model;
 mod monitor;
 mod pg;
+mod population;
 mod report;
 mod result;
 mod run;
@@ -122,6 +123,21 @@ enum Command {
         /// JSONL output. Defaults to stdout.
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// Population-scale measurement: park a large cohort, then probe what
+    /// everything still costs at rest. Standing cost, not throughput — the
+    /// question a long-running deployment actually has.
+    Population {
+        /// Scenario name (a `[population]` one).
+        scenario: String,
+        /// Override the size ladder, e.g. `1000,10000`.
+        #[arg(long, value_delimiter = ',')]
+        sizes: Option<Vec<u32>>,
+        #[arg(long)]
+        samples: Option<u32>,
+        /// Probe an existing population instead of rebuilding it.
+        #[arg(long)]
+        reuse: bool,
     },
     /// The persisted pattern micro-benchmarks: per-construct cost including
     /// the rows it writes. Reported, never gated.
@@ -259,6 +275,20 @@ fn main() -> ExitCode {
         Command::Monitor { interval, out } => {
             block_on(monitor::run(&database_url, *interval, out.as_deref()))
         }
+        Command::Population {
+            scenario,
+            sizes,
+            samples,
+            reuse,
+        } => block_on(population_run(
+            &root,
+            &database_url,
+            scenario,
+            sizes.clone(),
+            *samples,
+            *reuse,
+            if supplied_url { "external" } else { "local" },
+        )),
         Command::MicroPersisted { iterations } => block_on(micro_persisted(
             &root,
             &database_url,
@@ -344,12 +374,40 @@ fn check(root: &Path) -> Result<(), String> {
                 scenario.name
             ));
         }
-        if model.message_catches > 0 && scenario.execute.correlators == 0 {
-            return Err(format!(
-                "{}: the model waits on a message but no correlator would deliver it — \
-                 the drain would stall",
-                scenario.name
-            ));
+        // Rate scenarios drain to completion, so every wait state needs
+        // something to release it. Population scenarios deliberately do not:
+        // their cohort stays parked, and that is the measurement.
+        match &scenario.population {
+            None => {
+                if model.message_catches > 0 && scenario.execute.correlators == 0 {
+                    return Err(format!(
+                        "{}: the model waits on a message but no correlator would deliver \
+                         it — the drain would stall",
+                        scenario.name
+                    ));
+                }
+            }
+            Some(population) => {
+                if population.sizes.is_empty() {
+                    return Err(format!("{}: [population] sizes is empty", scenario.name));
+                }
+                let parks_on_ok = match population.parks_on {
+                    scenario::ParksOn::Timer => model.timers > 0,
+                    scenario::ParksOn::Message => model.message_catches > 0,
+                };
+                if !parks_on_ok {
+                    return Err(format!(
+                        "{}: [population] parks_on = {:?} but {} has no such wait state — \
+                         the cohort would never park and every probe would measure an \
+                         empty table",
+                        scenario.name, population.parks_on, model.file
+                    ));
+                }
+                println!(
+                    "    population: parks on {:?}, sizes {:?}, {} samples/probe",
+                    population.parks_on, population.sizes, population.samples
+                );
+            }
         }
     }
     println!(
@@ -452,6 +510,42 @@ fn select(root: &Path, args: &RunArgs) -> Result<Vec<scenario::Scenario>, String
                 .to_string(),
         ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn population_run(
+    root: &Path,
+    database_url: &str,
+    name: &str,
+    sizes: Option<Vec<u32>>,
+    samples: Option<u32>,
+    reuse: bool,
+    provisioned_by: &str,
+) -> Result<(), String> {
+    let scenario = scenario::load_all(root)?
+        .into_iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| format!("no scenario named '{name}' (try `rbpmn-bench list`)"))?;
+    println!("=== {} — {}", scenario.name, scenario.summary);
+    let report = population::run(
+        &scenario,
+        &population::PopulationOptions {
+            root: root.to_path_buf(),
+            database_url: database_url.to_string(),
+            provisioned_by: provisioned_by.to_string(),
+            sizes,
+            samples,
+            reuse,
+        },
+    )
+    .await?;
+    print!("{}", report.render());
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    let path = report.write(root)?;
+    println!("-> {}", path.display());
+    Ok(())
 }
 
 async fn micro_persisted(

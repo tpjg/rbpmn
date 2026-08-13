@@ -1,0 +1,56 @@
+name = "population-message"
+model = "population-message.bpmn"
+summary = "A million instances parked on an open subscription — standing cost, and correlate at that size."
+
+measures = [
+  "what every hot path costs while a large cohort sits parked: an empty worker poll, a claim, a new instance start, reading an event page, opening the inspector on an old instance",
+  "correlate() against N open subscriptions — the one this model exists for. Delivery must find its single match among a million on the (message_name, correlation_key) index, and the contract is exactly-one, so the lookup cannot be approximate",
+  "whether those costs are flat in the population or grow with it — the suite probes at several sizes so the answer is a curve, not a point",
+  "the standing storage of a long-running deployment: table and index sizes per instance, at each size",
+  "how long it takes to park the cohort in the first place (reported, not a headline — the build is setup)",
+]
+excludes = [
+  "throughput: this scenario deliberately has almost none, which is the point. A year-long flow at 2M instances/year is 0.06 instances/sec; the risk was never the rate",
+  "the passage of time: nothing waits a year. The cohort is parked and probed, and the timer_fire probe forces a handful of due dates rather than waiting for them",
+  "correlation key collisions: keys here are unique per instance by construction, so this measures the healthy path and never the 409",
+  "history levels: every event is written",
+]
+
+[bindings]
+service_topic = "bench-service"
+
+[bindings.correlation]
+element = "AwaitCallback"
+message = "ContractCallback"
+key = "contract.id"
+
+[workload]
+warmup = 0
+instances = 1000
+seed = 20260813
+history = "full"
+
+[[workload.fields]]
+path = "contract.id"
+kind = "unique"
+prefix = "contract-"
+
+[[workload.fields]]
+path = "region"
+kind = "pick"
+values = ["emea", "amer", "apac"]
+
+[execute]
+service_workers = 8
+db_pool = 24
+
+[execute.patch]
+registered = true
+
+[population]
+# Ascending, and each is a superset of the last: the build tops up rather
+# than starting over, so the whole curve costs one build.
+sizes = [10000, 100000, 1000000]
+samples = 200
+builders = 12
+parks_on = "message"

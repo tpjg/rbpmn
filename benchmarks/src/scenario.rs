@@ -81,6 +81,48 @@ pub struct Scenario {
     pub execute: Execute,
     #[serde(default)]
     pub steady: Option<Steady>,
+    /// Present on the population scenarios: this one is measured at rest,
+    /// against a large parked cohort, rather than by rate.
+    #[serde(default)]
+    pub population: Option<Population>,
+}
+
+/// The population family asks a different question from the rest of the
+/// suite. Everything else measures a **rate** — how fast can instances be
+/// pushed through. This measures **standing cost**: with a million instances
+/// parked on a year-long wait, what does anything still cost?
+///
+/// That is the shape of a long-running deployment: a year's cohort alive at
+/// once, almost no throughput, and every query that touches the instance,
+/// timer, subscription or event tables doing so against a population that
+/// only ever grew. Rate benchmarks say nothing about it — a drain that
+/// finishes in two seconds never had a million rows to walk past.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Population {
+    /// Population sizes to measure at, ascending. The suite builds up to
+    /// each in turn and probes there, so one run yields a **curve** rather
+    /// than a point — which is the only way to tell "this is slow" from
+    /// "this grows with the population", and the latter is the only one that
+    /// matters at a million.
+    pub sizes: Vec<u32>,
+    /// Timed repetitions per probe at each size.
+    pub samples: u32,
+    /// Concurrent starters while building. The build is setup, not
+    /// measurement, so it is parallel; the build rate is still reported
+    /// because "how long to park a million" is a fair question.
+    pub builders: u32,
+    /// Whether the parked cohort waits on a timer or a subscription. Derived
+    /// from the model, and stated here so a mismatch is caught at check time
+    /// rather than by a probe silently measuring nothing.
+    pub parks_on: ParksOn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ParksOn {
+    Timer,
+    Message,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

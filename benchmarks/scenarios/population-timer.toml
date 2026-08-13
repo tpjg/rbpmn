@@ -1,0 +1,50 @@
+name = "population-timer"
+model = "population-timer.bpmn"
+summary = "A million instances parked on a year-long timer — standing cost, not throughput."
+
+measures = [
+  "what every hot path costs while a large cohort sits parked: an empty worker poll, a claim, a new instance start, the scheduler's sleep computation, firing one due timer, reading an event page, opening the inspector on an old instance",
+  "whether those costs are flat in the population or grow with it — the suite probes at several sizes so the answer is a curve, not a point",
+  "the standing storage of a long-running deployment: table and index sizes per instance, at each size",
+  "how long it takes to park the cohort in the first place (reported, not a headline — the build is setup)",
+]
+excludes = [
+  "throughput: this scenario deliberately has almost none, which is the point. A year-long flow at 2M instances/year is 0.06 instances/sec; the risk was never the rate",
+  "the passage of time: nothing waits a year. The cohort is parked and probed, and the timer_fire probe forces a handful of due dates rather than waiting for them",
+  "the storm shape at full scale: firing one due timer against N armed is measured; draining all N at once is extrapolated from it and stated as such",
+  "history levels: every event is written",
+]
+
+[bindings]
+service_topic = "bench-service"
+
+[workload]
+warmup = 0
+instances = 1000
+seed = 20260813
+history = "full"
+
+[[workload.fields]]
+path = "contract.id"
+kind = "unique"
+prefix = "contract-"
+
+[[workload.fields]]
+path = "region"
+kind = "pick"
+values = ["emea", "amer", "apac"]
+
+[execute]
+service_workers = 8
+db_pool = 24
+
+[execute.patch]
+registered = true
+
+[population]
+# Ascending, and each is a superset of the last: the build tops up rather
+# than starting over, so the whole curve costs one build.
+sizes = [10000, 100000, 1000000]
+samples = 200
+builders = 12
+parks_on = "timer"

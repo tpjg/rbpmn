@@ -11,11 +11,12 @@ engine's entire stack is one Postgres, so "hardware spec" collapses to a
 documented machine and a documented server, and both fit in this directory.
 
 ```
-just bench            # the lifecycle suite, writes results/
-just bench SCENARIO   # one scenario
-just bench-micro      # pure-core criterion suite + regression gate (fast)
-just bench-baseline   # re-record this machine's micro baseline (manual)
-just bench-report     # render results/*.json into a markdown table
+just bench                 # the lifecycle suite, writes results/
+just bench SCENARIO        # one scenario
+just bench-population      # park a large cohort, probe standing cost at each size
+just bench-micro           # pure-core criterion suite + regression gate (fast)
+just bench-baseline        # re-record this machine's micro baseline (manual)
+just bench-report          # render results/*.json into a markdown table
 ```
 
 Needs the local Postgres this repository already assumes (`just serve`, the
@@ -74,7 +75,51 @@ result file, what it measures and what it does **not**. Read those before
 quoting anything: `just bench-report` prints them under each table, and
 `rbpmn-bench list` prints them on their own.
 
-### B. Pattern micro-benchmarks — per-construct cost
+### B. Population — standing cost, not throughput
+
+`just bench-population` asks the question the rest of the suite cannot: with
+a large cohort parked and doing nothing, what does everything *still* cost?
+
+That is the shape of a long-running deployment. Year-long flows at 2M
+instances/year mean **0.06 instances per second and 2 000 000 live
+instances** — the rate is a non-event and the population is everything. A
+drain benchmark that finishes in two seconds never had a million rows to walk
+past.
+
+Two scenarios, both a five-step flow that parks its cohort on a long wait:
+`population-timer` (a `P1Y` timer) and `population-message` (an open
+subscription). The suite builds to each configured size in turn and probes
+there, so the output is a **curve, not a point** — the question is not "is
+this fast" but "does this grow with the population", and only the second one
+matters when the population is going to be a million either way.
+
+Probed at each size: an empty worker poll, a claim-and-complete, starting an
+instance, `count_tasks`, an `/v1/events` page, opening the inspector on an
+old instance, the admin "which definitions are in use" query, plus
+`timer_next_due` / `timer_fire` or `correlate` depending on what the cohort
+waits on. Each is timed individually and reported as a distribution.
+
+Two honest notes on method. The build is parallel and its rate is reported
+but is *not* a headline — it is setup. And `timer_fire` forces a handful of
+due dates rather than waiting a year; the claim, the instance lock, the
+re-check, the step and the row delete are all real, and the storm figure
+(how long to drain N simultaneous timers) is extrapolated from the per-fire
+rate and labelled as such.
+
+**What it found immediately.** `Engine::next_due_in` — the scheduler's sleep
+computation, run on every idle cycle of every node — computes
+`min(t.due_at)` by *joining* `rbpmn_timer` to `rbpmn_instance` to filter on
+`status = 'active'`. The join defeats the index-min shortcut. Measured at
+10 000 armed timers:
+
+| query | plan | time |
+|---|---|---|
+| `next_due_in` as shipped | hash join over two sequential scans | **7.4 ms** |
+| `min(due_at)` on the timer table alone | index-only scan + limit | **0.022 ms** |
+
+336× at ten thousand, and linear in the population. See "Findings" below.
+
+### C. Pattern micro-benchmarks — per-construct cost
 
 **Pure core** (`benches/core_constructs.rs`, criterion): one `step`
 transition per construct — a token crossing a sequence flow, an exclusive
@@ -371,6 +416,34 @@ otherwise — `rbpmn-bench check` lints and compiles every one of them against
 its manifest with no database and no Docker, which is the fast check that a
 benchmark model is still a model this engine would deploy.
 
+## Findings
+
+### The scheduler's sleep computation is linear in the armed population
+
+`Engine::next_due_in` filters `min(due_at)` through a join on instance
+status, which turns an index-only lookup into a scan of both tables. At 10k
+armed timers that is 7.4 ms against 0.022 ms; extrapolated linearly, roughly
+0.7 s at a million.
+
+It matters more than "once per sleep" suggests, because `NOTIFY
+rbpmn_timer` fires whenever a timer is armed and wakes *every* sleeping
+scheduler, each of which recomputes it. In a quiet system with a large parked
+cohort that is fine. During a bulk arrival window — exactly the batch-import
+shape a long-running deployment has — it is arm-rate × nodes × a scan of the
+whole timer and instance tables.
+
+The obvious shape of a fix is that the *sleep hint* does not need the status
+filter at all: sleeping until a timer that turns out to belong to a
+non-active instance just means waking to find nothing to do, which the drain
+already handles via its re-check under the instance lock. But this is
+deliberately **not** filed as a one-line fix. `scheduler.rs` documents, at
+length and from three separate bugs, that the drain's eligibility rules and
+the sleep's must not disagree — that disagreement is what produced its
+busy-spin bugs — and the deferral exclusion in the same query is part of that
+agreement. Changing it means re-reading `spec/` and re-running `just tla`,
+per the repository's own rule about hand-written models. It is a design
+round, not a patch.
+
 ## Two harness bugs worth knowing about
 
 Both were found by the benchmark measuring itself, and both are the reason
@@ -384,6 +457,12 @@ some numbers in `results/` are not comparable with numbers taken before them.
    which is indexed, and does the exact per-phase accounting once at the end.
 2. **The definition key was re-derived per instance**, re-parsing the whole
    BPMN document on every `start`.
+3. **A probe claimed work items and never completed them.** The default lease
+   is ten minutes, so the next build phase in the population ladder sat
+   waiting for leases to expire — it read as a build running at 13
+   instances/sec instead of 1500. Probes now complete what they claim, which
+   also advances those instances into the cohort; the population is
+   re-counted after probing rather than assumed.
 
 Neither was an engine bug. Both are the reason this file says to read the
 harness configuration in a result before trusting the result.

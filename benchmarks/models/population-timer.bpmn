@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A long-running flow, for the population scenarios: register, then wait a
+     year, then do the work.
+
+     The shape exists to build a large *parked* population cheaply. One
+     service task before the wait, so parking an instance costs a start and
+     one completion; four after it, so the model is a realistic five-step
+     flow rather than a start event with a timer bolted on. Nothing after the
+     wait ever runs during a benchmark — a year does not elapse — which is
+     the point: the measurement is what the engine costs while a million
+     instances sit there doing nothing.
+
+     P1Y is a duration, not a date, so the timers become due spread across
+     the arrival pattern rather than all at once. That is the benign shape;
+     the storm shape (`timeDate`, everything due at one instant) is what the
+     scenario's `timer_fire` probe forces on purpose. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/benchmarks">
+  <bpmn:process id="population-timer" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="RegisterContract" name="Register contract">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:intermediateCatchEvent id="ContractTerm" name="Contract term">
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration>P1Y</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:serviceTask id="AssessRenewal" name="Assess renewal">
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="PriceRenewal" name="Price renewal">
+      <bpmn:incoming>f4</bpmn:incoming>
+      <bpmn:outgoing>f5</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="NotifyCustomer" name="Notify customer">
+      <bpmn:incoming>f5</bpmn:incoming>
+      <bpmn:outgoing>f6</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="CloseContract" name="Close contract">
+      <bpmn:incoming>f6</bpmn:incoming>
+      <bpmn:outgoing>f7</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f7</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="RegisterContract" />
+    <bpmn:sequenceFlow id="f2" sourceRef="RegisterContract" targetRef="ContractTerm" />
+    <bpmn:sequenceFlow id="f3" sourceRef="ContractTerm" targetRef="AssessRenewal" />
+    <bpmn:sequenceFlow id="f4" sourceRef="AssessRenewal" targetRef="PriceRenewal" />
+    <bpmn:sequenceFlow id="f5" sourceRef="PriceRenewal" targetRef="NotifyCustomer" />
+    <bpmn:sequenceFlow id="f6" sourceRef="NotifyCustomer" targetRef="CloseContract" />
+    <bpmn:sequenceFlow id="f7" sourceRef="CloseContract" targetRef="End" />
+  </bpmn:process>
+</bpmn:definitions>
