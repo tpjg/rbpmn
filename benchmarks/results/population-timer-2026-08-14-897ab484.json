@@ -1,11 +1,11 @@
 {
   "schema": "rbpmn-bench-population/1",
   "scenario": "population-timer",
-  "run_id": "664720cf",
-  "started_at": "2026-08-14T08:37:01Z",
+  "run_id": "1cee4747",
+  "started_at": "2026-08-14T08:38:12Z",
   "checkout": {
-    "git_sha": "2eb2a5c696b2c126c77ea2d36734593fd1e86aeb",
-    "dirty": true
+    "git_sha": "3cab32331a95936b89b5e826c916749f535c395c",
+    "dirty": false
   },
   "hardware": {
     "host_id": "897ab484",
@@ -169,9 +169,9 @@
   "samples_per_probe": 100,
   "steps": [
     {
-      "population": 1000000,
-      "build_secs": 0.0,
-      "build_instances_per_sec": 0.0,
+      "population": 10000,
+      "build_secs": 13.750714916,
+      "build_instances_per_sec": 727.2349154998655,
       "tables": {
         "rbpmn_definition": {
           "rows": 1,
@@ -184,14 +184,14 @@
           "index_bytes": 16384
         },
         "rbpmn_event": {
-          "rows": 12009969,
-          "total_bytes": 3757817856,
-          "index_bytes": 1292017664
+          "rows": 122778,
+          "total_bytes": 38273024,
+          "index_bytes": 13123584
         },
         "rbpmn_instance": {
-          "rows": 1000306,
-          "total_bytes": 368820224,
-          "index_bytes": 60080128
+          "rows": 10037,
+          "total_bytes": 4382720,
+          "index_bytes": 704512
         },
         "rbpmn_migrations": {
           "rows": 8,
@@ -224,111 +224,423 @@
           "index_bytes": 16384
         },
         "rbpmn_timer": {
-          "rows": 1000000,
-          "total_bytes": 185057280,
-          "index_bytes": 75538432
+          "rows": 10426,
+          "total_bytes": 2105344,
+          "index_bytes": 860160
         },
         "rbpmn_token": {
-          "rows": 1000100,
-          "total_bytes": 156884992,
-          "index_bytes": 54386688
+          "rows": 10037,
+          "total_bytes": 2252800,
+          "index_bytes": 606208
         },
         "rbpmn_work_item": {
-          "rows": 1001200,
-          "total_bytes": 438796288,
-          "index_bytes": 203644928
+          "rows": 10037,
+          "total_bytes": 4923392,
+          "index_bytes": 2424832
         }
       },
-      "total_bytes": 4907589632,
-      "bytes_per_instance": 4907.589632,
+      "total_bytes": 52150272,
+      "bytes_per_instance": 5215.0272,
       "probes": {
         "admin_definitions_in_use": {
           "count": 20,
-          "min": 0.061875,
-          "mean": 0.11536454999999998,
-          "p50": 0.087709,
-          "p95": 0.29479099999999997,
-          "p99": 0.310417,
-          "max": 0.310417
+          "min": 0.16370800000000002,
+          "mean": 0.19668729999999998,
+          "p50": 0.193583,
+          "p95": 0.220583,
+          "p99": 0.248292,
+          "max": 0.248292
         },
         "claim_empty": {
           "count": 100,
-          "min": 0.172917,
-          "mean": 0.31605756999999995,
-          "p50": 0.194959,
-          "p95": 0.327125,
-          "p99": 3.516584,
-          "max": 7.042167
+          "min": 0.228666,
+          "mean": 0.44511828000000003,
+          "p50": 0.262667,
+          "p95": 1.0859999999999999,
+          "p99": 1.3155000000000001,
+          "max": 3.719791
         },
         "claim_hit": {
           "count": 100,
-          "min": 0.741833,
-          "mean": 1.1866491399999999,
-          "p50": 0.988125,
-          "p95": 1.8809580000000001,
-          "p99": 2.359583,
-          "max": 4.7922080000000005
+          "min": 0.737708,
+          "mean": 1.6801274699999995,
+          "p50": 0.9045420000000001,
+          "p95": 4.554291,
+          "p99": 4.716208,
+          "max": 4.812041000000001
         },
         "count_tasks": {
           "count": 100,
-          "min": 0.11124999999999999,
-          "mean": 0.13790714999999998,
-          "p50": 0.125167,
-          "p95": 0.19858399999999998,
-          "p99": 0.2945,
-          "max": 0.411458
+          "min": 0.123666,
+          "mean": 0.16906374999999996,
+          "p50": 0.141541,
+          "p95": 0.309041,
+          "p99": 0.333125,
+          "max": 0.36725
         },
         "event_page": {
           "count": 100,
-          "min": 0.30779100000000004,
-          "mean": 0.38411746999999996,
-          "p50": 0.350875,
-          "p95": 0.48404200000000003,
-          "p99": 0.813542,
-          "max": 1.932791
+          "min": 0.33762499999999995,
+          "mean": 0.4293704100000001,
+          "p50": 0.3635,
+          "p95": 0.686542,
+          "p99": 0.710625,
+          "max": 0.897792
         },
         "inspect_instance": {
           "count": 100,
-          "min": 0.32162500000000005,
-          "mean": 0.6732196,
-          "p50": 0.591333,
-          "p95": 1.255917,
-          "p99": 1.726625,
-          "max": 2.193792
+          "min": 0.49404099999999995,
+          "mean": 0.6032420500000002,
+          "p50": 0.5230830000000001,
+          "p95": 0.9139579999999999,
+          "p99": 0.9456249999999999,
+          "max": 1.045042
         },
         "start_instance": {
           "count": 100,
-          "min": 0.773416,
-          "mean": 1.5328207799999995,
-          "p50": 1.4033749999999998,
-          "p95": 2.20275,
-          "p99": 2.479708,
-          "max": 4.9804580000000005
+          "min": 0.446416,
+          "mean": 0.72417913,
+          "p50": 0.565083,
+          "p95": 1.372833,
+          "p99": 1.8098750000000001,
+          "max": 2.6684579999999998
         },
         "timer_fire": {
           "count": 100,
-          "min": 0.714459,
-          "mean": 1.18189127,
-          "p50": 1.062166,
-          "p95": 1.925834,
-          "p99": 2.448333,
-          "max": 2.5531249999999996
+          "min": 0.852291,
+          "mean": 1.0344166499999996,
+          "p50": 1.004125,
+          "p95": 1.3286660000000001,
+          "p99": 1.737375,
+          "max": 1.7574999999999998
         },
         "timer_next_due": {
           "count": 100,
-          "min": 0.047416,
-          "mean": 0.06495622000000001,
-          "p50": 0.050959,
-          "p95": 0.106875,
-          "p99": 0.2455,
-          "max": 0.5835
+          "min": 0.117208,
+          "mean": 0.21831541999999995,
+          "p50": 0.186875,
+          "p95": 0.417792,
+          "p99": 0.516458,
+          "max": 0.569625
+        }
+      }
+    },
+    {
+      "population": 100000,
+      "build_secs": 166.156946584,
+      "build_instances_per_sec": 541.6565593572752,
+      "tables": {
+        "rbpmn_definition": {
+          "rows": 1,
+          "total_bytes": 49152,
+          "index_bytes": 32768
+        },
+        "rbpmn_environment_topic": {
+          "rows": 1,
+          "total_bytes": 32768,
+          "index_bytes": 16384
+        },
+        "rbpmn_event": {
+          "rows": 1205673,
+          "total_bytes": 377495552,
+          "index_bytes": 129507328
+        },
+        "rbpmn_instance": {
+          "rows": 100104,
+          "total_bytes": 44875776,
+          "index_bytes": 6348800
+        },
+        "rbpmn_migrations": {
+          "rows": 8,
+          "total_bytes": 32768,
+          "index_bytes": 16384
+        },
+        "rbpmn_retention_floor": {
+          "rows": 1,
+          "total_bytes": 24576,
+          "index_bytes": 16384
+        },
+        "rbpmn_retention_lease": {
+          "rows": 0,
+          "total_bytes": 16384,
+          "index_bytes": 8192
+        },
+        "rbpmn_retention_policy": {
+          "rows": 0,
+          "total_bytes": 16384,
+          "index_bytes": 8192
+        },
+        "rbpmn_scope": {
+          "rows": 0,
+          "total_bytes": 16384,
+          "index_bytes": 8192
+        },
+        "rbpmn_subscription": {
+          "rows": 0,
+          "total_bytes": 24576,
+          "index_bytes": 16384
+        },
+        "rbpmn_timer": {
+          "rows": 100148,
+          "total_bytes": 18268160,
+          "index_bytes": 7200768
+        },
+        "rbpmn_token": {
+          "rows": 99935,
+          "total_bytes": 17981440,
+          "index_bytes": 5054464
+        },
+        "rbpmn_work_item": {
+          "rows": 100513,
+          "total_bytes": 45187072,
+          "index_bytes": 21372928
+        }
+      },
+      "total_bytes": 504020992,
+      "bytes_per_instance": 5040.20992,
+      "probes": {
+        "admin_definitions_in_use": {
+          "count": 20,
+          "min": 0.131875,
+          "mean": 0.1585981,
+          "p50": 0.144667,
+          "p95": 0.210375,
+          "p99": 0.238584,
+          "max": 0.238584
+        },
+        "claim_empty": {
+          "count": 100,
+          "min": 0.125166,
+          "mean": 0.3421142,
+          "p50": 0.149209,
+          "p95": 0.8981250000000001,
+          "p99": 1.2269169999999998,
+          "max": 1.402292
+        },
+        "claim_hit": {
+          "count": 100,
+          "min": 0.866583,
+          "mean": 1.0588983200000002,
+          "p50": 0.953916,
+          "p95": 1.4968329999999999,
+          "p99": 1.706,
+          "max": 5.729
+        },
+        "count_tasks": {
+          "count": 100,
+          "min": 0.067625,
+          "mean": 0.15146087000000003,
+          "p50": 0.112959,
+          "p95": 0.260209,
+          "p99": 0.412292,
+          "max": 0.48416699999999996
+        },
+        "event_page": {
+          "count": 100,
+          "min": 0.41154100000000005,
+          "mean": 0.5605808999999995,
+          "p50": 0.424666,
+          "p95": 0.6776249999999999,
+          "p99": 4.662375,
+          "max": 4.9055
+        },
+        "inspect_instance": {
+          "count": 100,
+          "min": 0.407666,
+          "mean": 0.52471878,
+          "p50": 0.441459,
+          "p95": 0.770458,
+          "p99": 0.958958,
+          "max": 1.2776669999999999
+        },
+        "start_instance": {
+          "count": 100,
+          "min": 0.5910000000000001,
+          "mean": 0.8108600399999999,
+          "p50": 0.654208,
+          "p95": 1.386958,
+          "p99": 1.546667,
+          "max": 2.000041
+        },
+        "timer_fire": {
+          "count": 100,
+          "min": 0.870791,
+          "mean": 1.1031958100000006,
+          "p50": 0.996708,
+          "p95": 1.650541,
+          "p99": 2.28225,
+          "max": 2.76875
+        },
+        "timer_next_due": {
+          "count": 100,
+          "min": 0.062708,
+          "mean": 0.11681831999999996,
+          "p50": 0.072083,
+          "p95": 0.24250000000000002,
+          "p99": 0.3205,
+          "max": 0.43675
+        }
+      }
+    },
+    {
+      "population": 1000000,
+      "build_secs": 1591.670372542,
+      "build_instances_per_sec": 565.443709656191,
+      "tables": {
+        "rbpmn_definition": {
+          "rows": 1,
+          "total_bytes": 49152,
+          "index_bytes": 32768
+        },
+        "rbpmn_environment_topic": {
+          "rows": 1,
+          "total_bytes": 32768,
+          "index_bytes": 16384
+        },
+        "rbpmn_event": {
+          "rows": 12007107,
+          "total_bytes": 3756777472,
+          "index_bytes": 1291214848
+        },
+        "rbpmn_instance": {
+          "rows": 1000483,
+          "total_bytes": 371531776,
+          "index_bytes": 60768256
+        },
+        "rbpmn_migrations": {
+          "rows": 8,
+          "total_bytes": 32768,
+          "index_bytes": 16384
+        },
+        "rbpmn_retention_floor": {
+          "rows": 1,
+          "total_bytes": 24576,
+          "index_bytes": 16384
+        },
+        "rbpmn_retention_lease": {
+          "rows": 0,
+          "total_bytes": 16384,
+          "index_bytes": 8192
+        },
+        "rbpmn_retention_policy": {
+          "rows": 0,
+          "total_bytes": 16384,
+          "index_bytes": 8192
+        },
+        "rbpmn_scope": {
+          "rows": 0,
+          "total_bytes": 16384,
+          "index_bytes": 8192
+        },
+        "rbpmn_subscription": {
+          "rows": 0,
+          "total_bytes": 24576,
+          "index_bytes": 16384
+        },
+        "rbpmn_timer": {
+          "rows": 1000107,
+          "total_bytes": 184049664,
+          "index_bytes": 74604544
+        },
+        "rbpmn_token": {
+          "rows": 1000000,
+          "total_bytes": 155181056,
+          "index_bytes": 53739520
+        },
+        "rbpmn_work_item": {
+          "rows": 1001000,
+          "total_bytes": 438779904,
+          "index_bytes": 202563584
+        }
+      },
+      "total_bytes": 4906532864,
+      "bytes_per_instance": 4906.532864,
+      "probes": {
+        "admin_definitions_in_use": {
+          "count": 20,
+          "min": 0.14195899999999997,
+          "mean": 0.26437095,
+          "p50": 0.19512500000000002,
+          "p95": 0.464667,
+          "p99": 1.029,
+          "max": 1.029
+        },
+        "claim_empty": {
+          "count": 100,
+          "min": 0.13783299999999998,
+          "mean": 0.34681823,
+          "p50": 0.163584,
+          "p95": 0.983334,
+          "p99": 1.4194170000000002,
+          "max": 1.8375
+        },
+        "claim_hit": {
+          "count": 100,
+          "min": 0.7193339999999999,
+          "mean": 0.9441337700000002,
+          "p50": 0.861458,
+          "p95": 1.601875,
+          "p99": 2.164,
+          "max": 2.2058329999999997
+        },
+        "count_tasks": {
+          "count": 100,
+          "min": 0.06774999999999999,
+          "mean": 0.15024376,
+          "p50": 0.116791,
+          "p95": 0.297583,
+          "p99": 0.358708,
+          "max": 0.517917
+        },
+        "event_page": {
+          "count": 100,
+          "min": 0.318542,
+          "mean": 0.40546128999999986,
+          "p50": 0.359125,
+          "p95": 0.533666,
+          "p99": 0.857667,
+          "max": 1.671833
+        },
+        "inspect_instance": {
+          "count": 100,
+          "min": 0.322292,
+          "mean": 0.9393137199999998,
+          "p50": 0.760458,
+          "p95": 2.036,
+          "p99": 2.6931659999999997,
+          "max": 4.148416999999999
+        },
+        "start_instance": {
+          "count": 100,
+          "min": 0.770458,
+          "mean": 1.3670154499999998,
+          "p50": 1.126417,
+          "p95": 2.094958,
+          "p99": 2.786458,
+          "max": 5.541625
+        },
+        "timer_fire": {
+          "count": 100,
+          "min": 0.668042,
+          "mean": 0.8887391499999997,
+          "p50": 0.809042,
+          "p95": 1.32075,
+          "p99": 2.2933749999999997,
+          "max": 2.570833
+        },
+        "timer_next_due": {
+          "count": 100,
+          "min": 0.04675,
+          "mean": 0.08500085,
+          "p50": 0.049375,
+          "p95": 0.19612500000000002,
+          "p99": 0.40108299999999997,
+          "max": 0.4165
         }
       }
     }
   ],
   "warnings": [
-    "hardware.md does not say what the disk is — fill in `disk` (nvme | ssd | network) before publishing these numbers",
-    "the checkout has uncommitted changes",
-    "--reuse: the population was not rebuilt, so its instances may come from an earlier run with different seeding. Build sizes and rates below describe only what this run added."
+    "hardware.md does not say what the disk is — fill in `disk` (nvme | ssd | network) before publishing these numbers"
   ]
 }

@@ -106,18 +106,34 @@ re-check, the step and the row delete are all real, and the storm figure
 (how long to drain N simultaneous timers) is extrapolated from the per-fire
 rate and labelled as such.
 
-**What it found immediately.** `Engine::next_due_in` — the scheduler's sleep
-computation, run on every idle cycle of every node — computes
-`min(t.due_at)` by *joining* `rbpmn_timer` to `rbpmn_instance` to filter on
-`status = 'active'`. The join defeats the index-min shortcut. Measured at
-10 000 armed timers:
+**Where it stands now.** Three findings came out of this family and all three
+are fixed (see "Findings"): the scheduler's sleep computation was linear in
+the armed population, the push worker's claim sorted the whole backlog, and
+the probes were measuring vacuum lag. With those in, standing cost is flat:
 
-| query | plan | time |
-|---|---|---|
-| `next_due_in` as shipped | hash join over two sequential scans | **7.4 ms** |
-| `min(due_at)` on the timer table alone | index-only scan + limit | **0.022 ms** |
+| probe p50 (ms) | 10 000 | 100 000 | 1 000 000 | growth |
+|---|---:|---:|---:|---:|
+| `timer_next_due` | 0.187 | 0.072 | **0.049** | 0.3x |
+| `admin_definitions_in_use` | 0.194 | 0.145 | **0.195** | 1.0x |
+| `count_tasks` | 0.142 | 0.113 | **0.117** | 0.8x |
+| `claim_empty` | 0.263 | 0.149 | **0.164** | 0.6x |
+| `event_page` | 0.363 | 0.425 | **0.359** | 1.0x |
+| `inspect_instance` | 0.523 | 0.441 | **0.760** | 1.5x |
+| `timer_fire` | 1.004 | 0.997 | **0.809** | 0.8x |
+| `claim_hit` | 0.905 | 0.954 | **0.861** | 1.0x |
+| `start_instance` | 0.565 | 0.654 | **1.126** | 2.0x |
+| | | | | |
+| total storage | 49.7 MB | 480.7 MB | **4.6 GB** | |
+| bytes per instance | 5 215 | 5 040 | **4 907** | |
 
-336× at ten thousand, and linear in the population. See "Findings" below.
+Every probe is sub-millisecond at a million parked instances except
+`start_instance` (1.13 ms), and nothing tracks the population — the two
+mildly rising rows are the only ones worth watching as the ladder grows.
+Storage is dead linear at ~4.9 kB per parked instance.
+
+Before those three fixes the same ladder read 391 ms for `timer_next_due`
+(175x growth), 1.3 ms for `claim_empty` (6.3x) and 1.3 ms for `count_tasks`
+(9.0x).
 
 ### C. Pattern micro-benchmarks — per-construct cost
 
