@@ -418,31 +418,113 @@ benchmark model is still a model this engine would deploy.
 
 ## Findings
 
-### The scheduler's sleep computation is linear in the armed population
+### The push worker's claim sorts the whole backlog to return one row
 
-`Engine::next_due_in` filters `min(due_at)` through a join on instance
-status, which turns an index-only lookup into a scan of both tables. At 10k
-armed timers that is 7.4 ms against 0.022 ms; extrapolated linearly, roughly
-0.7 s at a million.
+This is the big one, and it is on the engine's default execution path.
 
-It matters more than "once per sleep" suggests, because `NOTIFY
-rbpmn_timer` fires whenever a timer is armed and wakes *every* sleeping
-scheduler, each of which recomputes it. In a quiet system with a large parked
-cohort that is fine. During a bulk arrival window — exactly the batch-import
-shape a long-running deployment has — it is arm-rate × nodes × a scan of the
-whole timer and instance tables.
+`worker.rs` claims with `w.topic = any($1)` — it passes the set of topics it
+has handlers for. `tasks.rs::get_task` claims with `w.topic = $1`, a single
+topic. Same table, same index, same predicates otherwise. Measured against
+~87 000 claimable work items, with a **single-element** array in the first
+case:
 
-The obvious shape of a fix is that the *sleep hint* does not need the status
-filter at all: sleeping until a timer that turns out to belong to a
-non-active instance just means waking to find nothing to do, which the drain
-already handles via its re-check under the instance lock. But this is
-deliberately **not** filed as a one-line fix. `scheduler.rs` documents, at
-length and from three separate bugs, that the drain's eligibility rules and
-the sleep's must not disagree — that disagreement is what produced its
-busy-spin bugs — and the deferral exclusion in the same query is part of that
-agreement. Changing it means re-reading `spec/` and re-running `just tla`,
-per the repository's own rule about hand-written models. It is a design
-round, not a patch.
+| claim | plan | time |
+|---|---|---|
+| `topic = any(array[…])` (push worker) | parallel sequential scan + **sort of the entire claimable set** | **~30 ms** |
+| `topic = 'literal'` (pull API) | index scan on `rbpmn_work_item_pull`, stops at the first row | **0.18 ms** |
+
+~170×. The cause is that an index on `(topic, created_at, item_no)` scanned
+with `topic = ANY(…)` cannot guarantee output globally ordered by
+`(created_at, item_no)` — Postgres treats it as several index searches whose
+concatenation is unordered — so it cannot use the index to satisfy the
+`ORDER BY`, and falls back to scanning and sorting everything claimable in
+order to take `LIMIT 1`. Note that the array having one element does not
+save it; the plan is chosen for the general case.
+
+The consequence is that the push worker's cost per claim grows with the
+**backlog**, not with the work. It is invisible at small backlogs — the whole
+rest of this suite never sees it, because a drain of 1000 instances never has
+more than a few thousand claimable rows — and it is the dominant cost as soon
+as a backlog is large.
+
+**It is why this suite cannot currently build a million-instance population
+using the engine's own push worker.** At 100 000 instances the claim was
+~30 ms and spilling sort buffers to disk (`IO/BuffileWrite`); extrapolated to
+a 900 000-row backlog it is hours. That is a benchmark limitation *and* a
+finding: the same shape is what a production system meets after any outage
+that lets work accumulate.
+
+Directions, none of them free, all of them design decisions:
+
+- Bind a single topic when there is only one handled topic. Trivial, and it
+  fixes the common case completely — but it is a special case, not a fix.
+- Claim per topic (a query each, round-robin or first-hit). Loses global FIFO
+  *across* topics; the design brief already documents FIFO as
+  "fair-but-not-strict" under concurrent consumers, so this may be within the
+  contract already — but it is a contract question, not an optimisation.
+- Keep one query and drop the cross-topic ordering guarantee. Same question,
+  stated more honestly.
+
+### The scheduler's sleep computation was linear in the armed population — fixed
+
+`Engine::next_due_in` computed `min(due_at)` by *joining* `rbpmn_timer` to
+`rbpmn_instance` to filter on `status = 'active'`. The join defeats
+Postgres's MIN→index transformation, which rewrites `min(col)` into
+`order by col limit 1` internally and then requires the resulting path to
+**be** an IndexPath; across a join the best path is a nested loop
+*containing* an index scan, so the transformation is abandoned and the
+aggregate is computed over the whole join.
+
+No index or foreign key was missing — `rbpmn_timer_due`, both primary keys
+and the FK were all already there, and the fast plan uses exactly them. The
+optimization is refused before indexes are considered.
+
+The fix is to write the transformation by hand: `order by t.due_at limit 1`,
+same predicates, same value (`due_at` is NOT NULL). Measured on this
+scenario, identical ladder, the only change being that query:
+
+| population | 10 000 | 100 000 | 1 000 000 | growth |
+|---|---:|---:|---:|---:|
+| `min()` over the join | 2.228 ms | 17.335 ms | **390.955 ms** | 175× |
+| `order by … limit 1` | 0.104 ms | 0.123 ms | **0.206 ms** | 2.0× |
+
+**1 898× at a million armed timers**, and the curve is flat. It matters more
+than "once per sleep" suggests, because `NOTIFY rbpmn_timer` wakes every
+sleeping scheduler whenever any timer is armed, so the old cost was
+arm-rate × nodes × 391 ms.
+
+Every predicate was preserved — status filter, deferral exclusion — so the
+drain's eligibility rules and the sleep's remain identical, which is the
+agreement `scheduler.rs` documents from three separate busy-spin bugs. The
+sleep query is now the same query `drain_due_timers` issues, minus the
+`due_at <= now()` bound and with `limit 1`. `cargo test -p rbpmn-engine`
+(90 tests) and `just tla` (11 configs) both pass unchanged.
+
+The cost is honest rather than free: it is O(k) in timers walked before one
+belongs to a live, non-deferred instance — normally 1, but a block of
+soonest-due timers all belonging to frozen instances is walked past on every
+call. `min()` was O(n) unconditionally.
+
+### Calibration: what run-to-run variance looks like at a million
+
+Worth knowing before reading any single number above. Comparing the two full
+ladders — same code except that one query, same machine, same ladder — the
+probes that *cannot* be affected by the change still moved:
+
+| probe @ 1M | before | after |
+|---|---:|---:|
+| `claim_empty` | 1.242 ms | 1.292 ms |
+| `count_tasks` | 1.213 ms | 1.263 ms |
+| `event_page` | 0.430 ms | 0.469 ms |
+| `start_instance` | 1.320 ms | **3.667 ms** |
+| `inspect_instance` | 0.938 ms | **2.661 ms** |
+
+Most are within a few percent; two moved by ~2.8×, in the direction that
+would look like a regression if you were hunting for one. Nothing in the
+rewrite touches instance creation or inspection — that is build-order,
+cache-state and autovacuum-timing variance at a 4.5 GB working set. **Read
+only large moves as signal**, which is exactly why the headline above is
+quoted as three orders of magnitude and not as a percentage.
 
 ## Two harness bugs worth knowing about
 
@@ -457,7 +539,14 @@ some numbers in `results/` are not comparable with numbers taken before them.
    which is indexed, and does the exact per-phase accounting once at the end.
 2. **The definition key was re-derived per instance**, re-parsing the whole
    BPMN document on every `start`.
-3. **A probe claimed work items and never completed them.** The default lease
+3. **The population build went through the push worker**, so it inherited the
+   claim-sort problem above and could not reach a million — it was managing
+   ~500 completions/sec and spilling sort buffers. The build now completes
+   work items **by id**, which runs the identical transactional step and
+   only changes how the item is chosen. The build rate reported in a
+   population result is therefore not a claim-path number and must not be
+   read as one.
+4. **A probe claimed work items and never completed them.** The default lease
    is ten minutes, so the next build phase in the population ladder sat
    waiting for leases to expire — it read as a build running at 13
    instances/sec instead of 1500. Probes now complete what they claim, which

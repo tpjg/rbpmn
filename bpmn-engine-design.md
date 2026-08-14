@@ -588,7 +588,10 @@ means moving on), then step + delete the row via the `timer-fired` event in
 that one transaction. Draining = repeat until nothing is due; every node
 runs the same loop (competing consumers). There is **never** a per-timer
 in-process wait — a sleeping timer is a passive row. After draining, each
-scheduler sleeps until `SELECT min(due_at)` (cheap on the index), capped by
+scheduler sleeps until the earliest live `due_at` — `order by due_at limit
+1`, deliberately not `min()`: across the join to `rbpmn_instance` the
+MIN→index transformation is refused, and the population benchmark measured
+391ms at a million armed timers against 0.2ms for the ordered form — capped by
 a fallback poll interval (~30s, configurable), and a `NOTIFY` on timer
 insert (`rbpmn_timer` channel) wakes sleepers when an earlier timer appears
 — polling is the safety net, not the mechanism. Nothing fires before

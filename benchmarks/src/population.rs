@@ -25,7 +25,7 @@ use crate::pg;
 use crate::result::Latency;
 use crate::scenario::{ParksOn, Scenario};
 use crate::vars;
-use rbpmn_engine::{Engine, GetTaskOptions, WorkerOptions};
+use rbpmn_engine::{Engine, GetTaskOptions};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
@@ -134,21 +134,12 @@ pub async fn run(
             )
         })?;
 
-    let counters = Arc::new(AtomicU32::new(0));
-    let patch = scenario
-        .execute
-        .patch
-        .clone()
-        .unwrap_or_else(|| serde_json::json!({ "registered": true }));
+    // Handlers are registered so `deploy` passes `unresolved-topic`; no
+    // worker loop ever runs them, because the build completes work items by
+    // id (see `build_to`).
     let mut builder = Engine::builder(pool.clone());
     for topic in scenario.service_topics(&model) {
-        builder = builder.handler(
-            topic,
-            Arc::new(BuildHandler {
-                patch: patch.clone(),
-                completed: counters.clone(),
-            }),
-        );
+        builder = builder.declare_topic(topic);
     }
     let engine = builder.build();
     engine
@@ -294,29 +285,6 @@ fn check_model_parks_as_declared(
     }
 }
 
-struct BuildHandler {
-    patch: serde_json::Value,
-    completed: Arc<AtomicU32>,
-}
-
-impl rbpmn_engine::ServiceTaskHandler for BuildHandler {
-    fn execute(
-        &self,
-        _item: rbpmn_engine::WorkItem,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<serde_json::Value, rbpmn_engine::HandlerFailure>,
-                > + Send
-                + '_,
-        >,
-    > {
-        self.completed.fetch_add(1, Ordering::Relaxed);
-        let patch = self.patch.clone();
-        Box::pin(async move { Ok(patch) })
-    }
-}
-
 struct Build {
     secs: f64,
     rate: f64,
@@ -345,18 +313,55 @@ async fn build_to(
     }
     let started = Instant::now();
 
-    // Workers to advance each instance from its start event to the wait.
+    // Advance each instance from its start event to the wait state by
+    // completing its work item **by id**, not by claiming it by topic.
+    //
+    // That is deliberate and it is not the engine's normal path. The push
+    // worker claims with `topic = any($1)`, which cannot use the claim
+    // index's ordering and therefore sorts the entire claimable backlog to
+    // take one row (see the README's findings). Building a population *is* a
+    // large backlog by construction, so a build that went through the push
+    // worker would spend its time on that and never reach a million — it
+    // measured ~30 ms per claim at 100 000 and was spilling sort buffers to
+    // disk. Completion by id runs the identical transactional step; only the
+    // choosing of which item is different, and the build is setup rather
+    // than measurement. It also keeps the build honest: the build rate below
+    // is not a claim-path number and must not be read as one.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut workers = Vec::new();
-    for n in 0..scenario.execute.service_workers {
+    for _ in 0..scenario.execute.service_workers.max(1) {
         let engine = engine.clone();
+        let pool = pool.clone();
+        let stop = stop.clone();
+        let patch = scenario
+            .execute
+            .patch
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({ "registered": true }));
         workers.push(tokio::spawn(async move {
-            engine
-                .run_worker(WorkerOptions {
-                    owner: format!("bench-build-{n}"),
-                    lease: Duration::from_secs(120),
-                    poll_interval: Duration::from_millis(100),
-                })
-                .await;
+            while !stop.load(Ordering::Relaxed) {
+                let ids: Vec<Uuid> = match sqlx::query_scalar(
+                    "select id from rbpmn_work_item where state = 'available' limit 64",
+                )
+                .fetch_all(&pool)
+                .await
+                {
+                    Ok(ids) => ids,
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        continue;
+                    }
+                };
+                if ids.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                for id in ids {
+                    // Two builders racing for one item is normal; the loser
+                    // gets the engine's idempotent already-closed no-op.
+                    let _ = engine.complete_work_item(id, patch.clone()).await;
+                }
+            }
         }));
     }
 
@@ -389,21 +394,45 @@ async fn build_to(
             .map_err(|e| format!("a builder task panicked: {e}"))??;
     }
 
-    // Wait until every started instance has reached the wait state, so the
-    // probes run against a settled population rather than a moving one.
-    let deadline = Instant::now() + Duration::from_secs(1800);
+    // Every start has been issued; the workers are still advancing those
+    // instances to the wait state. Refresh statistics before they do the
+    // bulk of it — the population just grew by an order of magnitude, and a
+    // claim planned against the previous size flips to the plan documented
+    // in `run::analyze_before_execute`. Cheap here, and the build is setup.
+    sqlx::query("analyze rbpmn_instance, rbpmn_work_item")
+        .execute(pool)
+        .await
+        .map_err(|e| format!("analyzing mid-build: {e}"))?;
+
+    // Wait until nothing is left to claim, which means every started
+    // instance has reached its wait state.
+    //
+    // An existence check on the partial claim index, not a count of parked
+    // instances: the obvious version — active instances with no open work
+    // item — is an anti-join over the whole population, and at 100 000 it
+    // measured 71 ms while running every 100 ms. A harness that polls in
+    // O(population) becomes the load it is trying to observe. Third time
+    // this exact mistake has appeared in this file's history; the rule is
+    // that anything in a loop must cost what is *left to do*, never what
+    // has been done.
+    let deadline = Instant::now() + Duration::from_secs(3600);
     loop {
-        let parked = parked_count(pool, &model.key).await?;
-        if parked >= target {
+        let open: bool = sqlx::query_scalar(
+            "select exists (select 1 from rbpmn_work_item \
+             where state in ('available','locked'))",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("polling build progress: {e}"))?;
+        if !open {
             break;
         }
         if Instant::now() > deadline {
-            return Err(format!(
-                "building to {target} stalled at {parked} parked instances"
-            ));
+            return Err(format!("building to {target} stalled with work still open"));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    stop.store(true, Ordering::Relaxed);
     for worker in workers {
         worker.abort();
     }

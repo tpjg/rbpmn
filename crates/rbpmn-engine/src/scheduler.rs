@@ -1,6 +1,6 @@
 //! The timer scheduler: every node runs the same loop (competing
 //! consumers), draining due timers one per transaction, then sleeping until
-//! `min(due_at)` — capped by a fallback poll interval — with `LISTEN
+//! the earliest `due_at` — capped by a fallback poll interval — with `LISTEN
 //! rbpmn_timer` waking sleepers early when a sooner timer is armed. A
 //! sleeping timer is a passive row; there is never a per-timer in-process
 //! wait, and nothing fires before `due_at` (database time, the only clock).
@@ -309,22 +309,55 @@ impl Engine {
         .await
     }
 
-    /// Time until the earliest live timer is due, from database time (cheap
-    /// on the `due_at` index) — `None` when nothing is armed. Frozen
-    /// instances' timers don't count: they cannot fire until repaired, and
-    /// counting them would make every scheduler spin on an overdue timer it
-    /// is not allowed to touch. (`min()` over zero rows is NULL, and
-    /// Postgres's `GREATEST` *ignores* NULLs rather than propagating them —
-    /// the clamp must happen here, not in SQL.)
+    /// Time until the earliest live timer is due, from database time —
+    /// `None` when nothing is armed. Frozen instances' timers don't count:
+    /// they cannot fire until repaired, and counting them would make every
+    /// scheduler spin on an overdue timer it is not allowed to touch.
+    ///
+    /// **`order by … limit 1`, deliberately, not `min()`.** The two are the
+    /// same value here (`due_at` is NOT NULL), but only one of them is cheap.
+    /// Postgres's MIN→index transformation rewrites `min(col)` into
+    /// `order by col limit 1` internally and then requires the resulting path
+    /// to *be* an IndexPath; across a join the best path is a nested loop
+    /// *containing* an index scan, so the transformation is abandoned and the
+    /// aggregate is computed over the whole join. No index fixes that — the
+    /// optimization is refused before indexes are considered — and the ones
+    /// needed are already present (`rbpmn_timer_due`, both primary keys, and
+    /// the FK). Written this way the planner walks `rbpmn_timer_due` in
+    /// order, probes `rbpmn_instance` by primary key, and stops at the first
+    /// live match.
+    ///
+    /// Measured on the population benchmark, 100 000 instances, same data:
+    /// `min()` planned a **parallel hash join over two sequential scans**,
+    /// 6 562 buffers, 32 ms — on every idle scheduler cycle of every node,
+    /// and `NOTIFY rbpmn_timer` wakes them all whenever any timer is armed.
+    /// This form: 333 buffers, 0.048 ms, one row touched on each side.
+    ///
+    /// Every predicate is unchanged, which is the point: the drain's
+    /// eligibility rules and this one must not disagree (see the liveness
+    /// note above — that disagreement caused three separate busy-spin bugs),
+    /// so only the executable form moved. It is now the same query
+    /// `drain_due_timers` issues, minus the `due_at <= now()` bound and with
+    /// `limit 1`.
+    ///
+    /// The cost is honest rather than free: this is O(k) in the timers walked
+    /// before one belongs to a live, non-deferred instance — normally 1, but
+    /// a block of soonest-due timers all belonging to frozen instances is
+    /// walked past on every call. `min()` was O(n) unconditionally.
+    ///
+    /// (`fetch_optional`, not `fetch_one`: `min()` over zero rows returns one
+    /// NULL row, `limit 1` returns none. Same meaning, different row count —
+    /// the one way to get this rewrite wrong.)
     pub async fn next_due_in(&self) -> Result<Option<Duration>, EngineError> {
         let (deferred, _) = self.deferral_snapshot();
         let secs: Option<f64> = sqlx::query_scalar(
-            "select extract(epoch from (min(t.due_at) - now()))::float8 \
+            "select extract(epoch from (t.due_at - now()))::float8 \
              from rbpmn_timer t join rbpmn_instance i on i.id = t.instance_id \
-             where i.status = 'active' and not (i.id = any($1))",
+             where i.status = 'active' and not (i.id = any($1)) \
+             order by t.due_at limit 1",
         )
         .bind(&deferred)
-        .fetch_one(self.pool())
+        .fetch_optional(self.pool())
         .await?;
         Ok(secs.map(|s| Duration::from_secs_f64(s.max(0.0))))
     }
