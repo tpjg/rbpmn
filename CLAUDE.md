@@ -133,6 +133,11 @@ inclusive gateway, block structure, messages-only interaction, build order).
   everywhere; new fixtures without a `bpmndi:BPMNDiagram` section get theirs
   from this (idempotent; two reject fixtures have hand-written DI — see the
   comments in them).
+- `just cleanup` — **destructive**: drops every `rbpmn_*` database (including
+  the `rbpmn_test_*` throwaways a panicked integration test leaves behind for
+  inspection) and removes all build output. `just ui` is required afterwards.
+  Keeps `benchmarks/.baselines/` — machine-local, and deleting it silently
+  disarms the micro gate.
 - `just bench` — the benchmark suite (`benchmarks/README.md`). Needs the local
   Postgres, **not** Docker; `just bench-compose` is the opt-in pinned-server
   variant. `just bench-micro` is the pure-core criterion suite plus the only

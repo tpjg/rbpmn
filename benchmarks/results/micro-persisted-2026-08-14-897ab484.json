@@ -1,9 +1,9 @@
 {
   "schema": "rbpmn-bench-persisted/1",
-  "started_at": "2026-08-14T07:57:48Z",
+  "started_at": "2026-08-14T09:32:21Z",
   "iterations": 200,
   "checkout": {
-    "git_sha": "10b68a4c116244e025f7ac9eecb332ac077ea64b",
+    "git_sha": "9e01e0e9d938ebd0736b8ffb4a85f00f64f9000c",
     "dirty": true
   },
   "hardware": {
@@ -94,9 +94,7 @@
       "rbpmn_definition": [],
       "rbpmn_environment_topic": [],
       "rbpmn_event": [
-        "autovacuum_vacuum_scale_factor=0.1",
-        "autovacuum_analyze_scale_factor=0.02",
-        "fillfactor=100"
+        "autovacuum_analyze_scale_factor=0.02"
       ],
       "rbpmn_instance": [
         "autovacuum_vacuum_scale_factor=0.05",
@@ -108,8 +106,14 @@
       "rbpmn_retention_lease": [],
       "rbpmn_retention_policy": [],
       "rbpmn_scope": [],
-      "rbpmn_subscription": [],
-      "rbpmn_timer": [],
+      "rbpmn_subscription": [
+        "autovacuum_vacuum_scale_factor=0.05",
+        "autovacuum_analyze_scale_factor=0.02"
+      ],
+      "rbpmn_timer": [
+        "autovacuum_vacuum_scale_factor=0.05",
+        "autovacuum_analyze_scale_factor=0.02"
+      ],
       "rbpmn_token": [
         "autovacuum_vacuum_scale_factor=0.02",
         "autovacuum_vacuum_threshold=200",
@@ -129,74 +133,74 @@
     {
       "name": "single-task",
       "steps_per_instance": 2.0,
-      "micros_per_instance": 1161.005,
-      "micros_per_step": 580.5025,
+      "micros_per_instance": 1157.509375,
+      "micros_per_step": 578.7546875,
       "marginal_micros_vs_baseline": 0.0,
       "events_per_instance": 12.0,
-      "bytes_per_instance": 4710.4
+      "bytes_per_instance": 4792.32
     },
     {
       "name": "sequence-2",
       "steps_per_instance": 3.0,
-      "micros_per_instance": 1780.32125,
-      "micros_per_step": 593.4404166666667,
-      "marginal_micros_vs_baseline": 619.3162499999999,
+      "micros_per_instance": 1817.7741650000003,
+      "micros_per_step": 605.9247216666668,
+      "marginal_micros_vs_baseline": 660.2647900000002,
       "events_per_instance": 17.0,
-      "bytes_per_instance": 6225.92
+      "bytes_per_instance": 6348.8
     },
     {
       "name": "exclusive-2",
       "steps_per_instance": 3.0,
-      "micros_per_instance": 1951.6777099999997,
-      "micros_per_step": 650.5592366666666,
-      "marginal_micros_vs_baseline": 790.6727099999996,
+      "micros_per_instance": 1852.1095850000002,
+      "micros_per_step": 617.3698616666667,
+      "marginal_micros_vs_baseline": 694.6002100000001,
       "events_per_instance": 23.0,
-      "bytes_per_instance": 7782.4
+      "bytes_per_instance": 8273.92
     },
     {
       "name": "parallel-2",
       "steps_per_instance": 3.0,
-      "micros_per_instance": 1842.9797899999999,
-      "micros_per_step": 614.3265966666667,
-      "marginal_micros_vs_baseline": 681.9747899999998,
+      "micros_per_instance": 1852.87021,
+      "micros_per_step": 617.6234033333334,
+      "marginal_micros_vs_baseline": 695.360835,
       "events_per_instance": 24.0,
-      "bytes_per_instance": 8314.88
+      "bytes_per_instance": 8192.0
     },
     {
       "name": "parallel-4",
       "steps_per_instance": 5.0,
-      "micros_per_instance": 3223.6102100000003,
-      "micros_per_step": 644.722042,
-      "marginal_micros_vs_baseline": 2062.60521,
+      "micros_per_instance": 3292.099165,
+      "micros_per_step": 658.419833,
+      "marginal_micros_vs_baseline": 2134.58979,
       "events_per_instance": 36.0,
-      "bytes_per_instance": 14254.08
+      "bytes_per_instance": 13557.76
     },
     {
       "name": "parallel-8",
       "steps_per_instance": 9.0,
-      "micros_per_instance": 6070.259795,
-      "micros_per_step": 674.4733105555556,
-      "marginal_micros_vs_baseline": 4909.254795,
+      "micros_per_instance": 6124.668960000001,
+      "micros_per_step": 680.5187733333335,
+      "marginal_micros_vs_baseline": 4967.159585000001,
       "events_per_instance": 60.0,
-      "bytes_per_instance": 24616.96
+      "bytes_per_instance": 25231.36
     },
     {
       "name": "subprocess",
       "steps_per_instance": 3.0,
-      "micros_per_instance": 1981.7464549999997,
-      "micros_per_step": 660.5821516666666,
-      "marginal_micros_vs_baseline": 820.7414549999996,
+      "micros_per_instance": 1994.6758300000001,
+      "micros_per_step": 664.8919433333334,
+      "marginal_micros_vs_baseline": 837.166455,
       "events_per_instance": 25.0,
       "bytes_per_instance": 9052.16
     },
     {
       "name": "loop-3",
       "steps_per_instance": 5.0,
-      "micros_per_instance": 3317.8610400000007,
-      "micros_per_step": 663.572208,
-      "marginal_micros_vs_baseline": 2156.8560400000006,
+      "micros_per_instance": 3453.974165,
+      "micros_per_step": 690.794833,
+      "marginal_micros_vs_baseline": 2296.46479,
       "events_per_instance": 43.0,
-      "bytes_per_instance": 15073.28
+      "bytes_per_instance": 14950.4
     }
   ],
   "warnings": [

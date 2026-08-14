@@ -217,8 +217,7 @@ happened to notice.
 Every run writes `results/<scenario>-<mode>-<date>-<host-id>.json` containing:
 
 - the rbpmn git sha, and whether the checkout was **dirty**
-- the scenario TOML's SHA-256, every model file's SHA-256, `tuning.sql`'s
-  SHA-256, and the RNG seed
+- the scenario TOML's SHA-256, every model file's SHA-256, and the RNG seed
 - the **deployed bindings manifest** — the other half of a definition, and the
   half no other engine's benchmark can show you, because in every other engine
   it is smeared into vendor XML attributes
@@ -415,7 +414,6 @@ attached; the result file carries them so that is easy.
 benchmarks/
   README.md        # this file
   compose.yml      # OPTIONAL pinned+tuned Postgres (just bench-compose)
-  tuning.sql       # per-table autovacuum settings, applied and hashed per run
   hardware.md      # filled-in template, parsed into every result
   models/          # the .bpmn used here — NOT the tests/fixtures corpus
   scenarios/       # one TOML per benchmark
@@ -573,8 +571,8 @@ far behind autovacuum happened to be, which is not a property of the engine.
 
 That is not sweeping a real cost under the rug. Vacuum lag after heavy
 completion churn is a genuine operational concern for exactly the tables the
-design brief called churn-heavy, and `tuning.sql` sets an aggressive
-`autovacuum_vacuum_scale_factor` on `rbpmn_work_item` for it. But "how does
+design brief called churn-heavy, and the engine's migration 0009 sets an
+aggressive `autovacuum_vacuum_scale_factor` on `rbpmn_work_item` for it. But "how does
 the engine perform at rest with a large population" and "what happens while
 autovacuum is behind" are different questions, and a run that mixes them
 answers neither. The second one deserves its own scenario.

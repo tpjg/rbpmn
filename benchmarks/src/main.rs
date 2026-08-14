@@ -62,10 +62,9 @@ fn guard_database(url: &str, allow_any: bool) -> Result<(), String> {
     }
     Err(format!(
         "refusing to benchmark database '{name}': the harness starts hundreds of \
-         thousands of instances and applies per-table autovacuum settings \
-         (benchmarks/tuning.sql), so it only runs against a database whose name says \
-         it is for benchmarking. Create one — `createdb rbpmn_bench` — or pass \
-         --allow-any-database if you are sure."
+         thousands of instances, truncates every rbpmn table and vacuums them, so it \
+         only runs against a database whose name says it is for benchmarking. Create \
+         one — `createdb rbpmn_bench` — or pass --allow-any-database if you are sure."
     ))
 }
 

@@ -1144,9 +1144,16 @@ async fn settle(pool: &PgPool) {
     tokio::time::sleep(Duration::from_secs(2)).await;
 }
 
-/// Per-table storage parameters the engine's own migrations deliberately do
-/// not set. Applying them here — rather than assuming a default — is why the
-/// result file can name them.
+/// A hook for **benchmark-only** database tuning: if `benchmarks/tuning.sql`
+/// exists it is applied and hashed into the result.
+///
+/// Normally it does not exist, and that is the point. The per-table
+/// autovacuum settings used to live there, which was the wrong side of the
+/// line — a setting only the benchmark applies makes the benchmark measure a
+/// system nobody runs. They are now in the engine's own migration 0009, and
+/// what the result records is `postgres.table_options`: the settings that
+/// are actually in force, read back from the catalogue, rather than a script
+/// asserting what they ought to be.
 pub(crate) async fn apply_tuning(pool: &PgPool, root: &Path) -> Result<Option<String>, String> {
     use sha2::{Digest, Sha256};
     let path = root.join("tuning.sql");

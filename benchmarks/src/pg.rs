@@ -3,7 +3,7 @@
 //! Two jobs. Before a run: capture the settings that decide the numbers, so
 //! nothing is a hidden default — the curated list is what `compose.yml`
 //! tunes, and the catch-all sweeps up everything whose source is not
-//! `default`, which is what catches a setting the tuning file grew after
+//! `default`, which is what catches a server setting added after
 //! this list was written. During a run: the samples the monitor takes.
 
 use serde::{Deserialize, Serialize};
@@ -61,9 +61,9 @@ pub struct PostgresFacts {
     /// whatever the reason (config file, command line, ALTER SYSTEM).
     pub non_default_settings: BTreeMap<String, String>,
     /// Per-table storage parameters — where the churn-heavy tables'
-    /// autovacuum settings live. The engine's migrations set none; the
-    /// benchmark applies `benchmarks/tuning.sql`, which is why the applied
-    /// values are recorded rather than assumed.
+    /// autovacuum settings live. Set by the engine's migration 0009 and read
+    /// back from the catalogue here, so a result records the settings that
+    /// were actually in force rather than the ones something intended.
     pub table_options: BTreeMap<String, Vec<String>>,
 }
 

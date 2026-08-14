@@ -354,21 +354,48 @@ to a browser audience are all the application's job.
 
 ## Developing
 
-```sh
-cargo test            # everything, including the fixture corpus
-just lint             # clippy -D warnings + fmt --check
-just serve            # run the HTTP server with a throwaway token
-just playground       # linter playground (builds WASM first)
-just parity           # Rust-vs-WASM byte parity + bpmnlint plugin test
-just feel-parity      # FEEL subset differentialled against dsntk (own lockfile)
-just tla              # TLA+ model check of the locking + lease protocol
-just ui               # build the UI documents — run once after cloning
-just ui-test          # the UI's pure modules, no browser needed
-just demo             # a real stuck instance + two clickable links
-just e2e-ui           # drive both documents in a real browser
-just bench            # the benchmark suite (separate track — see benchmarks/)
-just bench-micro      # pure-core micro-benchmarks + the regression gate
-```
+Nothing runs automatically — there is no CI workflow and no git hook. Every
+check below is a deliberate command, so it is worth knowing which ones a
+change *owes*.
+
+**Always, before committing:**
+
+| | |
+|---|---|
+| `cargo test` | everything including the fixture corpus. Needs a local Postgres for the engine's integration tests. |
+| `just lint` | clippy `-D warnings` across the whole workspace + `cargo fmt --check`. |
+
+**Owed by what you touched** — these guard things `cargo test` cannot see:
+
+| If you changed | Run | Because |
+|---|---|---|
+| a linter rule, `rbpmn-model`, `rbpmn-core` | `just ui` | the editor embeds the linter; without it the document you serve validates against yesterday's rules, and nothing checks that for you |
+| anything WASM-facing | `just parity` | byte-parity of native Rust vs WASM over the corpus, for both exports, plus the bpmnlint plugin |
+| lock order, the work-item lease, the scheduler's claim, scope teardown, retention | `just tla` | the specs are hand-written and will not tell you they drifted |
+| the FEEL subset / `condition::eval` | `just feel-parity` | differential against dsntk over ~8k expression/document pairs |
+| the two UI documents | `just ui-test`, `just e2e-ui` | the pure modules under node, then both documents in a real browser (the only place the CSP is enforced) |
+| a fixture without DI | `just fixtures-di` | so it renders in bpmn-js and any standard modeler |
+
+**Occasionally, to catch performance regressions** (a separate track — see
+[benchmarks/README.md](benchmarks/README.md); none of it gates on absolute
+numbers):
+
+| | When | Cost |
+|---|---|---|
+| `just bench-micro` | after touching the semantic core | ~10 min. The only benchmark that can fail: pure-core suite vs *this machine's* baseline, with that machine's measured noise in the threshold. A machine with no baseline reports and passes — record one with `just bench-baseline`. |
+| `just bench` | before a release, or after touching the claim/step/persist paths | ~3 min. Seven lifecycle scenarios; compare against the committed `results/`. |
+| `just bench-population` | after touching anything a large parked population meets — the scheduler, claims, retention, indexes | ~45 min to a million instances. This is the one that found the three engine issues fixed in migration 0008 and the scheduler's sleep query. |
+| `just bench-report` | when quoting numbers | renders `results/*.json` grouped by host. |
+
+**Utility:**
+
+| | |
+|---|---|
+| `just serve` / `just demo` | the HTTP server with a throwaway token / a live demo with an instance frozen on an incident |
+| `just playground` | fixture browser + live lint |
+| `just e2e` | every fixture rendered in a browser, plus the full inspection stack |
+| `just bench-check` | lint every benchmark model against its manifest (no database) |
+| `just cleanup` | **destructive**: drops every `rbpmn_*` database (including the `rbpmn_test_*` throwaways a panicked test leaves for inspection) and removes all build output — `target/` alone is typically tens of GB. Keeps `benchmarks/.baselines/`, which is machine-local and costs ten minutes to re-record. |
 
 **Bootstrap:** `just ui` before the first `cargo build`, because the UI
 bundles are compile output and are gitignored like every other artifact here.

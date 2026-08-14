@@ -300,3 +300,60 @@ bench-compose SCENARIO='':
 # Park a large cohort and probe standing cost (slow; builds to 1M by default).
 bench-population SCENARIO='population-timer' *ARGS: bench-db
     cargo run --release -p rbpmn-bench -- population "{{SCENARIO}}" {{ARGS}}
+
+# Remove every build artifact and every rbpmn database, for disk space or to
+# force a genuinely clean build.
+#
+# Destructive and deliberately loud about it: it prints each thing before
+# removing it. Scope is strictly `rbpmn_`-prefixed databases — including the
+# `rbpmn_test_*` throwaways an integration test leaves behind when it panics
+# (deliberately, for inspection) — plus this repository's own build output.
+# Nothing outside those is touched.
+#
+# NOT removed: benchmarks/.baselines/. It is machine-local, tiny, and costs
+# ten minutes of criterion to re-record; deleting it would silently disarm
+# the micro gate, which is the opposite of tidy. Remove it by hand if you
+# want a fresh baseline.
+#
+# After this, `just ui` is required before the next `cargo build` (the UI
+# bundles are compile output — rbpmn-ui's build.rs will say so).
+
+# Remove all build artifacts and all rbpmn_* databases (destructive).
+cleanup:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    echo "== databases =="
+    dbs=$(psql -h localhost postgres -tAc "select datname from pg_database where datname like 'rbpmn\_%'" 2>/dev/null || true)
+    if [ -z "$dbs" ]; then
+        echo "  (none, or no local postgres)"
+    else
+        for db in $dbs; do
+            echo "  dropping $db"
+            psql -h localhost postgres -c "drop database $db (force)" >/dev/null
+        done
+    fi
+    echo "== cargo =="
+    for dir in . feel-parity; do
+        if [ -d "$dir/target" ]; then
+            echo "  cargo clean in $dir ($(du -sh "$dir/target" 2>/dev/null | cut -f1))"
+            (cd "$dir" && cargo clean)
+        fi
+    done
+    echo "== node and generated assets =="
+    for path in \
+        playground/node_modules playground/dist playground/src/wasm playground/src/fixtures.generated.js \
+        ui/node_modules ui/dist ui/wasm ui/src/generated \
+        bpmnlint-plugin-rbpmn/node_modules bpmnlint-plugin-rbpmn/wasm \
+        crates/rbpmn-ui/assets e2e/screenshots spec/states; do
+        if [ -e "$path" ]; then
+            echo "  removing $path ($(du -sh "$path" 2>/dev/null | cut -f1))"
+            rm -rf "$path"
+        fi
+    done
+    for jar in spec/.tla2tools-*.jar; do
+        [ -e "$jar" ] && { echo "  removing $jar"; rm -f "$jar"; }
+    done
+    find . -name __pycache__ -type d -not -path './target/*' -exec rm -rf {} + 2>/dev/null || true
+    echo
+    echo "clean. Note: benchmarks/.baselines/ kept (machine-local; 10 min to re-record)."
+    echo "Run 'just ui' before the next cargo build — the UI bundles are compile output."

@@ -101,6 +101,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "claim_fifo",
         include_str!("../migrations/0008_claim_fifo.sql"),
     ),
+    (
+        9,
+        "autovacuum",
+        include_str!("../migrations/0009_autovacuum.sql"),
+    ),
 ];
 
 /// A claimed unit of service work, as handed to a push-mode handler.
