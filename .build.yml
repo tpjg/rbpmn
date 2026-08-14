@@ -127,6 +127,28 @@ tasks:
       pg_isready -h localhost
       psql "$RBPMN_TEST_ADMIN_URL" -tAc 'select version()'
 
+      # A role named after the build user, because a great deal of this repo
+      # assumes `$USER` has one — true on any developer machine, false here.
+      # `just serve`, `just demo` and e2e/demo.py's psql helper all connect
+      # without -U, so libpq falls back to $USER and finds nothing: the
+      # e2e_ui served half skipped itself and the build went green on the
+      # `file://` half alone. This fixes the class rather than the instance.
+      #
+      # whoami rather than a literal `build`, so this survives a builder that
+      # names its user something else. Check-then-create so a re-run is a
+      # no-op instead of a failure — every other provisioning step in this
+      # repo (`just bench-db`, `just serve`) is idempotent for the same
+      # reason.
+      ROLE=$(whoami)
+      echo "build user: $ROLE"
+      sudo -u postgres psql -tAc "select 1 from pg_roles where rolname = '$ROLE'" | grep -q 1 \
+        || sudo -u postgres psql -c "create role \"$ROLE\" superuser login"
+
+      # Prove it works the way the scripts will use it: no -U, no URL, which
+      # is exactly what e2e/demo.py's psql helper does.
+      psql -q -h localhost postgres -c 'select 1' >/dev/null
+      echo "psql as $ROLE without -U: ok"
+
   - setup_playwright: |
       # Its own task so the ~150 MB chromium download is visible in the build
       # log as itself rather than as part of a test that appears to hang.
