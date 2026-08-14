@@ -26,3 +26,9 @@ __pycache__/
 # mistake the whole benchmark track exists to prevent. Everyone records their
 # own with `just bench-baseline`.
 /benchmarks/.baselines/
+# Run output, for the same reason and one more: every file is stamped with the
+# machine that produced it (`hardware.host_id`) and the commit it measured, so
+# a committed result is one machine's numbers presented as the project's. They
+# also churn on every run. Keep the ones you care about outside the repo, or
+# publish them somewhere that records the hardware alongside.
+/benchmarks/results/
