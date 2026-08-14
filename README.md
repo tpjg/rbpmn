@@ -389,7 +389,7 @@ it gates on absolute numbers):
 | | When | Cost |
 |---|---|---|
 | `just bench-micro` | after touching the semantic core | ~10 min. The only benchmark that can fail: pure-core suite vs *this machine's* baseline, with that machine's measured noise in the threshold. A machine with no baseline reports and passes — record one with `just bench-baseline`. |
-| `just bench` | before a release, or after touching the claim/step/persist paths | ~3 min. Seven lifecycle scenarios; compare against the committed `results/`. |
+| `just bench` | before a release, or after touching the claim/step/persist paths | ~3 min. Seven lifecycle scenarios. `results/` is gitignored — there is no baseline set in the repo, so comparing releases means keeping your own runs, from the same machine. |
 | `just bench-population` | after touching anything a large parked population meets — the scheduler, claims, retention, indexes | ~45 min to a million instances. This is the one that found the three engine issues fixed in migration 0008 and the scheduler's sleep query. |
 | `just bench-report` | when quoting numbers | renders `results/*.json` grouped by host. |
 

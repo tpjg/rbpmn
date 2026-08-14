@@ -144,7 +144,7 @@ enum Command {
         #[arg(long, default_value = "200")]
         iterations: u32,
     },
-    /// Compare the pure-core micro suite against this machine's committed
+    /// Compare the pure-core micro suite against this machine's recorded
     /// baseline. The only command that can fail a build.
     Gate {
         #[arg(long)]
@@ -160,7 +160,7 @@ enum Command {
         #[arg(long)]
         criterion_dir: PathBuf,
     },
-    /// Render the committed results into a markdown comparison table.
+    /// Render this machine's results into a markdown comparison table.
     Report {
         /// Write here instead of stdout.
         #[arg(long)]
@@ -485,7 +485,8 @@ async fn lifecycle(
         for warning in &result.warnings {
             println!("    warning: {warning}");
         }
-        // Never replace a committed measurement silently.
+        // Never replace a measurement silently: `results/` is gitignored,
+        // so an overwritten one is gone.
         println!(
             "    -> {}{}",
             path.display(),

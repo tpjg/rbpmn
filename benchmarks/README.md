@@ -212,6 +212,26 @@ happened to notice.
 
 ---
 
+## Results are not committed
+
+`benchmarks/results/` is gitignored, and so is `benchmarks/.baselines/`. Both
+for the same reason, which is the reason this whole track exists: **every
+result file is stamped with the machine that produced it**
+(`hardware.host_id`) and the commit it measured. Committed, it stops being
+"what that laptop measured" and becomes "rbpmn's numbers" — precisely the
+claim the report renderer refuses to make when it groups tables by host and
+declines to compare across them. They would also churn on every run.
+
+So a result is a local artifact. Keep the ones you care about outside the
+repository, or publish them somewhere that carries the hardware alongside —
+the file already contains everything needed for that, which is the point of
+the provenance block below.
+
+The practical consequence: `just bench-report` renders what *this* machine
+has measured, and there is no baseline set in the repository to compare a run
+against. Comparing releases means keeping your own results — and comparing
+them only against results from the same machine.
+
 ## Reproducibility
 
 Every run writes `results/<scenario>-<mode>-<date>-<host-id>.json` containing:
@@ -235,6 +255,8 @@ The mode is in the filename because `saturation` and `steady` are different
 measurements of the same scenario, and without it the second one written on a
 given day would silently replace the first. Re-running the same mode does
 replace it — that is correct, and the run says `(replaced)` when it happens.
+Since these files are not in git, nothing recovers a result you overwrote:
+copy one aside before a run you intend to compare against.
 
 ### Starting conditions, and why they are not "cheating"
 
@@ -331,13 +353,11 @@ machine's baseline. A benchmark counts as regressed when it is slower than the
 threshold (25% by default) **plus that benchmark's recorded noise on this
 machine**.
 
-**Baselines are never committed.** They live in `benchmarks/.baselines/`,
-which is gitignored, one file per host id. That is not tidiness: the gate
-folds a machine's own measured noise into its threshold, so a baseline
-describes one machine and nothing else, and a committed one would be a
-standing invitation to compare against numbers from someone else's laptop —
-the single mistake this whole track exists to prevent. Record your own:
-`just bench-baseline`. A machine without one reports and passes.
+**Baselines are never committed**, for the same reason results are not —
+see "Results are not committed" above. They live in `benchmarks/.baselines/`,
+one file per host id. The gate folds a machine's own measured noise into its
+threshold, so a baseline describes one machine and nothing else. Record your
+own: `just bench-baseline`. A machine without one reports and passes.
 
 The noise term is not caution, it is the difference between a gate and a coin
 toss. The first version compared point estimates against a flat 25%; run
@@ -417,8 +437,8 @@ benchmarks/
   hardware.md      # filled-in template, parsed into every result
   models/          # the .bpmn used here — NOT the tests/fixtures corpus
   scenarios/       # one TOML per benchmark
-  results/         # committed result JSON
-  .baselines/      # per-machine micro baselines — GITIGNORED, never committed
+  results/         # run output — GITIGNORED, see "Results are not committed"
+  .baselines/      # per-machine micro baselines — GITIGNORED, same reason
   src/             # the harness (rbpmn-bench)
   benches/         # the pure-core criterion suite
 ```
@@ -616,7 +636,7 @@ quoted as three orders of magnitude and not as a percentage.
 ## Two harness bugs worth knowing about
 
 Both were found by the benchmark measuring itself, and both are the reason
-some numbers in `results/` are not comparable with numbers taken before them.
+numbers taken before them are not comparable with numbers taken after.
 
 1. **The drain-progress poll was O(database).** It counted this pass's
    instances with `business_key like '<run>:%'` — a sequential scan, because

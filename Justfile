@@ -224,7 +224,7 @@ bench-steady SCENARIO='': bench-db
     fi
 
 # The pure-core criterion suite (no database, no IO, no clock) plus the
-# regression gate against this machine's committed baseline. Fast, and the
+# regression gate against this machine's recorded baseline. Fast, and the
 # one benchmark that may fail a build — see benchmarks/src/gate.rs for the
 # fences on that. A machine with no baseline yet reports and passes.
 
@@ -251,9 +251,10 @@ bench-baseline:
 bench-micro-persisted: bench-db
     cargo run --release -p rbpmn-bench -- micro-persisted
 
-# Render the committed results into a markdown comparison table, grouped by
+# Render this machine's results into a markdown comparison table, grouped by
 # host — two machines' numbers are not comparable and a table that put them
-# adjacent would imply they were.
+# adjacent would imply they were. results/ is gitignored, so this renders what
+# you have measured locally; there is no baseline set in the repository.
 
 # Render benchmarks/results/*.json into a markdown table, grouped by host.
 bench-report:
@@ -310,10 +311,11 @@ bench-population SCENARIO='population-timer' *ARGS: bench-db
 # (deliberately, for inspection) — plus this repository's own build output.
 # Nothing outside those is touched.
 #
-# NOT removed: benchmarks/.baselines/. It is machine-local, tiny, and costs
-# ten minutes of criterion to re-record; deleting it would silently disarm
-# the micro gate, which is the opposite of tidy. Remove it by hand if you
-# want a fresh baseline.
+# NOT removed: benchmarks/.baselines/ or benchmarks/results/. Both are
+# gitignored, so both are the only copy there is. The baseline costs ten
+# minutes of criterion to re-record and deleting it would silently disarm the
+# micro gate; the results are measurements you cannot re-take at the commit
+# they describe. Remove either by hand.
 #
 # After this, `just ui` is required before the next `cargo build` (the UI
 # bundles are compile output — rbpmn-ui's build.rs will say so).

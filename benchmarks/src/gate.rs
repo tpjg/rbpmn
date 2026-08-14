@@ -61,10 +61,12 @@ pub struct BenchStat {
 
 /// `benchmarks/.baselines/micro-baseline-<host-id>.json`.
 ///
-/// A whole gitignored directory rather than a pattern inside the committed
-/// `results/`: a directory that is entirely machine-local is much harder to
-/// commit by accident than one file among several that are meant to be
-/// committed.
+/// Its own directory rather than a file among the results. Both are
+/// machine-local and both are gitignored, but they are different kinds of
+/// thing: a result is output, while a baseline is *state a check depends
+/// on*. Deleting a result costs you a measurement; deleting a baseline
+/// silently disarms the gate, which is why `just cleanup` names it
+/// specifically.
 pub fn baseline_path(root: &Path, host_id: &str) -> PathBuf {
     root.join(".baselines")
         .join(format!("micro-baseline-{host_id}.json"))
@@ -94,7 +96,7 @@ fn collect(root: &Path, dir: &Path, out: &mut BTreeMap<String, BenchStat>) -> Re
         if path.is_dir() {
             // `report/` is criterion's HTML; `base/` and `change/` are its
             // own baseline bookkeeping, which this gate deliberately does
-            // not use — the committed per-host file is the baseline.
+            // not use — the per-host file in .baselines/ is the baseline.
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             if name == "report" || name == "base" || name == "change" {
                 continue;

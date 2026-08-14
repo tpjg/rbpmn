@@ -1,4 +1,5 @@
-//! Rendering committed results into a markdown comparison table.
+//! Rendering the results this machine has measured into a markdown
+//! comparison table.
 //!
 //! The renderer's job is not to make numbers look good — it is to make them
 //! impossible to quote without their conditions. Every table is grouped by
@@ -26,8 +27,9 @@ pub fn render(root: &Path) -> Result<String, String> {
     let mut skipped: Vec<String> = Vec::new();
     for path in &paths {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        // A micro baseline lives in the same directory and is a different
-        // shape; so might a result from a future schema. Skip loudly.
+        // Micro baselines live in `.baselines/`, not here — but a persisted
+        // micro report does share this directory, and so might a result from
+        // a future schema. Skip loudly rather than failing the render.
         match serde_json::from_str::<RunResult>(&text) {
             Ok(run) => runs.push(run),
             Err(_) => skipped.push(

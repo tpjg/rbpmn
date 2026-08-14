@@ -85,7 +85,11 @@ inclusive gateway, block structure, messages-only interaction, build order).
   threshold — a flat threshold fired twice on identical code before the noise
   term existed. Those baselines live in gitignored `benchmarks/.baselines/`
   and are **never committed**: a baseline describes one machine, and a
-  committed one invites comparing against another's. Also load-bearing: `just bench` starts from an empty database
+  committed one invites comparing against another's. `benchmarks/results/` is
+  gitignored for the same reason — every file is stamped with the machine
+  that produced it, so a committed result is one laptop's numbers presented
+  as the project's. Both are the only copy there is; `just cleanup`
+  deliberately removes neither. Also load-bearing: `just bench` starts from an empty database
   and runs `ANALYZE` before measuring, because without it the claim path's
   plan flips (measured 20 vs 175 instances/sec) and the suite measures when
   autovacuum last ran instead of the engine.

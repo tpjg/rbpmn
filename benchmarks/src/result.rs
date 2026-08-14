@@ -1,8 +1,11 @@
 //! The result file: everything needed to reproduce the run, plus what it
 //! measured.
 //!
-//! Written to `results/<scenario>-<date>-<host-id>.json` and committed. The
-//! provenance block is not decoration — a number whose scenario hash, model
+//! Written to `results/<scenario>-<mode>-<date>-<host-id>.json`, which is
+//! **gitignored**: every file is stamped with the machine that produced it,
+//! and committed it would stop being "what that laptop measured" and become
+//! "rbpmn's numbers". The provenance block is what makes a file worth
+//! keeping outside the repository — a number whose scenario hash, model
 //! hash, seed, Postgres settings and hardware are not attached cannot be
 //! compared with anything, including itself six months later.
 
@@ -14,7 +17,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Bump when a field changes meaning. Readers (the report renderer, and
-/// anyone comparing two committed results) check it.
+/// anyone comparing two results) check it.
 pub const SCHEMA: &str = "rbpmn-bench/1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,7 +176,8 @@ impl RunResult {
     /// result on the same machine — two different measurements, one
     /// filename, the second silently replacing the first. Re-running the
     /// *same* mode still replaces, which is right, and the caller says so
-    /// out loud; git keeps the history either way.
+    /// out loud — which matters more than it used to, because `results/` is
+    /// gitignored and nothing recovers an overwritten measurement.
     pub fn path(&self, root: &Path) -> PathBuf {
         let date = self.started_at.get(..10).unwrap_or("unknown-date");
         root.join("results").join(format!(

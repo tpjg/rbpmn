@@ -1224,7 +1224,10 @@ pub fn host_of(url: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Never print a URL with its password in it — result files are committed.
+/// Never print a URL with its password in it. Result files are not
+/// committed, but they are the artifact you hand someone when you quote a
+/// number, which is worse: a credential in git is at least revocable by
+/// someone who goes looking.
 pub fn redact(url: &str) -> String {
     match url.split_once("://") {
         Some((scheme, rest)) => match rest.split_once('@') {
