@@ -26,6 +26,11 @@ packages:
   - python3-pip              # playwright, for `just e2e-ui`
 sources:
   - git@git.sr.ht:~tpjg/rbpmn
+secrets:
+  # SSH key for the clone. The repository is private, so without this the
+  # build fails at checkout — before any task runs, and with an error about
+  # the source rather than about anything in here.
+  - d41aec0c-ac90-45ea-af0c-10346977e65a
 environment:
   # The engine's integration tests create and drop throwaway `rbpmn_test_*`
   # databases. Their default admin URL is `postgres://$USER@localhost/postgres`
