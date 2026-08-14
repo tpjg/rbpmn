@@ -92,6 +92,13 @@ inclusive gateway, block structure, messages-only interaction, build order).
 
 ## Commands
 
+`.build.yml` is sourcehut CI: one task per command below, in the order a
+developer would run them. `just ui` is a task of its own and must stay first
+— everything that builds `rbpmn-ui` needs it. Benchmarks are **not** on CI by
+design (`just lint` compiles the harness via `--workspace`, so it cannot rot,
+but nothing runs it). CI is the backstop; the point of the table in README's
+"Developing" is knowing which command a change owes *before* pushing.
+
 - `cargo test` — everything including the fixture corpus. The rbpmn-engine
   integration tests need a reachable local Postgres (they create and drop
   throwaway `rbpmn_test_*` databases; override via `RBPMN_TEST_ADMIN_URL`).

@@ -354,9 +354,15 @@ to a browser audience are all the application's job.
 
 ## Developing
 
-Nothing runs automatically — there is no CI workflow and no git hook. Every
-check below is a deliberate command, so it is worth knowing which ones a
-change *owes*.
+`.build.yml` runs every check below on sourcehut, one CI task per command, so
+a red build names the discipline that broke rather than "tests failed". The
+benchmarks are deliberately not on CI — they are a separate track that never
+gates on absolute numbers, and a shared builder is the worst machine to
+measure on.
+
+CI is the backstop, not the workflow: knowing which command a change *owes*
+is what keeps the loop short, because every one of these guards something
+`cargo test` structurally cannot see.
 
 **Always, before committing:**
 
@@ -376,9 +382,9 @@ change *owes*.
 | the two UI documents | `just ui-test`, `just e2e-ui` | the pure modules under node, then both documents in a real browser (the only place the CSP is enforced) |
 | a fixture without DI | `just fixtures-di` | so it renders in bpmn-js and any standard modeler |
 
-**Occasionally, to catch performance regressions** (a separate track — see
-[benchmarks/README.md](benchmarks/README.md); none of it gates on absolute
-numbers):
+**Occasionally, to catch performance regressions** — local only, never on CI
+(a separate track — see [benchmarks/README.md](benchmarks/README.md); none of
+it gates on absolute numbers):
 
 | | When | Cost |
 |---|---|---|
