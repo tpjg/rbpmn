@@ -38,6 +38,12 @@ environment:
   # superuser, which also has the CREATEDB right they need.
   RBPMN_TEST_ADMIN_URL: "postgres://postgres@localhost:5432/postgres"
   CARGO_TERM_COLOR: always
+  # The served half of `just e2e-ui` is the only place the editor's own fetch
+  # happens, and it caught both a `connect-src 'none'` policy that blocked
+  # the editor's own button and a URL that resolved one path segment short.
+  # It skips itself when Postgres or the ports are unavailable, which is
+  # right locally and wrong here — this makes the skip a failure.
+  RBPMN_E2E_REQUIRE_SERVED: "1"
 tasks:
   - setup: |
       # Rust from rustup, not from Debian: bookworm ships ~1.63 and this

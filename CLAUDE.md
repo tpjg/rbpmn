@@ -126,7 +126,11 @@ but nothing runs it). CI is the backstop; the point of the table in README's
 - `just ui-test` — the UI's pure modules under node, no browser, no build
   artifacts. `just e2e-ui` drives both documents in a real browser: from
   `file://`, and then — when Postgres is up — against a real server behind an
-  auth-injecting proxy. Both halves earn their keep. The CSP is only actually
+  auth-injecting proxy. Both halves earn their keep, and the served one
+  skips itself when Postgres or its ports are unavailable: right for a
+  developer, wrong for CI, which sets `RBPMN_E2E_REQUIRE_SERVED=1` to turn
+  that skip into a failure. It went green on the `file://` half alone once
+  already. The CSP is only actually
   enforced in a browser, and the served half is the only place the editor's
   own fetch happens: it caught a `connect-src 'none'` policy that blocked the
   editor's own button, and a URL that resolved one path segment short.

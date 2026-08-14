@@ -31,6 +31,27 @@ SHOTS = Path(os.environ.get("RBPMN_SCREENSHOT_DIR", REPO / "e2e" / "screenshots"
 failures: list[str] = []
 
 
+def skip_served(reason):
+    """Skip the served half locally; refuse to skip it where it is mandatory.
+
+    Both of this half's skip paths print one line and let the run finish with
+    "ui documents ok" — a test that silently downgrades itself to a weaker
+    check and still passes. That is the shape this repo refuses elsewhere
+    (`just tla` will not read a spec that stopped parsing as "fails as
+    expected"), and it bit exactly as predicted: CI ran green for a build
+    with the served half skipped, because the builder's user has no
+    PostgreSQL role.
+
+    The graceful skip is still right for a developer without Postgres — the
+    `file://` half is worth running on its own. So the strictness is opt-in
+    and CI opts in: `RBPMN_E2E_REQUIRE_SERVED=1`.
+    """
+    if os.environ.get("RBPMN_E2E_REQUIRE_SERVED") == "1":
+        check(False, f"served stack: {reason} (RBPMN_E2E_REQUIRE_SERVED is set)")
+    else:
+        print(f"served stack: {reason} — skipping")
+
+
 def check(condition, message):
     if not condition:
         failures.append(message)
@@ -324,7 +345,7 @@ def check_served(browser):
     import demo
 
     if demo.psql("select 1").returncode != 0:
-        print("served stack: no local Postgres — skipping")
+        skip_served("no local Postgres")
         return
 
     # Skipped rather than failed when the ports are taken: `just demo` runs
@@ -333,7 +354,7 @@ def check_served(browser):
     # guard, because there it is the demo's own correctness at stake.
     for port in (7420, demo.PROXY_PORT):
         if demo.port_in_use(port):
-            print(f"served stack: port {port} is busy (is `just demo` running?) — skipping")
+            skip_served(f"port {port} is busy (is `just demo` running?)")
             return
 
     print("served stack (real engine, auth-injecting proxy)")
