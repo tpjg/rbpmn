@@ -55,7 +55,14 @@ AllRows == <<"token", "item", "timer", "subscription", "scope">>
 \* phase 6 that is tokens, work items, timers, subscriptions AND scopes — so
 \* `RowOrder` is a parameter rather than the single "item" this spec started
 \* with, and the claim being checked is about *any* of them.
-Resources == ({"inst"} \X Instances) \cup (Range(RowOrder) \X Instances)
+\* Per-instance rows, plus the two resource classes phase 7 introduced that
+\* are NOT per-instance: the definition row (retention's `retired_instances`
+\* counter, `delete_definition`, deploy) and the global singleton
+\* `rbpmn_retention_floor`.
+Resources ==
+    ({"inst"} \X Instances)
+        \cup (Range(RowOrder) \X Instances)
+        \cup {<<"defn", "d">>, <<"global", "g">>}
 
 VARIABLES
     lock,     \* Resources -> Nodes \cup {NoOne}
@@ -78,7 +85,9 @@ vars == <<lock, pc, kind, target>>
 OtherRows == SelectSeq(RowOrder, LAMBDA r : r # "timer")
 
 Order(n) ==
-    CASE kind[n] = "claim" -> <<"item">>
+    CASE kind[n] = "claim"  -> <<"item">>
+      [] kind[n] = "retire" -> <<"inst", "defn", "global">>
+      [] kind[n] = "deploy" -> <<"defn">>
       [] kind[n] = "timer" /\ HistoricalTimerOrder -> <<"timer", "inst">> \o OtherRows
       [] OTHER -> <<"inst">> \o RowOrder
 
@@ -89,16 +98,34 @@ LastOf(n) == Len(Order(n))
 \* row with SKIP LOCKED and commits, never touching the instance row. It was
 \* missing from this model, and its absence is what let the old
 \* `SingleLockOrder` invariant look true.
-Kinds == {"complete", "timer", "claim"}
+\* Every shape of transaction that takes a lock, traced from the code:
+\*
+\*   complete  instance row -> its per-instance rows          (runtime.rs)
+\*   timer     [try-advisory] instance row NOWAIT -> rows     (scheduler.rs)
+\*   claim     one work-item row, SKIP LOCKED, no instance    (tasks.rs, worker.rs)
+\*   retire    instance rows SKIP LOCKED -> definition -> floor (retention.rs
+\*             `execute_retention`/`delete_instance`; one instance row here
+\*             stands for the batch, which is what the ordering turns on)
+\*   deploy    advisory(key) -> definition rows               (deploy.rs)
+\*
+\* `retire` and `deploy` were outside this model until the third audit found
+\* them. They are the reason the invariant below is about *needing* the
+\* instance row rather than about holding rows at all.
+Kinds == {"complete", "timer", "claim", "retire", "deploy"}
 
 MaxLen == Len(RowOrder) + 1
 
-Res(n, j) == <<Order(n)[j], target[n]>>
+\* The non-per-instance resources are singletons: every node contends for the
+\* same definition and floor row regardless of which instance it targets.
+Res(n, j) ==
+    CASE Order(n)[j] = "defn"   -> <<"defn", "d">>
+      [] Order(n)[j] = "global" -> <<"global", "g">>
+      [] OTHER -> <<Order(n)[j], target[n]>>
 
 \* Neither the timer claim nor the work-item claim ever waits for its first
 \* lock: NOWAIT on the instance row, SKIP LOCKED on the work-item row. They
 \* give the attempt up rather than queue.
-FirstIsTry(n) == kind[n] \in {"timer", "claim"}
+FirstIsTry(n) == kind[n] \in {"timer", "claim", "retire"}
 
 TypeOK ==
     /\ lock \in [Resources -> Nodes \cup {NoOne}]
@@ -181,7 +208,9 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 (* what this invariant says and the stronger one confused with it.          *)
 (***************************************************************************)
 HoldsSomeRow(n) ==
-    \E k \in Range(RowOrder) : lock[<<k, target[n]>>] = n
+    \/ \E k \in Range(RowOrder) : lock[<<k, target[n]>>] = n
+    \/ lock[<<"defn", "d">>] = n
+    \/ lock[<<"global", "g">>] = n
 
 StillNeedsInstance(n) ==
     /\ pc[n] \in 1..LastOf(n)

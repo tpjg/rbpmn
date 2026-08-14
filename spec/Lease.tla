@@ -60,8 +60,14 @@ HoldsLive(w) == state = "locked" /\ owner = w /\ until > now
 
 \* Exactly `CLAIMABLE` (crates/rbpmn-engine/src/lib.rs): free or lapsed, past
 \* any retry backoff, and the instance still active.
+\*
+\* `until < now`, not `<= now`: the SQL is `lock_until < now()` for claiming
+\* and `lock_until > now()` for holding, so at the single instant
+\* `lock_until = now()` an item is *neither* claimable nor live. Writing `<=`
+\* here would make the two predicates partition the timeline and quietly
+\* close a gap the database leaves open.
 Claimable ==
-    /\ state = "available" \/ (state = "locked" /\ until <= now)
+    /\ state = "available" \/ (state = "locked" /\ until < now)
     /\ retryAt <= now
     /\ active
 

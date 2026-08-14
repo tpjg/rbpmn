@@ -8,7 +8,7 @@ Run with `just tla` (needs `java`; fetches `tla2tools.jar` on first use).
 
 | Spec | Models | Checks |
 |---|---|---|
-| `LockOrder.tla` | the instance row plus every per-instance row a step touches (`RowOrder`: tokens, work items, timers, subscriptions, scopes), across N nodes | one lock order for the *stepping* paths; no AB/BA deadlock; every transaction returns to idle |
+| `LockOrder.tla` | **every lock-taking transaction shape in the engine** — step, timer claim, work claim, retention, deploy — over per-instance rows plus the definition and floor rows | nobody holds rows while still needing the instance row; no AB/BA deadlock; every transaction returns to idle |
 | `Lease.tla` | the work-item lease: TTL, renewal, expiry, completion | no double delivery; exactly-once completion under at-least-once delivery; nothing stranded |
 | `TimerTeardown.tla` | the scheduler's unlocked timer pick racing a scope teardown | no timer row outlives the token it is armed on; no timer ever fires with its token gone |
 | `Retention.tla` | a retention pass across its transaction-free archive gap | nothing deleted without an archive; the truncation floor covers every deletion and invents none; only due records go |
@@ -65,6 +65,29 @@ both workers believe they hold the item. That state is *reachable and fine*:
 every mutation is conditional on `lock_owner = $me AND lock_until > now()` in
 the database, so belief is never authority. Safety does not come from
 preventing the confusion — it comes from the confusion not mattering.
+
+## The lock inventory `LockOrder` covers
+
+Traced from the code on the third audit, because the first two both missed
+paths. Every shape that takes a lock:
+
+| Path | Order | First lock waits? |
+|---|---|---|
+| step (`runtime.rs`) | instance row → its per-instance rows | blocking |
+| timer claim (`scheduler.rs`) | [try-advisory] → instance row → rows | NOWAIT |
+| work claim (`tasks.rs`, `worker.rs`) | one work-item row, **no instance row** | SKIP LOCKED |
+| retention (`retention.rs`) | instance rows → definition row → floor row | SKIP LOCKED |
+| `delete_definition` | definition row → policy row | blocking |
+| deploy (`deploy.rs`) | advisory(key) → definition rows | blocking |
+
+`retire` and `deploy` were outside the model until the third audit. Two
+things are deliberately *not* modelled and are argued instead: the
+scheduler's `pg_try_advisory_xact_lock` and the migration advisory. Both are
+excluded for the same reason — a try-lock never waits, so it cannot be an
+edge in a wait-for cycle; the migration one also runs only at startup.
+
+Inverting retention's order in the model (floor → definition → instance)
+violates the invariant, so these kinds are not decoration.
 
 ## What the Lease spec does and does not claim
 
