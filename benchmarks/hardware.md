@@ -26,7 +26,7 @@ this ran on" has to travel with the number rather than be quietly dropped.
 # ram_gb = 36
 
 # Not detectable, and the one that matters. nvme | ssd | network | unknown
-disk = "unknown"
+disk = "ssd"
 
 # local  — harness and Postgres on one machine. This is the default and the
 #          shape the engine is actually deployed in: it is a library inside

@@ -299,7 +299,7 @@ bench-compose SCENARIO='':
 #   just bench-population population-timer '--sizes 10000,100000'
 
 # Park a large cohort and probe standing cost (slow; builds to 1M by default).
-bench-population SCENARIO='population-timer' *ARGS: bench-db
+bench-population SCENARIO='population-timer' *ARGS='': bench-db
     cargo run --release -p rbpmn-bench -- population "{{SCENARIO}}" {{ARGS}}
 
 # Remove every build artifact and every rbpmn database, for disk space or to
