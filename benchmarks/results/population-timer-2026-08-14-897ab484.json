@@ -1,0 +1,334 @@
+{
+  "schema": "rbpmn-bench-population/1",
+  "scenario": "population-timer",
+  "run_id": "664720cf",
+  "started_at": "2026-08-14T08:37:01Z",
+  "checkout": {
+    "git_sha": "2eb2a5c696b2c126c77ea2d36734593fd1e86aeb",
+    "dirty": true
+  },
+  "hardware": {
+    "host_id": "897ab484",
+    "detected": {
+      "os": "macos",
+      "arch": "aarch64",
+      "cpu_model": "Apple M2",
+      "physical_cores": 8,
+      "logical_cores": 8,
+      "ram_gb": 24.0
+    },
+    "declared": {
+      "cpu_model": null,
+      "physical_cores": null,
+      "ram_gb": null,
+      "disk": "unknown",
+      "postgres_location": "local",
+      "postgres_provisioning": "local",
+      "notes": "Anything a reader needs in order to interpret the numbers: virtualization,\na shared host, thermal limits, a laptop on battery, an unusual filesystem,\na Docker storage driver that is not overlay2.\n"
+    },
+    "declaration_mismatches": [
+      "hardware.md does not say what the disk is — fill in `disk` (nvme | ssd | network) before publishing these numbers"
+    ]
+  },
+  "postgres": {
+    "version": "PostgreSQL 18.4 (Postgres.app) on aarch64-apple-darwin23.6.0, compiled by Apple clang version 15.0.0 (clang-1500.3.9.4), 64-bit",
+    "local": true,
+    "connection_host": "localhost",
+    "provisioned_by": "local",
+    "settings": {
+      "autovacuum": "on",
+      "autovacuum_max_workers": "3",
+      "autovacuum_naptime": "60s",
+      "autovacuum_vacuum_cost_delay": "2ms",
+      "autovacuum_vacuum_cost_limit": "-1",
+      "autovacuum_vacuum_scale_factor": "0.2",
+      "autovacuum_vacuum_threshold": "50",
+      "checkpoint_completion_target": "0.9",
+      "checkpoint_timeout": "300s",
+      "default_transaction_isolation": "read committed",
+      "effective_cache_size": "5242888kB",
+      "effective_io_concurrency": "16",
+      "fsync": "on",
+      "full_page_writes": "on",
+      "jit": "on",
+      "maintenance_work_mem": "65536kB",
+      "max_connections": "100",
+      "max_locks_per_transaction": "64",
+      "max_wal_size": "1024MB",
+      "max_worker_processes": "8",
+      "min_wal_size": "80MB",
+      "random_page_cost": "4",
+      "seq_page_cost": "1",
+      "server_version": "18.4 (Postgres.app)",
+      "shared_buffers": "163848kB",
+      "synchronous_commit": "on",
+      "track_io_timing": "off",
+      "wal_buffers": "5128kB",
+      "wal_level": "replica",
+      "work_mem": "4096kB"
+    },
+    "non_default_settings": {
+      "auth_permission_dialog.dialog_executable_path": "/Applications/Postgres.app/Contents/MacOS/PostgresPermissionDialog (command line)",
+      "autovacuum_worker_slots": "16 (configuration file)",
+      "config_file": "/Users/timo/Library/Application Support/Postgres/var-18/postgresql.conf (override)",
+      "data_directory": "/Users/timo/Library/Application Support/Postgres/var-18 (override)",
+      "default_text_search_config": "pg_catalog.english (configuration file)",
+      "dynamic_shared_memory_type": "posix (configuration file)",
+      "hba_file": "/Users/timo/Library/Application Support/Postgres/var-18/pg_hba.conf (override)",
+      "ident_file": "/Users/timo/Library/Application Support/Postgres/var-18/pg_ident.conf (override)",
+      "lc_messages": "en_US.UTF-8 (configuration file)",
+      "lc_monetary": "en_US.UTF-8 (configuration file)",
+      "lc_numeric": "en_US.UTF-8 (configuration file)",
+      "lc_time": "en_US.UTF-8 (configuration file)",
+      "log_timezone": "Europe/Madrid (configuration file)",
+      "max_connections": "100 (configuration file)",
+      "max_wal_size": "1024 (configuration file)",
+      "min_wal_size": "80 (configuration file)",
+      "port": "5432 (command line)",
+      "shared_buffers": "16384 (configuration file)",
+      "shared_preload_libraries": "auth_permission_dialog (command line)",
+      "transaction_deferrable": "off (override)",
+      "transaction_isolation": "read committed (override)",
+      "transaction_read_only": "off (override)"
+    },
+    "table_options": {
+      "rbpmn_definition": [],
+      "rbpmn_environment_topic": [],
+      "rbpmn_event": [
+        "autovacuum_vacuum_scale_factor=0.1",
+        "autovacuum_analyze_scale_factor=0.02",
+        "fillfactor=100"
+      ],
+      "rbpmn_instance": [
+        "autovacuum_vacuum_scale_factor=0.05",
+        "autovacuum_analyze_scale_factor=0.02",
+        "fillfactor=85"
+      ],
+      "rbpmn_migrations": [],
+      "rbpmn_retention_floor": [],
+      "rbpmn_retention_lease": [],
+      "rbpmn_retention_policy": [],
+      "rbpmn_scope": [],
+      "rbpmn_subscription": [],
+      "rbpmn_timer": [],
+      "rbpmn_token": [
+        "autovacuum_vacuum_scale_factor=0.02",
+        "autovacuum_vacuum_threshold=200",
+        "autovacuum_analyze_scale_factor=0.02",
+        "autovacuum_vacuum_cost_delay=0"
+      ],
+      "rbpmn_work_item": [
+        "autovacuum_vacuum_scale_factor=0.02",
+        "autovacuum_vacuum_threshold=200",
+        "autovacuum_analyze_scale_factor=0.02",
+        "autovacuum_vacuum_cost_delay=0",
+        "fillfactor=85"
+      ]
+    }
+  },
+  "provenance": {
+    "scenario_sha256": "bb984915a737826b0fc0be75557454f64ce0fc4938e29acc200d62a169a10981",
+    "models": {
+      "population-timer.bpmn": "84e3f1a93b98051714da8fd573c23bdaaef4278edaea89edc4297720e39650b3"
+    },
+    "tuning_sha256": "2825f2d8b7158ebe3fb6c2c7a21754ef7f416d059871e32204fb30022269a6fb",
+    "seed": 20260813,
+    "bindings": {
+      "correlations": {},
+      "indexes": [],
+      "topics": {
+        "AssessRenewal": "bench-service",
+        "CloseContract": "bench-service",
+        "NotifyCustomer": "bench-service",
+        "PriceRenewal": "bench-service",
+        "RegisterContract": "bench-service"
+      }
+    }
+  },
+  "scope": {
+    "summary": "A million instances parked on a year-long timer — standing cost, not throughput.",
+    "measures": [
+      "what every hot path costs while a large cohort sits parked: an empty worker poll, a claim, a new instance start, the scheduler's sleep computation, firing one due timer, reading an event page, opening the inspector on an old instance",
+      "whether those costs are flat in the population or grow with it — the suite probes at several sizes so the answer is a curve, not a point",
+      "the standing storage of a long-running deployment: table and index sizes per instance, at each size",
+      "how long it takes to park the cohort in the first place (reported, not a headline — the build is setup)"
+    ],
+    "excludes": [
+      "throughput: this scenario deliberately has almost none, which is the point. A year-long flow at 2M instances/year is 0.06 instances/sec; the risk was never the rate",
+      "the passage of time: nothing waits a year. The cohort is parked and probed, and the timer_fire probe forces a handful of due dates rather than waiting for them",
+      "the storm shape at full scale: firing one due timer against N armed is measured; draining all N at once is extrapolated from it and stated as such",
+      "history levels: every event is written"
+    ],
+    "elements": 8,
+    "service_tasks": 5,
+    "user_tasks": 0,
+    "timers": 1,
+    "message_catches": 0,
+    "subprocesses": 0
+  },
+  "samples_per_probe": 100,
+  "steps": [
+    {
+      "population": 1000000,
+      "build_secs": 0.0,
+      "build_instances_per_sec": 0.0,
+      "tables": {
+        "rbpmn_definition": {
+          "rows": 1,
+          "total_bytes": 49152,
+          "index_bytes": 32768
+        },
+        "rbpmn_environment_topic": {
+          "rows": 1,
+          "total_bytes": 32768,
+          "index_bytes": 16384
+        },
+        "rbpmn_event": {
+          "rows": 12009969,
+          "total_bytes": 3757817856,
+          "index_bytes": 1292017664
+        },
+        "rbpmn_instance": {
+          "rows": 1000306,
+          "total_bytes": 368820224,
+          "index_bytes": 60080128
+        },
+        "rbpmn_migrations": {
+          "rows": 8,
+          "total_bytes": 32768,
+          "index_bytes": 16384
+        },
+        "rbpmn_retention_floor": {
+          "rows": 1,
+          "total_bytes": 24576,
+          "index_bytes": 16384
+        },
+        "rbpmn_retention_lease": {
+          "rows": 0,
+          "total_bytes": 16384,
+          "index_bytes": 8192
+        },
+        "rbpmn_retention_policy": {
+          "rows": 0,
+          "total_bytes": 16384,
+          "index_bytes": 8192
+        },
+        "rbpmn_scope": {
+          "rows": 0,
+          "total_bytes": 16384,
+          "index_bytes": 8192
+        },
+        "rbpmn_subscription": {
+          "rows": 0,
+          "total_bytes": 24576,
+          "index_bytes": 16384
+        },
+        "rbpmn_timer": {
+          "rows": 1000000,
+          "total_bytes": 185057280,
+          "index_bytes": 75538432
+        },
+        "rbpmn_token": {
+          "rows": 1000100,
+          "total_bytes": 156884992,
+          "index_bytes": 54386688
+        },
+        "rbpmn_work_item": {
+          "rows": 1001200,
+          "total_bytes": 438796288,
+          "index_bytes": 203644928
+        }
+      },
+      "total_bytes": 4907589632,
+      "bytes_per_instance": 4907.589632,
+      "probes": {
+        "admin_definitions_in_use": {
+          "count": 20,
+          "min": 0.061875,
+          "mean": 0.11536454999999998,
+          "p50": 0.087709,
+          "p95": 0.29479099999999997,
+          "p99": 0.310417,
+          "max": 0.310417
+        },
+        "claim_empty": {
+          "count": 100,
+          "min": 0.172917,
+          "mean": 0.31605756999999995,
+          "p50": 0.194959,
+          "p95": 0.327125,
+          "p99": 3.516584,
+          "max": 7.042167
+        },
+        "claim_hit": {
+          "count": 100,
+          "min": 0.741833,
+          "mean": 1.1866491399999999,
+          "p50": 0.988125,
+          "p95": 1.8809580000000001,
+          "p99": 2.359583,
+          "max": 4.7922080000000005
+        },
+        "count_tasks": {
+          "count": 100,
+          "min": 0.11124999999999999,
+          "mean": 0.13790714999999998,
+          "p50": 0.125167,
+          "p95": 0.19858399999999998,
+          "p99": 0.2945,
+          "max": 0.411458
+        },
+        "event_page": {
+          "count": 100,
+          "min": 0.30779100000000004,
+          "mean": 0.38411746999999996,
+          "p50": 0.350875,
+          "p95": 0.48404200000000003,
+          "p99": 0.813542,
+          "max": 1.932791
+        },
+        "inspect_instance": {
+          "count": 100,
+          "min": 0.32162500000000005,
+          "mean": 0.6732196,
+          "p50": 0.591333,
+          "p95": 1.255917,
+          "p99": 1.726625,
+          "max": 2.193792
+        },
+        "start_instance": {
+          "count": 100,
+          "min": 0.773416,
+          "mean": 1.5328207799999995,
+          "p50": 1.4033749999999998,
+          "p95": 2.20275,
+          "p99": 2.479708,
+          "max": 4.9804580000000005
+        },
+        "timer_fire": {
+          "count": 100,
+          "min": 0.714459,
+          "mean": 1.18189127,
+          "p50": 1.062166,
+          "p95": 1.925834,
+          "p99": 2.448333,
+          "max": 2.5531249999999996
+        },
+        "timer_next_due": {
+          "count": 100,
+          "min": 0.047416,
+          "mean": 0.06495622000000001,
+          "p50": 0.050959,
+          "p95": 0.106875,
+          "p99": 0.2455,
+          "max": 0.5835
+        }
+      }
+    }
+  ],
+  "warnings": [
+    "hardware.md does not say what the disk is — fill in `disk` (nvme | ssd | network) before publishing these numbers",
+    "the checkout has uncommitted changes",
+    "--reuse: the population was not rebuilt, so its instances may come from an earlier run with different seeding. Build sizes and rates below describe only what this run added."
+  ]
+}

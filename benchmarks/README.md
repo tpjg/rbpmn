@@ -537,6 +537,32 @@ belongs to a live, non-deferred instance — normally 1, but a block of
 soonest-due timers all belonging to frozen instances is walked past on every
 call. `min()` was O(n) unconditionally.
 
+### Vacuum lag on the partial claim indexes is worth 630x
+
+Completing a work item removes it from the claim indexes — they are partial
+on the open states — and leaves a dead entry behind until vacuum reclaims it.
+Until then, a claim walks past every one of them. Measured on a
+million-instance population, same query, same data, minutes apart:
+
+| | claim latency |
+|---|---:|
+| straight after the build, vacuum still behind | **25.885 ms** |
+| after an explicit `VACUUM rbpmn_work_item` | **0.041 ms** |
+
+This is why two runs of the population ladder disagreed by up to 14x on the
+claim probes with **identical code**: one happened to probe a vacuumed
+database and the other did not. The population runner now `VACUUM ANALYZE`s
+before probing, for the same reason it `ANALYZE`s — otherwise it reports how
+far behind autovacuum happened to be, which is not a property of the engine.
+
+That is not sweeping a real cost under the rug. Vacuum lag after heavy
+completion churn is a genuine operational concern for exactly the tables the
+design brief called churn-heavy, and `tuning.sql` sets an aggressive
+`autovacuum_vacuum_scale_factor` on `rbpmn_work_item` for it. But "how does
+the engine perform at rest with a large population" and "what happens while
+autovacuum is behind" are different questions, and a run that mixes them
+answers neither. The second one deserves its own scenario.
+
 ### Calibration: suite position was worth up to 2x
 
 Scenarios run back to back were systematically depressed the further down the

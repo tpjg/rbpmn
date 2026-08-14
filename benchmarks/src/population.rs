@@ -205,9 +205,30 @@ pub async fn run(
         .await?;
         parked_so_far = size.max(parked_so_far);
 
-        // Statistics before probing: every probe below is a plan the planner
-        // has to choose, and the whole point is to measure the engine rather
-        // than when autovacuum last ran (see `run::analyze_before_execute`).
+        // Settle the database before probing, in both senses.
+        //
+        // ANALYZE, because every probe below is a plan the planner has to
+        // choose and the point is to measure the engine rather than when
+        // autovacuum last ran (see `run::analyze_before_execute`).
+        //
+        // VACUUM, because building the population *completed* one work item
+        // per instance, and completion removes the row from the partial
+        // claim indexes — leaving a dead entry behind until vacuum reclaims
+        // it. Until then a claim walks past all of them. Measured at a
+        // million: the same claim took 25.885 ms with the build's dead
+        // entries still in the index and 0.041 ms straight after a VACUUM.
+        // 630x, and it is what made two runs of this ladder disagree by up
+        // to 14x on the claim probes with identical code. Probing without
+        // this measures how far behind autovacuum happened to be.
+        //
+        // It is not hiding a real cost — vacuum lag after heavy completion
+        // churn is a genuine operational concern, and the README says so —
+        // but it is a *different* measurement from standing cost at rest,
+        // and mixing the two produces a number that answers neither.
+        sqlx::query("vacuum analyze rbpmn_work_item, rbpmn_instance, rbpmn_timer")
+            .execute(&pool)
+            .await
+            .map_err(|e| format!("vacuuming at population {size}: {e}"))?;
         sqlx::query("analyze")
             .execute(&pool)
             .await
