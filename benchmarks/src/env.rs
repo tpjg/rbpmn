@@ -149,21 +149,60 @@ impl Detected {
         }
     }
 
-    /// Stable across runs, meaningless across machines — which is the point.
+    /// Stable across runs, meaningless across machines — which is the point,
+    /// and the first version got the stable half wrong.
+    ///
+    /// It hashed `hostname`, which on a laptop carries a DHCP-assigned
+    /// suffix: the same machine reported `timo-air` on one network and
+    /// `timo-air.home` on another, so its id changed when it moved. That
+    /// silently orphans the micro baseline — the gate then reports "no
+    /// baseline for this host" and stops gating, safely but quietly — and
+    /// splits one machine into two sections of the report.
+    ///
+    /// So: a real machine identifier where the platform has one
+    /// (`/etc/machine-id`, macOS's `IOPlatformUUID`), falling back to the
+    /// hostname with any DNS suffix stripped. The hardware facts stay in the
+    /// hash so that a cloned VM image — same machine-id, different CPU
+    /// allocation — is not mistaken for the machine it was cloned from.
     fn host_id(&self) -> String {
-        let hostname = Command::new("hostname")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
+        let identity = machine_id().unwrap_or_else(|| {
+            Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().split('.').next().unwrap_or_default().to_string())
+                .unwrap_or_default()
+        });
         let mut hasher = Sha256::new();
-        hasher.update(hostname.as_bytes());
+        hasher.update(identity.as_bytes());
         hasher.update(self.cpu_model.as_bytes());
         hasher.update(self.arch.as_bytes());
         hasher.update(self.physical_cores.unwrap_or(0).to_le_bytes());
         format!("{:x}", hasher.finalize())[..8].to_string()
     }
+}
+
+/// A machine identifier that survives a network change, where the platform
+/// offers one.
+fn machine_id() -> Option<String> {
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(id) = std::fs::read_to_string(path) {
+            let id = id.trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    // macOS: the platform UUID, burned into the hardware.
+    let output = Command::new("ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| line.contains("IOPlatformUUID"))
+        .and_then(|line| line.split('"').nth(3))
+        .map(|id| id.to_string())
 }
 
 fn probe_linux() -> (String, Option<u32>, Option<u32>, Option<f64>) {
