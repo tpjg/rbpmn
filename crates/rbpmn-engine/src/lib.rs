@@ -96,6 +96,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "retention",
         include_str!("../migrations/0007_retention.sql"),
     ),
+    (
+        8,
+        "claim_fifo",
+        include_str!("../migrations/0008_claim_fifo.sql"),
+    ),
 ];
 
 /// A claimed unit of service work, as handed to a push-mode handler.

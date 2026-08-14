@@ -1,13 +1,13 @@
 {
   "schema": "rbpmn-bench-persisted/1",
-  "started_at": "2026-08-13T22:32:06Z",
+  "started_at": "2026-08-14T07:18:21Z",
   "iterations": 200,
   "checkout": {
-    "git_sha": "7745fa310c0c69a2aa837a5c221c8b5fd1346e54",
+    "git_sha": "dea3e78a02e1b2948f569ced24697cae6eca7966",
     "dirty": true
   },
   "hardware": {
-    "host_id": "a11a098b",
+    "host_id": "814a60fd",
     "detected": {
       "os": "macos",
       "arch": "aarch64",
@@ -129,74 +129,74 @@
     {
       "name": "single-task",
       "steps_per_instance": 2.0,
-      "micros_per_instance": 1048.9025,
-      "micros_per_step": 524.45125,
+      "micros_per_instance": 1257.6316649999999,
+      "micros_per_step": 628.8158324999999,
       "marginal_micros_vs_baseline": 0.0,
       "events_per_instance": 12.0,
-      "bytes_per_instance": 4177.92
+      "bytes_per_instance": 4382.72
     },
     {
       "name": "sequence-2",
       "steps_per_instance": 3.0,
-      "micros_per_instance": 1638.779585,
-      "micros_per_step": 546.2598616666667,
-      "marginal_micros_vs_baseline": 589.8770850000001,
+      "micros_per_instance": 1766.8029199999999,
+      "micros_per_step": 588.9343066666667,
+      "marginal_micros_vs_baseline": 509.171255,
       "events_per_instance": 17.0,
-      "bytes_per_instance": 5775.36
+      "bytes_per_instance": 6062.08
     },
     {
       "name": "exclusive-2",
       "steps_per_instance": 3.0,
-      "micros_per_instance": 1710.845835,
-      "micros_per_step": 570.2819450000001,
-      "marginal_micros_vs_baseline": 661.9433350000002,
+      "micros_per_instance": 1963.5614549999998,
+      "micros_per_step": 654.5204849999999,
+      "marginal_micros_vs_baseline": 705.9297899999999,
       "events_per_instance": 23.0,
-      "bytes_per_instance": 8396.8
+      "bytes_per_instance": 8151.04
     },
     {
       "name": "parallel-2",
       "steps_per_instance": 3.0,
-      "micros_per_instance": 1738.236875,
-      "micros_per_step": 579.4122916666666,
-      "marginal_micros_vs_baseline": 689.3343750000001,
+      "micros_per_instance": 1984.83875,
+      "micros_per_step": 661.6129166666667,
+      "marginal_micros_vs_baseline": 727.207085,
       "events_per_instance": 24.0,
       "bytes_per_instance": 8232.96
     },
     {
       "name": "parallel-4",
       "steps_per_instance": 5.0,
-      "micros_per_instance": 2958.85271,
-      "micros_per_step": 591.770542,
-      "marginal_micros_vs_baseline": 1909.9502100000002,
+      "micros_per_instance": 3263.054375,
+      "micros_per_step": 652.610875,
+      "marginal_micros_vs_baseline": 2005.4227100000003,
       "events_per_instance": 36.0,
-      "bytes_per_instance": 12820.48
+      "bytes_per_instance": 13271.04
     },
     {
       "name": "parallel-8",
       "steps_per_instance": 9.0,
-      "micros_per_instance": 5563.10875,
-      "micros_per_step": 618.1231944444445,
-      "marginal_micros_vs_baseline": 4514.20625,
+      "micros_per_instance": 6551.157915,
+      "micros_per_step": 727.9064349999999,
+      "marginal_micros_vs_baseline": 5293.52625,
       "events_per_instance": 60.0,
-      "bytes_per_instance": 24248.32
+      "bytes_per_instance": 23142.4
     },
     {
       "name": "subprocess",
       "steps_per_instance": 3.0,
-      "micros_per_instance": 1690.31125,
-      "micros_per_step": 563.4370833333334,
-      "marginal_micros_vs_baseline": 641.40875,
+      "micros_per_instance": 2123.6183300000002,
+      "micros_per_step": 707.8727766666667,
+      "marginal_micros_vs_baseline": 865.9866650000004,
       "events_per_instance": 25.0,
-      "bytes_per_instance": 8847.36
+      "bytes_per_instance": 9093.12
     },
     {
       "name": "loop-3",
       "steps_per_instance": 5.0,
-      "micros_per_instance": 2991.56458,
-      "micros_per_step": 598.3129160000001,
-      "marginal_micros_vs_baseline": 1942.6620800000003,
+      "micros_per_instance": 3758.814375,
+      "micros_per_step": 751.762875,
+      "marginal_micros_vs_baseline": 2501.18271,
       "events_per_instance": 43.0,
-      "bytes_per_instance": 15073.28
+      "bytes_per_instance": 15933.44
     }
   ],
   "warnings": [

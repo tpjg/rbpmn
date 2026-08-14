@@ -297,6 +297,7 @@ pub async fn run(scenario: &Scenario, options: &RunOptions) -> Result<Option<Run
     if options.fresh && options.phases != Phases::Execute {
         truncate_all(&pool).await?;
     }
+    settle(&pool).await;
     let tuning = apply_tuning(&pool, &options.root).await?;
     engine
         .sync_environment()
@@ -1115,6 +1116,32 @@ async fn latencies_ms(
         LatencyFrom::Instant(at) => query.bind(at),
     };
     query.fetch_all(pool).await
+}
+
+/// Force a checkpoint and let the background workers catch up before a
+/// scenario starts.
+///
+/// Suite hygiene, and it is not optional. Running the scenarios back to back
+/// without this, the *last* two in the suite measured roughly half what they
+/// measured standing alone — 327 against 574-655 instances/sec for
+/// `timer-short`, 1186 against 1444-1537 for `usertask-inbox` — because each
+/// scenario starts while the checkpointer and autovacuum are still working
+/// through the previous one's writes. Truncating the tables does not undo
+/// that; the debt is in the WAL and the background workers, not the rows.
+///
+/// A benchmark whose numbers depend on alphabetical position is not
+/// measuring the engine. Failure here is tolerated with a warning rather
+/// than fatal: `CHECKPOINT` needs superuser or `pg_checkpoint`, and a run
+/// against a database where the caller lacks it should still produce
+/// numbers — noisier ones, honestly labelled.
+async fn settle(pool: &PgPool) {
+    if let Err(e) = sqlx::query("checkpoint").execute(pool).await {
+        eprintln!(
+            "warning: could not checkpoint before the run ({e}); results may depend on \
+             what ran before them"
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
 }
 
 /// Per-table storage parameters the engine's own migrations deliberately do

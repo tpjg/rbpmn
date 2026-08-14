@@ -504,7 +504,13 @@ fn select(root: &Path, args: &RunArgs) -> Result<Vec<scenario::Scenario>, String
             .find(|s| &s.name == name)
             .map(|s| vec![s])
             .ok_or_else(|| format!("no scenario named '{name}' (try `rbpmn-bench list`)")),
-        (None, true) => Ok(all),
+        // `--all` means every *rate* scenario. Population scenarios are a
+        // different measurement with their own command: driven as a rate
+        // benchmark they would be drained rather than parked, which is the
+        // opposite of what they are for — and `population-message` would
+        // simply hang, because nothing is configured to deliver the messages
+        // its cohort is supposed to sit waiting on.
+        (None, true) => Ok(all.into_iter().filter(|s| s.population.is_none()).collect()),
         (None, false) => Err(
             "name a scenario, or pass --all for the whole suite (try `rbpmn-bench list`)"
                 .to_string(),

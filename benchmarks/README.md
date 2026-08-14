@@ -418,9 +418,9 @@ benchmark model is still a model this engine would deploy.
 
 ## Findings
 
-### The push worker's claim sorts the whole backlog to return one row
+### The push worker's claim sorted the whole backlog to return one row — fixed by migration 0008
 
-This is the big one, and it is on the engine's default execution path.
+This was the big one, and it was on the engine's default execution path.
 
 `worker.rs` claims with `w.topic = any($1)` — it passes the set of topics it
 has handlers for. `tasks.rs::get_task` claims with `w.topic = $1`, a single
@@ -454,16 +454,48 @@ a 900 000-row backlog it is hours. That is a benchmark limitation *and* a
 finding: the same shape is what a production system meets after any outage
 that lets work accumulate.
 
-Directions, none of them free, all of them design decisions:
+**The fix, shipped as migration 0008:** an index leading on `created_at`,
+so that scanning it in order *is* global FIFO order across all topics —
+exactly the ordering the claim asks for. The planner walks it, applies topic
+as a per-row filter, probes the instance by primary key and stops at the
+first match. **No query changed.**
 
-- Bind a single topic when there is only one handled topic. Trivial, and it
-  fixes the common case completely — but it is a special case, not a fix.
-- Claim per topic (a query each, round-robin or first-hit). Loses global FIFO
-  *across* topics; the design brief already documents FIFO as
-  "fair-but-not-strict" under concurrent consumers, so this may be within the
-  contract already — but it is a contract question, not an optimisation.
-- Keep one query and drop the cross-topic ordering guarantee. Same question,
-  stated more honestly.
+```sql
+create index rbpmn_work_item_fifo on rbpmn_work_item (created_at, item_no)
+    where state in ('available', 'locked');
+```
+
+It does not replace the topic-leading indexes, and that turned out to be the
+interesting part: the planner picks between them per query, by how selective
+the topic is. A worker serving the dominant topic gets this index and stops
+after one row (0.041 ms); a worker serving a rare one gets
+`rbpmn_work_item_claim`, fetches its handful of rows and top-N sorts them
+(0.129 ms for a topic holding 10 rows of 100 000). Both shapes earn their
+keep.
+
+The write cost is small for structural reasons, not by luck: the index is
+partial on the open states so it holds only open items (~32 bytes per open
+row, the smallest index on the table); a claim does not touch it, because
+`available` → `locked` stays inside the predicate and changes neither
+indexed column; only a completion costs anything, one entry removed once in
+a work item's life, on a path already dominated by a transaction commit.
+Measured: 50 000 instance starts (pure insert, zero claims) came out
+indistinguishable with and without it, inside run-to-run noise. The
+end-to-end lifecycle number — every write the index causes included — went
+from 147 to 338 instances/sec at 2 000 instances.
+
+At the suite's default 1 000-instance scale the gain is smaller, because the
+gain tracks *backlog size*: `parallel-4` (4 000 claimable at drain start)
+improved 68%, `linear-5-service` 19%, and the two-work-item scenarios are
+within noise. The dramatic numbers are at backlog scale, which is exactly
+the post-outage shape.
+
+The alternative considered and not taken: emit one ordered index scan per
+topic and let `Merge Append` do the k-way merge (measured 0.081 ms, also
+preserving global FIFO exactly). It is deterministic where the index is
+planner-dependent, but it needs query-building code and takes up to N row
+locks to use one. The index ships first because it is a migration rather
+than a change to the hottest path in the engine.
 
 ### The scheduler's sleep computation was linear in the armed population — fixed
 
@@ -504,6 +536,21 @@ The cost is honest rather than free: it is O(k) in timers walked before one
 belongs to a live, non-deferred instance — normally 1, but a block of
 soonest-due timers all belonging to frozen instances is walked past on every
 call. `min()` was O(n) unconditionally.
+
+### Calibration: suite position was worth up to 2x
+
+Scenarios run back to back were systematically depressed the further down the
+alphabet they sat. `timer-short` measured 327 instances/sec in the suite and
+574-655 standing alone; `usertask-inbox` 1 186 against 1 444-1 537. Each
+scenario truncates its tables, but that does not undo the debt — the
+checkpointer and autovacuum are still working through the previous
+scenario's writes, and that lives in the WAL and the background workers
+rather than in the rows.
+
+A benchmark whose numbers depend on alphabetical position is not measuring
+the engine, so every scenario now issues a `CHECKPOINT` and settles for two
+seconds before it starts. Both scenarios returned to their standalone range
+immediately (638 and 1 575).
 
 ### Calibration: what run-to-run variance looks like at a million
 

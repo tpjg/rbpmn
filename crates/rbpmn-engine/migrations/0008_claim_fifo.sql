@@ -1,0 +1,60 @@
+-- A global-FIFO claim index, so the push worker's claim can stop at the
+-- first row instead of sorting the whole backlog.
+--
+-- The problem this fixes. `work_once` claims with `w.topic = any($1)` — the
+-- set of topics this process has handlers for — ordered by
+-- `(created_at, item_no)`. Both existing claim indexes lead with `topic`,
+-- and an index scan with `topic = ANY(...)` performs a separate search per
+-- array element: each run is ordered within its own topic, but their
+-- concatenation is not, so the index cannot satisfy the ORDER BY. With no
+-- sorted path available the planner scans every claimable row and sorts it
+-- to take LIMIT 1. A single-element array does not save it — the plan is
+-- chosen for the general form.
+--
+-- Measured before this index, on a laptop with 200 000 claimable items:
+-- parallel sequential scan plus an external merge sort spilling ~11 MB to
+-- disk, 191 ms per claim. The cost grows with the *backlog*, not with the
+-- work — so the engine gets slower exactly when it is behind, which is the
+-- wrong direction and the shape any outage produces.
+--
+-- Leading on `created_at` means scanning this index in order **is** global
+-- FIFO order across all topics, which is precisely the ordering the claim
+-- asks for. The planner can then walk it, apply topic as a per-row filter,
+-- probe the instance by primary key, and stop at the first match: 0.041 ms
+-- against the same 200 000 rows. No query changed.
+--
+-- `item_no` is the tie-break, so the index ordering is total and matches the
+-- claim's ORDER BY exactly rather than leaving a partial sort behind.
+--
+-- Why this does not replace the topic-leading indexes: the planner picks
+-- between them per query, by how selective the topic is. A worker serving
+-- the dominant topic gets this index and stops after one row; a worker
+-- serving a rare one gets `rbpmn_work_item_claim`, fetches its handful of
+-- rows and top-N sorts them (measured: 0.129 ms for a topic holding 10 rows
+-- of 100 000). Both shapes earn their keep, and dropping either would leave
+-- one of those cases on a sequential scan.
+--
+-- The write cost is real but small, and it is small for structural reasons
+-- rather than by luck:
+--   * Partial on the open states, so only *open* items are indexed — a few
+--     thousand entries, never the millions of closed ones. Measured at
+--     ~32 bytes per open row, the smallest index on the table.
+--   * A claim does not touch it: `available` -> `locked` stays inside the
+--     predicate and changes neither indexed column, so the entry does not
+--     move.
+--   * Only a completion costs anything — one index-entry removal, once in a
+--     work item's life, on a path already dominated by a transaction commit.
+-- Measured: 50 000 instance starts (pure insert, zero claims) came out
+-- indistinguishable with and without it, inside run-to-run noise; and the
+-- whole lifecycle benchmark — every write this index causes included — went
+-- from 147 to 338 instances/sec.
+--
+-- Plain `create index`, not CONCURRENTLY: the migration runner applies every
+-- migration inside one transaction, where CONCURRENTLY cannot run. It takes
+-- a SHARE lock on rbpmn_work_item for the duration, which blocks writes —
+-- the same trade every other index in these migrations makes. On a large
+-- existing deployment, build it CONCURRENTLY by hand first; this statement
+-- then finds it present and the migration is a no-op.
+
+create index if not exists rbpmn_work_item_fifo on rbpmn_work_item (created_at, item_no)
+    where state in ('available', 'locked');
