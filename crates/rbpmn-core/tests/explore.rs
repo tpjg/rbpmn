@@ -76,7 +76,9 @@ fn corpus_state_spaces_hold_the_invariants() {
 
         let xml = fs::read_to_string(fixtures_dir().join(&sc.fixture)).unwrap();
         let defs = rbpmn_model::parse(&xml).unwrap();
-        let proc = ExecutableProcess::compile(&defs, "p", &sc.bindings)
+        // The fixture names its own process; not every one of them is `p`.
+        let process_id = defs.processes[0].id.clone();
+        let proc = ExecutableProcess::compile(&defs, &process_id, &sc.bindings)
             .unwrap_or_else(|e| panic!("{}: {e}", sc.fixture));
         states += assert_clean(
             &sc.fixture,

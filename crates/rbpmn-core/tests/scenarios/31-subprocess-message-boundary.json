@@ -1,0 +1,32 @@
+{
+  "fixture": "accept/31-subprocess-message-boundary.bpmn",
+  "bindings": { "correlations": { "cancelled_during_work": "order.id" } },
+  "variables": { "order": { "id": "o-31" } },
+  "actions": [{ "deliver": "cancelled_during_work", "patch": { "cancellation": { "by": "buyer" } } }],
+  "expect": {
+    "status": "completed",
+    "variables": { "order": { "id": "o-31" }, "cancellation": { "by": "buyer" } },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started sp",
+      "message-subscribed cancelled_during_work CANCELLED o-31",
+      "element-started s2",
+      "element-completed s2",
+      "flow-taken fi1",
+      "element-started pick",
+      "work-item-created pick user pick",
+      "message-received cancelled_during_work CANCELLED",
+      "variables-patched",
+      "work-item-cancelled pick",
+      "element-started cancelled_during_work",
+      "element-completed cancelled_during_work",
+      "flow-taken f3",
+      "element-started end_cancelled",
+      "element-completed end_cancelled",
+      "instance-completed"
+    ]
+  }
+}

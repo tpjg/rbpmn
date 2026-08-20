@@ -273,6 +273,28 @@ fn compile_diagnostics(key: &str, e: CompileError) -> Vec<Diagnostic> {
                 format!("decision binding is not usable: {reason}"),
             )]
         }
+        // One diagnostic per offending element, like `MissingCorrelation`:
+        // the modeller has to look at both arms, and an editor highlights
+        // what it is told to highlight.
+        CompileError::AmbiguousMessageArm {
+            elements,
+            message,
+            binding,
+        } => elements
+            .iter()
+            .map(|el| {
+                Diagnostic::error(
+                    rule::AMBIGUOUS_MESSAGE_ARM,
+                    el,
+                    format!(
+                        "'{}' catch '{message}' correlated by the same key ('{binding}') while \
+                         both are live, so every delivery would be ambiguous — give one arm a \
+                         different message, or a different correlation binding",
+                        elements.join("' and '")
+                    ),
+                )
+            })
+            .collect(),
         CompileError::InvalidCorrelation { element, reason } => {
             vec![Diagnostic::error(
                 rule::MESSAGE_HAS_CORRELATION,
@@ -361,6 +383,146 @@ mod tests {
             check_deployable(&two, &Bindings::new(), &[], &crate::NoDecisions),
             DeployCheck::NotExactlyOneProcess(2)
         ));
+    }
+
+    /// `ambiguous-message-arm`: two message boundaries on one host, both
+    /// catching PAID by the same key. They are armed together and withdrawn
+    /// together, so *every* delivery would be ambiguous — a freeze that is
+    /// certain at deploy belongs at deploy.
+    const TWO_BOUNDARIES: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="defs">
+  <bpmn:message id="m" name="PAID" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:userTask id="ut"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:userTask>
+    <bpmn:boundaryEvent id="b1" attachedToRef="ut">
+      <bpmn:outgoing>f3</bpmn:outgoing><bpmn:messageEventDefinition messageRef="m" />
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="b2" attachedToRef="ut">
+      <bpmn:outgoing>f4</bpmn:outgoing><bpmn:messageEventDefinition messageRef="m" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="end"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="e1"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="e2"><bpmn:incoming>f4</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ut" />
+    <bpmn:sequenceFlow id="f2" sourceRef="ut" targetRef="end" />
+    <bpmn:sequenceFlow id="f3" sourceRef="b1" targetRef="e1" />
+    <bpmn:sequenceFlow id="f4" sourceRef="b2" targetRef="e2" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    /// A receive task waiting for PAID with a PAID boundary on itself: the
+    /// host's own arm and the boundary's, on one token.
+    const HOST_AND_ITS_BOUNDARY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="defs">
+  <bpmn:message id="m" name="PAID" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:receiveTask id="rt" messageRef="m"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:receiveTask>
+    <bpmn:boundaryEvent id="b" attachedToRef="rt">
+      <bpmn:outgoing>f3</bpmn:outgoing><bpmn:messageEventDefinition messageRef="m" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="end"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="e1"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="rt" />
+    <bpmn:sequenceFlow id="f2" sourceRef="rt" targetRef="end" />
+    <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="e1" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    /// A PAID boundary on a subprocess and a PAID catch two scopes down: the
+    /// parent's arm is live for the whole life of the body, so depth changes
+    /// nothing.
+    const BOUNDARY_AND_A_CATCH_INSIDE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="defs">
+  <bpmn:message id="m" name="PAID" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:subProcess id="sp">
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:startEvent id="s2"><bpmn:outgoing>g1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:subProcess id="sp2">
+        <bpmn:incoming>g1</bpmn:incoming><bpmn:outgoing>g2</bpmn:outgoing>
+        <bpmn:startEvent id="s3"><bpmn:outgoing>h1</bpmn:outgoing></bpmn:startEvent>
+        <bpmn:receiveTask id="inner" messageRef="m"><bpmn:incoming>h1</bpmn:incoming><bpmn:outgoing>h2</bpmn:outgoing></bpmn:receiveTask>
+        <bpmn:endEvent id="e3"><bpmn:incoming>h2</bpmn:incoming></bpmn:endEvent>
+        <bpmn:sequenceFlow id="h1" sourceRef="s3" targetRef="inner" />
+        <bpmn:sequenceFlow id="h2" sourceRef="inner" targetRef="e3" />
+      </bpmn:subProcess>
+      <bpmn:endEvent id="e2"><bpmn:incoming>g2</bpmn:incoming></bpmn:endEvent>
+      <bpmn:sequenceFlow id="g1" sourceRef="s2" targetRef="sp2" />
+      <bpmn:sequenceFlow id="g2" sourceRef="sp2" targetRef="e2" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="b" attachedToRef="sp">
+      <bpmn:outgoing>f3</bpmn:outgoing><bpmn:messageEventDefinition messageRef="m" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="end"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="e1"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sp" />
+    <bpmn:sequenceFlow id="f2" sourceRef="sp" targetRef="end" />
+    <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="e1" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    fn ambiguity(xml: &str, bindings: &Bindings) -> Vec<Diagnostic> {
+        let c = checked(xml, bindings);
+        c.diagnostics
+            .into_iter()
+            .filter(|d| d.rule == rule::AMBIGUOUS_MESSAGE_ARM)
+            .collect()
+    }
+
+    #[test]
+    fn two_message_boundaries_on_one_host_are_ambiguous() {
+        let d = ambiguity(
+            TWO_BOUNDARIES,
+            &Bindings::new()
+                .correlation("b1", "order.id")
+                .correlation("b2", "order.id"),
+        );
+        let elements: Vec<&str> = d.iter().map(|d| d.element.as_str()).collect();
+        assert_eq!(elements, vec!["b1", "b2"], "{d:?}");
+    }
+
+    #[test]
+    fn a_boundary_catching_its_host_s_own_message_is_ambiguous() {
+        let d = ambiguity(
+            HOST_AND_ITS_BOUNDARY,
+            &Bindings::new()
+                .correlation("rt", "order.id")
+                .correlation("b", "order.id"),
+        );
+        let elements: Vec<&str> = d.iter().map(|d| d.element.as_str()).collect();
+        assert_eq!(elements, vec!["rt", "b"], "{d:?}");
+    }
+
+    #[test]
+    fn a_subprocess_boundary_and_a_catch_inside_it_are_ambiguous() {
+        let d = ambiguity(
+            BOUNDARY_AND_A_CATCH_INSIDE,
+            &Bindings::new()
+                .correlation("inner", "order.id")
+                .correlation("b", "order.id"),
+        );
+        // Declaration order, which puts the parent scope's boundary before a
+        // node two scopes down — a stable order, and the one an editor will
+        // list the two highlights in.
+        let elements: Vec<&str> = d.iter().map(|d| d.element.as_str()).collect();
+        assert_eq!(elements, vec!["b", "inner"], "{d:?}");
+    }
+
+    /// The negative that makes the rule L2 rather than L1: the same message
+    /// under *different* bindings resolves to different keys, both arms may
+    /// legitimately be live, and only the manifest could ever have told.
+    #[test]
+    fn the_same_message_under_different_bindings_is_fine() {
+        let c = checked(
+            TWO_BOUNDARIES,
+            &Bindings::new()
+                .correlation("b1", "order.id")
+                .correlation("b2", "order.replacementId"),
+        );
+        assert!(c.ok(), "{:?}", c.diagnostics);
     }
 
     /// A lint error stops the pipeline before compilation, so the verdict

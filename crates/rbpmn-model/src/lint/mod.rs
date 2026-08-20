@@ -254,21 +254,25 @@ fn element_rules(
                 match &b.trigger {
                     BoundaryTrigger::Timer(spec) => check_timer(id, spec, out),
                     BoundaryTrigger::Error { .. } => {}
-                    BoundaryTrigger::Message(_) => out.push(Diagnostic::error(
-                        rule::NO_UNSUPPORTED_ELEMENT,
-                        id,
-                        "message boundary events are not supported in v1 \
-                         (v1 boundary events: timer, error)",
-                    )),
+                    // A message boundary is a message element like any other:
+                    // the XML says *which* message is caught here, and the
+                    // correlation key is manifest data checked at L2 against
+                    // this element's own id.
+                    BoundaryTrigger::Message(message_ref) => {
+                        check_message(defs, id, message_ref.as_deref(), out)
+                    }
                     BoundaryTrigger::None => out.push(Diagnostic::error(
                         rule::BPMN_STRUCTURE,
                         id,
-                        "boundary event requires an event definition (timer or error)",
+                        "boundary event requires an event definition (timer, error or message)",
                     )),
                     BoundaryTrigger::Unsupported { tag } => out.push(Diagnostic::error(
                         rule::NO_UNSUPPORTED_ELEMENT,
                         id,
-                        format!("'{tag}' boundary events are not supported (v1: timer, error)"),
+                        format!(
+                            "'{tag}' boundary events are not supported \
+                             (v1: timer, error, message)"
+                        ),
                     )),
                 }
             }
@@ -612,15 +616,28 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
 
         let host_kind = &g.node(host).kind;
         if !host_kind.is_supported_boundary_host() {
-            out.push(Diagnostic::error(
-                rule::BOUNDARY_ON_SUPPORTED_HOST,
-                id,
+            // The business rule task earns its own sentence: it was an
+            // accepted host until the message-boundary round, and the reason
+            // it stopped being one is not "unsupported" but "impossible" —
+            // the decision is answered inside the transaction that parks the
+            // token, so the arm is created and withdrawn in one step. Saying
+            // only "cannot attach" would read as a phase restriction that
+            // might lift later; it never will.
+            let why = if matches!(host_kind, NodeKind::BusinessRuleTask) {
+                "boundary events cannot attach to a business rule task — the decision is \
+                 answered inside the transaction that starts it, so a boundary here is \
+                 armed and cancelled in the same step and can never fire. Model the \
+                 alternative outcome as a decision result and an exclusive gateway after \
+                 the task"
+                    .to_string()
+            } else {
                 format!(
                     "boundary events cannot attach to a {} — supported hosts: \
                      service task, user task, receive task, embedded subprocess",
                     host_kind.describe()
-                ),
-            ));
+                )
+            };
+            out.push(Diagnostic::error(rule::BOUNDARY_ON_SUPPORTED_HOST, id, why));
             continue;
         }
 

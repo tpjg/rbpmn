@@ -622,6 +622,170 @@ fn multiple_timer_boundaries_first_fires_wins() {
     assert_eq!(state.timers().count(), 0);
 }
 
+/// The core-level statement of `spec/BoundaryExit.tla`: on one host with one
+/// message boundary there is **exactly one exit**. Whichever of
+/// `CompleteWorkItem` and `DeliverMessage` runs first resolves the host; the
+/// loser is refused with a typed error *before any mutation*, which is what
+/// lets the engine answer a late caller `AlreadyClosed` / 404 instead of
+/// stepping a second exit into the instance.
+///
+/// Two models, because the fixture cannot show both halves: on fixture 29
+/// either exit runs the instance to completion, so the loser meets the
+/// instance-status guard first. The inline model below leaves an open task on
+/// *both* continuations, so the loser meets the element-level guard — the one
+/// the engine maps to `AlreadyClosed { state: "cancelled" }` and 404.
+#[test]
+fn a_message_boundary_and_its_host_have_exactly_one_exit() {
+    let defs = load("accept/29-message-boundary.bpmn");
+    let bindings = Bindings::new().correlation("paid_during_contest", "ticket.reference");
+    let proc = ExecutableProcess::compile(&defs, "ticket", &bindings).unwrap();
+    let started = |proc: &ExecutableProcess, host: &str, boundary: &str| {
+        let mut state = InstanceState::new();
+        step(
+            proc,
+            &mut state,
+            Command::Start {
+                variables: json!({"ticket": {"reference": "T-2026-0042"}}),
+            },
+        )
+        .unwrap();
+        let item = state
+            .open_work_item_at(proc.node_by_id(host).unwrap())
+            .unwrap();
+        let sub = state
+            .armed_subscription_at(proc.node_by_id(boundary).unwrap())
+            .unwrap();
+        (state, item, sub)
+    };
+
+    // The clerk wins: the boundary's subscription went with the completion,
+    // so the payment has nothing left to be delivered to.
+    let (mut state, item, sub) = started(&proc, "handle_contest", "paid_during_contest");
+    step(
+        &proc,
+        &mut state,
+        Command::CompleteWorkItem {
+            id: item,
+            patch: json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(state.subscriptions().count(), 0);
+    let before = state.clone();
+    let err = step(
+        &proc,
+        &mut state,
+        Command::DeliverMessage {
+            id: sub,
+            patch: json!({"payment": {"amount": 60}}),
+        },
+    );
+    assert_eq!(
+        err,
+        Err(StepError::InstanceNotActive(InstanceStatus::Completed))
+    );
+    assert_eq!(state, before, "the refused delivery mutated the instance");
+
+    // The payment wins: the work item was cancelled, not completed, and the
+    // clerk's patch never lands.
+    let (mut state, item, sub) = started(&proc, "handle_contest", "paid_during_contest");
+    step(
+        &proc,
+        &mut state,
+        Command::DeliverMessage {
+            id: sub,
+            patch: json!({"payment": {"amount": 60}}),
+        },
+    )
+    .unwrap();
+    let before = state.clone();
+    let err = step(
+        &proc,
+        &mut state,
+        Command::CompleteWorkItem {
+            id: item,
+            patch: json!({"contest": {"upheld": true}}),
+        },
+    );
+    assert_eq!(
+        err,
+        Err(StepError::InstanceNotActive(InstanceStatus::Completed))
+    );
+    assert_eq!(state, before, "the refused completion mutated the instance");
+    assert_eq!(state.variables["contest"], Value::Null);
+
+    // Same race, with work waiting on both continuations so the instance is
+    // still active when the loser calls: now the refusal is the element's own.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m_paid" name="PAID" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:userTask id="handle_contest"/>
+    <bpmn:boundaryEvent id="paid_during_contest" attachedToRef="handle_contest">
+      <bpmn:messageEventDefinition messageRef="m_paid"/>
+    </bpmn:boundaryEvent>
+    <bpmn:userTask id="t_decided"/>
+    <bpmn:userTask id="t_paid"/>
+    <bpmn:endEvent id="end_decided"/>
+    <bpmn:endEvent id="end_paid"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="handle_contest"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="handle_contest" targetRef="t_decided"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="paid_during_contest" targetRef="t_paid"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="t_decided" targetRef="end_decided"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="t_paid" targetRef="end_paid"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let defs = rbpmn_model::parse(xml).unwrap();
+    let proc = ExecutableProcess::compile(&defs, "p", &bindings).unwrap();
+
+    let (mut state, item, sub) = started(&proc, "handle_contest", "paid_during_contest");
+    step(
+        &proc,
+        &mut state,
+        Command::CompleteWorkItem {
+            id: item,
+            patch: json!({}),
+        },
+    )
+    .unwrap();
+    let before = state.clone();
+    let err = step(
+        &proc,
+        &mut state,
+        Command::DeliverMessage {
+            id: sub,
+            patch: json!({"payment": {"amount": 60}}),
+        },
+    );
+    assert_eq!(err, Err(StepError::UnknownSubscription(sub)));
+    assert_eq!(state, before, "the refused delivery mutated the instance");
+
+    let (mut state, item, sub) = started(&proc, "handle_contest", "paid_during_contest");
+    step(
+        &proc,
+        &mut state,
+        Command::DeliverMessage {
+            id: sub,
+            patch: json!({}),
+        },
+    )
+    .unwrap();
+    let before = state.clone();
+    let err = step(
+        &proc,
+        &mut state,
+        Command::CompleteWorkItem {
+            id: item,
+            patch: json!({"contest": {"upheld": true}}),
+        },
+    );
+    assert_eq!(err, Err(StepError::WorkItemNotOpen(item)));
+    assert_eq!(state, before, "the refused completion mutated the instance");
+    assert_eq!(state.variables["contest"], Value::Null);
+}
+
 /// Token conservation across a mid-advance freeze: a parallel sibling still
 /// queued when the incident fires must park (Incident wait at its target),
 /// never silently vanish — a frozen instance that lost a branch could never

@@ -137,12 +137,17 @@ impl NodeKind {
     }
 
     /// Activities that can host boundary events (v1 subset).
+    ///
+    /// Deliberately **not** the business rule task: a decision is answered
+    /// inside the transaction that parks its token, so a boundary there is
+    /// armed and cancelled in one step and can never fire. It was accepted
+    /// once, and produced exactly the "seems to run" this linter exists to
+    /// kill (docs/design/boundary-messages.md, finding 3).
     pub fn is_supported_boundary_host(&self) -> bool {
         matches!(
             self,
             NodeKind::ServiceTask { .. }
                 | NodeKind::UserTask
-                | NodeKind::BusinessRuleTask
                 | NodeKind::ReceiveTask { .. }
                 | NodeKind::SubProcess(_)
         )

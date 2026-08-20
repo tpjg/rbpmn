@@ -81,6 +81,13 @@ pub mod rule {
     /// pure `lint(xml)`; the id is reserved here and the engine enforces it.
     pub const UNRESOLVED_TOPIC: &str = "unresolved-topic";
     pub const BOUNDARY_ON_SUPPORTED_HOST: &str = "boundary-on-supported-host";
+    /// Two message arms for the same message *and* the same correlation
+    /// binding that can be live at once. Deploy-time (L2) like
+    /// `unresolved-decision`: with *different* bindings both arms resolve to
+    /// different keys and both may legitimately be live, so only the manifest
+    /// decides — and the manifest is never in the XML. Enforced in
+    /// `rbpmn_core::compile`, reported through `check_deployable`.
+    pub const AMBIGUOUS_MESSAGE_ARM: &str = "ambiguous-message-arm";
     pub const NO_IMPLICIT_SPLIT: &str = "no-implicit-split";
     pub const IMPLICIT_MERGE_AFTER_PARALLEL: &str = "implicit-merge-after-parallel";
     // Structural prerequisites added beyond the brief's initial list (documented
@@ -170,6 +177,11 @@ pub const CATALOGUE: &[RuleInfo] = &[
         id: rule::BOUNDARY_ON_SUPPORTED_HOST,
         severity: Severity::Error,
         summary: "Boundary events only on tasks/subprocesses we support; error boundaries on service tasks/subprocesses.",
+    },
+    RuleInfo {
+        id: rule::AMBIGUOUS_MESSAGE_ARM,
+        severity: Severity::Error,
+        summary: "Two message arms for the same message and the same correlation binding can be live at once (two boundaries on one host, a host and its own boundary, a subprocess boundary and a catch inside it): every delivery would be ambiguous, so deploy refuses it.",
     },
     RuleInfo {
         id: rule::NO_IMPLICIT_SPLIT,

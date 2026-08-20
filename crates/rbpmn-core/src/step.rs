@@ -45,7 +45,11 @@ pub enum Command {
     /// timer interrupts its host; an event-gateway timer wins the race.
     FireTimer { id: TimerId },
     /// A correlated message arrived for an open subscription, carrying an
-    /// RFC 7386 merge patch (like work-item completion).
+    /// RFC 7386 merge patch (like work-item completion). Delivering to a
+    /// catch resumes its token; to a message boundary interrupts its host
+    /// (work item withdrawn, subscription withdrawn, or the whole scope torn
+    /// down) and takes the boundary path; to an event-gateway alternative
+    /// wins the race — the same three shapes `FireTimer` has.
     DeliverMessage { id: SubscriptionId, patch: Value },
     /// A decision was evaluated for the token parked at `token`.
     ///
@@ -472,7 +476,63 @@ pub fn step(
                     adv.take_gateway_path(state, sub.token, token.node, sub.element)?;
                     adv.run(state)
                 }
-                _ => Err(StepError::Invariant(format!(
+                // The three below are the interrupting message boundary, one
+                // arm per host wait kind — deliberately `FireTimer`'s shape
+                // line for line, because "an arm on a parked token fired" is
+                // one thing whichever kind of arm it was.
+                //
+                // Interrupting boundary on a task: cancel the work item and
+                // continue on the boundary path. The host never completes, so
+                // the holder of a live lease learns at its next verb
+                // (`AlreadyClosed { state: "cancelled" }`) — a lease protects
+                // a worker from other workers, never from the process.
+                WaitKind::WorkItem(wid) => {
+                    let item = state.work_items.get_mut(&wid).ok_or_else(|| {
+                        StepError::Invariant(format!(
+                            "message boundary {id:?} host work item {wid:?} does not exist"
+                        ))
+                    })?;
+                    item.open = false;
+                    let host_element = item.element;
+                    adv.events.push(Event::WorkItemCancelled {
+                        id: wid,
+                        element: proc.node_id(host_element).to_string(),
+                    });
+                    adv.interrupt_to_boundary(state, sub.token, sub.element)?;
+                    adv.run(state)
+                }
+                // Interrupting boundary on a receive task: two subscriptions
+                // on one token, and this is the boundary's. The host's own is
+                // withdrawn instead of a work item.
+                WaitKind::Message(sid) => {
+                    let host = state.subscriptions.remove(&sid).ok_or_else(|| {
+                        StepError::Invariant(format!(
+                            "message boundary {id:?} host subscription {sid:?} does not exist"
+                        ))
+                    })?;
+                    adv.events.push(Event::SubscriptionCancelled {
+                        id: sid,
+                        element: proc.node_id(host.element).to_string(),
+                        message: host.message,
+                    });
+                    adv.interrupt_to_boundary(state, sub.token, sub.element)?;
+                    adv.run(state)
+                }
+                // Interrupting boundary on a subprocess: `interrupt_to_boundary`
+                // tears the child scope down recursively and continues in the
+                // parent scope, where the boundary's flow lives.
+                WaitKind::Scope(_) => {
+                    adv.interrupt_to_boundary(state, sub.token, sub.element)?;
+                    adv.run(state)
+                }
+                // A timer catch hosts nothing, a join holds no arm, an
+                // incident advances nothing, and a decision never survives the
+                // transaction that parked it — so none of these can own a
+                // subscription.
+                WaitKind::Timer(_)
+                | WaitKind::Join { .. }
+                | WaitKind::Incident
+                | WaitKind::Decision => Err(StepError::Invariant(format!(
                     "message {id:?} delivered to a token in an unrelated wait state"
                 ))),
             }
@@ -705,6 +765,10 @@ impl<'a> Advancer<'a> {
                 "timer boundary '{}' entered via a sequence flow",
                 node.id
             ))),
+            ExecKind::MessageBoundary { .. } => Err(StepError::Invariant(format!(
+                "message boundary '{}' entered via a sequence flow",
+                node.id
+            ))),
             ExecKind::ExclusiveGateway { default_flow } => {
                 self.element_started(node_ix);
                 let chosen = if node.outgoing.len() == 1 {
@@ -913,17 +977,22 @@ impl<'a> Advancer<'a> {
         });
     }
 
-    /// Arm the host's interrupting timer boundaries on its parked token.
-    /// `false` means one of them had an unresolvable deadline and the
-    /// instance is frozen at an incident — the caller must not continue, and
-    /// `freeze` has already withdrawn whatever this loop armed first.
+    /// Arm the host's interrupting boundaries on its parked token, in
+    /// declaration order: a timer becomes an armed timer, a message an open
+    /// subscription. `false` means one of them could not be armed — an
+    /// unresolvable deadline, an unusable correlation key, a duplicate
+    /// `(message, key)` — and the instance is frozen at an incident, so the
+    /// caller must not continue; `freeze` has already withdrawn whatever this
+    /// loop armed first.
     #[must_use]
     fn arm_boundaries(&mut self, state: &mut InstanceState, token: TokenId, host: NodeIx) -> bool {
-        for b in self.proc.timer_boundaries(host).to_vec() {
-            let ExecKind::TimerBoundary { due } = &self.proc.node(b).kind else {
-                unreachable!("timer_boundaries only holds timer boundary nodes");
+        for b in self.proc.boundaries(host).to_vec() {
+            let armed = match &self.proc.node(b).kind {
+                ExecKind::TimerBoundary { due } => self.arm_timer(state, token, b, due).is_some(),
+                ExecKind::MessageBoundary { .. } => self.subscribe(state, token, b).is_some(),
+                other => unreachable!("boundaries holds only armable boundaries, found {other:?}"),
             };
-            if self.arm_timer(state, token, b, due).is_none() {
+            if !armed {
                 return false;
             }
         }
@@ -999,22 +1068,25 @@ impl<'a> Advancer<'a> {
         self.leave_single(state, token, boundary)
     }
 
-    /// Open a subscription for the message catch at `element`, evaluating
-    /// its correlation key from the variables **now** (arm time). Keys must
-    /// be strings or exact integers (floats have no canonical spelling
-    /// across a jsonb round-trip — the same logical value would arm two
-    /// different keys); anything else can never match. Both cases, and a
+    /// Open a subscription for the message arm at `element` — a catch, a
+    /// receive task or a message boundary, all three through here —
+    /// evaluating its correlation key from the variables **now** (arm time).
+    /// Keys must be strings or exact integers (floats have no canonical
+    /// spelling across a jsonb round-trip — the same logical value would arm
+    /// two different keys); anything else can never match. Both cases, and a
     /// duplicate open (message, key) in this instance (which would make
     /// every delivery permanently ambiguous), freeze the instance as an
-    /// incident instead of waiting forever.
+    /// incident instead of waiting forever. A boundary's freeze parks its
+    /// host's token **at the boundary element**, exactly as `arm_timer`'s
+    /// does, so inspection names the arm that could not be made.
     fn subscribe(
         &mut self,
         state: &mut InstanceState,
         token: TokenId,
         element: NodeIx,
     ) -> Option<SubscriptionId> {
-        let ExecKind::MessageCatch { message, key } = &self.proc.node(element).kind else {
-            unreachable!("subscribe is only called on message catch nodes");
+        let Some((message, key)) = self.proc.message_arm(element) else {
+            unreachable!("subscribe is only called on message arms");
         };
         let value = rbpmn_model::condition::resolve_path(&state.variables, key);
         let key_value = match value {
@@ -1036,11 +1108,11 @@ impl<'a> Advancer<'a> {
         if state
             .subscriptions
             .values()
-            .any(|s| s.message == *message && s.key == key_value)
+            .any(|s| s.message == message && s.key == key_value)
         {
             self.events.push(Event::DuplicateSubscription {
                 element: self.proc.node_id(element).to_string(),
-                message: message.clone(),
+                message: message.to_string(),
                 key: key_value,
             });
             self.freeze(state, token, element, None, None);
@@ -1049,13 +1121,13 @@ impl<'a> Advancer<'a> {
         let id = state.alloc_subscription(SubscriptionState {
             element,
             token,
-            message: message.clone(),
+            message: message.to_string(),
             key: key_value.clone(),
         });
         self.events.push(Event::MessageSubscribed {
             id,
             element: self.proc.node_id(element).to_string(),
-            message: message.clone(),
+            message: message.to_string(),
             key: key_value,
             token,
         });

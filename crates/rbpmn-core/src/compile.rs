@@ -271,6 +271,19 @@ pub enum ExecKind {
     TimerBoundary {
         due: TimerSource,
     },
+    /// Message boundary: a subscription armed on the *host's* token, entered
+    /// only by its own delivery — never via a sequence flow. `key` is the
+    /// parsed correlation qualified name bound to the **boundary's** element
+    /// id, never the host's.
+    ///
+    /// `interrupting` is `true` for everything this phase compiles (lint
+    /// still refuses `cancelActivity="false"`); the field is here so the
+    /// non-interrupting arm is an added match, not a re-shaped variant.
+    MessageBoundary {
+        message: String,
+        key: Vec<String>,
+        interrupting: bool,
+    },
     /// Parks its token and arms every target catch event; the first to fire
     /// wins and the rest are cancelled.
     EventBasedGateway,
@@ -306,9 +319,13 @@ pub struct ExecutableProcess {
     ids: BTreeMap<String, NodeIx>,
     /// host node -> (error code, boundary node)
     error_boundaries: BTreeMap<NodeIx, Vec<(String, NodeIx)>>,
-    /// host node -> its interrupting timer boundary nodes, armed on the
-    /// host's token whenever the host starts waiting.
-    timer_boundaries: BTreeMap<NodeIx, Vec<NodeIx>>,
+    /// host node -> the boundary nodes armed on the host's token whenever it
+    /// starts waiting — timer *and* message, in **XML declaration order**.
+    /// One list rather than one per kind because arming allocates timer and
+    /// subscription ids and the golden traces pin them: two lists would make
+    /// the trace depend on which kind the code happened to walk first.
+    /// `error_boundaries` stays separate — it is matched by code, never armed.
+    boundaries: BTreeMap<NodeIx, Vec<NodeIx>>,
     /// Each static scope's start event; index 0 is the process root. The
     /// rest of the scope tree (parents, owners) is only needed while
     /// compiling, so it does not survive into the runtime model.
@@ -339,6 +356,21 @@ pub enum CompileError {
     MissingCorrelation(Vec<String>),
     #[error("correlation binding on '{element}': {reason}")]
     InvalidCorrelation { element: String, reason: String },
+    /// `ambiguous-message-arm`: two arms for the same message *and* the same
+    /// correlation binding that are live at the same time. The runtime rule
+    /// (a second open `(message, key)` freezes the instance) stays the
+    /// backstop; these shapes are certain the moment the manifest is known,
+    /// and a certain freeze belongs at deploy rather than in an incident.
+    #[error(
+        "message '{message}' correlated by '{binding}' is caught by arms that are live \
+         at the same time: {} — every delivery would be ambiguous",
+        .elements.join(", ")
+    )]
+    AmbiguousMessageArm {
+        elements: Vec<String>,
+        message: String,
+        binding: String,
+    },
     /// `decision-has-binding`: a business-rule task says *that* a decision
     /// happens, never which — that is manifest data, exactly like a topic.
     /// Unlike a topic there is no sensible default: guessing a decision by
@@ -611,6 +643,21 @@ impl ExecutableProcess {
                             due: timer_due(node, spec)?,
                         }
                     }
+                    // The correlation binding is the *boundary's* own element
+                    // id, exactly as a catch's is its own: the XML says which
+                    // message is caught here, the manifest says by which key.
+                    BoundaryTrigger::Message(message_ref) => {
+                        boundary_hosts.push((ix, b.attached_to.clone().unwrap_or_default()));
+                        ExecKind::MessageBoundary {
+                            message: message_name(node, message_ref)?,
+                            key: correlation(node)?,
+                            // Not `b.cancel_activity`: lint refuses the
+                            // non-interrupting form, and reading the
+                            // attribute here would make `compile_without_lint`
+                            // execute one as if it interrupted.
+                            interrupting: true,
+                        }
+                    }
                     _ => {
                         return Err(CompileError::Internal(format!(
                             "unsupported boundary trigger on '{}' survived lint",
@@ -688,7 +735,7 @@ impl ExecutableProcess {
         }
 
         let mut error_boundaries: BTreeMap<NodeIx, Vec<(String, NodeIx)>> = BTreeMap::new();
-        let mut timer_boundaries: BTreeMap<NodeIx, Vec<NodeIx>> = BTreeMap::new();
+        let mut boundaries: BTreeMap<NodeIx, Vec<NodeIx>> = BTreeMap::new();
         for (boundary_ix, host_id) in boundary_hosts {
             let host = *node_ix.get(host_id.as_str()).ok_or_else(|| {
                 CompileError::Internal(format!("boundary host '{host_id}' missing"))
@@ -716,10 +763,14 @@ impl ExecutableProcess {
                         .or_default()
                         .push((code.clone(), boundary_ix));
                 }
-                ExecKind::TimerBoundary { .. } => {
-                    // Timer boundaries arm on any waiting host token: tasks
-                    // (work items), receive tasks (subscriptions), and
-                    // subprocesses (the whole scope).
+                // Timer and message boundaries arm on any waiting host token:
+                // tasks (work items), receive tasks (subscriptions), and
+                // subprocesses (the whole scope). Never a business-rule task
+                // — its token is answered inside the transaction that parked
+                // it, so the arm could only ever be created and withdrawn in
+                // one step (lint refuses it; this is the "survived lint"
+                // guard behind that).
+                ExecKind::TimerBoundary { .. } | ExecKind::MessageBoundary { .. } => {
                     if !matches!(
                         nodes[host].kind,
                         ExecKind::Task { .. }
@@ -727,14 +778,22 @@ impl ExecutableProcess {
                             | ExecKind::SubProcess { .. }
                     ) {
                         return Err(CompileError::Internal(format!(
-                            "timer boundary '{}' on unsupported host survived lint",
+                            "boundary '{}' on unsupported host survived lint",
                             nodes[boundary_ix].id
                         )));
                     }
-                    timer_boundaries.entry(host).or_default().push(boundary_ix);
+                    boundaries.entry(host).or_default().push(boundary_ix);
                 }
                 _ => unreachable!("boundary_hosts only collects boundary nodes"),
             }
+        }
+
+        // Node indices line up with `flat` here: the one `continue` in the
+        // node pass (a business-rule task without a binding) already returned
+        // above with `MissingDecision`.
+        let owning_scope: Vec<ScopeIx> = flat.iter().map(|(s, _)| *s).collect();
+        if let Some(e) = ambiguous_message_arm(&nodes, &boundaries, &owning_scope, &child_scope) {
+            return Err(e);
         }
 
         // Each scope has exactly one start event (`single-start-event`),
@@ -759,7 +818,7 @@ impl ExecutableProcess {
             flows,
             ids,
             error_boundaries,
-            timer_boundaries,
+            boundaries,
             scope_starts,
             start,
         })
@@ -805,13 +864,27 @@ impl ExecutableProcess {
         self.scope_starts.get(scope).copied()
     }
 
-    /// The interrupting timer boundaries armed whenever `host` starts
-    /// waiting (declaration order).
-    pub fn timer_boundaries(&self, host: NodeIx) -> &[NodeIx] {
-        self.timer_boundaries
-            .get(&host)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+    /// The boundaries armed whenever `host` starts waiting — timer and
+    /// message alike, in XML declaration order. Error boundaries are not
+    /// here: they are matched by code when the host fails, never armed.
+    pub fn boundaries(&self, host: NodeIx) -> &[NodeIx] {
+        self.boundaries.get(&host).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// What `node` subscribes with, if anything: `(message, correlation
+    /// key)` for a message catch, a receive task **or** a message boundary.
+    ///
+    /// One accessor because `subscribe` is the single arming chokepoint for
+    /// all three — a second one would be a second place for the key-type and
+    /// duplicate rules to be applied slightly differently.
+    pub fn message_arm(&self, node: NodeIx) -> Option<(&str, &[String])> {
+        match &self.nodes[node].kind {
+            ExecKind::MessageCatch { message, key }
+            | ExecKind::MessageBoundary { message, key, .. } => {
+                Some((message.as_str(), key.as_slice()))
+            }
+            _ => None,
+        }
     }
 
     pub fn flow_by_id(&self, id: &str) -> Option<FlowIx> {
@@ -829,4 +902,93 @@ impl ExecutableProcess {
             _ => None,
         })
     }
+}
+
+/// `ambiguous-message-arm` (docs/design/boundary-messages.md §2.4).
+///
+/// Three shapes are certain the moment the manifest is known: two message
+/// boundaries on one host, a message boundary on a receive task catching the
+/// host's own message, and a message boundary on a subprocess with a catch of
+/// the same message anywhere inside its body. Certain because those arms are
+/// live over exactly the same span — the host's wait — so *every* delivery
+/// would be ambiguous, not merely some interleaving of them. The runtime
+/// duplicate rule (a second open `(message, key)` freezes the instance) stays
+/// the backstop for everything else.
+///
+/// The same message with a **different** binding is accepted: the two resolve
+/// to different keys and both may legitimately be live. That is the whole
+/// reason this is an L2 rule and not a linter one — only the manifest knows,
+/// and the manifest is never in the XML.
+fn ambiguous_message_arm(
+    nodes: &[ExecNode],
+    boundaries: &BTreeMap<NodeIx, Vec<NodeIx>>,
+    owning_scope: &[ScopeIx],
+    child_scope: &BTreeMap<NodeIx, ScopeIx>,
+) -> Option<CompileError> {
+    // scope -> the scope its owning subprocess sits in; the root has none.
+    let scope_count = child_scope.values().copied().max().map_or(1, |m| m + 1);
+    let mut parent_scope: Vec<Option<ScopeIx>> = vec![None; scope_count];
+    for (&owner, &child) in child_scope {
+        parent_scope[child] = Some(owning_scope[owner]);
+    }
+    let inside = |scope: ScopeIx, root: ScopeIx| -> bool {
+        let mut at = scope;
+        loop {
+            if at == root {
+                return true;
+            }
+            match parent_scope[at] {
+                Some(p) => at = p,
+                None => return false,
+            }
+        }
+    };
+    let arm = |ix: NodeIx| -> Option<(String, String)> {
+        match &nodes[ix].kind {
+            ExecKind::MessageCatch { message, key }
+            | ExecKind::MessageBoundary { message, key, .. } => {
+                Some((message.clone(), key.join(".")))
+            }
+            _ => None,
+        }
+    };
+
+    for (&host, attached) in boundaries {
+        let mut live: Vec<NodeIx> = attached
+            .iter()
+            .copied()
+            .filter(|&b| matches!(nodes[b].kind, ExecKind::MessageBoundary { .. }))
+            .collect();
+        if live.is_empty() {
+            continue;
+        }
+        // A receive task's own arm is live for exactly as long as its
+        // boundaries are — that is what makes host-vs-boundary certain.
+        if matches!(nodes[host].kind, ExecKind::MessageCatch { .. }) {
+            live.push(host);
+        }
+        // A subprocess boundary is armed before the body starts and withdrawn
+        // when it ends, so it overlaps every arm inside, at any depth.
+        if let Some(&body) = child_scope.get(&host) {
+            live.extend((0..nodes.len()).filter(|&n| inside(owning_scope[n], body)));
+        }
+        live.sort_unstable();
+        live.dedup();
+
+        let mut groups: BTreeMap<(String, String), Vec<NodeIx>> = BTreeMap::new();
+        for n in live {
+            if let Some(k) = arm(n) {
+                groups.entry(k).or_default().push(n);
+            }
+        }
+        if let Some(((message, binding), elements)) = groups.into_iter().find(|(_, v)| v.len() > 1)
+        {
+            return Some(CompileError::AmbiguousMessageArm {
+                elements: elements.iter().map(|&n| nodes[n].id.clone()).collect(),
+                message,
+                binding,
+            });
+        }
+    }
+    None
 }

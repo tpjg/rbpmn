@@ -269,7 +269,10 @@ pub fn reachable_conditions(proc: &ExecutableProcess, codes: &[String]) -> Vec<E
             }
             queue.push_back(proc.flow(f).target);
         }
-        for &b in proc.timer_boundaries(n) {
+        // Boundaries carry no incoming flow, so the flow walk alone never
+        // reaches one — and the conditions on a boundary path would drop out
+        // of the alphabet. Timer and message boundaries alike.
+        for &b in proc.boundaries(n) {
             queue.push_back(b);
         }
         for code in codes {

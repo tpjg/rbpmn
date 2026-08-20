@@ -1,0 +1,30 @@
+{
+  "fixture": "accept/30-receive-task-message-boundary.bpmn",
+  "bindings": {
+    "correlations": { "await_payment": "order.id", "cancelled_meanwhile": "order.id" }
+  },
+  "variables": { "order": { "id": "o-77" } },
+  "actions": [{ "deliver": "cancelled_meanwhile", "patch": { "cancellation": { "by": "buyer" } } }],
+  "expect": {
+    "status": "completed",
+    "variables": { "order": { "id": "o-77" }, "cancellation": { "by": "buyer" } },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started await_payment",
+      "message-subscribed await_payment PAID o-77",
+      "message-subscribed cancelled_meanwhile CANCELLED o-77",
+      "message-received cancelled_meanwhile CANCELLED",
+      "variables-patched",
+      "subscription-cancelled await_payment PAID",
+      "element-started cancelled_meanwhile",
+      "element-completed cancelled_meanwhile",
+      "flow-taken f3",
+      "element-started end_cancelled",
+      "element-completed end_cancelled",
+      "instance-completed"
+    ]
+  }
+}
