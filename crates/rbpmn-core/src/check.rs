@@ -273,26 +273,26 @@ fn compile_diagnostics(key: &str, e: CompileError) -> Vec<Diagnostic> {
                 format!("decision binding is not usable: {reason}"),
             )]
         }
-        // One diagnostic per offending element, like `MissingCorrelation`:
-        // the modeller has to look at both arms, and an editor highlights
-        // what it is told to highlight.
-        CompileError::AmbiguousMessageArm {
-            elements,
-            message,
-            binding,
-        } => elements
+        // One diagnostic per offending element of every group, like
+        // `MissingCorrelation`: the modeller has to look at each arm, and an
+        // editor highlights what it is told to highlight. The sentence is
+        // built once per group, not once per element — every element of a
+        // group is told the same thing.
+        CompileError::AmbiguousMessageArm(groups) => groups
             .iter()
-            .map(|el| {
-                Diagnostic::error(
-                    rule::AMBIGUOUS_MESSAGE_ARM,
-                    el,
-                    format!(
-                        "'{}' catch '{message}' correlated by the same key ('{binding}') while \
-                         both are live, so every delivery would be ambiguous — give one arm a \
-                         different message, or a different correlation binding",
-                        elements.join("' and '")
-                    ),
-                )
+            .flat_map(|g| {
+                let quantifier = if g.elements.len() == 2 { "both" } else { "all" };
+                let text = format!(
+                    "{} {quantifier} catch '{}' correlated by the same key ('{}') and are \
+                     live at the same time, so every delivery would be ambiguous — give one \
+                     arm a different message, or a different correlation binding",
+                    crate::compile::and_list(&g.elements),
+                    g.message,
+                    g.binding,
+                );
+                g.elements
+                    .iter()
+                    .map(move |el| Diagnostic::error(rule::AMBIGUOUS_MESSAGE_ARM, el, text.clone()))
             })
             .collect(),
         CompileError::InvalidCorrelation { element, reason } => {
@@ -509,6 +509,102 @@ mod tests {
         // list the two highlights in.
         let elements: Vec<&str> = d.iter().map(|d| d.element.as_str()).collect();
         assert_eq!(elements, vec!["b", "inner"], "{d:?}");
+    }
+
+    /// Two sequential user tasks, each carrying two PAID boundaries under one
+    /// binding: two ambiguities, and a modeller who is told about one fixes
+    /// it and is refused again.
+    const TWO_AMBIGUOUS_HOSTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="defs">
+  <bpmn:message id="m" name="PAID" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:userTask id="ut1"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:userTask>
+    <bpmn:boundaryEvent id="b1" attachedToRef="ut1">
+      <bpmn:outgoing>f5</bpmn:outgoing><bpmn:messageEventDefinition messageRef="m" />
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="b2" attachedToRef="ut1">
+      <bpmn:outgoing>f6</bpmn:outgoing><bpmn:messageEventDefinition messageRef="m" />
+    </bpmn:boundaryEvent>
+    <bpmn:userTask id="ut2"><bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing></bpmn:userTask>
+    <bpmn:boundaryEvent id="b3" attachedToRef="ut2">
+      <bpmn:outgoing>f7</bpmn:outgoing><bpmn:messageEventDefinition messageRef="m" />
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="b4" attachedToRef="ut2">
+      <bpmn:outgoing>f8</bpmn:outgoing><bpmn:messageEventDefinition messageRef="m" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="end"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="e1"><bpmn:incoming>f5</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="e2"><bpmn:incoming>f6</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="e3"><bpmn:incoming>f7</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="e4"><bpmn:incoming>f8</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ut1" />
+    <bpmn:sequenceFlow id="f2" sourceRef="ut1" targetRef="ut2" />
+    <bpmn:sequenceFlow id="f3" sourceRef="ut2" targetRef="end" />
+    <bpmn:sequenceFlow id="f5" sourceRef="b1" targetRef="e1" />
+    <bpmn:sequenceFlow id="f6" sourceRef="b2" targetRef="e2" />
+    <bpmn:sequenceFlow id="f7" sourceRef="b3" targetRef="e3" />
+    <bpmn:sequenceFlow id="f8" sourceRef="b4" targetRef="e4" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    /// Every group, not the first one found — and the groups stay *per host*:
+    /// the two tasks run one after the other, so `b1`'s arm is never live
+    /// beside `b3`'s and no diagnostic may claim it is.
+    #[test]
+    fn every_ambiguous_host_is_reported() {
+        let d = ambiguity(
+            TWO_AMBIGUOUS_HOSTS,
+            &Bindings::new()
+                .correlation("b1", "order.id")
+                .correlation("b2", "order.id")
+                .correlation("b3", "order.id")
+                .correlation("b4", "order.id"),
+        );
+        let elements: Vec<&str> = d.iter().map(|d| d.element.as_str()).collect();
+        assert_eq!(elements, vec!["b1", "b2", "b3", "b4"], "{d:?}");
+        for (i, host_pair) in [("b1", "b2"), ("b3", "b4")].iter().enumerate() {
+            let (first, second) = *host_pair;
+            let text = &d[i * 2].message;
+            assert_eq!(
+                text,
+                &d[i * 2 + 1].message,
+                "one group, one sentence: {d:?}"
+            );
+            assert!(
+                text.contains(&format!("'{first}' and '{second}' both catch")),
+                "{text}"
+            );
+        }
+    }
+
+    /// Three arms on one host: the sentence is a list, not "'b1' and 'b2' and
+    /// 'b3' … while both are live".
+    #[test]
+    fn three_ambiguous_arms_read_as_a_list() {
+        let three = TWO_BOUNDARIES.replace(
+            r#"<bpmn:endEvent id="end">"#,
+            r#"<bpmn:boundaryEvent id="b3" attachedToRef="ut">
+      <bpmn:outgoing>f5</bpmn:outgoing><bpmn:messageEventDefinition messageRef="m" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="e3"><bpmn:incoming>f5</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f5" sourceRef="b3" targetRef="e3" />
+    <bpmn:endEvent id="end">"#,
+        );
+        let d = ambiguity(
+            &three,
+            &Bindings::new()
+                .correlation("b1", "order.id")
+                .correlation("b2", "order.id")
+                .correlation("b3", "order.id"),
+        );
+        let elements: Vec<&str> = d.iter().map(|d| d.element.as_str()).collect();
+        assert_eq!(elements, vec!["b1", "b2", "b3"], "{d:?}");
+        assert!(
+            d[0].message.contains("'b1', 'b2' and 'b3' all catch"),
+            "{}",
+            d[0].message
+        );
     }
 
     /// The negative that makes the rule L2 rather than L1: the same message

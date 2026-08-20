@@ -79,9 +79,13 @@ pub fn check(proc: &ExecutableProcess, s: &InstanceState) -> Result<(), String> 
                 Some(_) => return Err(format!("scope {sc:?} disagrees with token {id:?}")),
                 None => return Err(format!("token {id:?} references missing scope {sc:?}")),
             },
+            // The element check is not redundant with the token one: a
+            // receive task with a message boundary carries *two*
+            // subscriptions on one token (the host's and the boundary's),
+            // and only the host's is the one this token waits behind.
             WaitKind::Message(si) => match s.subscriptions().find(|(i, _)| *i == *si) {
-                Some((_, sub)) if sub.token == id => {}
-                Some(_) => return Err(format!("subscription {si:?} points at another token")),
+                Some((_, sub)) if sub.token == id && sub.element == t.node => {}
+                Some(_) => return Err(format!("subscription {si:?} disagrees with token {id:?}")),
                 None => {
                     return Err(format!(
                         "token {id:?} references missing subscription {si:?}"

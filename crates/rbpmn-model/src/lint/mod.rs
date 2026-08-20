@@ -632,9 +632,9 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
                     .to_string()
             } else {
                 format!(
-                    "boundary events cannot attach to a {} — supported hosts: \
-                     service task, user task, receive task, embedded subprocess",
-                    host_kind.describe()
+                    "boundary events cannot attach to a {} — supported hosts: {}",
+                    host_kind.describe(),
+                    NodeKind::SUPPORTED_BOUNDARY_HOSTS
                 )
             };
             out.push(Diagnostic::error(rule::BOUNDARY_ON_SUPPORTED_HOST, id, why));

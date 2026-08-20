@@ -295,6 +295,25 @@ pub enum ExecKind {
     },
 }
 
+impl ExecKind {
+    /// What this node subscribes with, if anything: `(message, correlation
+    /// key)` for a message catch, a receive task **or** a message boundary.
+    ///
+    /// The one definition of "this is a message arm". `subscribe` is the
+    /// single arming chokepoint for all three and `ambiguous-message-arm`
+    /// reasons about exactly the same set, so a second `match` is a second
+    /// place for the two to disagree about what an arm is.
+    pub fn message_arm(&self) -> Option<(&str, &[String])> {
+        match self {
+            ExecKind::MessageCatch { message, key }
+            | ExecKind::MessageBoundary { message, key, .. } => {
+                Some((message.as_str(), key.as_slice()))
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecNode {
     pub id: String,
@@ -333,6 +352,46 @@ pub struct ExecutableProcess {
     start: NodeIx,
 }
 
+/// One `ambiguous-message-arm` group: the arms that catch `message` under
+/// `binding` and are live over the same span, in declaration order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousArms {
+    pub elements: Vec<String>,
+    pub message: String,
+    pub binding: String,
+}
+
+impl AmbiguousArms {
+    /// One group as a phrase, for the log line a deploy failure leaves
+    /// behind; [`crate::check`] renders the same group as a diagnostic per
+    /// element for an editor to highlight.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} catch '{}' correlated by '{}'",
+            and_list(&self.elements),
+            self.message,
+            self.binding
+        )
+    }
+}
+
+/// `'a' and 'b'`, `'a', 'b' and 'c'` — quoted, and readable at any length.
+/// Shared with [`crate::check`] so a group reads the same in the error and
+/// in the diagnostic.
+pub(crate) fn and_list(elements: &[String]) -> String {
+    match elements {
+        [] => String::new(),
+        [only] => format!("'{only}'"),
+        [rest @ .., last] => format!(
+            "{} and '{last}'",
+            rest.iter()
+                .map(|e| format!("'{e}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
     #[error("model rejected by the linter ({} error diagnostics)", .0.len())]
@@ -356,21 +415,22 @@ pub enum CompileError {
     MissingCorrelation(Vec<String>),
     #[error("correlation binding on '{element}': {reason}")]
     InvalidCorrelation { element: String, reason: String },
-    /// `ambiguous-message-arm`: two arms for the same message *and* the same
+    /// `ambiguous-message-arm`: arms for the same message *and* the same
     /// correlation binding that are live at the same time. The runtime rule
     /// (a second open `(message, key)` freezes the instance) stays the
     /// backstop; these shapes are certain the moment the manifest is known,
     /// and a certain freeze belongs at deploy rather than in an incident.
+    ///
+    /// **Every** group, not the first: a model with two ambiguous hosts is
+    /// two things to fix, and a modeller who only hears about one fixes it
+    /// and gets refused again — the same reason `MissingCorrelation` carries
+    /// every element.
     #[error(
-        "message '{message}' correlated by '{binding}' is caught by arms that are live \
-         at the same time: {} — every delivery would be ambiguous",
-        .elements.join(", ")
+        "message arms that are live at the same time, so every delivery would be \
+         ambiguous: {}",
+        .0.iter().map(AmbiguousArms::describe).collect::<Vec<_>>().join("; ")
     )]
-    AmbiguousMessageArm {
-        elements: Vec<String>,
-        message: String,
-        binding: String,
-    },
+    AmbiguousMessageArm(Vec<AmbiguousArms>),
     /// `decision-has-binding`: a business-rule task says *that* a decision
     /// happens, never which — that is manifest data, exactly like a topic.
     /// Unlike a topic there is no sensible default: guessing a decision by
@@ -622,49 +682,48 @@ impl ExecutableProcess {
                         node.id
                     )));
                 }
-                NodeKind::Boundary(b) => match &b.trigger {
-                    BoundaryTrigger::Error { error_ref } => {
-                        let code = error_ref
-                            .as_deref()
-                            .and_then(|r| defs.errors.iter().find(|e| e.id == r))
-                            .and_then(|e| e.code.clone())
-                            .ok_or_else(|| {
-                                CompileError::Internal(format!(
-                                    "error boundary '{}' without a coded error survived lint",
-                                    node.id
-                                ))
-                            })?;
-                        boundary_hosts.push((ix, b.attached_to.clone().unwrap_or_default()));
-                        ExecKind::ErrorBoundary { code }
-                    }
-                    BoundaryTrigger::Timer(spec) => {
-                        boundary_hosts.push((ix, b.attached_to.clone().unwrap_or_default()));
-                        ExecKind::TimerBoundary {
-                            due: timer_due(node, spec)?,
+                NodeKind::Boundary(b) => {
+                    // Recorded once, before the trigger says which kind of
+                    // arm this is: every boundary has a host, and the host
+                    // pass below is the one place that validates it.
+                    boundary_hosts.push((ix, b.attached_to.clone().unwrap_or_default()));
+                    match &b.trigger {
+                        BoundaryTrigger::Error { error_ref } => {
+                            let code = error_ref
+                                .as_deref()
+                                .and_then(|r| defs.errors.iter().find(|e| e.id == r))
+                                .and_then(|e| e.code.clone())
+                                .ok_or_else(|| {
+                                    CompileError::Internal(format!(
+                                        "error boundary '{}' without a coded error survived lint",
+                                        node.id
+                                    ))
+                                })?;
+                            ExecKind::ErrorBoundary { code }
                         }
-                    }
-                    // The correlation binding is the *boundary's* own element
-                    // id, exactly as a catch's is its own: the XML says which
-                    // message is caught here, the manifest says by which key.
-                    BoundaryTrigger::Message(message_ref) => {
-                        boundary_hosts.push((ix, b.attached_to.clone().unwrap_or_default()));
-                        ExecKind::MessageBoundary {
+                        BoundaryTrigger::Timer(spec) => ExecKind::TimerBoundary {
+                            due: timer_due(node, spec)?,
+                        },
+                        // The correlation binding is the *boundary's* own element
+                        // id, exactly as a catch's is its own: the XML says which
+                        // message is caught here, the manifest says by which key.
+                        BoundaryTrigger::Message(message_ref) => ExecKind::MessageBoundary {
                             message: message_name(node, message_ref)?,
                             key: correlation(node)?,
                             // Not `b.cancel_activity`: lint refuses the
-                            // non-interrupting form, and reading the
-                            // attribute here would make `compile_without_lint`
-                            // execute one as if it interrupted.
+                            // non-interrupting form, and reading the attribute
+                            // here would make `compile_without_lint` execute one
+                            // as if it interrupted.
                             interrupting: true,
+                        },
+                        _ => {
+                            return Err(CompileError::Internal(format!(
+                                "unsupported boundary trigger on '{}' survived lint",
+                                node.id
+                            )));
                         }
                     }
-                    _ => {
-                        return Err(CompileError::Internal(format!(
-                            "unsupported boundary trigger on '{}' survived lint",
-                            node.id
-                        )));
-                    }
-                },
+                }
                 NodeKind::SubProcess(_) => ExecKind::SubProcess {
                     scope: child_scope[&ix],
                 },
@@ -770,13 +829,16 @@ impl ExecutableProcess {
                 // it, so the arm could only ever be created and withdrawn in
                 // one step (lint refuses it; this is the "survived lint"
                 // guard behind that).
+                //
+                // Asked of the **model** kind, which is the kind lint judged:
+                // a second allowlist over `ExecKind` is a second answer to
+                // one question, and this one had already drifted (an
+                // intermediate message catch and a receive task are both
+                // `MessageCatch`, so it accepted a host lint refuses).
+                // `nodes` and `flat` share indices here — the only `continue`
+                // in the node pass returned above with `MissingDecision`.
                 ExecKind::TimerBoundary { .. } | ExecKind::MessageBoundary { .. } => {
-                    if !matches!(
-                        nodes[host].kind,
-                        ExecKind::Task { .. }
-                            | ExecKind::MessageCatch { .. }
-                            | ExecKind::SubProcess { .. }
-                    ) {
+                    if !flat[host].1.kind.is_supported_boundary_host() {
                         return Err(CompileError::Internal(format!(
                             "boundary '{}' on unsupported host survived lint",
                             nodes[boundary_ix].id
@@ -871,20 +933,10 @@ impl ExecutableProcess {
         self.boundaries.get(&host).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// What `node` subscribes with, if anything: `(message, correlation
-    /// key)` for a message catch, a receive task **or** a message boundary.
-    ///
-    /// One accessor because `subscribe` is the single arming chokepoint for
-    /// all three — a second one would be a second place for the key-type and
-    /// duplicate rules to be applied slightly differently.
+    /// What `node` subscribes with, if anything — see
+    /// [`ExecKind::message_arm`], which is where the answer lives.
     pub fn message_arm(&self, node: NodeIx) -> Option<(&str, &[String])> {
-        match &self.nodes[node].kind {
-            ExecKind::MessageCatch { message, key }
-            | ExecKind::MessageBoundary { message, key, .. } => {
-                Some((message.as_str(), key.as_slice()))
-            }
-            _ => None,
-        }
+        self.nodes[node].kind.message_arm()
     }
 
     pub fn flow_by_id(&self, id: &str) -> Option<FlowIx> {
@@ -943,16 +995,7 @@ fn ambiguous_message_arm(
             }
         }
     };
-    let arm = |ix: NodeIx| -> Option<(String, String)> {
-        match &nodes[ix].kind {
-            ExecKind::MessageCatch { message, key }
-            | ExecKind::MessageBoundary { message, key, .. } => {
-                Some((message.clone(), key.join(".")))
-            }
-            _ => None,
-        }
-    };
-
+    let mut found: Vec<AmbiguousArms> = Vec::new();
     for (&host, attached) in boundaries {
         let mut live: Vec<NodeIx> = attached
             .iter()
@@ -977,18 +1020,29 @@ fn ambiguous_message_arm(
 
         let mut groups: BTreeMap<(String, String), Vec<NodeIx>> = BTreeMap::new();
         for n in live {
-            if let Some(k) = arm(n) {
-                groups.entry(k).or_default().push(n);
+            if let Some((message, key)) = nodes[n].kind.message_arm() {
+                groups
+                    .entry((message.to_string(), key.join(".")))
+                    .or_default()
+                    .push(n);
             }
         }
-        if let Some(((message, binding), elements)) = groups.into_iter().find(|(_, v)| v.len() > 1)
-        {
-            return Some(CompileError::AmbiguousMessageArm {
+        for ((message, binding), elements) in groups {
+            if elements.len() < 2 {
+                continue;
+            }
+            let group = AmbiguousArms {
                 elements: elements.iter().map(|&n| nodes[n].id.clone()).collect(),
                 message,
                 binding,
-            });
+            };
+            // Nested hosts can reach the same set twice (a subprocess
+            // boundary sees an inner receive task's own boundary, and so
+            // does that receive task): one group, reported once.
+            if !found.contains(&group) {
+                found.push(group);
+            }
         }
     }
-    None
+    (!found.is_empty()).then_some(CompileError::AmbiguousMessageArm(found))
 }

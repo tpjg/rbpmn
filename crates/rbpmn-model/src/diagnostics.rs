@@ -161,7 +161,7 @@ pub const CATALOGUE: &[RuleInfo] = &[
     RuleInfo {
         id: rule::MESSAGE_HAS_CORRELATION,
         severity: Severity::Error,
-        summary: "Every message start/catch/throw references a named message; correlation bindings (FEEL qualified names) are registered in code and checked at deploy.",
+        summary: "Every message start/catch/throw/boundary references a named message; correlation bindings (FEEL qualified names) are registered in code and checked at deploy — a message boundary needs its own, keyed by the boundary's element id, never the host's.",
     },
     RuleInfo {
         id: rule::NO_FOREIGN_IMPLEMENTATION,

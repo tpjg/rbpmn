@@ -290,6 +290,11 @@ So: **touching any of these means re-reading `spec/` and re-running
   voluntary hand-back (`release_task`), the `guard_lease` predicate
 - the scheduler's claim path (`try_fire`) — pick, NOWAIT, re-check, and the
   in-transaction decision evaluation that can now abort a claim already made
+- `correlate_in_tx`'s resolve → lock → re-check (`runtime.rs`): the re-check
+  confirms *this* subscription row is still in the rehydrated state, never
+  "some open subscription" (`spec/BoundaryExit.tla`, `LateCallsAreTyped` —
+  `BoundaryExit_AnyRowRecheck.cfg` is the loosened form failing), and like the
+  timer claim it sees the row, never its token (`SubscriptionTeardown.cfg`)
 - what scope teardown reaps (`step.rs::tear_down_scope`) — specifically that
   a reaped token's arms are withdrawn *with* it
 - retention's plan/archive/execute split, the DUE re-check under the row

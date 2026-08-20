@@ -136,7 +136,17 @@ impl NodeKind {
         )
     }
 
-    /// Activities that can host boundary events (v1 subset).
+    /// The hosts [`Self::is_supported_boundary_host`] accepts, spelled for a
+    /// modeller. It lives beside the predicate — and is the only place the
+    /// list is written in prose — because the linter's message, the
+    /// predicate and the compiler's "survived lint" guard had already drifted
+    /// apart once.
+    pub const SUPPORTED_BOUNDARY_HOSTS: &'static str =
+        "service task, user task, receive task, embedded subprocess";
+
+    /// Activities that can host boundary events (v1 subset). **The** answer:
+    /// the linter asks it, and so does the compiler's guard, against this
+    /// same model kind.
     ///
     /// Deliberately **not** the business rule task: a decision is answered
     /// inside the transaction that parks its token, so a boundary there is
