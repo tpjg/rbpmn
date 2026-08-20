@@ -1,7 +1,7 @@
 // The validator: tiers L1 and L2, both of them the engine's own code.
 //
-//   L1  model-only lint   — rbpmn-model
-//   L2  model + manifest  — rbpmn-core::check_deployable
+//   L1  model-only lint              — rbpmn-model
+//   L2  model + manifest + decisions  — rbpmn-core::check_deployable
 //
 // Compiled to wasm32 from the same crates deploy uses, so the editor never
 // reimplements a rule and cannot reach a different verdict. L3 — are those
@@ -9,7 +9,7 @@
 // it is the one tier that needs a server and the only one that is not shared
 // code.
 
-import init, { check_deployable } from '../../wasm/rbpmn_wasm.js';
+import init, { check_deployable, evaluate_decision } from '../../wasm/rbpmn_wasm.js';
 import { WASM_BASE64 } from '../generated/wasm-inline.js';
 
 let ready = null;
@@ -34,6 +34,33 @@ export function initValidator() {
 /// "deploy would succeed". Reporting it as success would skip
 /// `unresolved-topic`, which is precisely the wiring gap the manifest exists
 /// to make visible.
-export function checkModel(xml, bindings) {
-  return JSON.parse(check_deployable(xml, JSON.stringify(bindings)));
+///
+/// Decisions are the exception, and the reason this tier is worth having:
+/// topics need a server to resolve, but a deployment's DMN artifacts travel
+/// inside it, so `unresolved-decision` and `feel-deterministic` are answered
+/// completely here. A confidential decision table is validated without
+/// leaving the browser.
+export function checkModel(xml, bindings, decisions = []) {
+  return JSON.parse(
+    check_deployable(xml, JSON.stringify(bindings), JSON.stringify(decisions))
+  );
+}
+
+/// Run one decision against sample input, for the try-it pane.
+///
+/// The same evaluator the engine runs, so what the pane shows is what an
+/// instance would get. A `null` outcome is an *answer*, not an error — dsntk
+/// cannot distinguish a legal "no rule matched" from a broken evaluation, so
+/// the pane shows the reason as explanation rather than as a verdict
+/// (docs/dmn.md, "What P1 measured").
+export function evaluateDecision(decisions, invocable, input) {
+  return JSON.parse(
+    evaluate_decision(
+      JSON.stringify(decisions),
+      invocable.namespace,
+      invocable.model,
+      invocable.name,
+      input
+    )
+  );
 }

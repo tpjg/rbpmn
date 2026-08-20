@@ -2,7 +2,7 @@
 //! the invariants the projection layer will rely on.
 
 use rbpmn_core::*;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 
@@ -684,4 +684,318 @@ fn freeze_parks_in_flight_sibling_tokens() {
     );
     // The sibling never entered its node: no work item was created for it.
     assert_eq!(state.open_work_items().count(), 0);
+}
+
+/// A decision's answer **replaces** what is at its bound path.
+///
+/// Both halves were wrong when the answer was applied as an RFC 7386 merge
+/// patch: null deleted the path instead of being stored, and an object answer
+/// kept keys from whatever was there before — so a decision in a loop would
+/// report a result it never produced.
+#[test]
+fn a_decision_answer_replaces_the_bound_path() {
+    let proc = ExecutableProcess::compile(
+        &load("accept/25-business-rule-task.bpmn"),
+        "p",
+        &Bindings::new().decision("decide", "Discount", "order.pricing"),
+    )
+    .unwrap();
+
+    // An object answer over an existing object: no stale keys survive.
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({ "order": { "pricing": { "stale": 1 }, "id": "A-1" } }),
+        },
+    )
+    .unwrap();
+    let token = awaiting_decision(&state);
+    step(
+        &proc,
+        &mut state,
+        Command::CompleteDecision {
+            token,
+            answer: Some(json!({ "fresh": 2 })),
+            reason: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(state.variables["order"]["pricing"], json!({ "fresh": 2 }));
+    // Siblings of the bound path are untouched — this is an assignment at a
+    // path, not a wholesale replacement of the document.
+    assert_eq!(state.variables["order"]["id"], json!("A-1"));
+
+    // A null answer is stored, not deleted.
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({ "order": { "pricing": { "stale": 1 } } }),
+        },
+    )
+    .unwrap();
+    let token = awaiting_decision(&state);
+    step(
+        &proc,
+        &mut state,
+        Command::CompleteDecision {
+            token,
+            answer: Some(Value::Null),
+            reason: Some("no rule matched".to_string()),
+        },
+    )
+    .unwrap();
+    let order = state.variables["order"].as_object().unwrap();
+    assert!(order.contains_key("pricing"), "{:?}", state.variables);
+    assert!(order["pricing"].is_null());
+
+    // The path is created when it is not there, and a non-object in the way
+    // is replaced rather than freezing the instance over a name collision.
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({ "order": "not an object" }),
+        },
+    )
+    .unwrap();
+    let token = awaiting_decision(&state);
+    step(
+        &proc,
+        &mut state,
+        Command::CompleteDecision {
+            token,
+            answer: Some(json!(7)),
+            reason: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(state.variables["order"]["pricing"], json!(7));
+}
+
+fn awaiting_decision(state: &InstanceState) -> rbpmn_core::TokenId {
+    state
+        .tokens()
+        .find(|(_, t)| t.wait == rbpmn_core::WaitKind::Decision)
+        .map(|(id, _)| id)
+        .expect("a token should await the decision")
+}
+
+/// A decision's reason has to survive into the record, on both paths.
+///
+/// FEEL nulls a decision whose input was the wrong type exactly as it nulls
+/// one where no rule matched, and a freeze with no explanation is a dead end
+/// for whoever finds the instance. Both were being dropped on the floor. The
+/// reason stays out of `Display` — golden traces are control flow — so this
+/// asserts on the payload, which is what `/v1/events` serialises.
+#[test]
+fn a_decision_explains_itself_in_the_record() {
+    let proc = ExecutableProcess::compile(
+        &load("accept/25-business-rule-task.bpmn"),
+        "p",
+        &Bindings::new().decision("decide", "Discount", "order.pricing"),
+    )
+    .unwrap();
+
+    // The null answer that continues: the reason rides along with it.
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({}),
+        },
+    )
+    .unwrap();
+    let token = awaiting_decision(&state);
+    let events = step(
+        &proc,
+        &mut state,
+        Command::CompleteDecision {
+            token,
+            answer: Some(Value::Null),
+            reason: Some("no rule matched".to_string()),
+        },
+    )
+    .unwrap();
+    let evaluated = events
+        .iter()
+        .find_map(|e| match e {
+            Event::DecisionEvaluated { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("a decision was evaluated");
+    assert_eq!(evaluated.as_deref(), Some("no rule matched"));
+    // ...and the trace line is unchanged by it.
+    assert!(
+        events
+            .iter()
+            .any(|e| e.to_string() == "decision-evaluated decide"),
+        "{events:?}"
+    );
+
+    // A reason attached to a real value would read as though something had
+    // gone wrong with it, so it is dropped there.
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({}),
+        },
+    )
+    .unwrap();
+    let token = awaiting_decision(&state);
+    let events = step(
+        &proc,
+        &mut state,
+        Command::CompleteDecision {
+            token,
+            answer: Some(json!(1)),
+            reason: Some("leaked".to_string()),
+        },
+    )
+    .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::DecisionEvaluated { reason: None, .. })),
+        "{events:?}"
+    );
+
+    // The failure that freezes: no code — DMN has none to give — but the
+    // detail says what happened.
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({}),
+        },
+    )
+    .unwrap();
+    let token = awaiting_decision(&state);
+    let events = step(
+        &proc,
+        &mut state,
+        Command::CompleteDecision {
+            token,
+            answer: None,
+            reason: Some("a function has no JSON representation".to_string()),
+        },
+    )
+    .unwrap();
+    let incident = events
+        .iter()
+        .find_map(|e| match e {
+            Event::IncidentRaised { code, detail, .. } => Some((code.clone(), detail.clone())),
+            _ => None,
+        })
+        .expect("an incident was raised");
+    assert_eq!(incident.0, None);
+    assert_eq!(
+        incident.1.as_deref(),
+        Some("a function has no JSON representation")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.to_string() == "incident-raised decide"),
+        "{events:?}"
+    );
+}
+
+/// A decision parked in one branch does not survive another branch's freeze.
+///
+/// `WaitKind::Decision` is the only wait state that must not outlive a step —
+/// the caller answers it before the transaction ends, which is why persistence
+/// refuses to write one. A parallel split whose second branch froze left the
+/// first parked on a decision *on a Failed instance*, and the engine's drain
+/// loop then answered it and got `InstanceNotActive` back. The transaction that
+/// rolled back was the one that would have recorded the incident, so the
+/// instance was never created at all and every retry did the same thing.
+#[test]
+fn a_freeze_takes_a_sibling_decision_with_it() {
+    let proc = ExecutableProcess::compile(
+        &load("accept/27-parallel-decision-and-freeze.bpmn"),
+        "p",
+        &Bindings::new().decision("decide", "Discount", "order.pricing"),
+    )
+    .unwrap();
+
+    // No `order.slaDuration`, so the timer branch cannot resolve and freezes
+    // while the decision branch is parked.
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({}),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(state.status, InstanceStatus::Failed);
+    assert!(
+        !state.tokens().any(|(_, t)| t.wait == WaitKind::Decision),
+        "a decision outlived the freeze: {:?}",
+        state
+            .tokens()
+            .map(|(_, t)| t.wait.clone())
+            .collect::<Vec<_>>()
+    );
+    // Both branches park where they stood, so inspection still shows where.
+    let at: Vec<&str> = state.tokens().map(|(_, t)| proc.node_id(t.node)).collect();
+    assert!(at.contains(&"decide"), "{at:?}");
+    assert!(at.contains(&"wait"), "{at:?}");
+}
+
+/// A history is self-contained: it records the document it started from.
+///
+/// Every later change is in the log — a patch in `variables-patched`, an
+/// answer in `decision-evaluated` — but until `instance-started` carried the
+/// initial document, the ground those applied to was not, and reconstructing
+/// the variables at any point needed the `Start` command from outside. Now the
+/// answer is a forward fold from the start, which is also the only direction
+/// that works: a merge patch's `null` deletes a member without recording what
+/// it deleted, so patches cannot be inverted to walk backwards.
+///
+/// The trace line is deliberately unchanged — business data of unbounded shape
+/// does not belong in a golden format.
+#[test]
+fn the_history_records_what_the_instance_started_with() {
+    let proc =
+        ExecutableProcess::compile(&load("accept/01-minimal.bpmn"), "p", &Bindings::new()).unwrap();
+    let mut state = InstanceState::new();
+    let opening = json!({ "order": { "id": "A-1", "amount": 900 }, "channel": "web" });
+    let events = step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: opening.clone(),
+        },
+    )
+    .unwrap();
+
+    let recorded = events
+        .iter()
+        .find_map(|e| match e {
+            Event::InstanceStarted { variables } => Some(variables.clone()),
+            _ => None,
+        })
+        .expect("the instance started");
+    assert_eq!(recorded, opening);
+
+    // ...and the trace format did not move with it.
+    assert_eq!(events[0].to_string(), "instance-started");
+
+    // The payload is what `/v1/events` serialises, so it has to survive the
+    // round trip the projection puts it through.
+    let payload = serde_json::to_value(&events[0]).unwrap();
+    assert_eq!(payload["kind"], "instance-started");
+    assert_eq!(payload["variables"], opening);
 }

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error dmn-validates @ 28-dangling-reference
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/28-dangling-reference" name="28-dangling-reference" id="_28-dangling-reference">
+  <decision name="Needs" id="needs">
+    <variable name="Needs" typeRef="number"/>
+    <knowledgeRequirement><requiredKnowledge href="#missingBkm"/></knowledgeRequirement>
+    <literalExpression><text>1</text></literalExpression>
+  </decision>
+</definitions>

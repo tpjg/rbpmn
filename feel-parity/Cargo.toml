@@ -1,6 +1,6 @@
 [package]
 name = "rbpmn-feel-parity"
-description = "Differential check: rbpmn's FEEL-subset condition evaluator against dsntk's FEEL. Deliberately outside the workspace — dsntk pulls ~170 crates plus a C library, none of which may reach rbpmn-model."
+description = "Differential check: rbpmn's FEEL-subset condition evaluator against dsntk's FEEL. Deliberately outside the workspace — dsntk pulls ~170 crates, none of which may reach rbpmn-model."
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
@@ -11,9 +11,12 @@ publish = false
 rbpmn-model = { path = "../crates/rbpmn-model" }
 serde_json = "1"
 
-# Pinned: dsntk is effectively single-maintainer (design brief, "Post-v1").
-dsntk-feel = "=0.3.0"
-dsntk-feel-parser = "=0.3.0"
-dsntk-feel-evaluator = "=0.3.0"
+# The fork rbpmn ships, at the rev it ships — this differential is only worth
+# running against the FEEL an rbpmn condition will actually meet at deploy.
+# (`just dsntk-rev` does not police this one: it is deliberately allowed to lag
+# while a fork rev is being evaluated, and `just feel-parity` is not on CI.)
+dsntk-feel = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
+dsntk-feel-parser = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
+dsntk-feel-evaluator = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
 
 [workspace]

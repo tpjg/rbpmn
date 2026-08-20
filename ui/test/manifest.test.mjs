@@ -12,6 +12,7 @@ import {
   parseManifest,
   serializeManifest,
   setBinding,
+  setDecisionBinding,
 } from '../src/editor/manifest.js';
 
 test('an empty document is an empty manifest, not an error', () => {
@@ -21,7 +22,12 @@ test('an empty document is an empty manifest, not an error', () => {
 
 test('missing groups are filled in, present ones preserved', () => {
   const parsed = parseManifest('{"topics":{"st":"payments"}}');
-  assert.deepEqual(parsed, { topics: { st: 'payments' }, correlations: {}, indexes: [] });
+  assert.deepEqual(parsed, {
+    topics: { st: 'payments' },
+    correlations: {},
+    indexes: [],
+    decisions: {},
+  });
 });
 
 // Quietly repairing a manifest here would produce the exact failure this
@@ -49,6 +55,7 @@ test('serialize/parse round-trips', () => {
     topics: { st: 'payments' },
     correlations: { rt: 'order.id' },
     indexes: ['order.status'],
+    decisions: { brt: { decision: 'Discount', result: 'order.discount' } },
   };
   assert.deepEqual(parseManifest(serializeManifest(manifest)), manifest);
 });
@@ -89,4 +96,53 @@ test('bindings pointing at absent elements are reported', () => {
     { group: 'correlations', elementId: 'alsoGone' },
   ]);
   assert.deepEqual(orphanedBindings(manifest, ['st', 'gone', 'alsoGone']), []);
+});
+
+// A business-rule task binds two things — which decision, and where the answer
+// lands — so its manifest entries are objects rather than strings.
+test('decision bindings round-trip and are validated as a pair', () => {
+  const manifest = parseManifest(
+    '{"decisions":{"brt":{"decision":"Discount","result":"order.discount"}}}'
+  );
+  assert.deepEqual(manifest.decisions.brt, {
+    decision: 'Discount',
+    result: 'order.discount',
+  });
+
+  for (const bad of [
+    '{"decisions":{"brt":"Discount"}}',
+    '{"decisions":{"brt":{"decision":"Discount"}}}',
+    '{"decisions":{"brt":{"decision":"Discount","result":""}}}',
+    '{"decisions":{"brt":{"decision":"D","result":"r","extra":1}}}',
+    '{"decisions":[]}',
+  ]) {
+    assert.throws(() => parseManifest(bad), undefined, bad);
+  }
+});
+
+// Half a binding is not a binding deploy would accept, and half of one in the
+// file is worse than none — but typing one field must not erase the other.
+test('a half-written decision binding never reaches the file', () => {
+  let manifest = setDecisionBinding(emptyManifest(), 'brt', 'decision', 'Discount');
+  assert.equal(manifest.decisions.brt.decision, 'Discount');
+  assert.equal(serializeManifest(manifest), '{}\n');
+
+  manifest = setDecisionBinding(manifest, 'brt', 'result', 'order.discount');
+  assert.match(serializeManifest(manifest), /"decisions"/);
+
+  // Clearing either half takes the whole entry out of the file again.
+  const cleared = setDecisionBinding(manifest, 'brt', 'result', '');
+  assert.equal(serializeManifest(cleared), '{}\n');
+});
+
+test('a decision binding on a vanished element is reported as orphaned', () => {
+  const manifest = setDecisionBinding(
+    setDecisionBinding(emptyManifest(), 'gone', 'decision', 'D'),
+    'gone',
+    'result',
+    'a.b'
+  );
+  assert.deepEqual(orphanedBindings(manifest, ['still-here']), [
+    { group: 'decisions', elementId: 'gone' },
+  ]);
 });

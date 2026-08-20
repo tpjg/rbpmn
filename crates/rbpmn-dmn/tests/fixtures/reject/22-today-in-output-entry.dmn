@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error feel-deterministic @ aged
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/22-today-in-output-entry" name="22-today-in-output-entry" id="_22-today-in-output-entry">
+  <inputData name="Born" id="born">
+    <variable name="Born" typeRef="date"/>
+  </inputData>
+  <decision name="Aged" id="aged">
+    <variable name="Aged" typeRef="Any"/>
+    <informationRequirement><requiredInput href="#born"/></informationRequirement>
+    <decisionTable hitPolicy="UNIQUE">
+      <input><inputExpression typeRef="date"><text>Born</text></inputExpression></input>
+      <output typeRef="Any"/>
+      <rule><inputEntry><text>-</text></inputEntry><outputEntry><text>years and months duration(Born, today())</text></outputEntry></rule>
+    </decisionTable>
+  </decision>
+</definitions>

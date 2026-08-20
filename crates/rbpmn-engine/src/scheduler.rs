@@ -31,7 +31,7 @@
 use crate::listen::Wakeup;
 use crate::runtime::{DefinitionRef, insert_engine_event, load_instance_nowait, persist_step};
 use crate::{Engine, EngineError, MAX_RECORDED_TIMER_FAILURES};
-use rbpmn_core::{Command, InstanceStatus, TimerId, step};
+use rbpmn_core::{Command, InstanceStatus, TimerId};
 use sqlx::Row;
 use std::time::Duration;
 use uuid::Uuid;
@@ -224,6 +224,20 @@ impl Engine {
     ///   unlocked pick; it cannot confirm the row's token survived. That
     ///   second half is teardown's invariant, upheld in
     ///   `Advancer::tear_down_scope`.
+    /// * **The transaction can roll back after the re-check has passed**
+    ///   (`spec/TimerTeardown.tla`, `Abort`). DMN put that window here: this
+    ///   path runs `step_answering_decisions`, which reads the definition's
+    ///   DMN and evaluates it in this same transaction, so a decision that
+    ///   will not compile aborts a claim already made. The rollback returns
+    ///   the claim rather than consuming it — identical state to `Drop` — and
+    ///   the model says so rather than the comment merely asserting it.
+    ///
+    ///   What that evaluation adds is *not* a new lock. The decision cache is
+    ///   an in-process `RwLock<HashMap>` of exactly the shape the compiled-
+    ///   process cache already had, never held across an `await`; and the
+    ///   `rbpmn_definition_decision` read takes no row locks, so it cannot
+    ///   join a cycle. `spec/LockOrder.tla` models database locks and needs
+    ///   no new arity for it.
     async fn try_fire(&self, instance_id: Uuid, timer_no: i64) -> Result<Attempt, EngineError> {
         let mut tx = self.pool().begin().await?;
         // Advisory-first is deadlock-free: try-lock never waits, and every
@@ -262,13 +276,23 @@ impl Engine {
             return Ok(Attempt::Resolved); // fired or cancelled under us
         }
 
-        let events = step(
+        // `step_answering_decisions`, not `step`: a timer can resume a token
+        // straight into a business-rule task, and a bare step would park it on
+        // a decision nobody answers. Every path that advances a token goes
+        // through this one — `persist_step` refuses to write a decision wait
+        // precisely so the next path that forgets fails loudly here rather
+        // than committing an instance no loader can read.
+        let events = crate::runtime::step_answering_decisions(
+            self,
+            &mut tx,
             &proc,
+            &definition,
             &mut state,
             Command::FireTimer {
                 id: TimerId(timer_no as u64),
             },
-        )?;
+        )
+        .await?;
         persist_step(&mut tx, &proc, &definition, instance_id, &state, &events).await?;
         tx.commit().await?;
         Ok(Attempt::Fired)
@@ -283,15 +307,21 @@ impl Engine {
         failures: u32,
         error: &EngineError,
     ) -> Result<(), EngineError> {
-        let Some(row) =
-            sqlx::query("select definition_id, definition_key from rbpmn_instance where id = $1")
-                .bind(instance_id)
-                .fetch_optional(self.pool())
-                .await?
+        let Some(row) = sqlx::query(
+            "select definition_id, definition_key, definition_version \
+             from rbpmn_instance where id = $1",
+        )
+        .bind(instance_id)
+        .fetch_optional(self.pool())
+        .await?
         else {
             return Ok(()); // instance gone; nothing to attach the event to
         };
-        let definition = DefinitionRef::new(row.get("definition_id"), row.get("definition_key"));
+        let definition = DefinitionRef::new(
+            row.get("definition_id"),
+            row.get("definition_key"),
+            row.get("definition_version"),
+        );
         let mut conn = self.pool().acquire().await?;
         insert_engine_event(
             &mut conn,

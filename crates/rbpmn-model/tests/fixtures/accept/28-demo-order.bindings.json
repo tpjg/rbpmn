@@ -1,0 +1,15 @@
+{
+  "topics": {
+    "charge": "payments",
+    "score": "risk-scoring"
+  },
+  "indexes": [
+    "channel"
+  ],
+  "decisions": {
+    "triage": {
+      "decision": "Triage",
+      "result": "triage.band"
+    }
+  }
+}

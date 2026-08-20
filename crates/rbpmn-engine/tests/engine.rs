@@ -595,6 +595,59 @@ async fn failing_a_live_lease_requires_its_owner() {
     db.drop().await;
 }
 
+/// The variable document is the application's, and the engine promises only
+/// to carry it. A number wider than an `f64` must therefore come back exactly
+/// as it went in — through `start`, through a merge patch, and through the
+/// `jsonb` column in between.
+///
+/// This is what `serde_json`'s `arbitrary_precision` feature buys, and the
+/// only thing that pins it: without it `serde_json::Number` is an `f64`, so a
+/// 30-digit order id silently became `1.2345678901234568e+29` on the way in —
+/// before PostgreSQL, whose `jsonb` numbers are arbitrary-precision `numeric`,
+/// ever saw it. Removing the feature turns this test red rather than turning
+/// somebody's invoice wrong (docs/dmn.md, "The `arbitrary_precision` spike").
+#[tokio::test]
+async fn numbers_wider_than_f64_survive_the_variable_document() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+
+    // Written as text, so the assertion is about the values themselves and
+    // not about whatever `json!` would have parsed them into.
+    let initial: serde_json::Value = serde_json::from_str(
+        r#"{ "rate": 0.3333333333333333333333333333333333,
+              "orderId": 123456789012345678901234567890,
+              "price": 1.50 }"#,
+    )
+    .unwrap();
+    let started = engine.start("p", None, initial).await.unwrap();
+
+    let id = open_items(&db.pool, started.id).await[0].0;
+    let patch: serde_json::Value =
+        serde_json::from_str(r#"{ "total": 9999999999999999999999999999999999 }"#).unwrap();
+    engine.complete_work_item(id, patch).await.unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+
+    let vars = engine.inspect_instance(started.id).await.unwrap().variables;
+    for (field, expected) in [
+        ("rate", "0.3333333333333333333333333333333333"),
+        ("orderId", "123456789012345678901234567890"),
+        // Trailing zeros are the application's business too: a price is 1.50.
+        ("price", "1.50"),
+        ("total", "9999999999999999999999999999999999"),
+    ] {
+        assert_eq!(
+            vars[field].to_string(),
+            expected,
+            "{field} did not survive the round trip"
+        );
+    }
+    db.drop().await;
+}
+
 #[tokio::test]
 async fn nul_bytes_in_variables_are_rejected_loudly() {
     let db = TestDb::create().await;
@@ -2332,7 +2385,7 @@ async fn inspection_carries_the_bindings_manifest() {
 // Phase 4: the pull-mode task API
 // ---------------------------------------------------------------------------
 
-use rbpmn_engine::{GetTaskOptions, LockExtension, TaskFilter, TaskOrder};
+use rbpmn_engine::{GetTaskOptions, LockExtension, Released, TaskFilter, TaskOrder};
 
 async fn three_review_instances(engine: &Engine) -> Vec<uuid::Uuid> {
     engine
@@ -2379,6 +2432,130 @@ async fn tasks_are_fifo_by_default_lifo_on_request() {
 }
 
 #[tokio::test]
+async fn a_claimed_task_names_the_pinned_definition_not_the_latest() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let xml = fixture("accept/01-minimal.bpmn");
+
+    let v1 = engine.deploy(&xml, &Bindings::default()).await.unwrap();
+    assert_eq!(v1.version, 1);
+    // The instance pins v1 and never migrates.
+    let instance = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let changed = xml.replace("<bpmn:process", "<!-- v2 --><bpmn:process");
+    let v2 = engine.deploy(&changed, &Bindings::default()).await.unwrap();
+    assert_eq!(v2.version, 2, "max(version) for key 'p' is now 2");
+    assert_ne!(v2.definition_id, v1.definition_id);
+
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(task.instance_id, instance.id);
+    assert_eq!(task.definition_key, "p");
+    assert_eq!(
+        (task.definition_id, task.definition_version),
+        (v1.definition_id, 1),
+        "the claim reports the pinned definition, not the latest version"
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn releasing_a_task_returns_it_to_the_queue_at_once() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let ids = three_review_instances(&engine).await;
+
+    // A long lease: without the release, nothing else could have this task
+    // for ten minutes.
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("alice"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(task.instance_id, ids[0]);
+
+    // Held: a peer claiming FIFO gets the *next* instance, not this one.
+    let peer = engine
+        .get_task("review", &GetTaskOptions::new("bob"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(peer.instance_id, ids[1], "alice's task is not on offer");
+
+    assert_eq!(
+        engine
+            .release_task(task.id, "alice", task.lease_no)
+            .await
+            .unwrap(),
+        Released::Released
+    );
+    // Immediately claimable again — by someone else, at the front of the
+    // queue, with the lease gone rather than waited out.
+    let reclaimed = engine
+        .get_task("review", &GetTaskOptions::new("carol"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(reclaimed.id, task.id, "FIFO: the released task is oldest");
+    assert_eq!(reclaimed.instance_id, ids[0]);
+
+    // The lease is carol's now: alice's stale release cannot take it from
+    // her — on either half of the guard — and it stays claimed.
+    assert_ne!(reclaimed.lease_no, task.lease_no, "a claim mints an epoch");
+    assert_eq!(
+        engine
+            .release_task(task.id, "alice", task.lease_no)
+            .await
+            .unwrap(),
+        Released::Lost
+    );
+    let (state, owner): (String, Option<String>) =
+        sqlx::query_as("select state, lock_owner from rbpmn_work_item where id = $1")
+            .bind(task.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (state.as_str(), owner.as_deref()),
+        ("locked", Some("carol"))
+    );
+
+    // A stranger cannot hand back what bob is holding, even holding bob's
+    // epoch — the owner check, from the other side (spec/Lease.tla,
+    // LiveLeaseEndsOnlyByItsHolder).
+    assert_eq!(
+        engine
+            .release_task(peer.id, "not-bob", peer.lease_no)
+            .await
+            .unwrap(),
+        Released::Lost
+    );
+    // Bob's own release lands, and a task nobody holds is the quiet no-op.
+    assert_eq!(
+        engine
+            .release_task(peer.id, "bob", peer.lease_no)
+            .await
+            .unwrap(),
+        Released::Released
+    );
+    assert_eq!(
+        engine
+            .release_task(peer.id, "bob", peer.lease_no)
+            .await
+            .unwrap(),
+        Released::Lost,
+        "a second release has nothing left to hand back"
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
 async fn leases_expire_and_tasks_return() {
     let db = TestDb::create().await;
     let engine = engine(&db).await;
@@ -2411,6 +2588,159 @@ async fn leases_expire_and_tasks_return() {
         .unwrap()
         .expect("expired lease is claimable");
     assert_eq!(reclaimed.id, task.id);
+    db.drop().await;
+}
+
+/// The bug the lease epoch exists for, driven exactly as it would happen:
+/// a release whose response was lost, retried after the same owner has
+/// claimed the same task again. Owner alone cannot tell those two claims
+/// apart, and FIFO makes the second one *likely* rather than exotic — the
+/// item just released is the oldest, so it is what the next claim returns.
+#[tokio::test]
+async fn a_replayed_release_cannot_free_the_claim_that_replaced_it() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let first = engine
+        .get_task("review", &GetTaskOptions::new("alice"))
+        .await
+        .unwrap()
+        .expect("a task");
+    // Committed, but the response never reached the client.
+    assert_eq!(
+        engine
+            .release_task(first.id, "alice", first.lease_no)
+            .await
+            .unwrap(),
+        Released::Released
+    );
+
+    // Alice's next claim hands back the very task she released.
+    let again = engine
+        .get_task("review", &GetTaskOptions::new("alice"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(again.id, first.id);
+    assert_eq!(again.lease_no, first.lease_no + 1, "a claim mints an epoch");
+
+    // The retry lands. It names a spent epoch, so it does nothing — and
+    // says so, rather than reporting a success that undid a live claim.
+    assert_eq!(
+        engine
+            .release_task(first.id, "alice", first.lease_no)
+            .await
+            .unwrap(),
+        Released::Lost
+    );
+    let (state, owner): (String, Option<String>) =
+        sqlx::query_as("select state, lock_owner from rbpmn_work_item where id = $1")
+            .bind(first.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (state.as_str(), owner.as_deref()),
+        ("locked", Some("alice")),
+        "the live claim survives its own predecessor's retry"
+    );
+    // Nobody else can take it while alice holds it.
+    assert!(
+        engine
+            .get_task("review", &GetTaskOptions::new("bob"))
+            .await
+            .unwrap()
+            .is_none(),
+        "a freed task here would be the double delivery the lease prevents"
+    );
+
+    // The current epoch still releases, so nothing was wedged by refusing.
+    assert_eq!(
+        engine
+            .release_task(again.id, "alice", again.lease_no)
+            .await
+            .unwrap(),
+        Released::Released
+    );
+    db.drop().await;
+}
+
+/// The one place `release_task` deliberately parts company with
+/// `extend_lock`: its guard carries no liveness clause. An expired lease
+/// nobody reclaimed still names its owner, and releasing it tidies the stale
+/// `lock_owner` off a row that was already claimable. Harmonising the two
+/// statements would look like a cleanup and would silently delete this.
+#[tokio::test]
+async fn an_expired_lease_is_still_its_owners_to_release() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let mut short = GetTaskOptions::new("w1");
+    short.ttl = Duration::from_millis(300);
+    let task = engine.get_task("review", &short).await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // The heartbeat is gone — extend_lock requires `lock_until > now()`.
+    assert_eq!(
+        engine
+            .extend_lock(task.id, "w1", Duration::from_secs(60))
+            .await
+            .unwrap(),
+        LockExtension::Lost
+    );
+    // The release is not: same owner, still locked, so the row is ours to
+    // hand back — and it comes back clean rather than lapsed.
+    assert_eq!(
+        engine
+            .release_task(task.id, "w1", task.lease_no)
+            .await
+            .unwrap(),
+        Released::Released
+    );
+    let (state, owner, deadline_cleared): (String, Option<String>, bool) = sqlx::query_as(
+        "select state, lock_owner, lock_until is null from rbpmn_work_item where id = $1",
+    )
+    .bind(task.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (state.as_str(), owner.as_deref(), deadline_cleared),
+        ("available", None, true),
+        "no lapsed lease left behind"
+    );
+
+    // Once a peer has taken it, the same expired claim is no longer ours.
+    let reclaimed = engine
+        .get_task("review", &GetTaskOptions::new("w2"))
+        .await
+        .unwrap()
+        .expect("released task is claimable");
+    assert_eq!(reclaimed.id, task.id);
+    assert_eq!(
+        engine
+            .release_task(task.id, "w1", task.lease_no)
+            .await
+            .unwrap(),
+        Released::Lost,
+        "ownership is the guard, and it moved"
+    );
     db.drop().await;
 }
 
@@ -3669,5 +3999,466 @@ async fn subprocess_error_boundary_catches_from_within() {
         status, "active",
         "a caught error must not freeze the instance"
     );
+    db.drop().await;
+}
+
+// ---------------------------------------------------------------- decisions
+//
+// A deployment carries its DMN artifacts (docs/dmn.md, D4), so an instance
+// pins the decisions that were in force exactly as it pins its process. These
+// tests run without the `dmn` feature too — and *that* is the interesting
+// half: an engine that cannot validate decisions must refuse a bundle
+// carrying them rather than accept it silently.
+
+const DECISION_DMN: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/pricing" name="pricing" id="_pricing">
+  <inputData name="Amount" id="amount"><variable name="Amount" typeRef="number"/></inputData>
+  <decision name="Discount" id="discount">
+    <variable name="Discount" typeRef="number"/>
+    <informationRequirement><requiredInput href="#amount"/></informationRequirement>
+    <literalExpression><text>Amount * 0.1</text></literalExpression>
+  </decision>
+</definitions>"##;
+
+#[cfg(feature = "dmn")]
+async fn decisions_of(pool: &PgPool, definition_id: uuid::Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "select dmn_xml from rbpmn_definition_decision where definition_id = $1 order by ordinal",
+    )
+    .bind(definition_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// The artifacts persist with the definition, in order, and are part of its
+/// content: changing a decision allocates a new version exactly as changing
+/// the diagram does. Without that, a rule change would silently apply to
+/// instances that were validated against the old one.
+#[cfg(feature = "dmn")]
+#[tokio::test]
+async fn a_deployment_carries_and_versions_its_decisions() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bundle =
+        rbpmn_engine::Bundle::new(fixture("accept/01-minimal.bpmn")).decision(DECISION_DMN);
+
+    let first = engine.deploy_bundle(&bundle).await.unwrap();
+    assert_eq!(decisions_of(&db.pool, first.definition_id).await.len(), 1);
+
+    // Byte-identical bundle: same version, no new row.
+    let again = engine.deploy_bundle(&bundle).await.unwrap();
+    assert!(again.reused);
+    assert_eq!(again.version, first.version);
+
+    // A changed decision is changed content.
+    let edited = rbpmn_engine::Bundle::new(fixture("accept/01-minimal.bpmn"))
+        .decision(DECISION_DMN.replace("Amount * 0.1", "Amount * 0.2"));
+    let third = engine.deploy_bundle(&edited).await.unwrap();
+    assert_eq!(third.version, first.version + 1);
+    assert!(decisions_of(&db.pool, third.definition_id).await[0].contains("0.2"));
+
+    // ...and the old version keeps the decisions it was validated with.
+    assert!(decisions_of(&db.pool, first.definition_id).await[0].contains("0.1"));
+    db.drop().await;
+}
+
+/// The rules that only exist because the artifacts travel inside the bundle:
+/// binding a decision needs no environment, so deploy can answer completely.
+#[cfg(feature = "dmn")]
+#[tokio::test]
+async fn decision_bindings_are_resolved_against_the_bundle() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bpmn = fixture("accept/01-minimal.bpmn");
+
+    let refused = |e: rbpmn_engine::DeployError, rule: &str| match e {
+        rbpmn_engine::DeployError::Rejected(d) => assert!(
+            d.iter().any(|d| d.rule == rule),
+            "expected {rule}, got {d:?}"
+        ),
+        other => panic!("expected a rejection, got {other:?}"),
+    };
+
+    // Nothing bundled: the binding cannot resolve.
+    let err = engine
+        .deploy_bundle(
+            &rbpmn_engine::Bundle::new(&bpmn).bindings(Bindings::new().decision(
+                "st",
+                "Discount",
+                "order.discount",
+            )),
+        )
+        .await
+        .unwrap_err();
+    refused(err, "unresolved-decision");
+
+    // Bundled, and it resolves.
+    engine
+        .deploy_bundle(
+            &rbpmn_engine::Bundle::new(&bpmn)
+                .bindings(Bindings::new().decision("st", "Discount", "order.discount"))
+                .decision(DECISION_DMN),
+        )
+        .await
+        .unwrap();
+
+    // A result path that is not a FEEL qualified name.
+    let err = engine
+        .deploy_bundle(
+            &rbpmn_engine::Bundle::new(&bpmn)
+                .bindings(Bindings::new().decision("st", "Discount", "not a path!"))
+                .decision(DECISION_DMN),
+        )
+        .await
+        .unwrap_err();
+    refused(err, "decision-has-binding");
+
+    // Two artifacts defining the same name: refused, never picked.
+    let other = DECISION_DMN
+        .replace("rbpmn.example/pricing", "rbpmn.example/other")
+        .replace(r#"name="pricing""#, r#"name="other""#);
+    let err = engine
+        .deploy_bundle(
+            &rbpmn_engine::Bundle::new(&bpmn)
+                .bindings(Bindings::new().decision("st", "Discount", "order.discount"))
+                .decision(DECISION_DMN)
+                .decision(other),
+        )
+        .await
+        .unwrap_err();
+    refused(err, "unresolved-decision");
+    db.drop().await;
+}
+
+/// A decision that reads the clock is refused at deploy, with the element
+/// that owns it — the same verdict the editor reaches offline.
+#[cfg(feature = "dmn")]
+#[tokio::test]
+async fn a_nondeterministic_decision_never_deploys() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let stamped = DECISION_DMN.replace("Amount * 0.1", "now()");
+    let err = engine
+        .deploy_bundle(
+            &rbpmn_engine::Bundle::new(fixture("accept/01-minimal.bpmn")).decision(stamped),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        rbpmn_engine::DeployError::Rejected(d) => assert!(
+            d.iter()
+                .any(|d| d.rule == "feel-deterministic" && d.element == "discount"),
+            "{d:?}"
+        ),
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+    db.drop().await;
+}
+
+/// The half that must hold in *every* build: an engine without DMN support
+/// refuses a bundle carrying decisions. Accepting it would deploy a
+/// definition nobody validated.
+#[cfg(not(feature = "dmn"))]
+#[tokio::test]
+async fn a_build_without_dmn_refuses_a_bundle_carrying_decisions() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let err = engine
+        .deploy_bundle(
+            &rbpmn_engine::Bundle::new(fixture("accept/01-minimal.bpmn")).decision(DECISION_DMN),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        rbpmn_engine::DeployError::Rejected(d) => {
+            assert!(d.iter().any(|d| d.rule == "dmn-validates"), "{d:?}")
+        }
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+    // ...while a bundle with no decisions is the ordinary case.
+    engine
+        .deploy_bundle(&rbpmn_engine::Bundle::new(fixture(
+            "accept/01-minimal.bpmn",
+        )))
+        .await
+        .unwrap();
+    db.drop().await;
+}
+
+/// Decisions cannot outlive the definition that carries them — enforced by
+/// the database, not by this code remembering to delete them.
+#[cfg(feature = "dmn")]
+#[tokio::test]
+async fn deleting_a_definition_takes_its_decisions_with_it() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let deployed = engine
+        .deploy_bundle(
+            &rbpmn_engine::Bundle::new(fixture("accept/01-minimal.bpmn")).decision(DECISION_DMN),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        decisions_of(&db.pool, deployed.definition_id).await.len(),
+        1
+    );
+
+    engine
+        .delete_definition("p", deployed.version)
+        .await
+        .unwrap();
+    let orphans: i64 = sqlx::query_scalar("select count(*) from rbpmn_definition_decision")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(orphans, 0, "a decision outlived its definition");
+    db.drop().await;
+}
+
+/// Startup re-validation covers decisions too. Definitions persist, but the
+/// code that validates them does not — a binary rebuilt without DMN support
+/// must say so rather than run a definition it can no longer check.
+#[cfg(feature = "dmn")]
+#[tokio::test]
+async fn startup_revalidation_covers_decisions() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy_bundle(
+            &rbpmn_engine::Bundle::new(fixture("accept/01-minimal.bpmn")).decision(DECISION_DMN),
+        )
+        .await
+        .unwrap();
+    assert!(
+        engine.check_active_definitions().await.unwrap().is_empty(),
+        "a good deployment must re-validate clean"
+    );
+
+    // Corrupt the stored artifact behind the engine's back: this is what a
+    // dsntk upgrade that stopped accepting it would look like.
+    sqlx::query("update rbpmn_definition_decision set dmn_xml = $1")
+        .bind("<not-dmn")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let drift = engine.check_active_definitions().await.unwrap();
+    assert!(
+        drift.iter().any(|d| d.rule == "dmn-validates"),
+        "drift must be loud: {drift:?}"
+    );
+    db.drop().await;
+}
+
+/// A decision actually running: the token reaches the business-rule task, the
+/// projection evaluates inside the same transaction, the answer lands at the
+/// bound path, and the instance completes — one call, no polling, no worker.
+///
+/// This is the shape D3 chose: the pure core parks and says what it needs,
+/// evaluation happens where dsntk is allowed, and the answer re-enters as
+/// command data.
+#[cfg(feature = "dmn")]
+#[tokio::test]
+async fn a_business_rule_task_evaluates_within_the_step() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy_bundle(
+            &rbpmn_engine::Bundle::new(fixture("accept/25-business-rule-task.bpmn"))
+                .bindings(Bindings::new().decision("decide", "Discount", "order.discount"))
+                .decision(DECISION_DMN),
+        )
+        .await
+        .unwrap();
+
+    let started = engine
+        .start("p", None, serde_json::json!({ "Amount": 250 }))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+
+    let vars: serde_json::Value =
+        sqlx::query_scalar("select variables from rbpmn_instance where id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    // Exactly 25, not 25.0: FEEL decimals are exact and the document
+    // now stores what it was given (the arbitrary_precision spike).
+    assert_eq!(vars["order"]["discount"].to_string(), "25");
+    // The input is untouched: a decision reads the document, it does not own it.
+    assert_eq!(vars["Amount"], serde_json::json!(250));
+
+    let trace: Vec<String> =
+        sqlx::query_scalar("select kind from rbpmn_event where instance_id = $1 order by id")
+            .bind(started.id)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert!(trace.iter().any(|k| k == "decision-requested"), "{trace:?}");
+    assert!(trace.iter().any(|k| k == "decision-evaluated"), "{trace:?}");
+    db.drop().await;
+}
+
+/// A decision whose answer the variable document cannot hold freezes the
+/// instance at the element rather than dropping the answer — the uniform
+/// incident shape, so inspection shows *where*.
+#[cfg(feature = "dmn")]
+#[tokio::test]
+async fn an_unrepresentable_answer_freezes_at_the_element() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    // A decision returning a range: a perfectly good FEEL value with no JSON
+    // representation. Typed `Any`, because a `number`-typed decision would
+    // have its range coerced to null by DMN's own type checking — which is a
+    // different outcome (an answer) and takes a different path.
+    let ranged = DECISION_DMN.replace("Amount * 0.1", "[1..10]").replace(
+        r#"<variable name="Discount" typeRef="number"/>"#,
+        r#"<variable name="Discount" typeRef="Any"/>"#,
+    );
+    engine
+        .deploy_bundle(
+            &rbpmn_engine::Bundle::new(fixture("accept/25-business-rule-task.bpmn"))
+                .bindings(Bindings::new().decision("decide", "Discount", "order.discount"))
+                .decision(ranged),
+        )
+        .await
+        .unwrap();
+
+    let started = engine
+        .start("p", None, serde_json::json!({ "Amount": 250 }))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "failed").await;
+
+    let (element, wait): (String, String) =
+        sqlx::query_as("select element_id, wait_kind from rbpmn_token where instance_id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!((element.as_str(), wait.as_str()), ("decide", "incident"));
+    db.drop().await;
+}
+
+/// A null answer is an answer (docs/dmn.md, "What P1 measured"): dsntk cannot
+/// tell a legal "no rule matched" from a broken evaluation, so the token
+/// continues with a null result and the *model* decides what that means.
+/// Freezing here would turn every incomplete decision table into an incident.
+#[cfg(feature = "dmn")]
+#[tokio::test]
+async fn a_null_answer_continues_rather_than_freezing() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    // An incomplete table: nothing matches a negative amount.
+    let table = DECISION_DMN.replace(
+        "<literalExpression><text>Amount * 0.1</text></literalExpression>",
+        r#"<decisionTable hitPolicy="UNIQUE">
+             <input><inputExpression typeRef="number"><text>Amount</text></inputExpression></input>
+             <output typeRef="number"/>
+             <rule><inputEntry><text>&gt; 0</text></inputEntry><outputEntry><text>1</text></outputEntry></rule>
+           </decisionTable>"#,
+    );
+    engine
+        .deploy_bundle(
+            &rbpmn_engine::Bundle::new(fixture("accept/25-business-rule-task.bpmn"))
+                .bindings(Bindings::new().decision("decide", "Discount", "order.discount"))
+                .decision(table),
+        )
+        .await
+        .unwrap();
+
+    let started = engine
+        .start("p", None, serde_json::json!({ "Amount": -1 }))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    let vars: serde_json::Value =
+        sqlx::query_scalar("select variables from rbpmn_instance where id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    // `vars["order"]["discount"]` is `Null` for a *missing* key too, so
+    // indexing cannot tell "the decision answered null" from "the answer went
+    // nowhere". Ask whether the key exists. It did not, before: the answer
+    // was applied as an RFC 7386 merge patch, where null means delete.
+    let order = vars["order"].as_object().expect("the bound path exists");
+    assert!(
+        order.contains_key("discount"),
+        "a null answer must be stored, not delete the path: {vars}"
+    );
+    assert!(order["discount"].is_null());
+    db.drop().await;
+}
+
+/// A business-rule task with no manifest binding cannot deploy. There is no
+/// default: guessing a decision by element id would invoke business logic
+/// nobody chose.
+#[cfg(feature = "dmn")]
+#[tokio::test]
+async fn a_business_rule_task_needs_a_binding() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let err = engine
+        .deploy_bundle(
+            &rbpmn_engine::Bundle::new(fixture("accept/25-business-rule-task.bpmn"))
+                .decision(DECISION_DMN),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        rbpmn_engine::DeployError::Rejected(d) => assert!(
+            d.iter()
+                .any(|d| d.rule == "decision-has-binding" && d.element == "decide"),
+            "{d:?}"
+        ),
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+    db.drop().await;
+}
+
+/// A timer that resumes a token straight into a business-rule task.
+///
+/// The scheduler is a *separate* step path from `start` and `complete`, and it
+/// was the one that still called the bare `step` — parking a token on a
+/// decision nobody answered, persisting a `wait_kind` no loader understands,
+/// and wedging the instance permanently and silently. Every decision test
+/// before this one reached the task through `start`, which is exactly why
+/// none of them saw it.
+#[cfg(feature = "dmn")]
+#[tokio::test]
+async fn a_timer_can_resume_into_a_decision() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy_bundle(
+            &rbpmn_engine::Bundle::new(fixture("accept/26-timer-then-decision.bpmn"))
+                .bindings(Bindings::new().decision("decide", "Discount", "order.discount"))
+                .decision(DECISION_DMN),
+        )
+        .await
+        .unwrap();
+
+    let started = engine
+        .start("p", None, serde_json::json!({ "Amount": 250 }))
+        .await
+        .unwrap();
+    // PT0S: due immediately.
+    while engine.fire_due_timer().await.unwrap() {}
+    wait_for_status(&db.pool, started.id, "completed").await;
+
+    let vars: serde_json::Value =
+        sqlx::query_scalar("select variables from rbpmn_instance where id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(vars["order"]["discount"].to_string(), "25");
+
+    // ...and the instance is still readable, which is the half that failed:
+    // a persisted decision wait made every later load error out.
+    engine.inspect_instance(started.id).await.unwrap();
     db.drop().await;
 }

@@ -65,9 +65,22 @@ struct DeliverAction {
 #[serde(untagged)]
 enum Action {
     Complete(CompleteAction),
+    Decide(DecideAction),
     Fail(FailAction),
     Fire(FireAction),
     Deliver(DeliverAction),
+}
+
+/// Answer the decision a business-rule task is waiting on.
+///
+/// The answer is *given*, not computed — which is the whole point of the
+/// design: the core cannot evaluate anything, so a golden trace for the
+/// decision path needs no evaluator, and a replay reads the recorded answer
+/// exactly this way (`docs/dmn.md`, D3).
+#[derive(Deserialize)]
+struct DecideAction {
+    decide: String,
+    answer: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -116,6 +129,27 @@ fn run_scenario(path: &Path, failures: &mut String) {
                     .unwrap_or_else(|| panic!("{name}: no open work item at '{complete}'"));
                 let patch = patch.clone().unwrap_or_else(|| serde_json::json!({}));
                 (complete, Command::CompleteWorkItem { id, patch })
+            }
+            Action::Decide(DecideAction { decide, answer }) => {
+                let node = proc
+                    .node_by_id(decide)
+                    .unwrap_or_else(|| panic!("{name}: no element '{decide}'"));
+                let token = state
+                    .tokens()
+                    .find(|(_, t)| t.node == node && t.wait == rbpmn_core::WaitKind::Decision)
+                    .map(|(id, _)| id)
+                    .unwrap_or_else(|| panic!("{name}: nothing awaits a decision at '{decide}'"));
+                (
+                    decide,
+                    Command::CompleteDecision {
+                        token,
+                        answer: answer.clone(),
+                        // Scenarios pin control flow and the variable
+                        // document; the evaluator's prose is engine-side and
+                        // has no bearing on either.
+                        reason: None,
+                    },
+                )
             }
             Action::Fail(FailAction { fail, code }) => {
                 let node = proc

@@ -16,24 +16,40 @@ inclusive gateway, block structure, messages-only interaction, build order).
   is `tests/fixtures.rs`. Execution scenarios (golden event traces) live in
   `crates/rbpmn-core/tests/scenarios/*.json` — the `Display` format of
   `Event` is stable API, like rule IDs.
-- `rbpmn-model` **and now `rbpmn-core`** stay dependency-light (no IO/async/DB)
+- `rbpmn-model` **and `rbpmn-core`** stay dependency-light (no IO/async/DB)
   — both must compile to wasm32. model powers the playground and the bpmnlint
-  plugin; core powers the editor's L2 check (`check_deployable`). This makes
-  the dsntk prohibition below apply to `rbpmn-core` too, which is a live
-  collision: the post-v1 business-rule task would naturally put DMN compile
-  support exactly there. Decide that before the spike, not during.
-- **One verdict, one implementation.** `rbpmn_core::check_deployable` is
-  everything `deploy` decides without a database (parse, one-process, lint,
-  compile-against-manifest, resolved topics); `Engine::deploy` calls it and
-  then does the environment link, and the editor calls it through WASM and
-  does the link against a fetched topic set. Don't grow a second copy of any
-  of those steps — `just parity` compares both WASM exports against native
-  over the whole corpus precisely so a surface cannot drift into reporting a
-  different verdict than deploy will.
+  plugin; core powers the editor's L2 check (`check_deployable`). The dsntk
+  prohibition below therefore applies to `rbpmn-core` too. That was once
+  flagged here as a live collision, because a business-rule task would
+  naturally put DMN compile support exactly there; it is **decided**
+  (`docs/dmn.md`, D1). `rbpmn-core` defines a `DecisionValidator` trait and
+  takes a `&dyn` — `rbpmn-dmn` implements it, and both the engine and the
+  editor pass the same implementation. Neither the trait nor the diagnostics
+  cost `rbpmn-core` a dependency. Keep new DMN work behind that seam.
+- **One verdict, one implementation.** `rbpmn_core::check_deployable(xml,
+  bindings, decisions, validator)` is everything `deploy` decides without a
+  database: parse, one-process, the DMN artifacts, decision bindings, lint,
+  compile-against-manifest, resolved topics. `Engine::deploy` calls it and then
+  does the environment link; the editor calls it through WASM and does the link
+  against a fetched topic set. Don't grow a second copy of any of those steps —
+  `just parity` compares both WASM exports against native over the whole corpus
+  precisely so a surface cannot drift into reporting a different verdict than
+  deploy will. Note what is *not* in the environment link: decisions travel
+  inside the deployment, so `unresolved-decision` is decidable offline while
+  `unresolved-topic` is not.
 - The engine advances tokens inside the caller's DB transaction; wait states
   are the transaction boundaries. The pure `step` core (rbpmn-core) is
-  IO-free and deterministic — keep it that way; time enters as command data
-  when timers land (phase 3), never from a clock.
+  IO-free and deterministic — keep it that way. Time and decisions both enter
+  as **command data**, never from a clock or an evaluator: the core parks at a
+  business-rule task and says what it needs, the projection evaluates inside
+  the same transaction, and the answer re-enters as
+  `Command::CompleteDecision`. That is what lets `chaos.rs` re-derive every
+  history through a core that cannot evaluate anything.
+  `WaitKind::Decision` is the one wait state that must **not** survive a
+  step — persistence refuses to write one, and a freeze takes any pending
+  decision with it. A token left parked on one made the engine answer a
+  decision on a `Failed` instance and roll back the transaction recording the
+  freeze; that was the bug.
 - FEEL null semantics in `condition::eval` are FEEL-exact and **verified**, not
   asserted: `just feel-parity` differentials the subset against dsntk. Two
   separate rules — `= null`/`!= null` are the null-check idiom (boolean);
@@ -60,10 +76,64 @@ inclusive gateway, block structure, messages-only interaction, build order).
   variable named `P3D`. That was the bug. The cost (a mistyped duration
   shaped like a name warns instead of erroring) is paid by the warning text,
   which carries the ISO-8601 complaint that made it fall through.
-- dsntk must never become a dependency of `rbpmn-model` **or `rbpmn-core`**:
-  its number crate binds a C library (`dfp-number-sys`), which kills wasm32
-  and with it the playground, the bpmnlint plugin and the editor.
-  `feel-parity` is outside the workspace for this reason.
+- **dsntk lives in `rbpmn-dmn` and nothing upstream of it may depend on it.**
+  Not `rbpmn-model`, not `rbpmn-core`. Upstream it would kill wasm32 and with
+  it the playground, the bpmnlint plugin and the editor. `feel-parity` and
+  `feel-number-parity` are outside the workspace for the same reason: the
+  latter links the C library, which must never reach this workspace's
+  lockfile, and both pull ~170 crates that have no business in it.
+- **dsntk comes from the fork, by git rev, and there is no
+  `[patch.crates-io]` anywhere.** The two things rbpmn needs from dsntk are
+  *features* of `github.com/tpjg/dsntk`, not substitutions:
+  - `dsntk-feel-number/use-fastnum` (its default) — a pure-Rust decimal128
+    replacing Intel's C library. This is what gets dsntk to wasm32 at all. It
+    is **verified, not asserted**: `just number-parity` differentials it
+    against the library it replaces (26 300 comparisons, three named deviation
+    classes, anything outside them fails) and `just dmn-tck` runs the DMN TCK
+    against published dsntk and against the fork, comparing case by case. Both
+    are owed by any fork bump, plus a re-read of `docs/dmn.md`'s gates.
+  - `dsntk-feel-evaluator/java-bridge`, left **off** — FEEL's external Java
+    function bridge, an HTTP POST to a JVM on localhost. **A decision must not
+    call out — not to Java, not to anything else.** (Timo's explicit call, and
+    the same shape as XML purity: the capability is *removed*, not disabled.)
+    `feel-deterministic` refuses the external functions at deploy; the absent
+    feature removes the ability at runtime. Do not enable it to fix a compile
+    error.
+  This replaced two shim crates plus a workspace-global patch, and the reason
+  is not tidiness: Cargo honours `[patch]` **only from the workspace root of
+  the build being run**, so every application depending on rbpmn had to repeat
+  it or get a silently weaker build. A feature travels down the dependency
+  graph; a patch does not. A build script in `rbpmn-dmn` used to prove the
+  patch was in effect — it is gone with the patch, and `just no-dmn` now
+  asserts the same two properties on the resolved tree instead.
+  - The rev is written down in four places (`crates/rbpmn-dmn`,
+    `feel-number-parity`, `dmn-wasm-probe`, `dmn-tck/run.sh`). **`just
+    dsntk-rev` checks they agree**, and `just number-parity` depends on it,
+    because a differential run against a rev nobody ships is green and
+    meaningless. `feel-parity` is deliberately outside that check — it is
+    allowed to lag while a rev is being evaluated.
+  - Feature unification cuts both ways here: any crate in the graph asking for
+    `java-bridge` restores an HTTP client for everyone. That is what the new
+    `just no-dmn` assertions catch, and they were verified by switching it on
+    and watching them fail.
+- **DMN is on by default, and the off switch must stay real.** `docs/dmn.md`
+  D9 records why it flipped: a definition plus its manifest is a fully
+  executable flow, and a decision is part of that definition. The feature
+  still turns off, and `just no-dmn` is the only thing keeping "optional" a
+  fact — it asserts the dependency graph in **both** directions and builds the
+  `#[cfg(not(feature = "dmn"))]` arms. Cargo unifies features per package
+  across the whole graph, so a single dependency edge that takes the defaults
+  switches `dmn` back on for everything; that has now gone wrong twice (a
+  self dev-dependency, and a server that did not opt out of the engine's
+  defaults), and both times every other check stayed green.
+- **One MSRV, 1.94**, declared once in the root manifest and inherited
+  everywhere. It is fastnum's floor, reached through the fork's
+  `dsntk-feel-number`, and DMN is in the default build — so it is the floor for
+  everything. A per-crate split was tried (model/core/wasm holding 1.91 so the
+  wasm32 surfaces stayed buildable without dsntk) and **removed**: it only ever
+  helped a downstream consumer of those crates standalone, and the machinery to
+  keep it honest — a second toolchain, its own recipe, its own CI task — cost
+  more than that was worth. Don't reintroduce it without such a consumer.
 - The UI documents inline business data into HTML, which makes **escaping our
   problem** — one mistake ships to every embedder at once. The rule:
   `escape_json_for_html` for the data block, `textContent` (never
@@ -98,9 +168,11 @@ inclusive gateway, block structure, messages-only interaction, build order).
 
 `.build.yml` is sourcehut CI: one task per command below, in the order a
 developer would run them. `just ui` is a task of its own and must stay first
-— everything that builds `rbpmn-ui` needs it. Benchmarks are **not** on CI by
-design (`just lint` compiles the harness via `--workspace`, so it cannot rot,
-but nothing runs it). CI is the backstop; the point of the table in README's
+— everything that builds `rbpmn-ui` needs it. Two deliberate omissions:
+benchmarks (`just lint` compiles the harness via `--workspace`, so it cannot
+rot, but nothing runs it) and `just dmn-tck` (it fetches the TCK, dsntk's
+source and a third-party runner from the network — the gate for a dsntk bump,
+not a per-commit check). CI is the backstop; the point of the table in README's
 "Developing" is knowing which command a change owes *before* pushing.
 
 - `cargo test` — everything including the fixture corpus. The rbpmn-engine
@@ -114,7 +186,35 @@ but nothing runs it). CI is the backstop; the point of the table in README's
   (gitignored); runs the full inspection stack when Postgres is reachable.
 - `just parity` — MUST stay green: byte-parity of native Rust vs WASM over the
   corpus for **both** exports (`lint` and `check_deployable`), plus the
-  bpmnlint plugin's pipeline test.
+  bpmnlint plugin's pipeline test. Both sides are built `--features dmn`
+  explicitly even though it is the default, so they cannot become different
+  builds comparing different validators.
+- `just no-dmn` — the DMN seam, built and asserted in both directions. See the
+  ground rule above; this is not optional paperwork, it is the check that
+  stops "optional" rotting into a claim.
+- `just number-parity` — the fork's `use-fastnum` decimal against the C
+  library it replaces, both as `dsntk-feel-number` from two different sources.
+  Runs `just dsntk-rev` first. Lives outside the workspace and cannot be
+  reached from it, so this stays owed by any fork bump. (The upstream
+  acceptance corpus now travels *with* the fork: `cargo test` inside it runs
+  191 assertions on both backends.)
+- `just dsntk-rev` — the four places the fork's rev is written down all name
+  the same one. Cheap, and a dependency of `number-parity` rather than a
+  chore, because a differential against a rev nobody ships proves nothing.
+- `just dmn-test` — `rbpmn-dmn`'s own tests. `cargo test` runs these too now
+  that it is a default member; this is the fast loop while working in it.
+- `just dmn-tck` — the DMN TCK twice, against dsntk 0.3.0 as published and
+  against the fork rbpmn ships, compared case by case. The gate for a fork
+  bump. Fetches third-party source; not on CI. Note the comparison now carries
+  two variables rather than one (the decimal *and* 0.3.0 → 0.3.1-dev): a
+  `[patch]` can no longer express the swap, because the fork's version does not
+  satisfy the `^0.3.0` its own siblings request — which the recipe's own
+  assertions caught rather than hid.
+- `just dmn-wasm-probe` — Gate 0b: the whole DMN stack compiling *and
+  evaluating* inside a real WebAssembly VM, built through wasm-pack exactly as
+  `rbpmn-wasm` is.
+- `just feel-parity` — the FEEL subset differentialled against dsntk over ~8k
+  expression/document pairs. Outside the workspace (it links the C library).
 - `just ui` — build the two UI documents into `crates/rbpmn-ui/assets/`.
   **Bootstrap step: run it once after cloning**, or `cargo build` fails with a
   build.rs message telling you to. The bundles are compile output and are
@@ -139,9 +239,9 @@ but nothing runs it). CI is the backstop; the point of the table in README's
   demonstration: UI routes are behind the bearer, browsers cannot send it on a
   navigation, and supplying it is the embedding application's job.
 - `just tla` — TLA+ model checking of the concurrency protocol (`spec/`).
-  Eleven configs; six are *expected* to fail, each matched against the
+  Thirteen configs; eight are *expected* to fail, each matched against the
   specific violation it demonstrates (a spec that stops parsing must not read
-  as "fails as expected"). Two reproduce bugs that were real. The lock order
+  as "fails as expected"). Three reproduce bugs that were real. The lock order
   is checked at two arities. Needs java; the jar is pinned and
   checksum-verified.
 - `just fixtures-di` — fixtures carry baked-in BPMN DI so they render
@@ -169,14 +269,22 @@ and the scheduler's timer claim racing scope teardown. The corpus-driven
 tests adapt to a new phase by themselves; **a hand-written model does not**,
 and nothing fails when it goes stale. Phase 6 proved that — `spec/` was not
 touched, and the conclusion that scopes changed nothing was an argument, not
-a check.
+a check. **DMN proved it again**: the claim path grew an in-transaction
+decision evaluation, `just tla` was run and stayed green, and `spec/` was not
+re-read until a review asked. (The answer, once read: no new lock enters the
+order, but the claim transaction can now roll back *after* its re-check
+passed, which `TimerTeardown.tla`'s `Abort` action now models. Running the
+checker is not the same as re-reading the model.)
 
 So: **touching any of these means re-reading `spec/` and re-running
 `just tla`**, not just keeping `cargo test` green.
 
 - lock acquisition order anywhere (`runtime.rs`, `scheduler.rs`, `tasks.rs`)
-- the work-item lease: TTL, renewal, ownership, the `guard_lease` predicate
-- the scheduler's claim path (`try_fire`) — pick, NOWAIT, re-check
+- the work-item lease: TTL, renewal, ownership, the lease epoch a claim
+  mints (only a claim mints one — a renewal continues the same lease), the
+  voluntary hand-back (`release_task`), the `guard_lease` predicate
+- the scheduler's claim path (`try_fire`) — pick, NOWAIT, re-check, and the
+  in-transaction decision evaluation that can now abort a claim already made
 - what scope teardown reaps (`step.rs::tear_down_scope`) — specifically that
   a reaped token's arms are withdrawn *with* it
 - retention's plan/archive/execute split, the DUE re-check under the row
@@ -193,12 +301,20 @@ survived, never that its *token* did — that half is teardown's invariant.
 - **XML purity is a principle (Timo's explicit call — resist eroding it).**
   BPMN files are 100% standard-namespace: no rbpmn extension attributes, no
   vendor attributes, ever. It is always tempting to "just add a hint in the
-  XML" — don't. Wiring lives in code at registration time (`map_topic`,
-  `map_correlation`, `declare_topic`, `declare_index`) and is validated at
-  deploy like a compiler validates types: fail early, never "seems to run".
-- Conditions are a **strict FEEL subset** (identical syntax and semantics, so
-  they stay valid when dsntk lands post-v1). Correlation keys use FEEL
-  qualified names too (`order.id`), registered — not in the XML.
+  XML" — don't. Wiring lives in code at registration time — one `Bindings`
+  value (`topic`, `correlation`, `decision`, `index`), plus `declare_topic`
+  and `declare_index` for the *environment* half — and is validated at deploy
+  like a compiler validates types: fail early, never "seems to run". This held
+  through DMN, which was the strongest pull yet: a business-rule task's
+  decision name and result path are a `Bindings::decision` call, not an
+  attribute, and the DMN artifacts travel in the deploy bundle beside the
+  BPMN rather than being referenced from inside it.
+- Conditions are a **strict FEEL subset** — identical syntax and semantics to
+  the full language, which is why every condition written before dsntk landed
+  is still valid now that it has. `condition::eval` remains rbpmn's own: it
+  runs in `rbpmn-model`, which must reach wasm32 and must not depend on dsntk.
+  The two are kept honest against each other by `just feel-parity`. Correlation
+  keys use FEEL qualified names too (`order.id`), registered — not in the XML.
 - Server config is env-only (`RBPMN_BIND`, `RBPMN_API_TOKEN[_FILE]`,
   `RBPMN_ALLOW_NON_LOOPBACK`); secrets never come from CLI args.
   Security posture: `docs/http-security.md`.

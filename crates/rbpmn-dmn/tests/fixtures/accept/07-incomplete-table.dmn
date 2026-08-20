@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/07-incomplete-table" name="07-incomplete-table" id="_07-incomplete-table">
+  <inputData name="Score" id="score">
+    <variable name="Score" typeRef="number"/>
+  </inputData>
+  <decision name="Grade" id="grade">
+    <variable name="Grade" typeRef="string"/>
+    <informationRequirement><requiredInput href="#score"/></informationRequirement>
+    <decisionTable hitPolicy="UNIQUE">
+      <input><inputExpression typeRef="number"><text>Score</text></inputExpression></input>
+      <output typeRef="string"/>
+      <rule><inputEntry><text>&gt;= 90</text></inputEntry><outputEntry><text>"A"</text></outputEntry></rule>
+      <rule><inputEntry><text>[80..90)</text></inputEntry><outputEntry><text>"B"</text></outputEntry></rule>
+    </decisionTable>
+  </decision>
+</definitions>

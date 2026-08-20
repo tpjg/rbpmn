@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<definitions namespace="https://rbpmn.example"
+             name="gate0"
+             id="_gate0"
+             xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/">
+    <description>Gate 0b: a decision table plus a literal expression, evaluated inside wasm.</description>
+    <inputData name="Amount" id="_amount">
+        <variable name="Amount" typeRef="number"/>
+    </inputData>
+    <decision name="Discount" id="_discount">
+        <variable name="Discount" typeRef="number"/>
+        <informationRequirement>
+            <requiredInput href="#_amount"/>
+        </informationRequirement>
+        <decisionTable hitPolicy="UNIQUE">
+            <input>
+                <inputExpression typeRef="number">
+                    <text>Amount</text>
+                </inputExpression>
+            </input>
+            <output typeRef="number"/>
+            <rule>
+                <inputEntry><text>&lt; 100</text></inputEntry>
+                <outputEntry><text>0</text></outputEntry>
+            </rule>
+            <rule>
+                <inputEntry><text>&gt;= 100</text></inputEntry>
+                <outputEntry><text>Amount * 0.1</text></outputEntry>
+            </rule>
+        </decisionTable>
+    </decision>
+</definitions>

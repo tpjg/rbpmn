@@ -1,0 +1,32 @@
+[package]
+name = "rbpmn-feel-number-parity"
+description = "Differential check: the dsntk fork's pure-Rust decimal against the Intel-decimal-backed dsntk-feel-number it replaces. Deliberately outside the workspace — it is the only place the C library is allowed to exist."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# The replacement under test: the fork's `dsntk-feel-number` with its default
+# `use-fastnum` backend. Renamed, because...
+dsntk-feel-number-pure = { git = "https://github.com/tpjg/dsntk", rev = "37156c7", package = "dsntk-feel-number", default-features = false, features = [
+  "use-fastnum",
+] }
+# ...this is the *same package name* from a different source: upstream 0.3.0
+# exactly as published, which is the C library. It builds `dfp-number-sys`
+# through cc-rs, which is why this crate has its own lockfile and never enters
+# the workspace.
+#
+# Two same-named packages coexist here only because one is renamed. That is
+# also what makes the comparison meaningful — the two really are the same crate
+# with two backends, so anything that differs is the decimal and not the API.
+dsntk-feel-number = "=0.3.0"
+
+# No `[patch.crates-io]` here, deliberately, and now doubly so: rbpmn no longer
+# patches anything, and patching *here* would replace the reference with the
+# thing under test, comparing a value against itself — green, and meaningless.
+#
+# The rev must match the one in `crates/rbpmn-dmn/Cargo.toml`, or this
+# differentials a decimal rbpmn does not ship. `just dsntk-rev` checks that.
+[workspace]

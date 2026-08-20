@@ -1,23 +1,59 @@
 [workspace]
 resolver = "3"
-members = ["benchmarks", "crates/rbpmn-core", "crates/rbpmn-engine", "crates/rbpmn-model", "crates/rbpmn-server", "crates/rbpmn-ui", "crates/rbpmn-wasm"]
+members = ["benchmarks", "crates/rbpmn-core", "crates/rbpmn-dmn", "crates/rbpmn-engine", "crates/rbpmn-model", "crates/rbpmn-server", "crates/rbpmn-ui", "crates/rbpmn-wasm"]
 # `benchmarks` is a member (one lockfile, and `just lint` covers it with
 # `--workspace`) but deliberately not a *default* member: `cargo test` and
 # `cargo build` must never compile criterion or a benchmark harness nobody
 # asked to run. Benchmarks are a separate track — see benchmarks/README.md.
-default-members = ["crates/rbpmn-core", "crates/rbpmn-engine", "crates/rbpmn-model", "crates/rbpmn-server", "crates/rbpmn-ui", "crates/rbpmn-wasm"]
+default-members = ["crates/rbpmn-core", "crates/rbpmn-dmn", "crates/rbpmn-engine", "crates/rbpmn-model", "crates/rbpmn-server", "crates/rbpmn-ui", "crates/rbpmn-wasm"]
+# `rbpmn-dmn` became a default member when DMN became a default feature
+# (docs/dmn.md, D9). It was kept out while DMN was opt-in, so that a plain
+# build paid for none of dsntk's ~100k lines; a plain build compiles it now
+# regardless, and the exclusion only hid its tests behind a command nobody had
+# to run.
+#
+# **There is no `[patch.crates-io]` here, and that is the point.** The two
+# substitutions rbpmn needs — a pure-Rust decimal128 in place of Intel's C
+# library, and no HTTP client for FEEL's external-Java bridge — are now
+# *features* of a dsntk fork (`use-fastnum`, and `java-bridge` left off), and
+# `rbpmn-dmn` depends on that fork by git rev. Cargo honours `[patch]` only
+# from the workspace root of the build being run, so the old arrangement
+# required every application depending on rbpmn to repeat it or get a silently
+# weaker build. A feature travels down the dependency graph; a patch does not.
+#
+# The out-of-workspace differentials stay separate and stay owed:
+# `just number-parity` and `just dmn-tck` link the C library, which must never
+# reach this workspace.
+#
 # feel-parity carries its own lockfile: dsntk pulls ~170 crates and a C
 # library, and none of that may reach the workspace. Run: `just feel-parity`.
-exclude = ["feel-parity"]
+# feel-number-parity is excluded for the same reason — it links the C-backed
+# original *and* the fork's replacement, to differential one against the other.
+#
+# dmn-tck holds Gate 0c, which fetches the DMN TCK, the dsntk source and the
+# TCK test runner into itself: none of it is ours, and the runner in
+# particular is a checkout of somebody else's repository that must not become
+# a member of this workspace.
+exclude = ["feel-parity", "feel-number-parity", "dmn-tck"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.91"
+# One floor for the whole workspace. DMN sets it: `rbpmn-feel-number`,
+# `rbpmn-dmn` and the shims need 1.94 because fastnum does, and DMN is in the
+# default build (docs/dmn.md, D9). Stated here rather than discovered by a
+# build failure.
+#
+# A per-crate split was tried — `rbpmn-model`/`rbpmn-core`/`rbpmn-wasm` holding
+# 1.91 so the wasm32 surfaces stayed buildable without dsntk — and removed
+# again. It only ever helped a downstream consumer of those crates standalone,
+# and the machinery to keep it honest (a second toolchain, its own recipe, its
+# own CI task) cost more than that was worth. See docs/dmn.md, D9.
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 roxmltree = "0.20"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 thiserror = "2"

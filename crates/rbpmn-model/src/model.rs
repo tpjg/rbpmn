@@ -77,12 +77,17 @@ pub enum NodeKind {
     Throw(ThrowKind),
     Boundary(BoundaryData),
     /// The XML carries no binding: the work-item topic is bound at engine
-    /// registration time (`map_topic`, default: element id). `foreign` lists
+    /// registration time (`Bindings::topic`, default: element id). `foreign` lists
     /// vendor-namespace bindings we detected but ignore (e.g. "camunda:topic").
     ServiceTask {
         foreign: Vec<String>,
     },
     UserTask,
+    /// Invokes a decision from the deployment's bundled DMN artifacts. Which
+    /// decision, and where its answer lands, are manifest data
+    /// (`Bindings::decision`) — never in the XML, exactly like a service
+    /// task's topic.
+    BusinessRuleTask,
     ReceiveTask {
         message_ref: Option<Id>,
     },
@@ -109,6 +114,7 @@ impl NodeKind {
             NodeKind::Boundary(_) => "boundary event",
             NodeKind::ServiceTask { .. } => "service task",
             NodeKind::UserTask => "user task",
+            NodeKind::BusinessRuleTask => "business rule task",
             NodeKind::ReceiveTask { .. } => "receive task",
             NodeKind::ExclusiveGateway { .. } => "exclusive gateway",
             NodeKind::ParallelGateway => "parallel gateway",
@@ -136,6 +142,7 @@ impl NodeKind {
             self,
             NodeKind::ServiceTask { .. }
                 | NodeKind::UserTask
+                | NodeKind::BusinessRuleTask
                 | NodeKind::ReceiveTask { .. }
                 | NodeKind::SubProcess(_)
         )
@@ -143,7 +150,7 @@ impl NodeKind {
 }
 
 /// Message events carry only the `messageRef`. Correlation bindings are
-/// registered in code (`map_correlation`, FEEL qualified names) and checked
+/// registered in code (`Bindings::correlation`, FEEL qualified names) and checked
 /// at deploy — never declared in the XML.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StartTrigger {

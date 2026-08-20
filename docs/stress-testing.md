@@ -276,8 +276,8 @@ the *fixtures first* ground rule, and the failing model opens in the
 playground with the token overlay, so a fuzz failure is something you can
 **look at**.
 
-Free side effect: generated models extend `just parity` from 52 fixtures to
-however many you care to generate (§6).
+Free side effect: generated models extend `just parity` beyond the corpus —
+60 fixtures today — to however many you care to generate (§6).
 
 ---
 
@@ -334,8 +334,22 @@ Two details make it work without a hand-maintained list to drift. Engine-level
 events (`work-item-retrying`, `timer-fire-failed`) are not `Event` variants, so
 *failing to deserialize* is precisely the projection onto core-visible kinds.
 And a `variables-patched` event always immediately follows the command that
-carried the patch, so the merge patch is recoverable from the log — only the
-initial variables of `Start` are not recorded, and the driver supplies those.
+carried the patch, so the merge patch is recoverable from the log. The ground
+those patches apply to is recorded too: `instance-started` carries the document
+the instance began with, so the variables at any point are **the start folded
+forward** — no value has to be kept outside the history for a replay to work.
+That direction is the cheap one and the only generally possible one: RFC 7386
+`null` deletes a member without recording what it deleted, so a merge patch
+cannot be inverted from the patch alone, and unwinding backwards from the
+current document is not a thing this log can support.
+
+One exception, and it is the reason to state the rule this precisely: a
+**decision** emits no `variables-patched` at all. Its answer *replaces* what is
+at the bound path rather than merging into it, and RFC 7386 cannot express a
+replacement — a null in a merge patch deletes the member instead of storing it.
+`decision-evaluated` carries the answer instead, so a business-rule fixture
+entering this corpus reconstructs `CompleteDecision` from that event, not from
+a patch that will not be there.
 
 Verified non-vacuous by injecting a real projection bug: dropping `FlowTaken`
 from what `persist_step` writes makes replay report the exact index where the
@@ -431,16 +445,30 @@ left as a candidate.
 
 ## 6. Cheap side quests with outsized value
 
-**FEEL differential against dsntk.** The highest confidence-per-day item in
-this document. `condition::eval` claims FEEL-*exact* null semantics that
-"must not change when dsntk swaps in" — null-safe equality, incomparable
-types yielding null, Kleene `and`/`or`, root collapse. dsntk passes the DMN
-TCK (3374/3391). Add `dsntk-feel` as a **dev-dependency only** (the
-dependency-light rule for `rbpmn-model` is about the shipped crate), generate
-random subset expressions × random variable documents, evaluate with both,
-assert equal. This converts an aspiration verified by hand-written tests into
-a verified fact *before* v1 ships, in exactly the corners where hand-written
-tests get thin.
+**FEEL differential against dsntk — landed** (`just feel-parity`), and it was
+the highest confidence-per-day item in this document. `condition::eval` claims
+FEEL-*exact* null semantics — null-safe equality, incomparable types yielding
+null, Kleene `and`/`or`, root collapse — and dsntk, which passes the DMN TCK
+(3374/3391 on its own submission), is the oracle. Random subset expressions ×
+random variable documents, evaluated by both, asserted equal. It found a real
+bug immediately: `x != 1` was answering *true* for a missing `x`, because two
+independent null rules had been conflated into one match arm.
+
+**The one thing it does *not* do is what this section originally proposed.**
+The sketch said "add `dsntk-feel` as a dev-dependency only — the
+dependency-light rule for `rbpmn-model` is about the shipped crate". That is
+wrong, and the reason is worth keeping: a dev-dependency still enters the
+**workspace lockfile**, and dsntk drags Intel's decimal C library with it
+through `dfp-number-sys`. One `cargo test` on a machine without a C toolchain,
+or one wasm32 build resolving that lockfile, and the crate that must reach the
+browser stops building. So `feel-parity/` is a separate crate *outside* the
+workspace with its own lockfile — and it stays outside even now that dsntk is
+a workspace dependency, because it links the **unpatched** dsntk on purpose.
+
+`feel-number-parity/` was built the same way and for the same reason when DMN
+arrived: it links the C library *and* the pure-Rust decimal that replaces it,
+to differential one against the other. Neither may ever become a workspace
+member.
 
 **Metamorphic equivalences.** No oracle needed, and they find real semantic
 bugs:
@@ -788,7 +816,7 @@ Randomized testing **falsifies**; it does not prove. Stated precisely:
 |---|---|---|---|
 | 1 | Invariant set + random driver over the corpus (§1, §2) | 1–2 d | Foundation for four later items |
 | 2 | Rehydration differential (§2) | ½ d | Crash-safety of the core boundary |
-| 3 | FEEL differential vs dsntk (§6) | 1 d | A stated must-not-change claim, verified |
+| ~~3~~ | ~~FEEL differential vs dsntk (§6)~~ | done | **Landed**: `feel-parity/`, `just feel-parity`. Grew a sibling — `feel-number-parity/`, `just number-parity` — when DMN needed a replacement decimal128 held to the same standard |
 | ~~4~~ | ~~Model generator + structural oracle (§3a, §3b)~~ | done | **Landed**: `tests/modelgen/` + `tests/generator.rs` |
 | ~~5~~ | ~~Explicit-state exploration (§7)~~ | done | **Landed**: `crates/rbpmn-core/tests/explore.rs` |
 | ~~6~~ | ~~Mutation fuzz (§3c) + restriction counterexamples (§3d)~~ | done | **Landed**: `tests/mutation.rs` |
@@ -797,18 +825,24 @@ Randomized testing **falsifies**; it does not prove. Stated precisely:
 | 9 | Kani on `iso8601` + `condition` parsers (§7) | 2–3 d | Panic/overflow proofs on untrusted input |
 | ~~10~~ | ~~TLA+ spec of the concurrency protocol (§7)~~ | done | **Landed**: `spec/`, `just tla` |
 
-Items 3, 4, 5 and 6 are done, and they compose: the generator feeds both the
-explorer and the mutation fuzz, all three sharing one invariant set. Of the
-six third outcomes, 1, 2, 5 and 6 are now hunted; **3 and 4 are not, and they
-are the ones that live in the Postgres layer** — which is also the newest and
-most concurrent code in the repo, verified by hand-written cases. Items 7 and 8 are done, which closes the design brief's testing-strategy #5
-and leaves **all six third outcomes hunted, none found**. What remains is
-narrower and optional: item 1's random driver and rehydration differential,
-item 9 (Kani on the parsers), extending the generator to boundary events and
-event-based gateways (§3's status note), and the two protocol pieces the specs
-do not yet model — the event-stream safe horizon and the deploy/undeclare
-race. None of them is load-bearing for v1; all of them are cheap next to what
-is already in place.
+Items 3 through 8 and 10 are done, and they compose: the generator feeds both
+the explorer and the mutation fuzz, all three sharing one invariant set. Items
+7 and 8 closed the design brief's testing-strategy #5, and **all six third
+outcomes are now hunted, none found**.
+
+What remains is narrower and optional: item 1's random driver and rehydration
+differential, item 9 (Kani on the parsers), and the two protocol pieces the
+specs do not model — the event-stream safe horizon and the deploy/undeclare
+race. None is load-bearing; all are cheap next to what is in place.
+
+**The generator's coverage gaps, named rather than left to be discovered.** It
+emits no boundary events, no event-based gateways (§3's status note) and **no
+business-rule tasks** — so decisions are exercised by the fixture corpus, the
+explorer (which does offer `CompleteDecision` for a token that parks on one)
+and the engine's integration tests, but not by generated models. That gap has
+teeth: the bug where a sibling branch's freeze stranded a token on
+`WaitKind::Decision` needed a *parallel split with a decision on one arm*, and
+no generated model can produce one. It was found by review, not by search.
 
 Item 1 is cheaper than listed — the invariant set already exists, leaving the
 random driver and the rehydration differential. Extending the generator to

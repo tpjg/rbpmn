@@ -128,7 +128,7 @@ Postgres — deliberately (see Non-goals).
 | Category | Supported | Explicitly rejected (linter rule) |
 |---|---|---|
 | Events | none start/end, message start/catch/throw, timer intermediate/boundary, error boundary, terminate end | signal, escalation, conditional, link, compensation, cancel, event subprocess (later) |
-| Tasks | service task (external work item), user task, receive task | script task, business rule task, manual task (map to user task?), send task (use throw event) |
+| Tasks | service task (external work item), user task, receive task, **business rule task** (DMN — shipped after this table was written; see "Decisions") | script task, manual task (use a user task), send task (use throw event), the abstract task |
 | Gateways | exclusive (split+join), parallel (split+join), event-based | **inclusive (both directions)**, complex |
 | Structure | embedded subprocess, sequential loops around whole blocks | **call activity**, multi-instance (later phase), transactions/compensation |
 | Other | — | lanes/pools as execution semantics (diagram-only, ignored), data objects (diagram-only) |
@@ -223,9 +223,10 @@ application running its own sqlx migrations in the shared schema.)
 
 ### Condition grammar: a strict FEEL subset
 Conditions are a strict subset of FEEL (DMN 1.3+) — identical syntax AND semantics,
-so every v1 condition remains a valid, identically-evaluating FEEL expression when
-dsntk lands post-v1, and models authored by FEEL-aware tooling
-(`expressionLanguage` = FEEL) parse as-is. The subset:
+so every v1 condition remains a valid, identically-evaluating FEEL expression now
+that dsntk **has** landed, and models authored by FEEL-aware tooling
+(`expressionLanguage` = FEEL) parse as-is. That bet paid: DMN arrived and not one
+condition had to change. The subset:
 - expressions: `identifier op literal`, combined with `and`/`or`, parentheses
 - ops: `=` `!=` `<` `<=` `>` `>=` (accept `==` on input, normalize to FEEL's `=`)
 - literals: numbers, double-quoted strings, `true`/`false`, `null`
@@ -233,9 +234,10 @@ dsntk lands post-v1, and models authored by FEEL-aware tooling
   instance's JSONB variable document; a missing path evaluates to null
 - nothing else: no functions, no arithmetic, no `in`/ranges, no date literals
 
-Null semantics are **exactly FEEL's** (they must not change when dsntk swaps
-in). Two *independent* rules — conflating them is what made `x != 1` true for
-a missing x until the dsntk differential caught it:
+Null semantics are **exactly FEEL's** — and now that dsntk is here and
+evaluating decisions beside these conditions, the two must not disagree about
+what a missing value means. Two *independent* rules; conflating them is what
+made `x != 1` true for a missing x until the dsntk differential caught it:
 
 1. **Against the `null` literal**: the null-check idiom, always a boolean.
    `x = null` is true iff x is missing/null; `x != null` its inverse.
@@ -254,16 +256,26 @@ never evaluate differently): ordering ops (`<` `<=` `>` `>=`) require a number
 literal; qualified-name segments are `[A-Za-z_][A-Za-z0-9_]*` (no spaces).
 
 Verified, not asserted: `just feel-parity` differentials the whole subset
-against dsntk over ~8k expression/document pairs. dsntk itself stays out of
-the workspace — `dsntk-feel-number` binds Intel's decimal C library through
-`dfp-number-sys`, so the stack cannot reach wasm32 and cannot enter
-`rbpmn-model` (see "Post-v1: decisions").
+against dsntk over ~8k expression/document pairs. That differential lives
+**outside the workspace**, because dsntk pulls ~170 transitive crates that a
+wasm32-targeting crate has no business carrying.
 
-Own tiny parser/evaluator in the pure core (no dsntk dependency in v1). Checked at
-deploy (`conditions-feel-subset`). Rationale unchanged: decisions belong in
-application code — compute outside, store the result, let the gateway read a flag.
-Correlation keys use the same FEEL qualified-name syntax, registered via
-`map_correlation` — the XML carries no rbpmn-specific syntax anywhere.
+*(Updated: dsntk is now a dependency of the workspace, in `rbpmn-dmn` only —
+see "Decisions" below for how the wasm32 problem was solved rather than
+avoided. `feel-parity` stays outside because dsntk pulls ~170 crates that have
+no business in `rbpmn-model`'s lockfile; `feel-number-parity` stays outside
+because it links the C library deliberately, to differential against it.)*
+
+The condition parser/evaluator stays rbpmn's own, in `rbpmn-model`, and that is
+not laziness about deleting it: conditions are validated at deploy, deploy
+validation must run in the browser, and `rbpmn-model` must therefore reach
+wasm32 without dsntk. Checked at deploy (`conditions-feel-subset`). The
+original rationale — *decisions belong outside control flow: compute, store the
+result, let the gateway read a flag* — survives DMN unchanged, because a
+business-rule task is exactly that shape: it computes and writes a variable,
+and the gateway still reads a flag. Correlation keys use the same FEEL
+qualified-name syntax, registered via `Bindings::correlation` — the XML carries
+no rbpmn-specific syntax anywhere.
 
 ### Execution semantics (the correctness core)
 - Pure core: `fn step(model, state, command) -> (state', effects)` — **no IO in the
@@ -937,9 +949,20 @@ against a production environment without leaving the browser. A dry-run
 endpoint that accepts XML cannot offer that, which is why it is rejected below.
 
 **A consequence to enforce: the dsntk prohibition now extends from
-`rbpmn-model` to `rbpmn-core`.** This is a live collision, not a hypothetical —
-the post-v1 business-rule task would naturally put DMN compile support exactly
-there. Decide it before the DMN spike, not during.
+`rbpmn-model` to `rbpmn-core`.** This was a live collision, not a
+hypothetical — the business-rule task would naturally put DMN compile support
+exactly there.
+
+*Decided, and the collision is what produced the shape.* `rbpmn-core` declares
+a `DecisionValidator` trait and takes a `&dyn`; `rbpmn-dmn` implements it;
+the engine and the editor pass **the same implementation**. `rbpmn-core`'s
+dependency set is unchanged and it still reaches wasm32. The prediction
+underneath the collision — that this would land "in a native crate, so the
+wasm32 constraint does not bite" — was simply wrong, and it was this section
+that made it wrong: an editor that validates the model+manifest *pair* offline
+must validate the decisions too, or it is back to reporting a different verdict
+than deploy will. So dsntk was taken to wasm32 instead of kept away from it.
+See "Decisions" below.
 
 **Severity discipline.** `unresolved-topic` keeps its rule id *and* its error
 severity. Rule ids and severities are stable public API asserted by the fixture
@@ -1052,50 +1075,89 @@ treated like a database extract.
   409 with the candidate ids for several — plus an index. Not in v1: the
   application already holds the UUID it was given.
 
-## Post-v1: decisions — FEEL / DMN via dsntk
-Candidate dependency: `dsntk` (DecisionToolkit, Rust, Apache-2.0/MIT, formerly `dmntk`).
-Unlike BPMN, **DMN has a real TCK** — and dsntk submits: 3374/3391 passed, 0 failed,
-16 not-supported (April 2026 submission). Independently verified correctness fits this
-project; effectively single-maintainer, so pin versions.
+## Decisions — FEEL / DMN via dsntk (**shipped**; was "post-v1")
 
-**Surveyed at 0.3.0 (August 2026) — the constraint that shapes both routes.**
-`dsntk-feel-number` binds Intel's decimal C library via `dfp-number-sys`
-(cc-rs), and it sits under `dsntk-feel`, so *every* dsntk crate carries it.
-Consequences, measured: no wasm32 (`sys/signal.h` not found — even the parser
-alone fails), C FFI and `unsafe` in a tree whose core is
-`#![forbid(unsafe_code)]`, 91 transitive crates for the parser and 173 for the
-evaluator against `rbpmn-model`'s 4, and `dsntk-feel-evaluator` carries an
-unconditional `reqwest::blocking` for FEEL's external-Java bridge (the crate
-declares no features, so there is nothing to gate). **dsntk can therefore
-never enter `rbpmn-model`** — it would take the linter playground and the
-bpmnlint plugin with it. Native-only crates are unaffected.
+Written as a post-v1 sketch, delivered as a phase. `docs/dmn.md` is the full
+record — decisions D1–D9, the gates, the measured deviations, the tracker.
+What belongs *here* is the reasoning that changed, because the prediction and
+the outcome differ in one important way and a fresh session should see both.
 
-Sequencing (deliberate):
-1. **Business-rule task first** (clean, additive): task evaluates a deployed DMN
-   artifact against the instance JSONB, result written back as merge patch; gateways
-   still read flags via the tiny grammar. Preserves "decisions computed outside
-   control flow, control flow reads results". New task kind + artifact type; zero
-   changes to semantic core or condition grammar. `dsntk-feel` / model-evaluation
-   crates only, not the whole toolkit. Unblocked: this lives in a native crate,
-   so the wasm32 constraint does not bite.
-2. **FEEL in sequence-flow conditions second, or never.** It deletes
-   the `conditions-feel-subset` restriction and couples control-flow correctness to an external
-   evaluator. If added: per-definition opt-in, tiny grammar stays the default.
-   Now known to be harder than sketched: conditions are validated at deploy,
-   deploy validation lives in `rbpmn-model`, and `rbpmn-model` is the WASM
-   crate. So this route forces a choice — a native-only validation path
-   (breaking "the playground never lies"), or keeping our parser for
-   validation and using dsntk only for evaluation (two grammars, forever).
-   Decide that before, not during.
+**The survey that shaped it** (dsntk 0.3.0, August 2026). DMN, unlike BPMN,
+has a real TCK, and dsntk submits against it — which is the kind of
+independently verified correctness this project is built on. But
+`dsntk-feel-number` binds Intel's decimal C library via `dfp-number-sys`, and
+it sits under `dsntk-feel`, so *every* dsntk crate carries it. Measured
+consequences: no wasm32 (`sys/signal.h` not found — even the parser alone
+fails), C FFI and `unsafe` in a tree whose core is `#![forbid(unsafe_code)]`,
+91 transitive crates for the parser and 173 for the evaluator against
+`rbpmn-model`'s 4, and `dsntk-feel-evaluator` carrying an unconditional
+`reqwest::blocking` for FEEL's external-Java bridge, with no feature to gate
+it off.
 
-Integration rules (either route):
-- Parse/validate all DMN + FEEL at deploy time — new linter rules `dmn-validates`,
-  `feel-parses` (same loudly-reject front door).
-- DMN artifacts deployed and versioned exactly like process definitions; instances
-  pin the decision version.
-- FEEL is deterministic except the clock builtins: `now()`/`today()` must route
-  through the injected clock or be rejected at deploy — retries/replay require
-  deterministic decisions.
+**What this section predicted, and got wrong.** It concluded the business-rule
+task was "unblocked: this lives in a native crate, so the wasm32 constraint
+does not bite". That was wrong, and the thing that made it wrong is in this
+same document: the editor validates the model+manifest **pair** offline, and
+once decisions are part of a deployment it must validate those too — or it is
+back to reporting a different verdict than deploy will, which
+"one verdict, one implementation" exists to prevent. So the constraint bit
+after all, and the answer was to take dsntk *to* wasm32 rather than keep it
+away:
+
+- **Replace the number type, keep dsntk otherwise unmodified.** A pure-Rust
+  decimal128 replaces `dfp-number-sys`. It is verified against the library it
+  replaces rather than assumed equivalent: 26 300 differential comparisons,
+  upstream's own vendored corpus, and the DMN TCK run twice — as published and
+  as we ship it — compared case by case. Three deviation classes are named,
+  counted and bounded; anything else fails the run.
+- **Remove the HTTP capability rather than disable it.** FEEL's external-Java
+  bridge is compiled out. rbpmn does not want a decision calling out — not to
+  Java, not to anything. `feel-deterministic` refuses the external functions at
+  deploy; the absent HTTP client removes the ability at runtime. Same shape as
+  XML purity: take the capability away, do not rely on policy.
+- **Both are now *features of a fork*, not substitutions.** They began as two
+  shim crates plus a workspace-global `[patch.crates-io]`, which worked and had
+  one fatal property: Cargo honours `[patch]` only from the workspace root of
+  the build being run, so every application depending on rbpmn had to repeat it
+  or get a silently weaker build. They are now `use-fastnum` (default) and
+  `java-bridge` (off) on [a dsntk fork](https://github.com/tpjg/dsntk), which
+  `rbpmn-dmn` depends on by git rev. A feature travels down the dependency
+  graph; a patch does not. The fork is also a viable upstream PR, which a pair
+  of shims never was.
+- **A seam, not a dependency.** `rbpmn-core` declares `DecisionValidator` and
+  takes a `&dyn`; `rbpmn-dmn` implements it; engine and editor pass the same
+  implementation. `rbpmn-model` and `rbpmn-core` keep their dependency sets
+  and their wasm32 target.
+
+**The sequencing held.** Step 1 was "business-rule task first, additive,
+decisions computed outside control flow with the gateway reading a flag" —
+that is exactly what shipped. Step 2 was "FEEL in sequence-flow conditions
+second, **or never**", and it is **never**: the reason given here (deploy
+validation lives in `rbpmn-model`, which is the wasm32 crate, so adopting
+dsntk there forces either a native-only validation path or two grammars
+forever) is still the reason. rbpmn's own subset stays.
+
+**Where the integration rules landed differently.** All DMN and FEEL is parsed
+and validated at deploy, as planned, through five new rule ids
+(`dmn-validates`, `feel-parses`, `feel-deterministic`, `decision-has-binding`,
+`unresolved-decision`). But:
+
+- DMN artifacts are **not** deployed and versioned as separate entities. They
+  travel *inside* the definition — `{bpmn, bindings, decisions}`, one content
+  hash over all three — so an instance pins its decisions by pinning its
+  definition, and there is no second versioning story to get wrong. It is also
+  what makes `unresolved-decision` decidable with no environment at all: unlike
+  a topic, a decision cannot be missing at deploy time, because it is in the
+  bundle.
+- `now()`/`today()` are **rejected**, not routed through an injected clock.
+  Rejecting is the smaller contract, and it is the same ruling the rest of the
+  engine takes: time enters as command data. A decision that needs the date
+  takes it as an input.
+- The answer **replaces** the value at its bound path rather than being merged
+  in. RFC 7386 cannot express what a decision means — a null in a merge patch
+  deletes the member instead of storing it, and merging an object answer keeps
+  keys from a previous run, so a decision in a loop would report a result it
+  never produced. (Both were real bugs, found in review.)
 
 ## Everything still open — one visible list
 
@@ -1108,10 +1170,11 @@ question is purely internal.
 |---|---|---|---|
 | **Embedded subprocesses** | The modelling style the engine exists to serve; unmodellable today | High | **v1, phase 6 — shipped** |
 | **Retention** | The failure mode that kills BPM installations; interacts with the new event cursor | Low | **v1, phase 7 — shipped** |
-| **Authoring & inspection surfaces** | A `.bpmn` is half-deployable without its manifest, and nothing outside this repo knows the manifest exists; the project's own debugger is dev-only | Medium | **v1, phase 8 — next** |
+| **Authoring & inspection surfaces** | A `.bpmn` is half-deployable without its manifest, and nothing outside this repo knows the manifest exists; the project's own debugger is dev-only | Medium | **v1, phase 8 — shipped** |
 | Event-stream read horizon | Hold history for a registered slow consumer *beyond* the nominal retention age | Low | Roadmap — purely additive over the phase-7 floor; see phase 7 for why the age subsumes it otherwise |
 | `rbpmn_event` time partitioning | Turns retention into `DROP PARTITION` at very large scale | Medium | Roadmap — physical only, no contract change; see phase 7 |
-| Non-interrupting boundary events | "Every 30 days while this runs"; rides on scope machinery | Medium | v2 — held out of v1 so it does not double phase 6's risk |
+| Non-interrupting boundary events | "Every 30 days while this runs"; rides on scope machinery | Medium | v2 — held out of v1 so it does not double phase 6's risk. **Designed**: slices 2–3 of [docs/design/boundary-messages.md](docs/design/boundary-messages.md) (side-path lint rule, `timeCycle` with the anchor as phase) |
+| Message boundary events | Xilium's payment-during-contest: a `PAID` correlated to a ticket parked at a user task is refused with `NoSubscription` today | Medium | **Design round done** — [docs/design/boundary-messages.md](docs/design/boundary-messages.md). Slice 1 is the interrupting form on all four hosts; also names a dead arm lint accepts today (a timer boundary on a business-rule task) and a loader gap (two subscriptions on one token) |
 | Expression-valued timers | Deadlines from the variable document; standard `tFormalExpression`, no extension needed | Small | **Shipped** — see the roadmap entry for the rulings taken |
 | Link events | Diagram hygiene once big models are common | Trivial | v2 |
 | Event subprocesses | "Cancel my order at any point" without boundary spaghetti | Medium | v3 |
@@ -1119,7 +1182,7 @@ question is purely internal.
 | Compensation + cancel + transaction subprocess | The real work; history becomes runtime state | High | v5 |
 | Cross-definition messaging (message start/throw) | Model fidelity for choreography; exactly-once emission for remote callers | Medium | **Needs a design round** — buffering, dead-lettering, message-start versioning |
 | Instance migration API | Long-lived instances pin their version forever; a five-year process can never get a fix | Very high | **Design only in v1**, needs its own round |
-| DMN / business-rule task via dsntk | Decisions as models rather than handler code | Medium-high | Spike in flight (`feel-parity`); see the dsntk section |
+| DMN / business-rule task via dsntk | Decisions as models rather than handler code | Medium-high | **Shipped, and in the default build** — see "Decisions" below and `docs/dmn.md`. Landed larger than this row implies: the editor authors DMN too, which forced dsntk onto wasm32 |
 | Upgrade escape hatch | Retroactively-stricter lint can refuse to boot with the deploy API unreachable | Low | Queued; matters at the first real upgrade |
 | Restricted inclusive gateway | More than the Camunda 7 lineage ever shipped | Moderate | Someday; revisit when fixture discipline is mature |
 
@@ -1259,8 +1322,8 @@ claimability requires `status = 'active'`; a repair API clearing the incident
 would have handed a worker an item whose token was parked at one.
 
 The subset is a FEEL **qualified name** (`order.slaDuration`), not general
-FEEL — the same strict subset correlation keys already use, so it stays
-syntactically and semantically valid when dsntk lands. `TimerSource` and
+FEEL — the same strict subset correlation keys already use, so it stayed
+syntactically and semantically valid when dsntk landed. `TimerSource` and
 `TimerDue` are deliberately distinct types rather than one enum with a
 "resolved" flag: the resolved form is what the projection stores, so an
 unresolved expression cannot reach the SQL cast by construction rather than
@@ -1307,8 +1370,12 @@ timer …). Budget fixtures per release, not code.
 
 ## Non-goals (write them down so nobody "helpfully" adds them)
 - Inclusive/complex gateways, call activities, compensation, BPEL anything
-- Embedded scripting; expression languages in v1 (see "Post-v1: decisions" for the
-  planned DMN/FEEL route — business-rule task, not gateway conditions)
+- Embedded scripting, and general expression languages. **Still a non-goal after
+  DMN shipped**, and the distinction is the whole point: a decision is a
+  *model* — declarative, validated at deploy, versioned with the definition —
+  not a script. Gateway conditions stay on rbpmn's own FEEL subset; the route
+  taken was business-rule task, not gateway conditions, exactly as this line
+  said. See "Decisions"
 - A modelling *engine* (we embed bpmn-io's) and an operations cockpit — no
   writes from any UI, no instance lists, no search, no scheduling views. Phase
   8's editor and read-only inspector are deliberately narrower than both; the

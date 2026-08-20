@@ -1,7 +1,10 @@
 //! Sequence-flow conditions: a **strict subset of FEEL** (DMN 1.3+) with
 //! identical syntax and semantics, so every v1 condition remains a valid,
-//! identically-evaluating FEEL expression when dsntk lands post-v1, and
-//! models authored by FEEL-aware tooling parse as-is.
+//! identically-evaluating FEEL expression now that dsntk *has* landed, and
+//! models authored by FEEL-aware tooling parse as-is. This evaluator stays
+//! rbpmn's own regardless: conditions are validated at deploy, deploy
+//! validation runs in the browser, and this crate must therefore reach wasm32
+//! without dsntk. `just feel-parity` is what keeps the two honest.
 //!
 //! ```text
 //! expr    := or
@@ -31,6 +34,7 @@
 //!     missing: a missing variable must never satisfy a negative condition.
 
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,8 +57,44 @@ impl CmpOp {
 pub enum Literal {
     Null,
     Bool(bool),
-    Num(f64),
+    Num(Num),
     Str(String),
+}
+
+/// A number literal, kept **as written**.
+///
+/// Not an `f64`. The variable document holds arbitrary-precision numbers (the
+/// `arbitrary_precision` spike in `docs/dmn.md`), and once DMN decisions
+/// started producing 34-digit decimals a comparator that read through `f64`
+/// would answer `a = 1.0000000000000000002` **true** for a stored `…001`.
+/// Storage became exact; this is comparison catching up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Num(String);
+
+impl Num {
+    /// The literal exactly as the model wrote it.
+    pub fn text(&self) -> &str {
+        &self.0
+    }
+
+    /// Its value as an `f64`, for callers that only need a magnitude — the
+    /// state-space explorer picking neighbouring values, say. Never used to
+    /// decide a comparison.
+    pub fn as_f64(&self) -> f64 {
+        self.0.parse().unwrap_or(f64::NAN)
+    }
+}
+
+impl From<String> for Num {
+    fn from(text: String) -> Self {
+        Num(text)
+    }
+}
+
+impl fmt::Display for Num {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -331,11 +371,14 @@ fn lex(src: &str) -> Result<Vec<(usize, Tok)>, CondError> {
                         return err(start, "digits required in exponent");
                     }
                 }
-                let n: f64 = src[i..j].parse().map_err(|_| CondError {
+                // Parsed only to reject nonsense; the *text* is what is kept,
+                // because f64 cannot hold every number a model may compare
+                // against.
+                src[i..j].parse::<f64>().map_err(|_| CondError {
                     offset: start,
                     message: format!("invalid number '{}'", &src[i..j]),
                 })?;
-                toks.push((start, Tok::Lit(Literal::Num(n))));
+                toks.push((start, Tok::Lit(Literal::Num(Num(src[i..j].to_string())))));
                 i = j;
             }
             b if (b as char).is_ascii_alphabetic() || b == b'_' => {
@@ -384,8 +427,9 @@ fn read_segment(src: &str, i: &mut usize) -> String {
 }
 
 /// Evaluate a condition against the instance variable document with **FEEL's
-/// exact semantics**, so dsntk can swap in post-v1 without any behavior
-/// change. Ternary (three-valued) logic is used internally and collapsed to a
+/// exact semantics** — verified against dsntk by `just feel-parity`, not
+/// asserted, which is how `x != 1` was caught answering true for a missing
+/// `x`. Ternary (three-valued) logic is used internally and collapsed to a
 /// boolean only at the root: `null` becomes `false`.
 ///
 /// The precise rules (all FEEL, DMN 1.3):
@@ -404,7 +448,7 @@ pub fn eval(expr: &Expr, variables: &serde_json::Value) -> bool {
 
 /// Parse a bare FEEL qualified name (`order.id`) into its path segments —
 /// the shared syntax between conditions and correlation-key bindings
-/// (`map_correlation` registers these; the XML never carries them). Same
+/// (`Bindings::correlation` registers these; the XML never carries them). Same
 /// strictness as the condition grammar: segments are
 /// `[A-Za-z_][A-Za-z0-9_]*`, joined by single dots, no spaces.
 pub fn parse_qname(src: &str) -> Result<Vec<String>, CondError> {
@@ -483,6 +527,128 @@ fn resolve<'a>(variables: &'a serde_json::Value, path: &[String]) -> &'a serde_j
     current
 }
 
+/// Compare two decimal numbers written as text, exactly.
+///
+/// Both sides can be wider than an `f64`: the stored value because the
+/// variable document is arbitrary-precision, the literal because a model may
+/// write any number it likes. Going through `f64` would collapse values that
+/// differ past the 17th digit, which is a wrong branch rather than a rounding
+/// error.
+///
+/// Returns `None` only when a side is not a decimal number at all (`NaN`,
+/// `Infinity` — which JSON cannot hold anyway).
+fn compare_decimals(a: &str, b: &str) -> Option<Ordering> {
+    let (a_neg, a_digits, a_exp) = decimal_parts(a)?;
+    let (b_neg, b_digits, b_exp) = decimal_parts(b)?;
+    // Zero has no sign here: `-0` and `0` are the same number.
+    let (a_zero, b_zero) = (a_digits.is_empty(), b_digits.is_empty());
+    if a_zero || b_zero {
+        return Some(match (a_zero, b_zero) {
+            (true, true) => Ordering::Equal,
+            (true, false) => {
+                if b_neg {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, true) => {
+                if a_neg {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, false) => unreachable!(),
+        });
+    }
+    if a_neg != b_neg {
+        return Some(if a_neg {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    let magnitude = compare_magnitudes(&a_digits, a_exp, &b_digits, b_exp);
+    Some(if a_neg {
+        magnitude.reverse()
+    } else {
+        magnitude
+    })
+}
+
+/// Compare two non-zero magnitudes given as significant digits and the
+/// decimal exponent of the *last* digit.
+///
+/// The arithmetic is `i128` because the exponent is `i64` and the digit count
+/// is added to it: `1e9223372036854775807` is a number `arbitrary_precision`
+/// now *accepts* from an ordinary API caller, and in `i64` that sum panicked
+/// in debug and wrapped — into a wrong branch — in release.
+fn compare_magnitudes(a: &str, a_exp: i128, b: &str, b_exp: i128) -> Ordering {
+    // Where the most significant digit sits. Different positions decide it
+    // outright, which is what makes this cheap for the common case.
+    let a_top = a.len() as i128 + a_exp;
+    let b_top = b.len() as i128 + b_exp;
+    if a_top != b_top {
+        return a_top.cmp(&b_top);
+    }
+    // Same position: compare digit by digit, treating a shorter number as
+    // padded with zeros.
+    let width = a.len().max(b.len());
+    let pad = |s: &str| {
+        let mut out = s.to_string();
+        out.push_str(&"0".repeat(width - s.len()));
+        out
+    };
+    pad(a).cmp(&pad(b))
+}
+
+/// `"-1.50e2"` -> `(true, "15", 1)`: sign, significant digits with leading and
+/// trailing zeros stripped, and the decimal exponent of the last kept digit.
+/// Empty digits mean zero.
+fn decimal_parts(text: &str) -> Option<(bool, String, i128)> {
+    let text = text.trim();
+    let (negative, rest) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (mantissa, exponent) = match rest.split_once(['e', 'E']) {
+        // `i64` on the way in — a literal outside that range is not a number
+        // this can compare — then `i128` for the arithmetic below.
+        Some((m, e)) => (m, i128::from(e.parse::<i64>().ok()?)),
+        None => (rest, 0),
+    };
+    let (integer, fraction) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    if integer.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !integer
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut digits = String::with_capacity(integer.len() + fraction.len());
+    digits.push_str(integer);
+    digits.push_str(fraction);
+    let mut exp = exponent - fraction.len() as i128;
+    // Strip trailing zeros (raising the exponent) then leading zeros, so
+    // `1.50` and `1.5` become the same (digits, exponent) pair.
+    while digits.ends_with('0') {
+        digits.pop();
+        exp += 1;
+    }
+    let digits = digits.trim_start_matches('0').to_string();
+    if digits.is_empty() {
+        exp = 0;
+    }
+    Some((negative, digits, exp))
+}
+
 fn compare(actual: &serde_json::Value, op: CmpOp, literal: &Literal) -> Option<bool> {
     use serde_json::Value;
     match op {
@@ -500,7 +666,9 @@ fn compare(actual: &serde_json::Value, op: CmpOp, literal: &Literal) -> Option<b
                 // missing).
                 (Value::Null, _) => None,
                 (Value::Bool(a), Literal::Bool(b)) => Some(a == b),
-                (Value::Number(a), Literal::Num(b)) => Some(a.as_f64() == Some(*b)),
+                (Value::Number(a), Literal::Num(b)) => {
+                    Some(compare_decimals(&a.to_string(), b.text()) == Some(Ordering::Equal))
+                }
                 (Value::String(a), Literal::Str(b)) => Some(a == b),
                 _ => None,
             };
@@ -513,12 +681,12 @@ fn compare(actual: &serde_json::Value, op: CmpOp, literal: &Literal) -> Option<b
             let (Value::Number(a), Literal::Num(b)) = (actual, literal) else {
                 return None;
             };
-            let a = a.as_f64()?;
+            let ordering = compare_decimals(&a.to_string(), b.text())?;
             Some(match op {
-                CmpOp::Lt => a < *b,
-                CmpOp::Le => a <= *b,
-                CmpOp::Gt => a > *b,
-                CmpOp::Ge => a >= *b,
+                CmpOp::Lt => ordering == Ordering::Less,
+                CmpOp::Le => ordering != Ordering::Greater,
+                CmpOp::Gt => ordering == Ordering::Greater,
+                CmpOp::Ge => ordering != Ordering::Less,
                 _ => unreachable!(),
             })
         }
@@ -584,17 +752,17 @@ mod tests {
                 Expr::Cmp {
                     path: vec!["a".into()],
                     op: CmpOp::Eq,
-                    value: Literal::Num(1.0)
+                    value: Literal::Num(Num("1".into()))
                 },
                 Expr::Cmp {
                     path: vec!["b".into()],
                     op: CmpOp::Eq,
-                    value: Literal::Num(2.0)
+                    value: Literal::Num(Num("2".into()))
                 },
                 Expr::Cmp {
                     path: vec!["c".into()],
                     op: CmpOp::Eq,
-                    value: Literal::Num(3.0)
+                    value: Literal::Num(Num("3".into()))
                 },
             ])
         );
@@ -621,6 +789,97 @@ mod tests {
         bad("a = ");
         bad("(a = 1");
         bad("a && b");
+    }
+
+    /// The reason `Literal::Num` keeps its text. Once decisions started
+    /// producing 34-digit decimals and the variable document started holding
+    /// them exactly, an `f64` comparator would answer these wrong — and a
+    /// wrong comparison is a token down the wrong branch, not a rounding
+    /// error.
+    #[test]
+    fn comparison_is_exact_beyond_f64() {
+        let vars: serde_json::Value = serde_json::from_str(
+            r#"{ "a": 1.0000000000000000001,
+                  "big": 123456789012345678901234567890,
+                  "price": 1.50 }"#,
+        )
+        .unwrap();
+        let t = |src: &str| eval(&ok(src), &vars);
+
+        // Differing past the 17th digit: f64 called these equal.
+        assert!(!t("a = 1.0000000000000000002"));
+        assert!(t("a = 1.0000000000000000001"));
+        assert!(t("a < 1.0000000000000000002"));
+        assert!(!t("a > 1.0000000000000000002"));
+
+        // A 30-digit integer, likewise.
+        assert!(t("big = 123456789012345678901234567890"));
+        assert!(!t("big = 123456789012345678901234567891"));
+        assert!(t("big > 123456789012345678901234567889"));
+
+        // Trailing zeros are not significance: 1.50 is 1.5.
+        assert!(t("price = 1.5"));
+        assert!(t("price = 1.50"));
+        assert!(t("price >= 1.5"));
+        assert!(!t("price > 1.5"));
+    }
+
+    #[test]
+    fn decimal_comparison_handles_the_awkward_shapes() {
+        let cmp = |a: &str, b: &str| compare_decimals(a, b);
+        assert_eq!(cmp("0", "-0"), Some(Ordering::Equal));
+        assert_eq!(cmp("0.0", "0"), Some(Ordering::Equal));
+        assert_eq!(cmp("-1", "1"), Some(Ordering::Less));
+        assert_eq!(cmp("-2", "-1"), Some(Ordering::Less));
+        assert_eq!(cmp("10", "9"), Some(Ordering::Greater));
+        assert_eq!(cmp("1e2", "100"), Some(Ordering::Equal));
+        assert_eq!(cmp("1E2", "100.00"), Some(Ordering::Equal));
+        assert_eq!(cmp("1.5e-1", "0.15"), Some(Ordering::Equal));
+        assert_eq!(cmp("-0.0", "0"), Some(Ordering::Equal));
+        assert_eq!(cmp("0.1", "0.09999"), Some(Ordering::Greater));
+        assert_eq!(cmp("100", "1e3"), Some(Ordering::Less));
+        // Not numbers at all.
+        assert_eq!(cmp("abc", "1"), None);
+        assert_eq!(cmp("1", ""), None);
+
+        // Exponents at the edge of the type they are parsed into. The digit
+        // count is *added* to the exponent to find the leading digit's
+        // position, and in `i64` that sum panicked in debug and — worse —
+        // wrapped into the opposite branch in release. `serde_json`'s
+        // `arbitrary_precision` hands these straight through from an API
+        // caller's payload, so it is reachable input, not a curiosity.
+        let max = i64::MAX.to_string();
+        let min = i64::MIN.to_string();
+        assert_eq!(cmp(&format!("1e{max}"), "1"), Some(Ordering::Greater));
+        assert_eq!(cmp("1", &format!("1e{max}")), Some(Ordering::Less));
+        assert_eq!(cmp(&format!("1e{min}"), "1"), Some(Ordering::Less));
+        assert_eq!(cmp(&format!("-1e{max}"), "1"), Some(Ordering::Less));
+        assert_eq!(
+            cmp(&format!("1e{max}"), &format!("1e{max}")),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            cmp(&format!("1.2345e{max}"), &format!("1.2344e{max}")),
+            Some(Ordering::Greater)
+        );
+        // Past `i64` the literal is not a number this can compare, and saying
+        // so beats guessing.
+        assert_eq!(cmp("1e9223372036854775808", "1"), None);
+    }
+
+    /// The same overflow, through the door it actually arrives by.
+    #[test]
+    fn an_extreme_exponent_from_a_payload_does_not_overflow() {
+        let vars: serde_json::Value =
+            serde_json::from_str(r#"{"a": 1e9223372036854775807, "b": -1e9223372036854775807}"#)
+                .unwrap();
+        assert!(eval(&ok("a > 1"), &vars));
+        assert!(!eval(&ok("a < 1"), &vars));
+        assert!(eval(&ok("b < 1"), &vars));
+        assert!(eval(&ok("a != 1"), &vars));
+        // ...and against a literal at the same extreme, from the other side.
+        assert!(eval(&ok("a = 1e9223372036854775807"), &vars));
+        assert!(!eval(&ok("a > 1e9223372036854775807"), &vars));
     }
 
     #[test]

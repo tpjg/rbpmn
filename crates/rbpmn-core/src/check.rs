@@ -1,10 +1,11 @@
 //! The deploy verdict, minus the database.
 //!
-//! `deploy` decides four things without touching Postgres — is this BPMN at
-//! all, is there exactly one process, does the linter pass, and does the
-//! model compile against its bindings manifest — and exactly one thing with
-//! it: are the resolved service topics covered by the environment as
-//! registered right now (`unresolved-topic`).
+//! `deploy` decides six things without touching Postgres — is this BPMN at
+//! all, is there exactly one process, do the bundled DMN artifacts validate,
+//! do the decision bindings resolve against them, does the linter pass, and
+//! does the model compile against its bindings manifest — and exactly one
+//! thing with it: are the resolved service topics covered by the environment
+//! as registered right now (`unresolved-topic`).
 //!
 //! That split lives here so both callers share it. `Engine::deploy` runs this
 //! and then the environment link; the editor runs this in WASM and does the
@@ -12,11 +13,18 @@
 //! the other, which is the same guarantee `just parity` buys for the linter:
 //! a surface that reports a verdict must report *the* verdict.
 //!
+//! Bundled DMN artifacts are validated here too, through an injected
+//! [`DecisionValidator`] — the core has no DMN model type and must not
+//! acquire one (`docs/dmn.md`, D1). Deploy passes `rbpmn_dmn`'s
+//! implementation and the editor passes the same one, which is what stops
+//! the two surfaces reaching different verdicts about the same bundle.
+//!
 //! Not covered here: manifest index declarations, whose validation is SQL
 //! identifier policy and stays in the engine. They are a performance
 //! declaration and cannot make a model unexecutable.
 
 use crate::compile::{Bindings, CompileError, ExecutableProcess};
+use crate::decisions::{DecisionValidator, Invocable};
 use rbpmn_model::{Diagnostic, ParseError, rule};
 
 /// What can be known about a deployment before the environment is consulted.
@@ -45,6 +53,11 @@ pub struct Checked {
     /// caller performs: any topic outside the covered set is an
     /// `unresolved-topic` error.
     pub topics: Vec<(String, String)>,
+    /// What the bundled decision artifacts expose, empty when there are none
+    /// or they did not compile. P2 matches manifest bindings against this for
+    /// `unresolved-decision`; unlike topics it needs no environment, because
+    /// the artifacts travel inside the deployment.
+    pub invocables: Vec<Invocable>,
 }
 
 impl Checked {
@@ -85,7 +98,20 @@ impl Checked {
 }
 
 /// Run every deploy check that does not need a database.
-pub fn check_deployable(xml: &str, bindings: &Bindings) -> DeployCheck {
+///
+/// `decisions` is the DMN artifacts the deployment bundles, as raw XML, and
+/// `validator` is what knows how to read them. They are checked
+/// *independently* of the process: a broken decision table and a broken
+/// diagram are separate problems, and making someone fix one to discover the
+/// other wastes a round trip.
+pub fn check_deployable(
+    xml: &str,
+    bindings: &Bindings,
+    decisions: &[String],
+    validator: &dyn DecisionValidator,
+) -> DeployCheck {
+    let decided = validator.check(decisions);
+
     let defs = match rbpmn_model::parse(xml) {
         Ok(defs) => defs,
         Err(e) => return DeployCheck::Unparseable(e),
@@ -95,7 +121,9 @@ pub fn check_deployable(xml: &str, bindings: &Bindings) -> DeployCheck {
     }
     let key = defs.processes[0].id.clone();
 
-    let mut diagnostics = rbpmn_model::lint(&defs);
+    let mut diagnostics = decided.diagnostics;
+    diagnostics.extend(decision_bindings(bindings, &decided.invocables));
+    diagnostics.extend(rbpmn_model::lint(&defs));
     // Compilation re-lints, so running it over a model the linter already
     // rejected would only restate those errors. Stop at the first gate, the
     // way deploy does.
@@ -104,6 +132,7 @@ pub fn check_deployable(xml: &str, bindings: &Bindings) -> DeployCheck {
             key,
             diagnostics,
             topics: Vec::new(),
+            invocables: decided.invocables,
         });
     }
 
@@ -120,6 +149,7 @@ pub fn check_deployable(xml: &str, bindings: &Bindings) -> DeployCheck {
                 key,
                 diagnostics,
                 topics,
+                invocables: decided.invocables,
             })
         }
         Err(e) => {
@@ -128,9 +158,85 @@ pub fn check_deployable(xml: &str, bindings: &Bindings) -> DeployCheck {
                 key,
                 diagnostics,
                 topics: Vec::new(),
+                invocables: decided.invocables,
             })
         }
     }
+}
+
+/// `decision-has-binding` and `unresolved-decision`, over the manifest.
+///
+/// This is the decision half of the link step, and unlike `unresolved-topic`
+/// it is *complete here*: topics are an environment question, but a
+/// deployment's decisions travel inside it, so the editor can answer this
+/// offline with no server and no upload.
+///
+/// The "a business-rule task must *have* a binding" half is not here: it needs
+/// the compiled process to know which elements are business-rule tasks, so it
+/// lives in `compile` and reports the same rule id. Both halves are
+/// `decision-has-binding`; this one checks the binding is well-formed and
+/// resolves, that one checks it exists.
+fn decision_bindings(bindings: &Bindings, invocables: &[Invocable]) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for (element, binding) in &bindings.decisions {
+        if let Err(e) = rbpmn_model::condition::parse_qname(&binding.result) {
+            diagnostics.push(Diagnostic::error(
+                rule::DECISION_HAS_BINDING,
+                element,
+                format!(
+                    "the decision result path is not a FEEL qualified name: {e} \
+                     (it names where the answer lands in the variable document, \
+                     like `order.discount`)"
+                ),
+            ));
+        }
+        let matches: Vec<&Invocable> = invocables
+            .iter()
+            .filter(|i| i.name == binding.decision)
+            .collect();
+        match matches.as_slice() {
+            [_] => {}
+            [] => diagnostics.push(Diagnostic::error(
+                rule::UNRESOLVED_DECISION,
+                element,
+                format!(
+                    "no decision named '{}' in the bundled DMN artifacts{}",
+                    binding.decision,
+                    if invocables.is_empty() {
+                        " — the deployment bundles none".to_string()
+                    } else {
+                        format!(
+                            " (available: {})",
+                            invocables
+                                .iter()
+                                .map(|i| i.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }
+                ),
+            )),
+            // Refused, never picked: delivering to "one of them" would be a
+            // guess, and a deployment that guesses is one that runs the wrong
+            // decision on a Tuesday.
+            several => diagnostics.push(Diagnostic::error(
+                rule::UNRESOLVED_DECISION,
+                element,
+                format!(
+                    "'{}' is defined by {} bundled artifacts ({}) — rename one, or \
+                     bundle only the artifact this deployment means",
+                    binding.decision,
+                    several.len(),
+                    several
+                        .iter()
+                        .map(|i| format!("{}/{}", i.namespace, i.model))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )),
+        }
+    }
+    diagnostics
 }
 
 /// One compile failure -> the diagnostics deploy reports for it.
@@ -147,6 +253,26 @@ fn compile_diagnostics(key: &str, e: CompileError) -> Vec<Diagnostic> {
                 )
             })
             .collect(),
+        CompileError::MissingDecision(elements) => elements
+            .iter()
+            .map(|el| {
+                Diagnostic::error(
+                    rule::DECISION_HAS_BINDING,
+                    el,
+                    "business-rule task has no decision binding — bind it with \
+                     Bindings::decision(element_id, decision_name, result_path). \
+                     There is no default: guessing a decision by element id would \
+                     invoke business logic nobody chose",
+                )
+            })
+            .collect(),
+        CompileError::InvalidDecision { element, reason } => {
+            vec![Diagnostic::error(
+                rule::DECISION_HAS_BINDING,
+                element,
+                format!("decision binding is not usable: {reason}"),
+            )]
+        }
         CompileError::InvalidCorrelation { element, reason } => {
             vec![Diagnostic::error(
                 rule::MESSAGE_HAS_CORRELATION,
@@ -181,7 +307,7 @@ mod tests {
 </bpmn:definitions>"#;
 
     fn checked(xml: &str, bindings: &Bindings) -> Checked {
-        match check_deployable(xml, bindings) {
+        match check_deployable(xml, bindings, &[], &crate::NoDecisions) {
             DeployCheck::Checked(c) => c,
             other => panic!("expected Checked, got {other:?}"),
         }
@@ -216,7 +342,7 @@ mod tests {
     #[test]
     fn not_bpmn_at_all() {
         assert!(matches!(
-            check_deployable("<not-xml", &Bindings::new()),
+            check_deployable("<not-xml", &Bindings::new(), &[], &crate::NoDecisions),
             DeployCheck::Unparseable(_)
         ));
     }
@@ -232,7 +358,7 @@ mod tests {
                </bpmn:process></bpmn:definitions>"#,
         );
         assert!(matches!(
-            check_deployable(&two, &Bindings::new()),
+            check_deployable(&two, &Bindings::new(), &[], &crate::NoDecisions),
             DeployCheck::NotExactlyOneProcess(2)
         ));
     }

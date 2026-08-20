@@ -30,7 +30,18 @@ pub const MAX_STATES: usize = 200_000;
 /// The invariant set of docs/stress-testing.md §1, in the subset expressible
 /// on core state alone. Checked at *every* reachable state.
 pub fn check(proc: &ExecutableProcess, s: &InstanceState) -> Result<(), String> {
-    let stimuli = s.open_work_items().count() + s.timers().count() + s.subscriptions().count();
+    // A token awaiting a decision is a pending stimulus too: `stimuli()`
+    // offers `CompleteDecision` for it, and the engine answers it inside the
+    // same transaction. Counting it is what keeps "deadlock" meaning "nothing
+    // can ever move this" rather than "nothing this list knows about".
+    let awaiting_decision = s
+        .tokens()
+        .filter(|(_, t)| t.wait == WaitKind::Decision)
+        .count();
+    let stimuli = s.open_work_items().count()
+        + s.timers().count()
+        + s.subscriptions().count()
+        + awaiting_decision;
     if s.status == InstanceStatus::Active && stimuli == 0 {
         return Err("active instance with no pending stimulus (deadlock)".into());
     }
@@ -77,7 +88,15 @@ pub fn check(proc: &ExecutableProcess, s: &InstanceState) -> Result<(), String> 
                     ));
                 }
             },
-            WaitKind::Join { .. } | WaitKind::EventGateway | WaitKind::Incident => {}
+            // `Decision` needs no cross-check: unlike a work item or a
+            // timer, it is not backed by a row that could disagree with the
+            // token. What answers it is a command, and `stimuli` supplies
+            // one — so the explorer walks decision paths rather than
+            // reporting them as deadlocks.
+            WaitKind::Join { .. }
+            | WaitKind::EventGateway
+            | WaitKind::Incident
+            | WaitKind::Decision => {}
         }
     }
 
@@ -203,6 +222,7 @@ pub fn canonical(proc: &ExecutableProcess, s: &InstanceState) -> String {
             WaitKind::Message(_) => "message".into(),
             WaitKind::EventGateway => "gateway".into(),
             WaitKind::Incident => "incident".into(),
+            WaitKind::Decision => "decision".into(),
             WaitKind::Scope(_) => "subprocess".into(),
         };
         let armed = arms.get(&id.0).map(|a| a.join(",")).unwrap_or_default();
@@ -281,7 +301,14 @@ pub fn patch_alphabet(proc: &ExecutableProcess, codes: &[String]) -> Vec<Value> 
     for (path, lit) in lits {
         let candidates = match lit {
             Literal::Bool(b) => vec![json!(b), json!(!b)],
-            Literal::Num(n) => vec![json!(n), json!(n - 1.0), json!(n + 1.0)],
+            // The literal itself and a neighbour either side, so the
+            // explorer walks both sides of every threshold. `as_f64` is fine
+            // here: these are probe values, not a comparison — the exactness
+            // that matters lives in `condition::compare`.
+            Literal::Num(n) => {
+                let v = n.as_f64();
+                vec![json!(v), json!(v - 1.0), json!(v + 1.0)]
+            }
             Literal::Str(s) => vec![json!(s), json!("~other~")],
             Literal::Null => vec![Value::Null, json!("~other~")],
         };
@@ -319,6 +346,28 @@ pub fn stimuli(s: &InstanceState, patches: &[Value], codes: &[Option<String>]) -
             out.push(Command::DeliverMessage {
                 id,
                 patch: p.clone(),
+            });
+        }
+    }
+    // A token parked on a decision is waiting for a command like any other.
+    // The engine answers it inside the same transaction, so an *operator*
+    // never sees this state — but the core does, between the two steps, and
+    // that is exactly the level this explorer works at. Both answers are
+    // supplied: a value, and the `None` that freezes, so the incident branch
+    // is walked too.
+    for (id, t) in s.tokens() {
+        if t.wait == WaitKind::Decision {
+            for p in patches {
+                out.push(Command::CompleteDecision {
+                    token: id,
+                    answer: Some(p.clone()),
+                    reason: None,
+                });
+            }
+            out.push(Command::CompleteDecision {
+                token: id,
+                answer: None,
+                reason: Some("explored".to_string()),
             });
         }
     }

@@ -7,7 +7,19 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = ["ui"]
+default = ["ui", "dmn"]
+# DMN artifacts in a deployment. **On** by default, like every other DMN
+# switch in this workspace.
+#
+# This is also what resolves a tension the opt-in arrangement had: a server
+# built *with* `ui` but *without* `dmn` ships an editor that validates a
+# bundle's decisions and says it would deploy, while the server itself refuses
+# that bundle — the verdict split P4 exists to prevent. Default-on makes the
+# ordinary build agree with itself. Turning it off keeps the loud refusal
+# (`dmn-validates`, naming the artifacts it cannot check) rather than a silent
+# accept, so the mismatch still announces itself on the first deploy instead
+# of after it.
+dmn = ["rbpmn-engine/dmn"]
 # The two UI documents. Opt-out rather than opt-in because they are static
 # and behind the same bearer as everything else; turn it off to drop ~2 MiB
 # of embedded assets from the binary.
@@ -15,7 +27,13 @@ ui = ["dep:rbpmn-ui"]
 
 [dependencies]
 rbpmn-model = { path = "../rbpmn-model" }
-rbpmn-engine = { path = "../rbpmn-engine", features = ["http"] }
+# `default-features = false`, and the server's own `dmn` re-enables it below.
+# Without that opt-out the engine's default would arrive whatever the server
+# asked for, and `--no-default-features` here would still compile dsntk — a
+# feature switch that does nothing is worse than not having one.
+rbpmn-engine = { path = "../rbpmn-engine", default-features = false, features = [
+  "http",
+] }
 rbpmn-ui = { path = "../rbpmn-ui", optional = true }
 uuid = { version = "1", features = ["serde"] }
 axum = "0.8"
@@ -31,4 +49,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-rbpmn-engine = { path = "../rbpmn-engine", features = ["http", "test-util"] }
+rbpmn-engine = { path = "../rbpmn-engine", default-features = false, features = [
+  "http",
+  "test-util",
+] }

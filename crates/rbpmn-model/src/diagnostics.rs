@@ -76,9 +76,9 @@ pub mod rule {
     pub const TIMER_EXPRESSION: &str = "timer-expression";
     pub const MESSAGE_HAS_CORRELATION: &str = "message-has-correlation";
     pub const NO_FOREIGN_IMPLEMENTATION: &str = "no-foreign-implementation";
-    /// Deploy-time rule checked against *registration state* (map_topic /
-    /// declare_topic), so it cannot fire from pure lint(xml); the id is
-    /// reserved here, enforcement lands with the engine (phase 2).
+    /// Deploy-time rule checked against *registration state*
+    /// (`Bindings::topic` against `declare_topic`), so it cannot fire from
+    /// pure `lint(xml)`; the id is reserved here and the engine enforces it.
     pub const UNRESOLVED_TOPIC: &str = "unresolved-topic";
     pub const BOUNDARY_ON_SUPPORTED_HOST: &str = "boundary-on-supported-host";
     pub const NO_IMPLICIT_SPLIT: &str = "no-implicit-split";
@@ -88,6 +88,19 @@ pub mod rule {
     pub const BPMN_STRUCTURE: &str = "bpmn-structure";
     pub const NO_MIXED_GATEWAY: &str = "no-mixed-gateway";
     pub const EVENT_GATEWAY_STRUCTURE: &str = "event-gateway-structure";
+
+    // DMN. The ids live here because there is one `Diagnostic` type and one
+    // catalogue; the rules themselves are implemented in `rbpmn-dmn`, which
+    // is where dsntk is allowed and nothing upstream of it may depend on
+    // (docs/dmn.md, D1). These constants are strings, so this costs
+    // `rbpmn-model` no dependency and keeps rule ids a single namespace.
+    pub const DMN_VALIDATES: &str = "dmn-validates";
+    pub const FEEL_PARSES: &str = "feel-parses";
+    pub const FEEL_DETERMINISTIC: &str = "feel-deterministic";
+    /// A business-rule task's manifest binding: present, well-formed, and
+    /// naming a decision the bundle actually exposes.
+    pub const DECISION_HAS_BINDING: &str = "decision-has-binding";
+    pub const UNRESOLVED_DECISION: &str = "unresolved-decision";
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -151,7 +164,7 @@ pub const CATALOGUE: &[RuleInfo] = &[
     RuleInfo {
         id: rule::UNRESOLVED_TOPIC,
         severity: Severity::Error,
-        summary: "Every service task's topic (map_topic, default: element id) must have a registered handler or a declared external-worker topic — checked at deploy against registration state.",
+        summary: "Every service task's topic (`Bindings::topic`, default: element id) must have a registered handler or a declared external-worker topic — checked at deploy against registration state.",
     },
     RuleInfo {
         id: rule::BOUNDARY_ON_SUPPORTED_HOST,
@@ -182,5 +195,30 @@ pub const CATALOGUE: &[RuleInfo] = &[
         id: rule::EVENT_GATEWAY_STRUCTURE,
         severity: Severity::Error,
         summary: "Event-based gateways race message/timer catch events or receive tasks, each with exactly one incoming flow.",
+    },
+    RuleInfo {
+        id: rule::DMN_VALIDATES,
+        severity: Severity::Error,
+        summary: "A bundled DMN artifact must parse and its decision logic must build; a decision that cannot be compiled cannot be deployed.",
+    },
+    RuleInfo {
+        id: rule::FEEL_PARSES,
+        severity: Severity::Error,
+        summary: "Every FEEL expression in a DMN artifact must parse — literal expressions, decision-table entries, item-definition constraints and the rest.",
+    },
+    RuleInfo {
+        id: rule::DECISION_HAS_BINDING,
+        severity: Severity::Error,
+        summary: "A business-rule task's decision binding lives in the manifest (never in the XML) and must be well-formed: a decision name, and a FEEL qualified name for where the answer lands.",
+    },
+    RuleInfo {
+        id: rule::UNRESOLVED_DECISION,
+        severity: Severity::Error,
+        summary: "Every bound decision must name exactly one invocable in the bundled DMN artifacts. Unlike unresolved-topic this needs no environment: decisions travel inside the deployment.",
+    },
+    RuleInfo {
+        id: rule::FEEL_DETERMINISTIC,
+        severity: Severity::Error,
+        summary: "Decisions must be deterministic and self-contained: no now()/today(), and no external Java or PMML functions. Time enters as an input, never from a clock.",
     },
 ];

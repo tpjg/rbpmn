@@ -10,6 +10,71 @@ lint:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo fmt --check
 
+# The build **without** DMN, which is the only thing keeping "optional" a fact.
+#
+# DMN is on by default: a definition plus its manifest is a fully executable
+# flow, and a decision is part of that definition. But the seam has to stay
+# real — it is what keeps dsntk out of `rbpmn-model` and `rbpmn-core`, which
+# must compile to wasm32, and it is the supported way to build without a 1.94
+# toolchain. A feature nobody builds is a feature that has already rotted; that
+# is exactly how the *previous* arrangement failed, claiming opt-in while every
+# default build compiled dsntk.
+#
+# The dependency assertions are the load-bearing half. Clippy and the tests
+# would pass just as happily with dsntk linked in.
+no-dmn:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for crate in rbpmn-server rbpmn-wasm; do
+      # The tree is captured in its own step so a `cargo tree` that *fails*
+      # is fatal. Written as `$(cargo tree ... | grep -c dsntk || true)` it was
+      # not: grep prints "0" for a broken tree exactly as it does for a clean
+      # one, and `|| true` swallowed cargo's exit code — so a resolver error,
+      # a bad manifest or an offline registry all reported the seam intact.
+      # The same hole as "a differential that skipped is a differential that
+      # passed", in the recipe written to stop that class of rot.
+      off=$(cargo tree --manifest-path crates/$crate/Cargo.toml --no-default-features -e normal)
+      n=$(printf '%s' "$off" | grep -c dsntk || true)
+      [ "$n" = "0" ] || { echo "$crate --no-default-features still links $n dsntk crates"; exit 1; }
+      # The mirror, and not a formality: both directions have been quietly
+      # wrong here. Feature unification means one dependency that takes the
+      # defaults switches `dmn` back on for the whole build — a self
+      # dev-dependency did exactly that, and `--no-default-features` ran the
+      # DMN tests it was meant to prove could be left out.
+      on=$(cargo tree --manifest-path crates/$crate/Cargo.toml -e normal)
+      m=$(printf '%s' "$on" | grep -c dsntk || true)
+      [ "$m" != "0" ] || { echo "$crate no longer links dsntk by default"; exit 1; }
+      # ...and the dsntk it links must be the fork's *defaults*, which is where
+      # the two properties that used to be `[patch.crates-io]` now live.
+      #
+      # This replaces a build script in `rbpmn-dmn` that proved the same thing
+      # from inside the build. The patch is gone, so that guard is gone with
+      # it; the property is not, and unlike a patch a feature can be switched
+      # back on by any crate in the graph. Cargo unifies features, so one
+      # dependency asking for `java-bridge` would restore an HTTP client for
+      # everyone — silently, and only here would it show.
+      c=$(printf '%s' "$on" | grep -c dfp-number-sys || true)
+      [ "$c" = "0" ] || { echo "$crate links Intel's decimal C library — use-fastnum is not in effect"; exit 1; }
+      j=$(printf '%s' "$on" | grep -c 'reqwest v0.13' || true)
+      [ "$j" = "0" ] || { echo "$crate links reqwest 0.13 — dsntk's java-bridge feature got switched on"; exit 1; }
+    done
+    cargo clippy -p rbpmn-server --no-default-features --all-targets -- -D warnings
+    cargo clippy -p rbpmn-engine --no-default-features --all-targets -- -D warnings
+    # `rbpmn-wasm` too, or its `#[cfg(not(feature = "dmn"))]` arms — the
+    # refusal path for bundled decision artifacts — are the one part of the
+    # seam nothing ever compiles. Asserting its dependency graph above while
+    # never type-checking the code that graph selects is half a check.
+    cargo clippy -p rbpmn-wasm --no-default-features --all-targets -- -D warnings
+    # ...and for **wasm32**, which is the target that makes the seam matter at
+    # all. Inherited from the MSRV recipe that used to do this incidentally on
+    # an old toolchain; that recipe is gone (one floor now, docs/dmn.md D9) but
+    # this check is not, because nothing else builds this crate without DMN for
+    # the browser.
+    rustup target add wasm32-unknown-unknown
+    cargo check -p rbpmn-wasm --no-default-features --target wasm32-unknown-unknown
+    cargo test -p rbpmn-engine --no-default-features
+
+
 fmt:
     cargo fmt
 
@@ -24,9 +89,15 @@ serve:
     cargo run -p rbpmn-server
 
 # Build the WASM linter: web target (playground) + node target (bpmnlint plugin).
+#
+# `--features dmn` on both even though it is now the default, and the native
+# dump in `parity` names it the same way. The redundancy is the point: both
+# sides of the parity check must ask for the feature identically, so a build
+# that ever loses it fails per fixture instead of quietly comparing two
+# different validators.
 wasm:
-    wasm-pack build crates/rbpmn-wasm --target web --out-dir ../../playground/src/wasm --no-typescript
-    wasm-pack build crates/rbpmn-wasm --target nodejs --out-dir ../../bpmnlint-plugin-rbpmn/wasm --no-typescript
+    wasm-pack build crates/rbpmn-wasm --target web --out-dir ../../playground/src/wasm --no-typescript --features dmn
+    wasm-pack build crates/rbpmn-wasm --target nodejs --out-dir ../../bpmnlint-plugin-rbpmn/wasm --no-typescript --features dmn
 
 # Linter playground: fixture browser + live lint at http://localhost:5173.
 playground: wasm
@@ -71,6 +142,13 @@ e2e-ui: ui-dist
 
 # The playground-never-lies check (Rust vs WASM byte parity) + the bpmnlint
 # plugin's corpus test. Run before releasing anything WASM-facing.
+#
+# Both sides must carry the same features. `dmn` is a *default* feature of
+# rbpmn-wasm, so `just wasm` and the native dump both get it and the only way
+# to mismatch is an explicit `--no-default-features` on one side — which this
+# check catches rather than skips: without the feature the validator refuses
+# bundled decisions instead of staying silent, so all 17 DMN fixtures differ
+# and parity fails per fixture. Verified by building one side each way.
 parity: wasm
     cd playground && npm install && npm run parity
     cd bpmnlint-plugin-rbpmn && npm install && npm test
@@ -82,10 +160,12 @@ parity: wasm
 # on a developer's machine and would make past hold/fail verdicts
 # irreproducible. To move to a new TLA+ release, bump both constants — the
 # recipe refuses to run on a mismatch rather than trusting the download.
-# Six of the eleven configs are EXPECTED to fail — they are the
-# counterexamples that show the checks have teeth, and two of them
-# reproduce bugs that were real (the AB/BA timer-claim sketch, and the
-# phase-6 scope teardown that left a timer row behind).
+# Eight of the thirteen configs are EXPECTED to fail — they are the
+# counterexamples that show the checks have teeth, and three of them
+# reproduce bugs that were real (the AB/BA timer-claim sketch, the phase-6
+# scope teardown that left a timer row behind, and release_task guarded by
+# owner alone, which shipped and which a review caught before the model
+# could — the model had no notion of a retried request to catch it with).
 tla:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -139,8 +219,20 @@ tla:
     check "lock order: rejected AB/BA sketch" LockOrderHistorical.cfg LockOrder.tla fail "Error: Deadlock reached"
     check "lock order: all five per-instance rows"  LockOrderAllRows.cfg           LockOrder.tla hold ""
     check "lock order: five rows, wrong order"      LockOrderAllRowsHistorical.cfg LockOrder.tla fail "Error: Deadlock reached"
-    check "lease: safety"                     Lease.cfg               Lease.tla     hold ""
-    check "lease: double belief is reachable" Lease_DoubleBelief.cfg  Lease.tla     fail "Invariant DoubleBeliefIsReachable is violated"
+    # -deadlock on the lease configs, and it is new: modelling the voluntary
+    # release made a terminal state reachable that the model could not reach
+    # before. An item released back to the queue of an instance frozen on an
+    # incident is claimable by nobody (CLAIMABLE requires an active instance)
+    # and completable by nobody — and it stays that way until an operator
+    # repairs the incident, which this model does not include. It is the same
+    # legitimate terminal state as a torn-down scope, not a livelock. Before
+    # the release existed, FailFinally simply re-fired forever from that
+    # state, so deadlock freedom held here by accident rather than by design;
+    # it is a property under test only for LockOrder.
+    check "lease: safety"                     Lease.cfg               Lease.tla     hold "" -deadlock
+    check "lease: double belief is reachable" Lease_DoubleBelief.cfg  Lease.tla     fail "Invariant DoubleBeliefIsReachable is violated" -deadlock
+    check "lease: release without its owner check" Lease_UncheckedRelease.cfg Lease.tla fail "Action property LiveLeaseEndsOnlyByItsHolder is violated" -deadlock
+    check "lease: release without its lease epoch"  Lease_EpochlessRelease.cfg Lease.tla fail "Action property ReleaseFreesOnlyTheLeaseItNamed is violated" -deadlock
     # -deadlock: a terminal state is legitimate here (everything torn down,
     # nothing armed). Deadlock freedom is a property under test only for
     # LockOrder, where the flag is deliberately absent.
@@ -155,6 +247,87 @@ tla:
 # workspace and not part of `test` — dsntk pulls ~170 crates and a C library.
 feel-parity:
     cd feel-parity && cargo test
+
+# ---------------------------------------------------------------------- DMN
+#
+# The dsntk route to DMN and full FEEL (docs/dmn.md). dsntk cannot reach
+# wasm32 as published: `dsntk-feel-number` binds Intel's decimal C library and
+# `dsntk-feel-evaluator` carries an unconditional `reqwest` for FEEL's
+# external-Java bridge. The first is replaced by `crates/rbpmn-feel-number`
+# and substituted through `[patch.crates-io]`; the second is refused outright.
+
+# Gate 0a: our decimal against the C library it replaces, plus upstream's own
+# 1166-line test corpus vendored as the acceptance suite.
+#
+# The vendored corpus runs under `cargo test` (`rbpmn-feel-number` is a default
+# member). The *differential* is outside the workspace and cannot be reached
+# from it, for the same reason as `feel-parity`: this is the only place the C
+# library is allowed to exist. That half is what this recipe is for, and it
+# stays owed by any change to the number crate.
+#
+# The run is green with divergences, not despite them — three classes are
+# named and counted (docs/dmn.md, "Measured deviations"), and anything outside
+# them fails. The transcendental tolerance applies at the `exp`/`ln`/`sqrt`/
+# `pow` call sites only; exact arithmetic must match digit for digit.
+number-parity: dsntk-rev
+    cd feel-number-parity && cargo test -- --nocapture
+
+# Every place the dsntk fork's revision is written down must name the same one.
+#
+# There are four, and they are not near each other: the crate that ships it,
+# the differential that verifies its decimal, the wasm gate, and the TCK gate.
+# A differential run against a rev nobody ships is green and meaningless — the
+# exact failure `number-parity` exists to prevent, one level up. So this is a
+# dependency of the gates rather than a separate chore.
+dsntk-rev:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    revs=$(grep -ho 'tpjg/dsntk[^"]*", rev = "[0-9a-f]*"' \
+             crates/rbpmn-dmn/Cargo.toml feel-number-parity/Cargo.toml dmn-wasm-probe/Cargo.toml \
+           | grep -o 'rev = "[0-9a-f]*"' | sort -u)
+    tck=$(grep -o '^DSNTK_FORK_REV=[0-9a-f]*' dmn-tck/run.sh | cut -d= -f2)
+    n=$(printf '%s\n' "$revs" | wc -l | tr -d ' ')
+    if [ "$n" != "1" ]; then
+      echo "dsntk fork revs disagree across manifests:"; printf '%s\n' "$revs"; exit 1
+    fi
+    manifest_rev=$(printf '%s' "$revs" | grep -o '[0-9a-f]\{7,\}')
+    if [ "$tck" != "$manifest_rev" ]; then
+      echo "dmn-tck/run.sh pins $tck but the manifests pin $manifest_rev"; exit 1
+    fi
+    echo "dsntk fork pinned at $manifest_rev everywhere"
+
+# Gate 0b: the DMN stack parsing, compiling and *evaluating* inside a real
+# WebAssembly VM, built through wasm-pack exactly as `rbpmn-wasm` is. Needs
+# node + wasm-pack and the wasm32-unknown-unknown target.
+#
+# Throwaway scaffolding, superseded by crates/rbpmn-dmn at P1 — it exists so
+# the gate's verdict is reproducible rather than remembered.
+dmn-wasm-probe:
+    rustup target add wasm32-unknown-unknown
+    cd dmn-wasm-probe && wasm-pack build --target nodejs --out-dir pkg --no-typescript && node run.mjs
+
+# The DMN crate's own tests: the fixture corpus, the value bridge's hostile
+# inputs, and the outcome pinning.
+#
+# `cargo test` runs these too, now that `rbpmn-dmn` is a default member
+# (docs/dmn.md, D9). Kept as a recipe because it is the fast loop while
+# working on the crate, not because it is the only way to reach it.
+dmn-test:
+    cargo test -p rbpmn-dmn
+
+# Gate 0c: the DMN TCK, run against dsntk twice — as published, and with our
+# decimal substituted — comparing the two verdicts case by case. The totals
+# are the weak half; the result files are compared byte for byte, because two
+# runs can agree on the count and disagree on which cases failed.
+#
+# Nothing is vendored: the corpus is separately OMG-licensed, and the dsntk
+# source and runner are pinned fetches with the crate tarball's checksum
+# verified before extraction (the `just tla` discipline). Needs git, curl and
+# a few minutes; `--patched-corpus` additionally applies dsntk's own
+# opinionated TCK patches, which is the corpus their published 3374/3391 was
+# measured against.
+dmn-tck *ARGS:
+    ./dmn-tck/run.sh {{ARGS}}
 
 # Bake DI into any fixture that lacks a BPMNDiagram section (idempotent).
 fixtures-di:
@@ -335,7 +508,7 @@ cleanup:
         done
     fi
     echo "== cargo =="
-    for dir in . feel-parity; do
+    for dir in . feel-parity feel-number-parity dmn-wasm-probe dmn-tck/stock dmn-tck/patched; do
         if [ -d "$dir/target" ]; then
             echo "  cargo clean in $dir ($(du -sh "$dir/target" 2>/dev/null | cut -f1))"
             (cd "$dir" && cargo clean)
@@ -346,7 +519,10 @@ cleanup:
         playground/node_modules playground/dist playground/src/wasm playground/src/fixtures.generated.js \
         ui/node_modules ui/dist ui/wasm ui/src/generated \
         bpmnlint-plugin-rbpmn/node_modules bpmnlint-plugin-rbpmn/wasm \
-        crates/rbpmn-ui/assets e2e/screenshots spec/states; do
+        crates/rbpmn-ui/assets e2e/screenshots spec/states \
+        dmn-wasm-probe/pkg \
+        dmn-tck/tck dmn-tck/runner dmn-tck/patches dmn-tck/stock/dsntk-0.3.0 dmn-tck/patched/dsntk-0.3.0 \
+        dmn-tck/dsntk-0.3.0.crate; do
         if [ -e "$path" ]; then
             echo "  removing $path ($(du -sh "$path" 2>/dev/null | cut -f1))"
             rm -rf "$path"

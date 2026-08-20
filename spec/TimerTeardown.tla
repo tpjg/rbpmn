@@ -23,6 +23,10 @@
 (* an invariant of teardown, not on the re-check.                           *)
 (*                                                                          *)
 (* BuggyTeardown = TRUE restores the shipped bug so TLC reproduces it.      *)
+(*                                                                          *)
+(* Abort models what DMN added to this path: the claim transaction can now  *)
+(* roll back after the re-check, because the decision it evaluates lives in *)
+(* the same transaction. See the action for why that changes nothing.       *)
 (***************************************************************************)
 EXTENDS Naturals
 
@@ -80,6 +84,29 @@ Drop(n) ==
     /\ UNCHANGED <<tokens, timerToken, dangling>>
 
 (***************************************************************************)
+(* The claim transaction rolls back AFTER the re-check has already passed.  *)
+(*                                                                          *)
+(* New with DMN. `try_fire` used to run a pure `step` under the lock; it now *)
+(* runs `step_answering_decisions`, which reads the definition's DMN from    *)
+(* the database and evaluates it inside this same transaction. A decision    *)
+(* that fails to compile aborts the transaction after the row was claimed    *)
+(* and the re-check passed — a window that did not exist before.             *)
+(*                                                                          *)
+(* Modelled separately from Drop even though it leaves identical state, and  *)
+(* that identity IS the finding: a rollback undoes the row deletion with     *)
+(* everything else, so the claim is returned rather than consumed. Writing   *)
+(* it as its own action is what turns "the abort is just a Drop" from an     *)
+(* argument into something TLC checks. Note what it does NOT do — it does    *)
+(* not clear timerToken. An abort that consumed the claim would silently     *)
+(* lose a timer, and it is Postgres, not the engine, that rules that out.    *)
+(***************************************************************************)
+Abort(n) ==
+    /\ picked[n] # NoTimer
+    /\ timerToken[picked[n]] # NoToken          \* the re-check passed...
+    /\ picked' = [picked EXCEPT ![n] = NoTimer]  \* ...and then it rolled back
+    /\ UNCHANGED <<tokens, timerToken, dangling>>
+
+(***************************************************************************)
 (* Interrupting boundary / terminate: tear a scope down. One transaction    *)
 (* under the instance lock, so it is atomic here.                           *)
 (*                                                                          *)
@@ -113,7 +140,7 @@ Fire(n) ==
 Next ==
     \/ \E timer \in Timers, token \in Tokens : Arm(timer, token)
     \/ \E n \in Nodes, timer \in Timers : Pick(n, timer)
-    \/ \E n \in Nodes : Drop(n) \/ Fire(n)
+    \/ \E n \in Nodes : Drop(n) \/ Abort(n) \/ Fire(n)
     \/ \E doomed \in SUBSET Tokens : Teardown(doomed)
 
 Spec == Init /\ [][Next]_vars

@@ -20,10 +20,20 @@ pub struct DeployBody {
     pub bpmn: String,
     #[serde(default)]
     pub bindings: Bindings,
+    /// The DMN artifacts this deployment invokes, as raw XML. Absent means
+    /// none; an engine built without the `dmn` feature refuses a non-empty
+    /// list rather than accepting a deployment it cannot validate.
+    #[serde(default)]
+    pub decisions: Vec<String>,
 }
 
 pub async fn deploy(State(engine): State<Engine>, Json(body): Json<DeployBody>) -> Response {
-    match engine.deploy(&body.bpmn, &body.bindings).await {
+    let bundle = rbpmn_engine::Bundle {
+        bpmn: body.bpmn,
+        bindings: body.bindings,
+        decisions: body.decisions,
+    };
+    match engine.deploy_bundle(&bundle).await {
         Ok(d) => (
             StatusCode::CREATED,
             Json(json!({
@@ -179,6 +189,37 @@ pub async fn extend_lock(
             Json(json!({ "outcome": "extended", "lockUntil": until })).into_response()
         }
         Ok(rbpmn_engine::LockExtension::Lost) => {
+            (StatusCode::CONFLICT, Json(json!({ "outcome": "lockLost" }))).into_response()
+        }
+        Err(e) => engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseTaskBody {
+    pub owner: String,
+    /// The `leaseNo` the claim returned. Required, so a request without one
+    /// is refused by the extractor (422) rather than defaulted to epoch 0 —
+    /// a default would release whatever claim happened to be current, which
+    /// is exactly the behaviour the epoch exists to stop.
+    pub lease_no: i64,
+}
+
+/// Hand a claimed task back without deciding it. Deliberately the same
+/// vocabulary as the heartbeat — 200 `released` / 409 `lockLost` — so a
+/// client that already handles a lost lease on extend handles it here
+/// unchanged. Safe to retry: a replay names a spent epoch and gets the 409.
+pub async fn release_task(
+    State(engine): State<Engine>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ReleaseTaskBody>,
+) -> Response {
+    match engine.release_task(id, &body.owner, body.lease_no).await {
+        Ok(rbpmn_engine::Released::Released) => {
+            Json(json!({ "outcome": "released" })).into_response()
+        }
+        Ok(rbpmn_engine::Released::Lost) => {
             (StatusCode::CONFLICT, Json(json!({ "outcome": "lockLost" }))).into_response()
         }
         Err(e) => engine_error(e),

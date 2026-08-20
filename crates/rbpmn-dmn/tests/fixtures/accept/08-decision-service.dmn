@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/08-decision-service" name="08-decision-service" id="_08-decision-service">
+  <inputData name="Amount" id="amount">
+    <variable name="Amount" typeRef="number"/>
+  </inputData>
+  <decision name="Approved" id="approved">
+    <variable name="Approved" typeRef="boolean"/>
+    <informationRequirement><requiredInput href="#amount"/></informationRequirement>
+    <literalExpression><text>Amount &lt; 1000</text></literalExpression>
+  </decision>
+  <decisionService name="Approval" id="approval">
+    <variable name="Approval" typeRef="boolean"/>
+    <outputDecision href="#approved"/>
+    <inputData href="#amount"/>
+  </decisionService>
+</definitions>

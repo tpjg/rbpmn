@@ -1,0 +1,55 @@
+[package]
+name = "rbpmn-dmn"
+description = "DMN and full FEEL for rbpmn: parse, validate and evaluate decision models. The one crate where dsntk is allowed — nothing upstream of it may depend on it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# A default workspace member since DMN became a default feature (docs/dmn.md,
+# D9), so `cargo test` runs this crate's tests. It was kept out while DMN was
+# opt-in — the `rbpmn-bench` precedent — so that a plain build paid for none of
+# dsntk; a plain build compiles it now regardless, and the exclusion only hid
+# these tests behind a command nobody had to run. `just dmn-test` is still the
+# fast loop while working here.
+
+[dependencies]
+# For `Diagnostic` and the rule ids — the same diagnostic type every other
+# rbpmn surface reports, so a DMN error is not a second kind of error.
+rbpmn-model = { path = "../rbpmn-model" }
+# For the `DecisionValidator` trait this crate implements, and `Invocable`.
+rbpmn-core = { path = "../rbpmn-core" }
+serde_json.workspace = true
+
+# dsntk, from the fork at `git.../tpjg/dsntk` rather than crates.io.
+#
+# The fork adds two features upstream does not have, and rbpmn needs both:
+#
+#   * `dsntk-feel-number/use-fastnum` (its default) swaps Intel's decimal C
+#     library for a pure-Rust decimal128, which is what gets this whole stack
+#     to wasm32 — and therefore what lets the playground, the bpmnlint plugin
+#     and the editor exist at all.
+#   * `dsntk-feel-evaluator/java-bridge` (off by default) is FEEL's external
+#     Java function bridge, an HTTP POST to a JVM on localhost. Left off, so
+#     there is no HTTP client in the build and no capability to refuse.
+#
+# Both were previously achieved with `[patch.crates-io]` in rbpmn's root
+# manifest plus two shim crates. That worked, but Cargo honours `[patch]` only
+# from the workspace root of the build being run — so every application
+# depending on rbpmn had to repeat it or get a silently weaker build. Depending
+# on the fork moves the fix inside the dependency graph, where it travels.
+#
+# Pinned by `rev`, for the same reason the version pins were exact: dsntk is
+# effectively single-maintainer, and moving it is a deliberate act that owes
+# `just number-parity` and `just dmn-tck`. All five entries must name the *same*
+# rev — `just dsntk-rev` checks that.
+dsntk-common = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
+dsntk-feel = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
+dsntk-feel-parser = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
+dsntk-model = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
+dsntk-model-evaluator = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
+
+[dev-dependencies]
+serde_json.workspace = true
+# The tests construct FEEL values directly to prove what the bridge refuses.
+dsntk-feel-temporal = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }

@@ -100,7 +100,7 @@ fn single_process<'a>(
 /// offline is what makes `rbpmn-bench check` useful with no database at all:
 /// a broken benchmark model is caught before Docker is started.
 pub fn check(model: &Model, bindings: &rbpmn_core::Bindings) -> Result<Vec<String>, String> {
-    match rbpmn_core::check_deployable(&model.xml, bindings) {
+    match rbpmn_core::check_deployable(&model.xml, bindings, &[], &rbpmn_core::NoDecisions) {
         rbpmn_core::DeployCheck::Unparseable(e) => Err(format!("{}: {e}", model.file)),
         rbpmn_core::DeployCheck::NotExactlyOneProcess(n) => {
             Err(format!("{}: expected one process, found {n}", model.file))

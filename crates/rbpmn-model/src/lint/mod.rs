@@ -168,8 +168,8 @@ fn element_rules(
                         format!(
                             "service task carries vendor implementation attribute(s) \
                              {} which rbpmn ignores — topics are bound at registration \
-                             time (map_topic; default topic = the element id), never \
-                             in the XML",
+                             time (`Bindings::topic`; default topic = the element id), \
+                             never in the XML",
                             foreign.join(", ")
                         ),
                     ));
@@ -275,7 +275,13 @@ fn element_rules(
             NodeKind::ReceiveTask { message_ref } => {
                 check_message(defs, id, message_ref.as_deref(), out)
             }
-            NodeKind::UserTask
+            // A business rule task needs nothing from the model: which
+            // decision it invokes and where the answer lands are manifest
+            // data, checked by `decision-has-binding` at compile against the
+            // deployment's bundled artifacts. The XML stays standard-namespace
+            // and says only that a decision happens here.
+            NodeKind::BusinessRuleTask
+            | NodeKind::UserTask
             | NodeKind::ExclusiveGateway { .. }
             | NodeKind::ParallelGateway
             | NodeKind::EventBasedGateway => {}
@@ -288,10 +294,6 @@ fn unsupported_message(tag: &str) -> String {
         "scriptTask" => " — compute in application code (a service task handler) instead",
         "sendTask" => " — use a message intermediate throw event instead",
         "manualTask" => " — use a user task instead",
-        "businessRuleTask" => {
-            " — planned post-v1 via DMN; until then compute the \
-             decision in application code and store the result as a variable"
-        }
         "task" => {
             " — the abstract task has no execution semantics; use a \
              service, user or receive task"
@@ -375,7 +377,7 @@ fn check_timer(id: &str, spec: &TimerSpec, out: &mut Vec<Diagnostic>) {
 
 /// The XML side of `message-has-correlation`: the element must reference a
 /// *named* message. The correlation binding itself (a FEEL qualified name
-/// into the instance variables) is registered in code (`map_correlation`)
+/// into the instance variables) is registered in code (`Bindings::correlation`)
 /// and checked at deploy against registration state — never in the XML.
 fn check_message(
     defs: &Definitions,

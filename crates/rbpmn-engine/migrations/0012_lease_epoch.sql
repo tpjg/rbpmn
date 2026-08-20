@@ -1,0 +1,34 @@
+-- The lease epoch: which claim, not just who claimed.
+--
+-- `lock_owner` names a claimant, and that is not enough to make a release
+-- safe to retry. The engine's whole task API assumes at-least-once delivery
+-- of client requests, and every other verb converges under it: `extend_lock`
+-- carries `lock_until > now()`, so a replay of an expired renewal does
+-- nothing; a repeated completion returns the idempotent `AlreadyClosed`.
+-- Release did not. A client whose release committed but whose response was
+-- lost retries it — and because a released item is available again and, being
+-- oldest, is the very item FIFO hands back to that same client on its next
+-- claim, the retry could land on a *live* lease the same owner had just been
+-- given, freeing a task somebody was already looking at.
+--
+-- `lease_no` closes it by making a claim identifiable rather than merely
+-- attributable. Every claim bumps it; a release names the epoch it was issued
+-- for; a stale request names an epoch that no longer exists and matches
+-- nothing. It is the same idea as an ETag, and it travels the same way: out
+-- on the claim, back in on the release.
+--
+-- Three properties this leans on, all deliberate:
+--   * Only a *claim* mints an epoch. `extend_lock` renews a lease without
+--     bumping it — a renewal continues the same claim, and the epoch must
+--     change exactly when the right to act changes hands, no sooner.
+--   * Both claim paths bump it, pull and push alike. A push claim that left
+--     the epoch alone would let a pull claimant's stale release free the
+--     worker's live lease, which is the same bug wearing different clothes.
+--   * It is per work item, not global: nothing coordinates, and the bump
+--     rides inside the claim's existing UPDATE. No extra statement, no index.
+--
+-- `not null default 0` is metadata-only on PostgreSQL 11+, so this is a
+-- catalogue change and not a table rewrite. Items claimed before the upgrade
+-- start at epoch 0 and get a real one the next time they are claimed.
+
+alter table rbpmn_work_item add column if not exists lease_no bigint not null default 0;

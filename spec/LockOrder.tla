@@ -107,6 +107,23 @@ LastOf(n) == Len(Order(n))
 \*             `execute_retention`/`delete_instance`; one instance row here
 \*             stands for the batch, which is what the ordering turns on)
 \*   deploy    advisory(key) -> definition rows               (deploy.rs)
+\*             ...which since P2 (docs/dmn.md) also inserts the deployment's
+\*             DMN artifacts into `rbpmn_definition_decision`. That is still
+\*             the `defn` resource in this model, and deliberately so: those
+\*             rows are created by the same transaction that creates their
+\*             parent, are reachable only through it, and their foreign key
+\*             takes KEY SHARE on a definition row this transaction just
+\*             inserted — so no other actor can be holding it. `delete_definition`
+\*             reaches them the same way round (definition, then cascade), so
+\*             there is no order to invert. A separate row kind would model a
+\*             contention that cannot arise.
+\*
+\* P3 added decision evaluation to the step path and no lock with it: it runs
+\* inside the transaction that already holds the instance row, reads
+\* `rbpmn_definition_decision` with a plain SELECT (ACCESS SHARE on the table,
+\* not a row lock this model represents), and waits for nothing. The token it
+\* parks is resolved before that same transaction commits, so it is never a
+\* state another actor can contend for. Checked against the code, not assumed.
 \*
 \* `retire` and `deploy` were outside this model until the third audit found
 \* them. They are the reason the invariant below is about *needing* the

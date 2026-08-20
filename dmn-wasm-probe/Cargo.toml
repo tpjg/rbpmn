@@ -1,0 +1,32 @@
+[package]
+name = "rbpmn-dmn-wasm-probe"
+description = "Gate 0b: does the dsntk DMN stack reach wasm32 once the C decimal library and the Java bridge are gone? Throwaway scaffolding — superseded by crates/rbpmn-dmn at P1. See docs/dmn.md."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The fork rbpmn actually ships, at the same rev — so the gate exercises the
+# real thing rather than a lookalike. Its defaults are the two blockers this
+# probe exists to check are gone:
+#
+#   * `use-fastnum` — no `dfp-number-sys`, so no Intel decimal C library and
+#     no C toolchain to find on a target that has none.
+#   * `java-bridge` off — no `reqwest::blocking`, which does not exist on
+#     wasm32 at all, and which rbpmn does not want the capability for anyway
+#     (`feel-deterministic` refuses external functions at deploy).
+#
+# There is no `[patch.crates-io]` any more. That is itself part of what this
+# gate now proves: reaching wasm32 takes a plain dependency, not a
+# substitution a downstream consumer has to know to repeat.
+dsntk-model = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
+dsntk-model-evaluator = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
+dsntk-feel = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
+wasm-bindgen = "0.2"
+
+[workspace]

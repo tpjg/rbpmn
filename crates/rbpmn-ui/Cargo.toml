@@ -9,7 +9,9 @@ license.workspace = true
 [dependencies]
 # For `InstanceInspection`. Anyone rendering an inspection already holds an
 # Engine to have produced one, so this costs the consumer nothing new.
-rbpmn-engine = { path = "../rbpmn-engine" }
+# The UI renders instances; it never evaluates a decision. Nothing here needs
+# dsntk, so it does not take the engine's default.
+rbpmn-engine = { path = "../rbpmn-engine", default-features = false }
 serde_json.workspace = true
 sha2 = "0.10"
 uuid = { version = "1", features = ["serde"] }
@@ -23,5 +25,7 @@ default = ["axum"]
 axum = ["dep:axum", "dep:tracing"]
 
 [dev-dependencies]
-rbpmn-engine = { path = "../rbpmn-engine", features = ["test-util"] }
+rbpmn-engine = { path = "../rbpmn-engine", default-features = false, features = [
+  "test-util",
+] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error feel-deterministic @ freshness
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/25-now-in-allowed-values" name="25-now-in-allowed-values" id="_25-now-in-allowed-values">
+  <itemDefinition name="Freshness" id="freshness">
+    <typeRef>date and time</typeRef>
+    <allowedValues><text>&lt; now()</text></allowedValues>
+  </itemDefinition>
+  <decision name="Ok" id="ok">
+    <variable name="Ok" typeRef="boolean"/>
+    <literalExpression><text>true</text></literalExpression>
+  </decision>
+</definitions>

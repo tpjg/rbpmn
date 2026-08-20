@@ -1,28 +1,91 @@
-//! Atomic deploy: one call carries the definition and its bindings manifest,
-//! validated together against the environment as it exists at that moment.
-//! Idempotent by content: same key + byte-identical XML + bindings returns
-//! the existing version; changed content allocates the next version.
+//! Atomic deploy: one call carries the definition, its bindings manifest and
+//! any DMN artifacts it invokes, validated together against the environment as
+//! it exists at that moment. Idempotent by content: same key + byte-identical
+//! bundle returns the existing version; changed content allocates the next.
+//!
+//! [`Bundle`] is that triple, and it *is* the HTTP body — the server
+//! deserializes this exact struct, so the library path and the wire path
+//! cannot drift into validating different things (the design brief's
+//! "one `DeploymentManifest` struct internally").
 
 use crate::{DeployError, Deployment, Engine};
 use rbpmn_core::{Bindings, ExecutableProcess};
 use rbpmn_model::{Diagnostic, Severity, rule};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use uuid::Uuid;
 
+/// Everything one deploy carries. Serializes 1:1 to `POST /v1/definitions`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Bundle {
+    /// The process definition.
+    pub bpmn: String,
+    /// Its wiring: topics, correlations, indexes, decision bindings.
+    #[serde(default)]
+    pub bindings: Bindings,
+    /// The DMN artifacts its business-rule tasks invoke, as raw XML.
+    ///
+    /// They travel *inside* the deployment rather than being registered
+    /// separately, which is what makes an instance pin its decisions the way
+    /// it pins its process: the alternative is a multi-call registration
+    /// dance with partially-wired states in the middle, which is the
+    /// "seems to run" failure this design exists to kill. The cost, accepted:
+    /// a decision table shared by two processes is deployed with each, and
+    /// changing a rule is a redeploy.
+    #[serde(default)]
+    pub decisions: Vec<String>,
+}
+
+impl Bundle {
+    pub fn new(bpmn: impl Into<String>) -> Self {
+        Self {
+            bpmn: bpmn.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn bindings(mut self, bindings: Bindings) -> Self {
+        self.bindings = bindings;
+        self
+    }
+
+    /// Add a DMN artifact. Order is preserved: artifacts may import each
+    /// other, so it is not ours to shuffle.
+    pub fn decision(mut self, dmn: impl Into<String>) -> Self {
+        self.decisions.push(dmn.into());
+        self
+    }
+}
+
 impl Engine {
+    /// Deploy a process and its manifest, with no decision artifacts.
+    ///
+    /// A thin spelling of [`Engine::deploy_bundle`], not a second
+    /// implementation — the overwhelmingly common case should not have to
+    /// name an empty bundle.
     pub async fn deploy(&self, xml: &str, bindings: &Bindings) -> Result<Deployment, DeployError> {
+        self.deploy_bundle(&Bundle::new(xml).bindings(bindings.clone()))
+            .await
+    }
+
+    /// Deploy a whole bundle: process, manifest and decision artifacts,
+    /// validated together and persisted in one transaction.
+    pub async fn deploy_bundle(&self, bundle: &Bundle) -> Result<Deployment, DeployError> {
+        let xml = &bundle.bpmn;
+        let bindings = &bundle.bindings;
         // Parse, the one-process rule, lint and compile-against-manifest, all
         // of it shared with the editor's WASM path (rbpmn_core::check) so the
         // two surfaces can never reach different verdicts. Only the
         // environment link below needs this process's registration state.
-        let checked = match rbpmn_core::check_deployable(xml, bindings) {
-            rbpmn_core::DeployCheck::Unparseable(e) => return Err(DeployError::Xml(e)),
-            rbpmn_core::DeployCheck::NotExactlyOneProcess(n) => {
-                return Err(DeployError::NotExactlyOneProcess(n));
-            }
-            rbpmn_core::DeployCheck::Checked(checked) => checked,
-        };
+        let checked =
+            match rbpmn_core::check_deployable(xml, bindings, &bundle.decisions, &validator()) {
+                rbpmn_core::DeployCheck::Unparseable(e) => return Err(DeployError::Xml(e)),
+                rbpmn_core::DeployCheck::NotExactlyOneProcess(n) => {
+                    return Err(DeployError::NotExactlyOneProcess(n));
+                }
+                rbpmn_core::DeployCheck::Checked(checked) => checked,
+            };
         let key = checked.key.clone();
 
         // Manifest index declarations are validated up front (fail early,
@@ -50,6 +113,14 @@ impl Engine {
         let mut hasher = Sha256::new();
         hasher.update(xml.as_bytes());
         hasher.update(bindings_json.to_string().as_bytes());
+        // Decisions are part of the content, so changing a rule allocates a
+        // new version exactly as changing the diagram does. The length prefix
+        // keeps two artifacts from hashing the same as one concatenation of
+        // them.
+        for dmn in &bundle.decisions {
+            hasher.update(dmn.len().to_le_bytes());
+            hasher.update(dmn.as_bytes());
+        }
         let content_hash = format!("{:x}", hasher.finalize());
 
         let mut tx = self.pool().begin().await?;
@@ -97,6 +168,20 @@ impl Engine {
         .fetch_one(&mut *tx)
         .await?
         .get("id");
+        // Same transaction as the definition row: a version that exists
+        // without the decisions it was validated with is a version that would
+        // run something else.
+        for (ordinal, dmn) in bundle.decisions.iter().enumerate() {
+            sqlx::query(
+                "insert into rbpmn_definition_decision (definition_id, ordinal, dmn_xml) \
+                 values ($1, $2, $3)",
+            )
+            .bind(id)
+            .bind(ordinal as i32)
+            .bind(dmn)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         self.apply_manifest_indexes(&key, bindings).await?;
 
@@ -133,7 +218,7 @@ impl Engine {
     /// Call after wiring the initial environment; fail loudly on diagnostics.
     pub async fn check_active_definitions(&self) -> Result<Vec<Diagnostic>, sqlx::Error> {
         let rows = sqlx::query(
-            "select distinct d.key, d.version, d.bpmn_xml, d.bindings from rbpmn_definition d \
+            "select distinct d.id, d.key, d.version, d.bpmn_xml, d.bindings from rbpmn_definition d \
              where d.id in (select definition_id from rbpmn_instance where status = 'active') \
                 or (d.key, d.version) in \
                    (select key, max(version) from rbpmn_definition group by key) \
@@ -162,6 +247,26 @@ impl Engine {
                         continue;
                     }
                 };
+            // Decisions persist with the definition, but *what validates them*
+            // is code — so a binary rebuilt without the `dmn` feature, or a
+            // dsntk upgrade that stopped accepting an artifact, is exactly the
+            // drift this pass exists to catch. Same argument as handler
+            // drift, one layer over.
+            let decisions: Vec<String> = sqlx::query_scalar(
+                "select dmn_xml from rbpmn_definition_decision \
+                 where definition_id = $1 order by ordinal",
+            )
+            .bind(row.get::<Uuid, _>("id"))
+            .fetch_all(self.pool())
+            .await?;
+            let decided = rbpmn_core::DecisionValidator::check(&validator(), &decisions);
+            for diagnostic in decided.diagnostics {
+                out.push(Diagnostic {
+                    message: format!("definition '{key}' v{version}: {}", diagnostic.message),
+                    ..diagnostic
+                });
+            }
+
             let Ok(defs) = rbpmn_model::parse(&row.get::<String, _>("bpmn_xml")) else {
                 out.push(Diagnostic::error(
                     rule::BPMN_STRUCTURE,
@@ -200,4 +305,21 @@ impl Engine {
         }
         Ok(out)
     }
+}
+
+/// The DMN validator this build carries — the same choice `rbpmn-wasm` makes,
+/// for the same reason: deploy and the editor must reach one verdict.
+///
+/// Without the `dmn` feature this is [`rbpmn_core::NoDecisions`], which
+/// **refuses** a bundle carrying decision artifacts. That is deliberate: a
+/// binary that cannot validate decisions must not accept a deployment
+/// containing them.
+#[cfg(feature = "dmn")]
+fn validator() -> impl rbpmn_core::DecisionValidator {
+    rbpmn_dmn::Validator
+}
+
+#[cfg(not(feature = "dmn"))]
+fn validator() -> impl rbpmn_core::DecisionValidator {
+    rbpmn_core::NoDecisions
 }

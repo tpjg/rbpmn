@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error dmn-validates @ 27-not-dmn
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/27" name="27-not-dmn" id="_27">
+  <decision name="Unclosed" id="unclosed">
+    <literalExpression><text>1</text>
+</definitions>

@@ -2,6 +2,10 @@
 //!
 //! A step takes a quiescent state and one command, advances every affected
 //! token synchronously to its next wait position, and returns the events.
+//! One wait position is not a resting place: [`WaitKind::Decision`] is a
+//! *request*, and the caller must answer it with [`Command::CompleteDecision`]
+//! before the transaction ends. Persistence refuses to write one, and a freeze
+//! takes any still pending along with it.
 //! Deterministic by construction: tokens advance breadth-first in a FIFO
 //! queue, split branches spawn in sequence-flow declaration order, and all
 //! collections iterate in id order — the same inputs always produce the same
@@ -43,6 +47,29 @@ pub enum Command {
     /// A correlated message arrived for an open subscription, carrying an
     /// RFC 7386 merge patch (like work-item completion).
     DeliverMessage { id: SubscriptionId, patch: Value },
+    /// A decision was evaluated for the token parked at `token`.
+    ///
+    /// Time and decisions enter this core the same way: as command data. The
+    /// projection evaluates inside the step's transaction and hands the
+    /// answer back, so a replay reads the recorded answer instead of running
+    /// an evaluator — which is what lets `chaos.rs` re-derive every history
+    /// through a core that cannot evaluate anything.
+    ///
+    /// The three shapes an evaluator can hand back: `Some(v)` is an answer,
+    /// `None` is a failure, and `reason` carries the evaluator's prose for
+    /// either — a *null* answer is still an answer, and its reason is the only
+    /// thing separating "no rule matched" from "the input was the wrong type".
+    ///
+    /// A `None` answer freezes the token at the element as an incident, and
+    /// that incident is **not catchable by an error boundary** — see the
+    /// reasoning at the handler below. (This said the opposite until the
+    /// contradiction was caught: a caller who modelled a boundary on a
+    /// business-rule task would have got a frozen instance instead.)
+    CompleteDecision {
+        token: TokenId,
+        answer: Option<Value>,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -68,6 +95,38 @@ pub enum StepError {
     Invariant(String),
 }
 
+/// Write `value` at `path`, replacing whatever was there and creating the
+/// objects along the way.
+///
+/// A non-object standing where the path needs to descend is replaced: the
+/// binding says where the answer goes, and the alternative — failing the step
+/// because a variable of the same name happened to be a string — would freeze
+/// an instance over a naming collision.
+fn assign(document: &mut Value, path: &[String], value: Value) {
+    let Some((last, parents)) = path.split_last() else {
+        *document = value;
+        return;
+    };
+    let mut current = document;
+    if !current.is_object() {
+        *current = Value::Object(serde_json::Map::new());
+    }
+    for segment in parents {
+        let map = current.as_object_mut().expect("made an object above");
+        let entry = map
+            .entry(segment.clone())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(serde_json::Map::new());
+        }
+        current = entry;
+    }
+    current
+        .as_object_mut()
+        .expect("made an object above")
+        .insert(last.clone(), value);
+}
+
 pub fn step(
     proc: &ExecutableProcess,
     state: &mut InstanceState,
@@ -83,7 +142,12 @@ pub fn step(
             state.status = InstanceStatus::Active;
             state.variables = variables;
             let mut adv = Advancer::new(proc);
-            adv.events.push(Event::InstanceStarted);
+            // The document as it was *before* the first token moved, so the
+            // history can be folded forward from here without the `Start`
+            // command being kept somewhere else.
+            adv.events.push(Event::InstanceStarted {
+                variables: state.variables.clone(),
+            });
             let token = state.next_token_id();
             adv.queue.push_back(Move {
                 token,
@@ -129,6 +193,87 @@ pub fn step(
                 element: proc.node_id(element).to_string(),
             });
             adv.leave_single(state, token_id, element)?;
+            adv.run(state)
+        }
+        Command::CompleteDecision {
+            token,
+            answer,
+            reason,
+        } => {
+            if state.status != InstanceStatus::Active {
+                return Err(StepError::InstanceNotActive(state.status));
+            }
+            let Some(parked) = state.tokens.get(&token).cloned() else {
+                return Err(StepError::Invariant(format!(
+                    "decision answered for token {token:?} which does not exist"
+                )));
+            };
+            if parked.wait != WaitKind::Decision {
+                return Err(StepError::Invariant(format!(
+                    "decision answered for token {token:?}, which is not waiting on one"
+                )));
+            }
+            let element = parked.node;
+            let ExecKind::BusinessRule { result, .. } = &proc.node(element).kind else {
+                return Err(StepError::Invariant(format!(
+                    "token {token:?} waits on a decision at a node that is not one"
+                )));
+            };
+
+            let mut adv = Advancer::new(proc);
+            adv.scope = parked.scope;
+
+            let Some(answer) = answer else {
+                // No usable answer: the uniform incident freeze. The token
+                // parks where it failed, its in-flight arms are withdrawn,
+                // and the instance freezes — so inspection shows *where*, and
+                // a repair API has one state to resume from.
+                //
+                // Deliberately not caught by an error boundary. Boundaries
+                // match an error *code*, and a failed decision has none to
+                // give: DMN has no error codes, so catching one would mean
+                // inventing a reserved code and teaching modelers to write it
+                // in their BPMN. That is a designed contract, and a feature is
+                // never the reason one ships early.
+                adv.freeze(state, token, element, None, reason);
+                return adv.run(state);
+            };
+
+            adv.events.push(Event::DecisionEvaluated {
+                element: proc.node_id(element).to_string(),
+                result: answer.clone(),
+                // Only a null answer can have one, and only then is it worth
+                // recording: a reason attached to a value would read as though
+                // something had gone wrong with it.
+                reason: reason.filter(|_| answer.is_null()),
+            });
+            // The answer **replaces** whatever is at the bound path. It is
+            // deliberately not a merge patch, which every other write to the
+            // variable document is, because RFC 7386 cannot express what a
+            // decision means:
+            //
+            //   * `null` in a merge patch *deletes* the member, so a null
+            //     answer would remove the bound path instead of storing null
+            //     — and a gateway reading `result = null` would then be
+            //     reading a missing value that happens to compare the same
+            //     way, for a different reason;
+            //   * merging an *object* answer keeps keys from the previous
+            //     run, so a decision inside a loop would report a result it
+            //     never produced.
+            //
+            // Replacement is also what a modeller means: `order.discount` is
+            // the decision's answer, not an accumulation of its answers. The
+            // write is recorded by `decision-evaluated`, which carries the
+            // value — there is no `variables-patched` for it, because it is
+            // not a patch.
+            assign(&mut state.variables, result, answer);
+
+            state.tokens.remove(&token);
+            adv.cancel_attachments(state, token);
+            adv.events.push(Event::ElementCompleted {
+                element: proc.node_id(element).to_string(),
+            });
+            adv.leave_single(state, token, element)?;
             adv.run(state)
         }
         Command::RaiseError { id, code } => {
@@ -194,7 +339,7 @@ pub fn step(
                     // Incident: the uniform freeze (token parked at the
                     // failed task, boundary timers withdrawn, instance
                     // frozen for repair).
-                    adv.freeze(state, token_id, element, code);
+                    adv.freeze(state, token_id, element, code, None);
                     Ok(adv.events)
                 }
             }
@@ -274,11 +419,15 @@ pub fn step(
                     adv.take_gateway_path(state, timer.token, token.node, timer.element)?;
                     adv.run(state)
                 }
-                WaitKind::Timer(_) | WaitKind::Join { .. } | WaitKind::Incident => {
-                    Err(StepError::Invariant(format!(
-                        "timer {id:?} fired on a token in an unrelated wait state"
-                    )))
-                }
+                // `Decision` cannot be reached: it is resolved inside the
+                // transaction that created it, so no timer can fire against a
+                // token still holding it.
+                WaitKind::Timer(_)
+                | WaitKind::Join { .. }
+                | WaitKind::Incident
+                | WaitKind::Decision => Err(StepError::Invariant(format!(
+                    "timer {id:?} fired on a token in an unrelated wait state"
+                ))),
             }
         }
         Command::DeliverMessage { id, patch } => {
@@ -394,6 +543,29 @@ impl<'a> Advancer<'a> {
                 self.element_started(node_ix);
                 self.element_completed(node_ix);
                 self.leave_single(state, token, node_ix)
+            }
+            // The decision itself is not evaluated here — this crate has no
+            // evaluator and must not acquire one. The token parks, the event
+            // says what is needed, and the projection answers it inside the
+            // same transaction (`docs/dmn.md`, D3).
+            ExecKind::BusinessRule { decision, .. } => {
+                self.element_started(node_ix);
+                state.tokens.insert(
+                    token,
+                    Token {
+                        node: node_ix,
+                        scope: self.scope,
+                        wait: WaitKind::Decision,
+                    },
+                );
+                self.events.push(Event::DecisionRequested {
+                    element: node.id.clone(),
+                    decision: decision.clone(),
+                });
+                // Boundaries arm as they do on any other activity: an error
+                // boundary here is what catches a decision that fails.
+                let _ = self.arm_boundaries(state, token, node_ix);
+                Ok(())
             }
             ExecKind::Task { kind, topic } => {
                 self.element_started(node_ix);
@@ -783,7 +955,7 @@ impl<'a> Advancer<'a> {
                     name: source.name(),
                     reason,
                 });
-                self.freeze(state, token, element, None);
+                self.freeze(state, token, element, None, None);
                 return None;
             }
         };
@@ -858,7 +1030,7 @@ impl<'a> Advancer<'a> {
                 element: self.proc.node_id(element).to_string(),
                 name: key.join("."),
             });
-            self.freeze(state, token, element, None);
+            self.freeze(state, token, element, None, None);
             return None;
         };
         if state
@@ -871,7 +1043,7 @@ impl<'a> Advancer<'a> {
                 message: message.clone(),
                 key: key_value,
             });
-            self.freeze(state, token, element, None);
+            self.freeze(state, token, element, None, None);
             return None;
         }
         let id = state.alloc_subscription(SubscriptionState {
@@ -905,6 +1077,7 @@ impl<'a> Advancer<'a> {
         token: TokenId,
         element: NodeIx,
         code: Option<String>,
+        detail: Option<String>,
     ) {
         self.cancel_attachments(state, token);
         // Close whatever work this token had open, exactly as the other
@@ -956,6 +1129,31 @@ impl<'a> Advancer<'a> {
                 wait: WaitKind::Incident,
             },
         );
+        // A sibling parked on a decision freezes with everything else.
+        //
+        // `WaitKind::Decision` is the one wait state that does not survive a
+        // step: the caller answers it before the transaction ends, which is
+        // why persistence refuses to write one. A parallel branch that reached
+        // a business-rule task *before* another branch froze the instance left
+        // exactly that — a Decision token on a Failed instance — and the
+        // engine's drain loop then answered it, got `InstanceNotActive`, and
+        // rolled the whole transaction back. Not the freeze: the start. The
+        // instance was never created, the incident never recorded, and every
+        // retry did the same thing.
+        //
+        // They park at their own node, like the queue below, so inspection
+        // still shows where each branch stood.
+        let pending: Vec<TokenId> = state
+            .tokens
+            .iter()
+            .filter(|(_, t)| t.wait == WaitKind::Decision)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in pending {
+            if let Some(t) = state.tokens.get_mut(&id) {
+                t.wait = WaitKind::Incident;
+            }
+        }
         for mv in std::mem::take(&mut self.queue) {
             state.tokens.insert(
                 mv.token,
@@ -970,6 +1168,7 @@ impl<'a> Advancer<'a> {
         self.events.push(Event::IncidentRaised {
             element: self.proc.node_id(element).to_string(),
             code,
+            detail,
         });
     }
 

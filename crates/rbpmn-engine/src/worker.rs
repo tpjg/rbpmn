@@ -94,12 +94,13 @@ impl Engine {
         // an incident-frozen instance's siblings are never re-executed.
         let claim = format!(
             "update rbpmn_work_item set state = 'locked', lock_owner = $2, \
-             lock_until = now() + make_interval(secs => $3) \
+             lock_until = now() + make_interval(secs => $3), \
+             lease_no = lease_no + 1 \
              where id = (select w.id from rbpmn_work_item w \
                 join rbpmn_instance i on i.id = w.instance_id \
                 where w.kind = 'service' and w.topic = any($1) and {claimable} \
                 order by w.created_at, w.item_no limit 1 for update of w skip locked) \
-             returning id, instance_id, definition_key, element_id, topic, \
+             returning id, instance_id, definition_key, element_id, topic, lease_no, \
                (select variables from rbpmn_instance i2 \
                  where i2.id = rbpmn_work_item.instance_id) as variables",
             claimable = crate::CLAIMABLE,
@@ -115,7 +116,10 @@ impl Engine {
         };
 
         // Claim and variables read are one statement (the RETURNING
-        // subquery): one claim, one snapshot.
+        // subquery): one claim, one snapshot. The claim mints a lease epoch
+        // here as the pull API's does — both paths must, or a pull
+        // claimant's stale release could free this worker's live lease.
+        let lease_no: i64 = row.get("lease_no");
         let item = WorkItem {
             id: row.get("id"),
             instance_id: row.get("instance_id"),
@@ -126,8 +130,10 @@ impl Engine {
         };
 
         let Some(handler) = self.handler_for(&item.topic) else {
-            // The environment changed underneath us: release the claim.
-            self.release_claim(item.id, &options.owner).await?;
+            // The environment changed underneath us: release the claim —
+            // the same hand-back the pull API exposes, one statement, one
+            // place. A peer worker that does have the handler picks it up.
+            self.release_task(item.id, &options.owner, lease_no).await?;
             return Ok(false);
         };
 
@@ -258,17 +264,5 @@ impl Engine {
         .fetch_one(self.pool())
         .await?;
         Ok(secs.map(|s| Duration::from_secs_f64(s.max(0.0))))
-    }
-
-    async fn release_claim(&self, work_item: uuid::Uuid, owner: &str) -> Result<(), EngineError> {
-        sqlx::query(
-            "update rbpmn_work_item set state = 'available', lock_owner = null, \
-             lock_until = null where id = $1 and lock_owner = $2 and state = 'locked'",
-        )
-        .bind(work_item)
-        .bind(owner)
-        .execute(self.pool())
-        .await?;
-        Ok(())
     }
 }

@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+
+-->
+<!-- The decision `just demo` runs, bundled with
+     `rbpmn-model/tests/fixtures/accept/28-demo-order.bpmn`.
+
+     A decision *table* rather than a literal expression, deliberately: it is
+     what a business rule usually looks like, and it is the view of dmn-js the
+     editor otherwise never shows off. It also demonstrates the thing that
+     silently bites — both inputs are **declared** (`inputData` +
+     `informationRequirement`), because a FEEL expression can only see names
+     the decision says it requires. Drop either declaration and the table still
+     deploys, still evaluates, and answers null forever.
+
+     Hit policy UNIQUE with a catch-all last rule, so there is always exactly
+     one match and the answer is never null for a real order. -->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             xmlns:dmndi="https://www.omg.org/spec/DMN/20191111/DMNDI/"
+             xmlns:dc="http://www.omg.org/spec/DMN/20180521/DC/"
+             xmlns:di="http://www.omg.org/spec/DMN/20180521/DI/"
+             namespace="https://rbpmn.dev/demo/triage" name="Triage" id="_triage">
+
+  <inputData name="order" id="in_order">
+    <variable name="order" typeRef="Any" />
+  </inputData>
+  <inputData name="risk" id="in_risk">
+    <variable name="risk" typeRef="Any" />
+  </inputData>
+
+  <decision name="Triage" id="dec_triage">
+    <variable name="Triage" typeRef="string" />
+    <informationRequirement id="req_order">
+      <requiredInput href="#in_order" />
+    </informationRequirement>
+    <informationRequirement id="req_risk">
+      <requiredInput href="#in_risk" />
+    </informationRequirement>
+    <decisionTable id="tbl_triage" hitPolicy="UNIQUE">
+      <input id="i_score" label="Risk score">
+        <inputExpression id="i_score_x" typeRef="number">
+          <text>risk.score</text>
+        </inputExpression>
+      </input>
+      <input id="i_total" label="Order total">
+        <inputExpression id="i_total_x" typeRef="number">
+          <text>order.total</text>
+        </inputExpression>
+      </input>
+      <output id="o_band" label="Band" name="band" typeRef="string" />
+
+      <rule id="r_high">
+        <inputEntry id="r_high_score"><text>&gt;= 70</text></inputEntry>
+        <inputEntry id="r_high_total"><text>-</text></inputEntry>
+        <outputEntry id="r_high_out"><text>"review"</text></outputEntry>
+      </rule>
+      <rule id="r_large">
+        <inputEntry id="r_large_score"><text>&lt; 70</text></inputEntry>
+        <inputEntry id="r_large_total"><text>&gt;= 500</text></inputEntry>
+        <outputEntry id="r_large_out"><text>"review"</text></outputEntry>
+      </rule>
+      <rule id="r_clear">
+        <inputEntry id="r_clear_score"><text>&lt; 70</text></inputEntry>
+        <inputEntry id="r_clear_total"><text>&lt; 500</text></inputEntry>
+        <outputEntry id="r_clear_out"><text>"auto"</text></outputEntry>
+      </rule>
+    </decisionTable>
+  </decision>
+
+  <dmndi:DMNDI>
+    <dmndi:DMNDiagram id="dia_triage">
+      <dmndi:DMNShape id="sh_triage" dmnElementRef="dec_triage">
+        <dc:Bounds height="80" width="180" x="300" y="80" />
+      </dmndi:DMNShape>
+      <dmndi:DMNShape id="sh_order" dmnElementRef="in_order">
+        <dc:Bounds height="45" width="125" x="220" y="260" />
+      </dmndi:DMNShape>
+      <dmndi:DMNShape id="sh_risk" dmnElementRef="in_risk">
+        <dc:Bounds height="45" width="125" x="420" y="260" />
+      </dmndi:DMNShape>
+      <!-- The two requirements need DI of their own, and it is not cosmetic.
+           Without a DMNEdge, dmn-js imports the requirement semantically but
+           has no connection to render, so the DRD draws two inputs floating
+           free of the decision — a picture saying the opposite of the model.
+           Worse, `ReplaceShapeHandler` re-attaches a shape's *rendered*
+           incoming connections, so morphing the decision to a literal
+           expression through the context pad dropped both requirements from
+           the XML. The decision then answered its else branch forever, which
+           is the exact trap this fixture exists to demonstrate not falling
+           into. -->
+      <dmndi:DMNEdge id="ed_order" dmnElementRef="req_order">
+        <di:waypoint x="283" y="260" />
+        <di:waypoint x="350" y="160" />
+      </dmndi:DMNEdge>
+      <dmndi:DMNEdge id="ed_risk" dmnElementRef="req_risk">
+        <di:waypoint x="483" y="260" />
+        <di:waypoint x="430" y="160" />
+      </dmndi:DMNEdge>
+    </dmndi:DMNDiagram>
+  </dmndi:DMNDI>
+</definitions>

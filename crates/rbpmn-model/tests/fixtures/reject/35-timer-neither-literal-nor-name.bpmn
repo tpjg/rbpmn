@@ -2,12 +2,22 @@
 <!-- expect-diagnostics:
   error timer-iso8601 @ c
 -->
-<!-- Unmarked content is a literal, always: without
-     xsi:type="bpmn:tFormalExpression" the text must be a valid ISO-8601
-     value, and "5 minutes" is not. The marker is required precisely because
-     the grammars overlap — "P30X" is a mistyped duration and a syntactically
-     valid qualified name at once, so inferring would turn a typo into a
-     silent variable lookup. -->
+<!-- The one timer text that has nowhere left to go. Parse order is the
+     discriminator — a valid ISO-8601 literal first, otherwise a FEEL
+     qualified name naming the deadline in the variable document — and
+     "5 minutes" is neither: not a duration, and not a qualified name either
+     (a space, and a leading digit). So this errors where accept/23 warns.
+
+     Note what is NOT consulted: xsi:type="bpmn:tFormalExpression". An
+     earlier version made that marker the discriminator, on the theory that
+     it signals the author meant an expression. bpmn-moddle emits it for any
+     expression object, so every bpmn-js modeler stamps it on ordinary
+     literal durations, and `P3D` became a variable lookup named `P3D`.
+
+     The grammars really do overlap, and that cost is paid in
+     accept/24-timer-typo-reads-as-variable.bpmn: `P30X` is a mistyped
+     duration *and* a valid qualified name, so it warns rather than
+     erroring, with the ISO-8601 complaint carried in the warning text. -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
   <bpmn:process id="p" isExecutable="true">
     <bpmn:startEvent id="start">

@@ -34,7 +34,15 @@ SERVER = "http://127.0.0.1:7420"
 PROXY_PORT = int(os.environ.get("RBPMN_DEMO_PORT", "8099"))
 DB = "rbpmn_demo"
 
-MODEL = REPO / "crates/rbpmn-model/tests/fixtures/accept/10-error-boundary.bpmn"
+MODEL = REPO / "crates/rbpmn-model/tests/fixtures/accept/28-demo-order.bpmn"
+DECISION = REPO / "crates/rbpmn-dmn/tests/fixtures/accept/09-demo-triage.dmn"
+# Read rather than written inline, because the editor opens on this same
+# deployment and reads the same file. The topic names below are also the ones
+# registered at `/v1/topics` further down: a second copy that drifted would
+# leave the editor reporting `unresolved-topic` against this very server.
+BINDINGS = json.loads(
+    (REPO / "crates/rbpmn-model/tests/fixtures/accept/28-demo-order.bindings.json").read_text()
+)
 
 
 def psql(sql, db="postgres"):
@@ -55,9 +63,17 @@ def api(path, body=None, method="POST"):
             "Content-Type": "application/json",
         },
     )
-    with urllib.request.urlopen(request) as response:
-        raw = response.read()
-        return json.loads(raw) if raw else None
+    try:
+        with urllib.request.urlopen(request) as response:
+            raw = response.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        # The body is the whole point of a 4xx here: rbpmn answers a refused
+        # deploy with its diagnostics, rule id and element included. Letting
+        # urllib raise a bare "HTTP Error 400: Bad Request" throws that away
+        # and makes a wiring mistake look like a broken script.
+        detail = e.read().decode(errors="replace").strip()
+        raise SystemExit(f"{method} {path} -> {e.code} {e.reason}\n{detail}") from None
 
 
 def wait_port(port, timeout=60):
@@ -170,14 +186,43 @@ class AuthInjectingProxy(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def available_item(instance, element):
+    """The open work item at `element`, or a clear failure."""
+    inspection = api(f"/v1/instances/{instance}/inspect", method="GET")
+    for item in inspection["workItems"]:
+        if item["state"] == "available" and item["elementId"] == element:
+            return item["id"]
+    raise SystemExit(
+        f"expected an open work item at {element!r}, got "
+        + repr([(w["elementId"], w["state"]) for w in inspection["workItems"]])
+    )
+
+
 def build_stuck_instance():
-    """Deploy, start, and fail until the instance freezes on an incident."""
-    api("/v1/topics", {"name": "payments"})
+    """Walk one order through the whole model and leave it on an incident.
+
+    The point is that the inspector has something to show. By the time this
+    returns, the instance's history holds the document it started with, a
+    worker's merge patch, a decision evaluated against that patch, the branch
+    the decision sent it down, and an incident — which is the full vocabulary
+    of the engine in one trace.
+    """
+    # Declared from the manifest rather than listed again: the environment half
+    # of the wiring has to cover exactly the topics the deployment resolves to,
+    # and deriving it is the only way that stays true when one of them is
+    # renamed.
+    for topic in sorted(set(BINDINGS["topics"].values())):
+        api("/v1/topics", {"name": topic})
+
+    # One deployment: process, wiring and decision together, versioned as a
+    # unit. The decision binding says which invocable `triage` calls and where
+    # its answer lands — in code, never in the XML.
     api(
         "/v1/definitions",
         {
             "bpmn": MODEL.read_text(),
-            "bindings": {"topics": {"st": "payments"}},
+            "decisions": [DECISION.read_text()],
+            "bindings": BINDINGS,
         },
     )
     instance = api(
@@ -197,16 +242,31 @@ def build_stuck_instance():
                 },
                 "customer": {"id": "c-88", "tier": "gold", "email": "ada@example.com"},
                 "payment": {"method": "card", "last4": "4242", "attempts": 0},
+                # Top-level and scalar, because that is what an index can be:
+                # it becomes a real index on one JSONB field, so a dotted path
+                # is refused at deploy.
+                "channel": "web",
             },
         },
     )["instanceId"]
 
-    inspection = api(f"/v1/instances/{instance}/inspect", method="GET")
-    item = next(w for w in inspection["workItems"] if w["state"] == "available")["id"]
+    # The risk worker answers with a merge patch — a *delta*, which is what a
+    # worker sends and why `variables-patched` records the patch rather than
+    # the result. The decision then reads `risk.score` from it.
+    api(
+        f"/v1/work-items/{available_item(instance, 'score')}/complete",
+        {"patch": {"risk": {"score": 82, "model": "fraud-v3"}}},
+    )
+
+    # 82 >= 70, so the table's first rule matches and `triage.band` is
+    # "review" — which is the branch the gateway takes, so an item is waiting
+    # at the user task rather than at the charge. Completing it walks on.
+    api(f"/v1/work-items/{available_item(instance, 'review')}/complete", {})
 
     # An error code the boundary does NOT catch (it listens for
     # PAYMENT_FAILED), so exhausting the budget freezes the instance instead
     # of taking the recovery path — the case someone actually gets paged for.
+    item = available_item(instance, "charge")
     for attempt in range(1, 12):
         outcome = api(
             f"/v1/work-items/{item}/fail",
@@ -236,7 +296,7 @@ def main():
         **os.environ,
         "RBPMN_DATABASE_URL": f"postgres://{os.environ.get('USER')}@localhost:5432/{DB}",
         "RBPMN_API_TOKEN": TOKEN,
-        "RBPMN_TOPICS": "payments",
+        "RBPMN_TOPICS": "risk-scoring,payments",
     }
     print("building and starting rbpmn-server ...")
     server = start_server(env)
@@ -255,12 +315,29 @@ def main():
    inspector   {base}/ui/inspect/{instance}
    editor      {base}/ui/editor
 
-   The instance is frozen on an incident: 'Charge card' kept
-   answering 502 and raised GATEWAY_TIMEOUT, which the error
-   boundary (PAYMENT_FAILED) does not catch.
+   One order walked the whole model. Its history holds, in order:
+   the variables it started with, a worker's merge patch (the risk
+   score), a DMN decision table evaluated against that patch, the
+   branch the decision chose, and the incident it ended on.
 
-   In the editor, press "Check against server" — the topic
-   'payments' is declared, so the wiring shows as covered.
+   It is frozen because 'Charge the card' kept answering 502 and
+   raised GATEWAY_TIMEOUT, which the error boundary (PAYMENT_FAILED)
+   does not catch — the case someone gets paged for.
+
+   Worth clicking, in the inspector:
+     * 'Triage the order' — the decision, its answer, and the
+       variables pane showing where the answer landed
+     * the gateway's two branches: 'review' was taken because the
+       risk score was 82
+     * 'Charge the card' — every retry, with the handler's message
+
+   The editor opens on this same deployment — the model, its
+   manifest and the decision together, which is what makes it a
+   deployment rather than a diagram. Press "Check against server":
+   both topics below are declared here, so the wiring comes back
+   covered. Open triage.dmn to see the table this instance ran, and
+   note that both its inputs are *declared* — a FEEL expression can
+   only read names the decision says it requires.
 
    Loopback only, and the proxy in front authenticates nobody:
    it just adds the bearer a browser cannot send. That is the

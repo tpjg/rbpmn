@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<!-- The model `just demo` runs, and the corpus's one deliberately *whole*
+     process: every other accept fixture isolates a rule, this one exercises
+     the engine's range end to end so there is something worth looking at in
+     the inspector.
+
+     Service task -> business-rule task -> exclusive split on the decision's
+     answer -> user task on one branch -> a second service task carrying an
+     error boundary. It deploys as a bundle with `28-demo-triage.dmn`, so it is
+     also the only fixture whose wiring includes a decision binding.
+
+     Being a whole deployment, it is the one fixture that has a manifest, and
+     the reason a `.json` sits in a corpus of `.bpmn`: `28-demo-order.bindings
+     .json` beside it. `tests/fixtures.rs` filters to the `.bpmn` extension, so
+     it is invisible to the corpus runner and belongs to the three consumers
+     below instead. One copy on purpose — the topic names in it are also
+     `just demo`'s `/v1/topics` registrations, so a second copy that drifted
+     would make the editor's own "Check against server" report
+     `unresolved-topic` against the very server the demo just started.
+
+     Do not delete it because it looks redundant. Three things read it, and
+     none of them is this corpus: `e2e/demo.py` deploys it, the editor opens on
+     it (`ui/src/editor/main.js`), and `e2e/ui.py` asserts that it does. The
+     corpus's own contribution is the one thing those three cannot check for
+     themselves — that it stays lint-clean. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures" expressionLanguage="https://www.omg.org/spec/DMN/20191111/FEEL/">
+  <bpmn:error id="err_pay" name="PaymentFailed" errorCode="PAYMENT_FAILED" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="placed" name="Order placed">
+      <bpmn:outgoing>f_score</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="score" name="Score risk">
+      <bpmn:incoming>f_score</bpmn:incoming>
+      <bpmn:outgoing>f_triage</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:businessRuleTask id="triage" name="Triage the order">
+      <bpmn:incoming>f_triage</bpmn:incoming>
+      <bpmn:outgoing>f_route</bpmn:outgoing>
+    </bpmn:businessRuleTask>
+    <bpmn:exclusiveGateway id="route" name="Band?" default="f_auto">
+      <bpmn:incoming>f_route</bpmn:incoming>
+      <bpmn:outgoing>f_manual</bpmn:outgoing>
+      <bpmn:outgoing>f_auto</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:userTask id="review" name="Review by hand">
+      <bpmn:incoming>f_manual</bpmn:incoming>
+      <bpmn:outgoing>f_reviewed</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:exclusiveGateway id="settle">
+      <bpmn:incoming>f_reviewed</bpmn:incoming>
+      <bpmn:incoming>f_auto</bpmn:incoming>
+      <bpmn:outgoing>f_charge</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="charge" name="Charge the card">
+      <bpmn:incoming>f_charge</bpmn:incoming>
+      <bpmn:outgoing>f_done</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="declined" name="Declined" attachedToRef="charge">
+      <bpmn:outgoing>f_declined</bpmn:outgoing>
+      <bpmn:errorEventDefinition errorRef="err_pay" />
+    </bpmn:boundaryEvent>
+    <bpmn:userTask id="retry_payment" name="Ask for another card">
+      <bpmn:incoming>f_declined</bpmn:incoming>
+      <bpmn:outgoing>f_abandoned</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:endEvent id="shipped" name="Shipped">
+      <bpmn:incoming>f_done</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="abandoned" name="Abandoned">
+      <bpmn:incoming>f_abandoned</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f_score" sourceRef="placed" targetRef="score" />
+    <bpmn:sequenceFlow id="f_triage" sourceRef="score" targetRef="triage" />
+    <bpmn:sequenceFlow id="f_route" sourceRef="triage" targetRef="route" />
+    <bpmn:sequenceFlow id="f_manual" name="review" sourceRef="route" targetRef="review">
+      <bpmn:conditionExpression>triage.band = "review"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_auto" name="straight through" sourceRef="route" targetRef="settle" />
+    <bpmn:sequenceFlow id="f_reviewed" sourceRef="review" targetRef="settle" />
+    <bpmn:sequenceFlow id="f_charge" sourceRef="settle" targetRef="charge" />
+    <bpmn:sequenceFlow id="f_done" sourceRef="charge" targetRef="shipped" />
+    <bpmn:sequenceFlow id="f_declined" sourceRef="declined" targetRef="retry_payment" />
+    <bpmn:sequenceFlow id="f_abandoned" sourceRef="retry_payment" targetRef="abandoned" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_p">
+    <bpmndi:BPMNPlane id="BPMNPlane_p" bpmnElement="p">
+      <bpmndi:BPMNShape id="placed_di" bpmnElement="placed">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="score_di" bpmnElement="score">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="triage_di" bpmnElement="triage">
+        <dc:Bounds x="325" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="route_di" bpmnElement="route" isMarkerVisible="true">
+        <dc:Bounds x="500" y="45" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="review_di" bpmnElement="review">
+        <dc:Bounds x="625" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="settle_di" bpmnElement="settle" isMarkerVisible="true">
+        <dc:Bounds x="800" y="45" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="charge_di" bpmnElement="charge">
+        <dc:Bounds x="925" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="declined_di" bpmnElement="declined">
+        <dc:Bounds x="957" y="92" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="shipped_di" bpmnElement="shipped">
+        <dc:Bounds x="1107" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="retry_payment_di" bpmnElement="retry_payment">
+        <dc:Bounds x="1075" y="170" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="abandoned_di" bpmnElement="abandoned">
+        <dc:Bounds x="1257" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f_score_di" bpmnElement="f_score">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_triage_di" bpmnElement="f_triage">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="325" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_route_di" bpmnElement="f_route">
+        <di:waypoint x="425" y="70" />
+        <di:waypoint x="500" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_manual_di" bpmnElement="f_manual">
+        <di:waypoint x="550" y="70" />
+        <di:waypoint x="625" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_auto_di" bpmnElement="f_auto">
+        <di:waypoint x="525" y="95" />
+        <di:waypoint x="525" y="140" />
+        <di:waypoint x="825" y="140" />
+        <di:waypoint x="825" y="95" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_reviewed_di" bpmnElement="f_reviewed">
+        <di:waypoint x="725" y="70" />
+        <di:waypoint x="800" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_charge_di" bpmnElement="f_charge">
+        <di:waypoint x="850" y="70" />
+        <di:waypoint x="925" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_done_di" bpmnElement="f_done">
+        <di:waypoint x="1025" y="70" />
+        <di:waypoint x="1107" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_declined_di" bpmnElement="f_declined">
+        <di:waypoint x="975" y="128" />
+        <di:waypoint x="975" y="210" />
+        <di:waypoint x="1075" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_abandoned_di" bpmnElement="f_abandoned">
+        <di:waypoint x="1175" y="210" />
+        <di:waypoint x="1257" y="210" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

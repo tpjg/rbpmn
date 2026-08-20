@@ -16,5 +16,23 @@ crate-type = ["cdylib", "rlib"]
 # dsntk note in CLAUDE.md.
 rbpmn-core = { path = "../rbpmn-core" }
 rbpmn-model = { path = "../rbpmn-model" }
+# The DMN validator the editor needs, optional so a build that does not want
+# decisions does not carry ~100k lines of dsntk. It reaches wasm32 only
+# because two `[patch.crates-io]` lines replace the C decimal and the Java
+# bridge's HTTP client — see docs/dmn.md.
+rbpmn-dmn = { path = "../rbpmn-dmn", optional = true }
 wasm-bindgen = "0.2"
 serde_json.workspace = true
+
+[features]
+# **On** by default, and *still* asked for explicitly by everything that builds
+# this module — `just wasm`, and the parity dump that must match it. The
+# redundancy is deliberate: both sides of the parity check name the feature, so
+# a build that ever loses it fails per fixture instead of quietly comparing two
+# different validators.
+#
+# Without it, bundled decision artifacts are *refused* rather than ignored, so
+# a build that dropped this feature cannot quietly accept a deployment it never
+# validated.
+default = ["dmn"]
+dmn = ["dep:rbpmn-dmn"]

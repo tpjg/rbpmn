@@ -161,6 +161,7 @@ impl Parser {
                 foreign: foreign_bindings(c),
             },
             "userTask" => NodeKind::UserTask,
+            "businessRuleTask" => NodeKind::BusinessRuleTask,
             "receiveTask" => NodeKind::ReceiveTask {
                 message_ref: attr_string(c, "messageRef"),
             },

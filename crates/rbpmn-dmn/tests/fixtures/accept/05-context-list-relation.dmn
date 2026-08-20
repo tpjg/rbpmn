@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/05-context-list-relation" name="05-context-list-relation" id="_05-context-list-relation">
+  <inputData name="Base" id="base">
+    <variable name="Base" typeRef="number"/>
+  </inputData>
+  <decision name="Quote" id="quote">
+    <variable name="Quote" typeRef="Any"/>
+    <informationRequirement><requiredInput href="#base"/></informationRequirement>
+    <context>
+      <contextEntry>
+        <variable name="net" typeRef="number"/>
+        <literalExpression><text>Base</text></literalExpression>
+      </contextEntry>
+      <contextEntry>
+        <variable name="tax" typeRef="number"/>
+        <literalExpression><text>net * 0.21</text></literalExpression>
+      </contextEntry>
+      <contextEntry>
+        <variable name="lines" typeRef="Any"/>
+        <list>
+          <literalExpression><text>net</text></literalExpression>
+          <literalExpression><text>tax</text></literalExpression>
+        </list>
+      </contextEntry>
+      <contextEntry>
+        <literalExpression><text>net + tax</text></literalExpression>
+      </contextEntry>
+    </context>
+  </decision>
+</definitions>

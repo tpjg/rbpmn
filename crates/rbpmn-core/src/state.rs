@@ -76,6 +76,14 @@ pub enum WaitKind {
     /// Parked at a subprocess, waiting for the child scope it opened to
     /// empty. Resumed when the last token inside that scope is consumed.
     Scope(ScopeId),
+    /// Parked at a business-rule task while its decision is evaluated.
+    ///
+    /// Transient by design: the projection evaluates and resumes the token
+    /// inside the *same* transaction, so this is never a state an operator
+    /// observes or a scheduler has to find. It exists because the pure core
+    /// must be able to say "waiting for an answer" without being able to
+    /// compute one (`docs/dmn.md`, D3).
+    Decision,
 }
 
 /// An open subprocess scope instance.

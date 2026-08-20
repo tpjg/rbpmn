@@ -420,3 +420,97 @@ textarea.prop-input {
   stroke: #d69e2e !important;
   stroke-width: 4px !important;
 }
+
+/* ------------------------------------------------------------- decisions */
+
+/* One canvas visible at a time. dmn-js and bpmn-js each own their container
+   outright, so they get one each rather than sharing and fighting over it. */
+.btn-mode {
+  margin-left: 8px;
+}
+
+.btn-mode-on {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.btn-small {
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+.btn-link {
+  border: none;
+  background: none;
+  padding: 3px 0;
+  color: var(--accent);
+  text-align: left;
+  flex: 1;
+}
+
+.decision-list {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+}
+
+.decision {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-bottom: 1px solid var(--line);
+  padding: 2px 0;
+}
+
+.decision.on .btn-link {
+  font-weight: 600;
+}
+
+.row {
+  display: flex;
+  gap: 6px;
+}
+
+/* The try-it pane: one decision, one input, one answer. */
+.try-it select,
+.try-it .code {
+  width: 100%;
+  margin-bottom: 6px;
+}
+
+.code-small {
+  min-height: 60px;
+  font-size: 12px;
+}
+
+.try-output {
+  margin: 8px 0 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.try-output:empty {
+  display: none;
+}
+
+.try-value {
+  border-color: var(--accent);
+}
+
+/* A null is an answer, not a failure — styled as information, not as an
+   error, because an incomplete decision table is a legitimate model. */
+.try-null {
+  color: var(--ink-soft);
+}
+
+.try-unrepresentable,
+.try-error {
+  border-color: var(--error);
+  background: var(--error-bg);
+}

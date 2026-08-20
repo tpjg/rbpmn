@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/02-decision-table" name="02-decision-table" id="_02-decision-table">
+  <inputData name="Amount" id="amount">
+    <variable name="Amount" typeRef="number"/>
+  </inputData>
+  <decision name="Discount" id="discount">
+    <variable name="Discount" typeRef="number"/>
+    <informationRequirement><requiredInput href="#amount"/></informationRequirement>
+    <decisionTable hitPolicy="UNIQUE">
+      <input><inputExpression typeRef="number"><text>Amount</text></inputExpression></input>
+      <output typeRef="number"/>
+      <rule><inputEntry><text>&lt; 100</text></inputEntry><outputEntry><text>0</text></outputEntry></rule>
+      <rule><inputEntry><text>[100..1000)</text></inputEntry><outputEntry><text>Amount * 0.05</text></outputEntry></rule>
+      <rule><inputEntry><text>&gt;= 1000</text></inputEntry><outputEntry><text>Amount * 0.1</text></outputEntry></rule>
+    </decisionTable>
+  </decision>
+</definitions>

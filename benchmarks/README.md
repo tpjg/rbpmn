@@ -197,6 +197,21 @@ closed loop that quietly slows down reports a rate it never ran at. Both
 modes record whether backpressure occurred; in saturation mode the answer is
 "not applicable, and here is why", not a bare `false`.
 
+**A steady pass starts `arrival_rate x duration_secs` instances, not
+`workload.instances`.** That field sizes a saturation backlog and has no
+meaning here; the two are independent numbers in the scenario file. Anything
+derived per instance therefore hangs off the arrival count — `measured_instances`
+in the result file, and the correlation keys. Getting that wrong is not a
+rounding error: `message-wait` started 1600 instances against 1000 keys, and
+the 600 with no message to receive surfaced 60 seconds later as a stall that
+blamed the workers.
+
+For a scenario that correlates, the keys are also **fed as instances arrive**
+rather than queued up front. A key for an instance that does not exist yet can
+only fail, and a failed key goes to the back of the queue — so pre-filling
+measured the harness's queue discipline instead of the engine (p50 2.8s against
+8ms once fed in step).
+
 ### Two latencies, deliberately not comparable
 
 - `latency_kind: "arrival"` — `completed_at − created_at`, the instance's own

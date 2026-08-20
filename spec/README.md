@@ -9,8 +9,8 @@ Run with `just tla` (needs `java`; fetches `tla2tools.jar` on first use).
 | Spec | Models | Checks |
 |---|---|---|
 | `LockOrder.tla` | **every lock-taking transaction shape in the engine** — step, timer claim, work claim, retention, deploy — over per-instance rows plus the definition and floor rows | nobody holds rows while still needing the instance row; no AB/BA deadlock; every transaction returns to idle |
-| `Lease.tla` | the work-item lease: TTL, renewal, expiry, completion | no double delivery; exactly-once completion under at-least-once delivery; nothing stranded |
-| `TimerTeardown.tla` | the scheduler's unlocked timer pick racing a scope teardown | no timer row outlives the token it is armed on; no timer ever fires with its token gone |
+| `Lease.tla` | the work-item lease: TTL, renewal, expiry, completion, the voluntary hand-back, and clients retrying their own requests | no double delivery; exactly-once completion under at-least-once delivery; a live lease ends only by the clock or its own holder; a release frees only the lease it named; nothing stranded |
+| `TimerTeardown.tla` | the scheduler's unlocked timer pick racing a scope teardown, and a claim transaction that rolls back after its re-check | no timer row outlives the token it is armed on; no timer ever fires with its token gone |
 | `Retention.tla` | a retention pass across its transaction-free archive gap | nothing deleted without an archive; the truncation floor covers every deletion and invents none; only due records go |
 
 Each spec ships with a companion config that is **expected to fail**, so the
@@ -22,11 +22,33 @@ checks are known to have teeth rather than passing vacuously:
 | `LockOrderHistorical.cfg` | **deadlock** | the timer-claim order the design brief rejected |
 | `Lease.cfg` | holds | the shipped lease |
 | `Lease_DoubleBelief.cfg` | **violation** | two workers really can both believe they hold one item |
+| `Lease_UncheckedRelease.cfg` | **violation** | `release_task` without its owner check, freeing a live holder's item |
+| `Lease_EpochlessRelease.cfg` | **violation** | `release_task` without its lease epoch — a retried release freeing the claim that replaced it |
 | `TimerTeardown.cfg` | holds | the shipped teardown |
 | `TimerTeardown_Buggy.cfg` | **violation** | the phase-6 bug: teardown reaping tokens but not their timers |
 | `Retention.cfg` | holds | the shipped pass |
 | `Retention_FloorFromPlan.cfg` | **violation** | advancing the floor from the plan instead of the deletions |
 | `Retention_NoRecheck.cfg` | **violation** | trusting the plan's DUE verdict across the archive gap |
+
+## What DMN changed here, and what it did not
+
+The claim path used to run a pure `step` under the instance lock. It now runs
+`step_answering_decisions`, which reads the definition's DMN from the database
+and evaluates it **inside the same transaction**. Two things follow, and both
+are written into the model rather than argued in a commit message — the
+standing warning in CLAUDE.md is that a hand-written model does not adapt and
+nothing fails when it goes stale.
+
+* A claim can now abort *after* its re-check passed, which was not previously
+  reachable from this path. `TimerTeardown.tla`'s `Abort` action models it. It
+  leaves state identical to `Drop`, because a rollback returns the claim
+  instead of consuming it — the identity is the point, and TLC checking it is
+  what makes it more than a claim.
+* No new lock enters the order. The decision cache is an in-process
+  `RwLock<HashMap>` of the same shape as the compiled-process cache that was
+  already taken here, never held across an `await`; the
+  `rbpmn_definition_decision` read takes no row locks and so cannot join a
+  cycle. `LockOrder.tla` models database locks and needs no new arity.
 
 ## What the failures show
 
@@ -105,6 +127,77 @@ had no failure path. With retry backoff and the incident freeze modelled, an
 item genuinely can be neither claimable nor completable, so the property is
 now `StrandedOnlyForAStatedReason` — it can happen, for exactly two reasons,
 both intended.
+
+`Release` — `release_task`, the voluntary hand-back — is the third exit from
+a claim, and the only one that returns an item to the queue with nothing
+having gone wrong. Its guard is transcribed like the others:
+`lock_owner = $me AND state = 'locked'`, with **no** liveness clause, because
+an expired lease nobody reclaimed still names its owner and releasing it only
+tidies the row.
+
+`LiveLeaseEndsOnlyByItsHolder` is the property that check earns: a live lease
+ends by the clock or by its own holder's hand, never by anyone else's. It has
+to be an **action** property, because the thing being ruled out is a
+transition rather than a state — no predicate over one state can distinguish
+"this item became available" from "*someone else* made this item available".
+That is what the `lastActor` variable is for.
+
+The first attempt was `NoForeignHandBack ==
+(HoldsLive(w) /\ v # w) => ~ReleaseGuard(v)`, and it was deleted rather than
+kept alongside: `HoldsLive(w)` already carries `owner = w`, so it is true by
+propositional reasoning in every state, reachable or not. It restated the
+guard's text instead of constraining behaviour, and would have gone on
+holding if `Release` had been given a different guard or a body that freed a
+live holder some other way — the same failure as the idealised `Complete`
+above, approached from the opposite side. The replacement quantifies over the
+whole of `Next`, so it checks the four guards *together*: `CLAIMABLE` keeps
+`Acquire` off a live lease, `guard_lease` keeps `Complete` and `Fail` off it,
+`ReleaseGuard` keeps `Release` off it. `believes` could not have expressed
+any of this — two workers believing at once is already reachable and already
+safe.
+
+## The lease epoch, and the request the model could not see
+
+`LiveLeaseEndsOnlyByItsHolder` is about *who* acted, and there is a bug it
+cannot see, because in that bug the holder and the actor are the same worker.
+
+`release_task` first shipped guarded by owner and state alone. The whole task
+API assumes at-least-once delivery of client requests, and every other verb
+survives it — `extend_lock` carries `lock_until > now()`, a repeated
+completion converges on `AlreadyClosed`. Release did not: a client whose
+release committed but whose response was lost retries it, and because the
+released item is available again and *oldest*, it is the very item FIFO hands
+back to that same client on its next claim. The retry then matches — same
+task, same owner, same statement — and frees a live claim somebody is looking
+at.
+
+`just tla` was green over this the whole time, and not by accident: **the
+model had no notion of a request**. A replay and a fresh release were the
+same step, so no property could separate them. The action that was missing is
+`ReleaseReplay`, and it needs the model to record which release requests were
+actually sent (`issued`), so that a retry re-offers one of those and nothing
+else. An earlier draft let a replay name any epoch below the current one, and
+TLC promptly produced a counterexample replaying epoch 0 — an epoch no client
+can ever have been given, since epochs come from claims and a claim always
+yields at least 1. A counterexample nobody can reach is worse than none: the
+config is the documentation of the bug, so it has to show the bug that
+happens.
+
+The property is `ReleaseFreesOnlyTheLeaseItNamed`: a release that *lands*
+named the lease that was actually current. It needs `named` for the same
+reason the other one needs `lastActor` — the difference between a retry and a
+fresh request is not visible in any single state, only in what the step
+carried. `Lease_EpochlessRelease.cfg` checks **both** properties, and only
+this one fires; that is the demonstration that they are not redundant.
+
+Modelling it also made a terminal state reachable for the first time, which
+is why the lease configs now run with `-deadlock`: an item released back to
+the queue of an instance frozen on an incident is claimable by nobody and
+completable by nobody, and stays so until an operator repairs the incident —
+which this model does not include. That is a legitimate end state, the same
+kind as a torn-down scope. It was unreachable before only because
+`FailFinally` re-fired forever from that state; deadlock freedom held here by
+accident, and remains a property under test only for `LockOrder`.
 
 ## Retention and the archive gap
 

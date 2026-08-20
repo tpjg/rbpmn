@@ -1,0 +1,118 @@
+/* Dark mode for the diagram libraries' own chrome.
+ *
+ * `shared/theme.js` handles the *elements* — strokes, fills and label text are
+ * written as inline styles at construction, by bpmn-js's `bpmnRenderer` and
+ * dmn-js's `drdRenderer` alike, so no stylesheet can reach them. This file
+ * handles everything around them: the palette, the context pad, popup menus,
+ * drag previews, drill-down overlays, and every dmn-js view.
+ *
+ * Those were unthemed until a night-time bug report: white icons on a white
+ * context pad, a palette glowing against the dark canvas, and — the loud one —
+ * dragging a pool painted `--shape-drop-allowed-fill-color` (a near-white
+ * grey) across the whole drop target and inverted the canvas.
+ *
+ * The libraries expose their palette as custom properties, so this overrides
+ * **primitives** rather than selectors. diagram-js, bpmn-js and dmn-js all
+ * define the same grey ramp on their own root element (`.djs-parent`,
+ * `.bjs-container`, `.dmn-js-parent`), and everything else derives from it —
+ * ~130 derived properties across five stylesheets, all of which follow from
+ * the twenty below. Overriding selectors instead would mean chasing each new
+ * one on every upgrade.
+ *
+ * The token *names* keep the light-mode lightness they were named for, so
+ * after inversion `--color-grey-225-10-15` is a light grey. The name lies;
+ * the alternative is not overriding them, and that is worse.
+ *
+ * Every selector here is prefixed `:root` purely for **specificity**. A media
+ * query adds none, so a bare `.djs-parent` ties with the vendor's own rule and
+ * source order decides — and source order here is a bundler's business, not
+ * ours: `decisions.js` imports dmn-js, which ships its *own* copy of
+ * diagram-js.css, and that copy landed after this file and silently won. The
+ * palette stayed white with every variable set correctly. `:root` makes the
+ * override independent of import order, which is the only way this stays fixed
+ * when someone adds an import.
+ */
+
+@media (prefers-color-scheme: dark) {
+  :root .djs-parent,
+  :root .bjs-container,
+  :root .dmn-js-parent {
+    /* The ramp, inverted about the midpoint. Hue and saturation are kept, so
+     * the chrome stays the same faintly-blue neutral it is in light mode. */
+    --color-grey-225-10-15: hsl(225, 10%, 92%);
+    --color-grey-225-10-35: hsl(225, 10%, 78%);
+    --color-grey-225-10-55: hsl(225, 10%, 62%);
+    --color-grey-225-10-75: hsl(225, 10%, 34%);
+    --color-grey-225-10-80: hsl(225, 10%, 30%);
+    --color-grey-225-10-85: hsl(225, 10%, 26%);
+    --color-grey-225-10-90: hsl(225, 10%, 22%);
+    --color-grey-225-10-95: hsl(225, 10%, 18%);
+    --color-grey-225-10-97: hsl(225, 10%, 15%);
+
+    /* Not "white" and "black": the surface colour and the ink colour. Both are
+     * only ever used as such — `--color-white` backs the canvas, the context
+     * pad, popups and the search container; `--color-black` is one crosshair.
+     * These are `--panel` and `--ink` from the two documents' stylesheets,
+     * repeated because a custom property cannot be aliased across files
+     * without assuming load order. */
+    --color-white: #1d2026;
+    --color-black: #e7e9ee;
+
+    /* A 30%-black shadow is invisible against a dark ground. Shadows get
+     * *stronger* here, not weaker — they are the only thing separating a
+     * popup from the canvas behind it once both are dark. */
+    --color-black-opacity-05: hsla(0, 0%, 0%, 25%);
+    --color-black-opacity-10: hsla(0, 0%, 0%, 40%);
+    --color-black-opacity-30: hsla(0, 0%, 0%, 65%);
+
+    /* The pale tints are backgrounds, and at 92–97% lightness they read as
+     * white patches. Same hue, dark enough to sit under the ink. */
+    --color-blue-205-100-95: hsl(205, 45%, 22%);
+    --color-red-360-100-92: hsl(360, 45%, 26%);
+    --color-red-360-100-97: hsl(360, 45%, 18%);
+
+    /* Errors at 40–45% lightness disappear into the panel. */
+    --color-red-360-100-40: hsl(360, 85%, 68%);
+    --color-red-360-100-45: hsl(360, 85%, 72%);
+
+    /* The canvas is the page, not a panel floating on it. */
+    --canvas-fill-color: #16181d;
+  }
+
+  /* Two exceptions where `--color-white` genuinely meant white: both sit on a
+   * saturated blue chip, where the ink colour would be dark-on-blue. These are
+   * the `{}` drill-down affordances — bpmn-js's into a collapsed subprocess,
+   * dmn-js's into a decision's logic. */
+  :root .bjs-container {
+    --drilldown-fill-color: #ffffff;
+  }
+
+  :root .dmn-drd-container {
+    --drill-down-overlay-color: #ffffff;
+  }
+
+  /* The definitions header — the model's name and id, editable in place, top
+   * left of the DRD. Its own background token covers the box; the text inside
+   * inherits from the page and would otherwise stay near-black. */
+  .dmn-definitions,
+  .dmn-definitions .dmn-definitions-name,
+  .dmn-definitions .dmn-definitions-id {
+    color: #e7e9ee;
+  }
+
+  /* The decision-table, literal-expression and boxed-expression views set text
+   * colours from their own tokens but leave the input elements to the page.
+   * Without this, typing into a cell is invisible. */
+  .dmn-decision-table-container input,
+  .dmn-decision-table-container textarea,
+  .dmn-literal-expression-container input,
+  .dmn-literal-expression-container textarea,
+  .dmn-boxed-expression-container input,
+  .dmn-boxed-expression-container textarea,
+  .dmn-decision-table-container [contenteditable],
+  .dmn-literal-expression-container [contenteditable],
+  .dmn-boxed-expression-container [contenteditable] {
+    color: #e7e9ee;
+    background: transparent;
+  }
+}

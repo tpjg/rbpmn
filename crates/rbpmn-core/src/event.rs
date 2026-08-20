@@ -21,7 +21,28 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
 pub enum Event {
-    InstanceStarted,
+    /// ...carrying the variables it started with.
+    ///
+    /// Without this the history is **not self-contained**: every later change
+    /// is recorded (a patch in `variables-patched`, an answer in
+    /// `decision-evaluated`) but the ground they apply to was not, so
+    /// reconstructing the document at any point meant having the `Start`
+    /// command from somewhere outside the log. The storm's replay driver had
+    /// to supply it; nothing else could.
+    ///
+    /// With it, the document at any point in an instance's life is *the start,
+    /// plus the changes up to there* — a forward fold. That is the cheap
+    /// direction. The alternative, unwinding from the current document by
+    /// inverting patches, is not generally possible: RFC 7386 `null` deletes a
+    /// member without recording what it deleted, so a patch is not invertible
+    /// from the patch alone. Compensation, were it ever built, wants the
+    /// forward fold for exactly that reason.
+    ///
+    /// Not in `Display` — the trace line stays `instance-started`, and this is
+    /// business data of unbounded shape. Same split as `decision-evaluated`.
+    InstanceStarted {
+        variables: Value,
+    },
     ElementStarted {
         element: String,
     },
@@ -50,9 +71,38 @@ pub enum Event {
         element: String,
         code: Option<String>,
     },
+    /// A business-rule task needs its decision evaluated. The projection
+    /// answers this inside the same transaction.
+    DecisionRequested {
+        element: String,
+        decision: String,
+    },
+    /// ...and the answer, which is what a replay reads back instead of
+    /// evaluating anything.
+    ///
+    /// The failure reason stays out of `Display` — that is stable API, and a
+    /// reason improved later must not break a golden trace, the
+    /// `timer-resolve-failed` precedent. It is in the *payload*, which is
+    /// serialised whole into `/v1/events`, because a null answer with no
+    /// explanation leaves an operator nothing to go on: FEEL nulls a decision
+    /// whose input was the wrong type exactly as it nulls one where no rule
+    /// matched, and dsntk's text is the only thing that tells them apart.
+    DecisionEvaluated {
+        element: String,
+        result: Value,
+        /// Why the answer is null, when the evaluator said. Never set for a
+        /// non-null answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     IncidentRaised {
         element: String,
         code: Option<String>,
+        /// What froze it, in prose, when the freezing path had prose to give
+        /// — a failed decision does, and it has no `code` because DMN has
+        /// none to give. Same split as above: payload, not `Display`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     VariablesPatched {
         patch: Value,
@@ -131,7 +181,7 @@ pub enum Event {
 impl fmt::Display for Event {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Event::InstanceStarted => write!(f, "instance-started"),
+            Event::InstanceStarted { .. } => write!(f, "instance-started"),
             Event::ElementStarted { element } => write!(f, "element-started {element}"),
             Event::ElementCompleted { element } => write!(f, "element-completed {element}"),
             Event::FlowTaken { flow } => write!(f, "flow-taken {flow}"),
@@ -149,7 +199,17 @@ impl fmt::Display for Event {
                 Some(code) => write!(f, "work-item-failed {element} {code}"),
                 None => write!(f, "work-item-failed {element}"),
             },
-            Event::IncidentRaised { element, code } => match code {
+            Event::DecisionRequested { element, decision } => {
+                write!(f, "decision-requested {element} {decision}")
+            }
+            // The *answer* is not in the trace line, only that one arrived:
+            // a decision's result is business data of unbounded shape, and a
+            // golden trace is a control-flow record. `variables-patched`
+            // already marks that the document changed.
+            Event::DecisionEvaluated { element, .. } => {
+                write!(f, "decision-evaluated {element}")
+            }
+            Event::IncidentRaised { element, code, .. } => match code {
                 Some(code) => write!(f, "incident-raised {element} {code}"),
                 None => write!(f, "incident-raised {element}"),
             },

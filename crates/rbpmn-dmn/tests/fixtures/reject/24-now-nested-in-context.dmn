@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error feel-deterministic @ deep
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/24-now-nested-in-context" name="24-now-nested-in-context" id="_24-now-nested-in-context">
+  <inputData name="Items" id="items">
+    <variable name="Items" typeRef="Any"/>
+  </inputData>
+  <decision name="Deep" id="deep">
+    <variable name="Deep" typeRef="Any"/>
+    <informationRequirement><requiredInput href="#items"/></informationRequirement>
+    <context>
+      <contextEntry>
+        <variable name="stamps" typeRef="Any"/>
+        <for iteratorVariable="item">
+          <in><literalExpression><text>Items</text></literalExpression></in>
+          <return><literalExpression><text>if item &gt; 0 then now() else null</text></literalExpression></return>
+        </for>
+      </contextEntry>
+    </context>
+  </decision>
+</definitions>

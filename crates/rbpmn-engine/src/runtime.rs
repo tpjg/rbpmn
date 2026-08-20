@@ -23,14 +23,26 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
+/// The definition an instance is pinned to, carried through the step path.
+/// All three fields are immutable for the instance's whole life — it never
+/// migrates — which is why they are denormalised onto its rows rather than
+/// re-read from `rbpmn_definition` (migration 0011).
 pub(crate) struct DefinitionRef {
     id: Uuid,
     key: String,
+    version: i32,
 }
 
 impl DefinitionRef {
-    pub(crate) fn new(id: Uuid, key: String) -> Self {
-        DefinitionRef { id, key }
+    pub(crate) fn new(id: Uuid, key: String, version: i32) -> Self {
+        DefinitionRef { id, key, version }
+    }
+
+    /// Only the decision path needs this; without the feature nothing reads
+    /// it, and an unused method is a warning in a workspace that keeps zero.
+    #[cfg(feature = "dmn")]
+    pub(crate) fn id(&self) -> Uuid {
+        self.id
     }
 }
 
@@ -88,36 +100,49 @@ impl Engine {
         if let Some(bk) = business_key {
             reject_nul_text(bk, "business key")?;
         }
-        let definition_id: Uuid = sqlx::query(
-            "select id from rbpmn_definition \
+        let row = sqlx::query(
+            "select id, version from rbpmn_definition \
              where key = $1 order by version desc limit 1",
         )
         .bind(key)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| EngineError::UnknownDefinition(key.to_string()))?
-        .get("id");
+        .ok_or_else(|| EngineError::UnknownDefinition(key.to_string()))?;
+        let definition_id: Uuid = row.get("id");
 
+        // Latest version at start, pinned from here on: the instance keeps
+        // this pair for life, and every row it writes carries it.
         let definition = DefinitionRef {
             id: definition_id,
             key: key.to_string(),
+            version: row.get("version"),
         };
         let proc = compiled_process(self, &mut *tx, definition_id, key).await?;
 
         let instance_id: Uuid = sqlx::query(
             "insert into rbpmn_instance \
-             (definition_id, definition_key, business_key, status, variables) \
-             values ($1, $2, $3, 'active', 'null'::jsonb) returning id",
+             (definition_id, definition_key, definition_version, business_key, \
+              status, variables) \
+             values ($1, $2, $3, $4, 'active', 'null'::jsonb) returning id",
         )
         .bind(definition.id)
         .bind(key)
+        .bind(definition.version)
         .bind(business_key)
         .fetch_one(&mut *tx)
         .await?
         .get("id");
 
         let mut state = InstanceState::new();
-        let events = step(&proc, &mut state, Command::Start { variables })?;
+        let events = step_answering_decisions(
+            self,
+            tx,
+            &proc,
+            &definition,
+            &mut state,
+            Command::Start { variables },
+        )
+        .await?;
         persist_step(tx, &proc, &definition, instance_id, &state, &events).await?;
 
         Ok(StartedInstance {
@@ -185,14 +210,18 @@ impl Engine {
             ));
         }
 
-        let events = step(
+        let events = step_answering_decisions(
+            self,
+            tx,
             &proc,
+            &definition,
             &mut state,
             Command::CompleteWorkItem {
                 id: WorkItemId(item_no as u64),
                 patch,
             },
-        )?;
+        )
+        .await?;
         persist_step(tx, &proc, &definition, instance_id, &state, &events).await?;
         Ok(Completion::Advanced(events))
     }
@@ -282,11 +311,15 @@ impl Engine {
             });
         }
 
-        let events = step(
+        let events = step_answering_decisions(
+            self,
+            tx,
             &proc,
+            &definition,
             &mut state,
             Command::DeliverMessage { id: sub_id, patch },
-        )?;
+        )
+        .await?;
         persist_step(tx, &proc, &definition, instance_id, &state, &events).await?;
         Ok(Correlation {
             instance_id,
@@ -399,14 +432,18 @@ impl Engine {
                 retries_left: retries,
             }
         } else {
-            let events = step(
+            let events = step_answering_decisions(
+                self,
+                tx,
                 &proc,
+                &definition,
                 &mut state,
                 Command::RaiseError {
                     id: WorkItemId(item_no as u64),
                     code: options.error_code.clone(),
                 },
-            )?;
+            )
+            .await?;
             persist_step(tx, &proc, &definition, instance_id, &state, &events).await?;
             if events
                 .iter()
@@ -635,7 +672,8 @@ pub(crate) async fn load_instance_nowait(
     EngineError,
 > {
     let sql = format!(
-        "select i.definition_id, i.definition_key, i.status, i.variables, \
+        "select i.definition_id, i.definition_key, i.definition_version, \
+                i.status, i.variables, \
                 i.next_token, i.next_work_item, i.next_timer, i.next_subscription, \
                 i.next_scope \
          from rbpmn_instance i where i.id = $1 for update{}",
@@ -658,6 +696,7 @@ pub(crate) async fn load_instance_nowait(
     let definition = DefinitionRef {
         id: inst.get("definition_id"),
         key: key.clone(),
+        version: inst.get("definition_version"),
     };
     let proc = compiled_process(engine, &mut *tx, definition.id, &key).await?;
     let status = status_from_db(&inst.get::<String, _>("status"))?;
@@ -949,6 +988,27 @@ pub(crate) async fn persist_step(
             WaitKind::EventGateway => ("event_gateway", None, None),
             WaitKind::Incident => ("incident", None, None),
             WaitKind::Scope(_) => ("scope", None, None),
+            // A decision is answered inside the transaction that asks for
+            // it, so no token should reach persistence still holding one.
+            // When one does, a step path forgot to drain.
+            //
+            // Third of three gates, and the only one that produces a usable
+            // message. Removing this arm does not compile — the match is
+            // exhaustive on purpose — and `rbpmn_token`'s `wait_kind` CHECK
+            // constraint has no `'decision'` member, so the insert would be
+            // refused even if some path invented a string for it. Aborting
+            // here costs the caller one failed operation and leaves the
+            // instance exactly as it was, while naming the token and element
+            // instead of surfacing a constraint violation. (Not
+            // hypothetical: the scheduler's timer path was such a caller.)
+            WaitKind::Decision => {
+                return Err(internal(format!(
+                    "token {} at '{}' reached persistence still awaiting a decision — \
+                     a step path advanced a token without answering it",
+                    id.0,
+                    proc.node_id(token.node)
+                )));
+            }
         };
         token_scopes.push(token.scope.0 as i64);
         token_nos.push(id.0 as i64);
@@ -995,14 +1055,16 @@ pub(crate) async fn persist_step(
                     .ok_or_else(|| internal("created work item missing from state".into()))?;
                 sqlx::query(
                     "insert into rbpmn_work_item \
-                     (instance_id, item_no, definition_id, definition_key, token_no, \
+                     (instance_id, item_no, definition_id, definition_key, \
+                      definition_version, token_no, \
                       kind, topic, element_id, state) \
-                     values ($1, $2, $3, $4, $5, $6, $7, $8, 'available')",
+                     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'available')",
                 )
                 .bind(instance_id)
                 .bind(id.0 as i64)
                 .bind(definition.id)
                 .bind(&definition.key)
+                .bind(definition.version)
                 .bind(token_no)
                 .bind(work_kind.to_string())
                 .bind(topic)
@@ -1096,7 +1158,7 @@ pub(crate) async fn persist_step(
             // on purpose: a new event variant must be classified here
             // deliberately — a wildcard would let a delta-bearing variant
             // compile straight into silent database drift.
-            Event::InstanceStarted
+            Event::InstanceStarted { .. }
             | Event::ElementStarted { .. }
             | Event::ElementCompleted { .. }
             | Event::FlowTaken { .. }
@@ -1107,6 +1169,14 @@ pub(crate) async fn persist_step(
             // changes rows. These carry the *reason* an operator needs.
             | Event::TimerResolveFailed { .. }
             | Event::DuplicateSubscription { .. }
+            // The decision pair changes no rows of its own: the token move is
+            // carried by ElementStarted/Completed, and the answer is *not*
+            // carried by `VariablesPatched` — a decision writes by replacement
+            // rather than by merge patch, so it emits none. `DecisionEvaluated`
+            // is therefore the only record that the variable document changed,
+            // which is precisely why it must stay in the history.
+            | Event::DecisionRequested { .. }
+            | Event::DecisionEvaluated { .. }
             | Event::InstanceCompleted
             | Event::InstanceTerminated => {}
         }
@@ -1202,4 +1272,183 @@ pub(crate) async fn insert_engine_event(
     .execute(&mut *tx)
     .await?;
     Ok(())
+}
+
+/// The decision artifacts of a definition version, compiled and cached.
+///
+/// Same shape as [`compiled_process`], keyed the same way and for the same
+/// reason: a deployed version is immutable, so this never needs invalidating.
+#[cfg(feature = "dmn")]
+pub(crate) async fn compiled_decisions(
+    engine: &Engine,
+    tx: &mut PgConnection,
+    definition_id: Uuid,
+) -> Result<std::sync::Arc<rbpmn_dmn::Decisions>, EngineError> {
+    if let Some(decisions) = engine.cached_decisions(definition_id) {
+        return Ok(decisions);
+    }
+    let artifacts: Vec<String> = sqlx::query_scalar(
+        "select dmn_xml from rbpmn_definition_decision \
+         where definition_id = $1 order by ordinal",
+    )
+    .bind(definition_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    // Deploy validated these, and startup re-validation re-checks them, so a
+    // failure here means the binary changed under a stored definition. That
+    // is an internal error rather than a user one: it must be loud, and it
+    // must not look like the decision merely answered nothing.
+    let compiled = rbpmn_dmn::Decisions::compile(&artifacts).map_err(|diagnostics| {
+        internal(format!(
+            "definition {definition_id} has decision artifacts this build cannot compile \
+             (deploy accepted them, so the binary or dsntk changed): {}",
+            diagnostics
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ))
+    })?;
+    let compiled = std::sync::Arc::new(compiled);
+    engine.cache_decisions(definition_id, compiled.clone());
+    Ok(compiled)
+}
+
+/// Run one step, then answer any decision it asked for — inside the same
+/// transaction, before anything is persisted.
+///
+/// This is the projection half of the design in `docs/dmn.md`, D3: the pure
+/// core parks at a business-rule task and says what it needs; evaluation
+/// happens here, where dsntk is allowed; the answer re-enters as command data
+/// so a replay never evaluates anything.
+///
+/// The loop matters. A decision's answer can advance the token straight into
+/// *another* business-rule task, so draining until none is pending is what
+/// makes a chain of decisions one transaction rather than a wedge.
+pub(crate) async fn step_answering_decisions(
+    engine: &Engine,
+    tx: &mut PgConnection,
+    proc: &ExecutableProcess,
+    definition: &DefinitionRef,
+    state: &mut rbpmn_core::InstanceState,
+    command: Command,
+) -> Result<Vec<Event>, EngineError> {
+    let mut events = step(proc, state, command)?;
+    loop {
+        // Any token that is waiting — there can be **several**. The core parks
+        // a branch on its decision and carries on with the rest of the step,
+        // so a parallel split into two business-rule tasks parks both in one
+        // `step`. (This comment used to claim the opposite and reason from it;
+        // the loop was right and the reason was wrong.) Answering one can also
+        // advance a token straight into another business-rule task, so
+        // draining until none is pending is what makes a chain of decisions
+        // one transaction rather than a wedge.
+        let Some(token) = state
+            .tokens()
+            .find(|(_, t)| t.wait == rbpmn_core::WaitKind::Decision)
+            .map(|(id, _)| id)
+        else {
+            return Ok(events);
+        };
+        let (answer, reason) = answer_decision(engine, tx, proc, definition, state, token).await?;
+        events.extend(step(
+            proc,
+            state,
+            Command::CompleteDecision {
+                token,
+                answer,
+                reason,
+            },
+        )?);
+    }
+}
+
+#[cfg(not(feature = "dmn"))]
+async fn answer_decision(
+    _engine: &Engine,
+    _tx: &mut PgConnection,
+    _proc: &ExecutableProcess,
+    _definition: &DefinitionRef,
+    _state: &rbpmn_core::InstanceState,
+    _token: rbpmn_core::TokenId,
+) -> Result<Answer, EngineError> {
+    // Unreachable in practice: deploy refuses a bundle carrying decisions
+    // when this feature is off, so no definition with a business-rule task
+    // can exist here. Freezing rather than panicking keeps the promise that
+    // an engine never takes an instance down for a wiring problem.
+    Ok(frozen("this engine was built without DMN support"))
+}
+
+#[cfg(feature = "dmn")]
+async fn answer_decision(
+    engine: &Engine,
+    tx: &mut PgConnection,
+    proc: &ExecutableProcess,
+    definition: &DefinitionRef,
+    state: &rbpmn_core::InstanceState,
+    token: rbpmn_core::TokenId,
+) -> Result<Answer, EngineError> {
+    use rbpmn_dmn::Outcome;
+
+    let Some((_, parked)) = state.tokens().find(|(id, _)| *id == token) else {
+        return Ok(frozen("the token waiting on this decision is gone"));
+    };
+    let rbpmn_core::ExecKind::BusinessRule { decision, .. } = &proc.node(parked.node).kind else {
+        return Ok(frozen(
+            "the token waits on a decision at a node that is not one",
+        ));
+    };
+    let decisions = compiled_decisions(engine, tx, definition.id()).await?;
+    let Some(invocable) = decisions
+        .invocables()
+        .iter()
+        .find(|i| &i.name == decision)
+        .cloned()
+    else {
+        // Deploy's `unresolved-decision` prevents this; if it ever happens the
+        // instance freezes rather than guessing.
+        return Ok(frozen(&format!(
+            "no decision named {decision:?} in this definition's DMN"
+        )));
+    };
+
+    match decisions.evaluate(&invocable, &state.variables) {
+        Outcome::Value(value) => Ok((Some(value), None)),
+        // A null is an answer (docs/dmn.md, "What P1 measured"): dsntk cannot
+        // tell a legal "no rule matched" from a broken evaluation, so neither
+        // can this. It is written as JSON null and the token continues; a
+        // modeller who wants that to be an error models it, with a gateway on
+        // `result = null`.
+        // The reason rides along even though the token continues: it is the
+        // only thing separating "no rule matched" from "the input was the
+        // wrong type", and an operator reading the history needs it.
+        Outcome::Null { reason } => Ok((
+            Some(serde_json::Value::Null),
+            reason.as_deref().map(one_line),
+        )),
+        // This one *is* unambiguous: a value the variable document cannot
+        // hold. Dropping it silently would be worse than freezing — and
+        // freezing without saying why is a dead end for whoever finds it.
+        Outcome::Unrepresentable(why) => Ok(frozen(&why)),
+    }
+}
+
+/// What an evaluation hands back: the answer, and the evaluator's prose about
+/// it. `None` for the answer is the freeze.
+type Answer = (Option<serde_json::Value>, Option<String>);
+
+fn frozen(reason: &str) -> Answer {
+    (None, Some(one_line(reason)))
+}
+
+/// dsntk's messages are multi-line and occasionally long; an event payload is
+/// read in a table cell. Collapse the whitespace and cap the length — the
+/// point is to name the failure, not to reproduce a stack trace.
+fn one_line(reason: &str) -> String {
+    const LIMIT: usize = 500;
+    let mut text: String = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() > LIMIT {
+        text = text.chars().take(LIMIT).collect::<String>() + "…";
+    }
+    text
 }

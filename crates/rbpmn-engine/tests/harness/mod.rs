@@ -211,6 +211,15 @@ pub async fn core_events(pool: &PgPool, instance: Uuid) -> Vec<Event> {
 /// consequences; only these four are stimuli the outside world supplied. A
 /// `variables-patched` immediately following its trigger carries that
 /// command's merge patch — `step` emits them adjacently.
+///
+/// **Decisions are refused rather than skipped.** A business-rule task is not
+/// a stimulus — the engine answers it from its own evaluation inside the step
+/// — so replaying one means feeding the *recorded* answer back in, which this
+/// flat `Vec<Command>` shape cannot express: the answer has to arrive when the
+/// token parks, not before. Nothing in the corpus has one today. The `_ => {}`
+/// below would quietly drop it and hand back a command sequence that replays
+/// to a different history, so the day a business-rule fixture joins the storm
+/// this says so instead.
 pub fn commands_from(events: &[Event]) -> Vec<Command> {
     let patch_after = |i: usize| -> serde_json::Value {
         match events.get(i + 1) {
@@ -234,6 +243,11 @@ pub fn commands_from(events: &[Event]) -> Vec<Command> {
                 id: *id,
                 patch: patch_after(i),
             }),
+            Event::DecisionEvaluated { element, .. } => panic!(
+                "replay cannot reconstruct the decision at {element:?}: a decision's \
+                 answer is not a stimulus, it is read back from `decision-evaluated` \
+                 when the token parks. See this function's doc comment."
+            ),
             _ => {}
         }
     }
@@ -255,14 +269,29 @@ pub async fn replay_verify(
     }
     let proc = pinned_process(pool, instance).await;
 
+    // The initial variables come from the **log**, not from the caller. That
+    // is the property `instance-started` was given a payload for: a history
+    // that cannot be replayed without a value kept outside it is not a
+    // history. `initial` is still taken, and cross-checked below, so a payload
+    // that recorded the wrong document fails here rather than replaying
+    // consistently against itself.
+    let logged = recorded
+        .iter()
+        .find_map(|e| match e {
+            Event::InstanceStarted { variables } => Some(variables.clone()),
+            _ => None,
+        })
+        .ok_or("history has no instance-started to start from")?;
+    if &logged != initial {
+        return Err(format!(
+            "instance-started recorded variables the instance did not start with\n  \
+             logged: {logged}\n  actual: {initial}"
+        ));
+    }
+
     let mut state = InstanceState::new();
-    let mut replayed: Vec<Event> = step_or(
-        &proc,
-        &mut state,
-        Command::Start {
-            variables: initial.clone(),
-        },
-    )?;
+    let mut replayed: Vec<Event> =
+        step_or(&proc, &mut state, Command::Start { variables: logged })?;
     for command in commands_from(&recorded) {
         replayed.extend(step_or(&proc, &mut state, command)?);
     }

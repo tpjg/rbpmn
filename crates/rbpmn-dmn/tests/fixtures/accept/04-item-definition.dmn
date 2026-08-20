@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/04-item-definition" name="04-item-definition" id="_04-item-definition">
+  <itemDefinition name="Tier" id="tier">
+    <typeRef>string</typeRef>
+    <allowedValues><text>"bronze", "silver", "gold"</text></allowedValues>
+  </itemDefinition>
+  <itemDefinition name="Customer" id="customer">
+    <itemComponent name="tier" id="customerTier">
+      <typeRef>string</typeRef>
+      <allowedValues><text>"bronze", "silver", "gold"</text></allowedValues>
+    </itemComponent>
+  </itemDefinition>
+  <inputData name="Level" id="level">
+    <variable name="Level" typeRef="Tier"/>
+  </inputData>
+  <decision name="IsGold" id="isGold">
+    <variable name="IsGold" typeRef="boolean"/>
+    <informationRequirement><requiredInput href="#level"/></informationRequirement>
+    <literalExpression><text>Level = "gold"</text></literalExpression>
+  </decision>
+</definitions>

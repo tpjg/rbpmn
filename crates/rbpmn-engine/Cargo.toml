@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 rbpmn-core = { path = "../rbpmn-core" }
+rbpmn-dmn = { path = "../rbpmn-dmn", optional = true }
 rbpmn-model = { path = "../rbpmn-model" }
 serde.workspace = true
 serde_json.workspace = true
@@ -20,10 +21,30 @@ tracing = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 
 [features]
+default = ["dmn"]
 http = ["dep:reqwest"]
+# DMN artifacts in a deployment. **On** by default: a workflow definition plus
+# its bindings manifest is meant to be a fully executable flow, and a decision
+# is part of that definition, not an add-on to it.
+#
+# It stays a feature, and `--no-default-features` stays tested (`just no-dmn`),
+# because the seam is what keeps `rbpmn-core` free of dsntk — that crate must
+# compile to wasm32, and dsntk's number crate binds a C library. Turning this
+# off is also the only supported way to build without dsntk's ~100k lines and
+# its 1.94 toolchain floor. With it off, a bundle carrying decision artifacts
+# is *refused* rather than silently accepted.
+dmn = ["dep:rbpmn-dmn"]
 test-util = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 axum = "0.8"
-rbpmn-engine = { path = ".", features = ["http", "test-util"] }
+# `default-features = false` matters more here than it looks. Cargo unifies
+# features per package across the graph, so a self dev-dependency that takes
+# the defaults switches `dmn` back on for the *whole* test build — and
+# `cargo test --no-default-features` silently ran the DMN tests it was meant
+# to prove could be left out.
+rbpmn-engine = { path = ".", default-features = false, features = [
+  "http",
+  "test-util",
+] }

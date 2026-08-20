@@ -1,0 +1,8 @@
+# The baseline: dsntk exactly as published, on Intel's decimal C library.
+#
+# The *only* difference from ../patched/Cargo.toml is the absence of a
+# `[patch.crates-io]` section. That difference is the experiment, which is why
+# these two manifests are committed and the sources they build are fetched.
+[workspace]
+resolver = "3"
+members = ["dsntk-0.3.0"]

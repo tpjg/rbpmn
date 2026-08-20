@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/01-literal-expression" name="01-literal-expression" id="_01-literal-expression">
+  <inputData name="Applicant" id="applicant">
+    <variable name="Applicant" typeRef="string"/>
+  </inputData>
+  <decision name="Greeting" id="greeting">
+    <variable name="Greeting" typeRef="string"/>
+    <informationRequirement><requiredInput href="#applicant"/></informationRequirement>
+    <literalExpression>
+      <text>"Hello " + Applicant</text>
+    </literalExpression>
+  </decision>
+</definitions>

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/06-iteration" name="06-iteration" id="_06-iteration">
+  <inputData name="Amounts" id="amounts">
+    <variable name="Amounts" typeRef="Any"/>
+  </inputData>
+  <decision name="Totals" id="totals">
+    <variable name="Totals" typeRef="Any"/>
+    <informationRequirement><requiredInput href="#amounts"/></informationRequirement>
+    <context>
+      <contextEntry>
+        <variable name="doubled" typeRef="Any"/>
+        <for iteratorVariable="item">
+          <in><literalExpression><text>Amounts</text></literalExpression></in>
+          <return><literalExpression><text>item * 2</text></literalExpression></return>
+        </for>
+      </contextEntry>
+      <contextEntry>
+        <variable name="anyBig" typeRef="boolean"/>
+        <some iteratorVariable="item">
+          <in><literalExpression><text>Amounts</text></literalExpression></in>
+          <satisfies><literalExpression><text>item &gt; 100</text></literalExpression></satisfies>
+        </some>
+      </contextEntry>
+      <contextEntry>
+        <variable name="allPositive" typeRef="boolean"/>
+        <every iteratorVariable="item">
+          <in><literalExpression><text>Amounts</text></literalExpression></in>
+          <satisfies><literalExpression><text>item &gt; 0</text></literalExpression></satisfies>
+        </every>
+      </contextEntry>
+    </context>
+  </decision>
+</definitions>

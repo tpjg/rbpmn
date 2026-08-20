@@ -481,6 +481,7 @@ async fn task_api_lifecycle_over_http() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
+    let v1 = body_json(resp).await;
     let resp = app
         .clone()
         .oneshot(authed(
@@ -491,6 +492,21 @@ async fn task_api_lifecycle_over_http() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // A newer version of the same key: the running instance stays on v1.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/definitions",
+            serde_json::json!({
+                "bpmn": MINIMAL_XML.replace("<bpmn:process", "<!-- v2 --><bpmn:process"),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(body_json(resp).await["version"], 2);
 
     // Count, then claim FIFO.
     let resp = app
@@ -514,8 +530,14 @@ async fn task_api_lifecycle_over_http() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let task = body_json(resp).await["task"].clone();
+    let lease_no = task["leaseNo"].as_i64().expect("the claim's lease epoch");
     assert_eq!(task["elementId"], "review");
     assert_eq!(task["variables"]["region"], "north");
+    // The pinned definition identity, not max(version): a version-pinned
+    // per-task screen manifest resolves against exactly this pair.
+    assert_eq!(task["definitionKey"], "p");
+    assert_eq!(task["definitionId"], v1["definitionId"]);
+    assert_eq!(task["definitionVersion"], 1);
     let task_id = task["id"].as_str().unwrap().to_string();
 
     // Nothing left to claim: 204.
@@ -554,23 +576,91 @@ async fn task_api_lifecycle_over_http() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     assert_eq!(body_json(resp).await["outcome"], "lockLost");
 
-    // Completion is owner-checked: a stranger is refused, the owner lands.
+    // Release hands the task back without deciding it — same vocabulary as
+    // the heartbeat: a stranger's release is the typed 409 and changes
+    // nothing, the owner's returns it to the queue at once.
+    for (owner, lease) in [("bob", lease_no), ("alice", lease_no + 1)] {
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                &format!("/v1/tasks/{task_id}/release"),
+                serde_json::json!({ "owner": owner, "leaseNo": lease }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{owner}/{lease}");
+        assert_eq!(body_json(resp).await["outcome"], "lockLost");
+    }
+    // The epoch is required, not defaulted: without it the request is a 400,
+    // never a release scoped to whatever claim happens to be current.
     let resp = app
         .clone()
         .oneshot(authed(
             "POST",
-            &format!("/v1/tasks/{task_id}/complete"),
-            serde_json::json!({ "owner": "bob", "patch": {} }),
+            &format!("/v1/tasks/{task_id}/release"),
+            serde_json::json!({ "owner": "alice" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/tasks/{task_id}/release"),
+            serde_json::json!({ "owner": "alice", "leaseNo": lease_no }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["outcome"], "released");
+    // Replaying it is the whole point of the epoch: it names a spent claim.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/tasks/{task_id}/release"),
+            serde_json::json!({ "owner": "alice", "leaseNo": lease_no }),
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Claimable again immediately, and by someone else — carol takes the
+    // task alice just handed back, which is the point of releasing it.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/tasks/get",
+            serde_json::json!({ "topic": "review", "owner": "carol" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["task"]["id"], task_id);
+
+    // Completion is owner-checked: a stranger is refused — and after the
+    // hand-back that includes alice, who no longer holds anything.
+    for stranger in ["bob", "alice"] {
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                &format!("/v1/tasks/{task_id}/complete"),
+                serde_json::json!({ "owner": stranger, "patch": {} }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{stranger}");
+    }
     let resp = app
         .clone()
         .oneshot(authed(
             "POST",
             &format!("/v1/tasks/{task_id}/complete"),
-            serde_json::json!({ "owner": "alice", "patch": { "approved": true } }),
+            serde_json::json!({ "owner": "carol", "patch": { "approved": true } }),
         ))
         .await
         .unwrap();
@@ -908,4 +998,66 @@ mod ui {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         db.drop().await;
     }
+}
+
+/// The deploy body is the bundle: process, manifest and decision artifacts in
+/// one atomic call. The editor this server ships validates exactly this shape
+/// offline, so the server must accept what the editor approved — otherwise
+/// the two surfaces reach different verdicts about the same JSON.
+#[cfg(feature = "dmn")]
+#[tokio::test]
+async fn deploy_carries_decision_artifacts() {
+    const PRICING: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/pricing" name="pricing" id="_pricing">
+  <inputData name="Amount" id="amount"><variable name="Amount" typeRef="number"/></inputData>
+  <decision name="Discount" id="discount">
+    <variable name="Discount" typeRef="number"/>
+    <informationRequirement><requiredInput href="#amount"/></informationRequirement>
+    <literalExpression><text>Amount * 0.1</text></literalExpression>
+  </decision>
+</definitions>"##;
+
+    let (app, db) = test_app().await;
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/definitions",
+            serde_json::json!({
+                "bpmn": MINIMAL_XML,
+                "decisions": [PRICING],
+                "bindings": { "decisions": { "st": { "decision": "Discount", "result": "order.discount" } } },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // A binding naming a decision the bundle does not carry is refused, with
+    // the rule id — the same answer the editor gives without a server.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/definitions",
+            serde_json::json!({
+                "bpmn": MINIMAL_XML,
+                "bindings": { "decisions": { "st": { "decision": "Missing", "result": "order.x" } } },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_json(resp).await;
+    assert!(
+        body["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["rule"] == "unresolved-decision"),
+        "{body}"
+    );
+    db.drop().await;
 }

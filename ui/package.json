@@ -11,7 +11,8 @@
   "dependencies": {
     "bpmn-auto-layout": "^1.3.0",
     "bpmn-js": "^18.22.1",
-    "bpmn-moddle": "^10.1.0"
+    "bpmn-moddle": "^10.1.0",
+    "dmn-js": "^17.10.1"
   },
   "devDependencies": {
     "vite": "^8.2.1"

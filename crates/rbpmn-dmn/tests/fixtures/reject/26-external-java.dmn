@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error feel-deterministic @ viaJava
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/26-external-java" name="26-external-java" id="_26-external-java">
+  <businessKnowledgeModel name="ViaJava" id="viaJava">
+    <variable name="ViaJava" typeRef="number"/>
+    <encapsulatedLogic kind="Java">
+      <formalParameter name="x" typeRef="number"/>
+      <context>
+        <contextEntry>
+          <variable name="class"/>
+          <literalExpression><text>"java.lang.Math"</text></literalExpression>
+        </contextEntry>
+        <contextEntry>
+          <variable name="method signature"/>
+          <literalExpression><text>"abs(double)"</text></literalExpression>
+        </contextEntry>
+      </context>
+    </encapsulatedLogic>
+  </businessKnowledgeModel>
+  <decision name="Absolute" id="absolute">
+    <variable name="Absolute" typeRef="number"/>
+    <knowledgeRequirement><requiredKnowledge href="#viaJava"/></knowledgeRequirement>
+    <literalExpression><text>ViaJava(-1)</text></literalExpression>
+  </decision>
+</definitions>

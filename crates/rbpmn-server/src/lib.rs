@@ -249,6 +249,7 @@ pub fn app(tokens: Tokens, engine: rbpmn_engine::Engine) -> Router {
         .route("/tasks/get", post(api::get_task))
         .route("/tasks/count", post(api::count_tasks))
         .route("/tasks/{id}/extend", post(api::extend_lock))
+        .route("/tasks/{id}/release", post(api::release_task))
         .route("/tasks/{id}/complete", post(api::complete_task))
         .route("/tasks/{id}/fail", post(api::fail_task))
         .route("/topics", post(api::declare_topic))

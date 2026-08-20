@@ -12,7 +12,7 @@
 # rot; it is never run.
 image: debian/bookworm
 packages:
-  - build-essential          # cc, for dsntk's dfp-number-sys (feel-parity)
+  - build-essential          # cc, for dsntk's dfp-number-sys (number-parity)
   - curl
   - git
   - pkg-config               # openssl-sys, below
@@ -47,7 +47,9 @@ environment:
 tasks:
   - setup: |
       # Rust from rustup, not from Debian: bookworm ships ~1.63 and this
-      # workspace needs 1.91, edition 2024 and let-chains.
+      # workspace needs 1.94 — fastnum's floor, which DMN brings into the
+      # default build (docs/dmn.md, D9). One floor for every crate; a
+      # per-crate split was tried and removed.
       #
       # Deliberately **not pinned** to an exact toolchain (Timo's call). The
       # trade is explicit: tracking stable catches new clippy lints the day
@@ -183,6 +185,14 @@ tasks:
       cd rbpmn
       just lint
 
+  - no_dmn: |
+      # The DMN seam, built and asserted. DMN is on by default; this is the
+      # only thing that keeps "optional" true rather than aspirational, and
+      # the previous arrangement rotted in exactly that way.
+      source "$HOME/.cargo/env"
+      cd rbpmn
+      just no-dmn
+
   - test: |
       # Everything, including the fixture corpus and the engine's integration
       # tests against the real Postgres configured above.
@@ -240,8 +250,8 @@ tasks:
       fi
 
   - tla: |
-      # TLA+ model checking of the concurrency protocol. Eleven configs, six
-      # of them *expected* to fail against the specific violation they
+      # TLA+ model checking of the concurrency protocol. Thirteen configs,
+      # eight of them *expected* to fail against the specific violation they
       # demonstrate — a spec that merely stops parsing must not read as "fails
       # as expected", and the recipe enforces that distinction.
       #
@@ -250,12 +260,32 @@ tasks:
       cd rbpmn
       just tla
 
+  - number_parity: |
+      # Our pure-Rust decimal128 against Intel's C library, which it replaces
+      # inside dsntk's own tree so the DMN stack can reach wasm32 at all.
+      # 26 300 comparisons; the three deviation classes are named and counted
+      # and anything outside them fails.
+      #
+      # This is the load-bearing check of the whole DMN stack — every decision
+      # rbpmn evaluates goes through this arithmetic — so it runs on every
+      # commit rather than on demand. Same C toolchain `feel_parity` needs,
+      # installed above.
+      source "$HOME/.cargo/env"
+      cd rbpmn
+      just number-parity
+
+      df -h /
+
   - feel_parity: |
       # The FEEL subset differentialled against dsntk (DMN-TCK-verified) over
       # ~8k expression/document pairs. Last because it is the most expensive
-      # thing here: dsntk pulls ~170 crates and a C library into its own
-      # lockfile outside the workspace, and there is no build cache on this
-      # builder.
+      # thing here: dsntk pulls ~170 crates into its own lockfile outside the
+      # workspace, and there is no build cache on this builder.
+      #
+      # `just dmn-tck` is the one command in README's owed-commands table with
+      # no task here, and deliberately: it fetches the DMN TCK, dsntk's source
+      # and a third-party test runner from the network. It is the gate for a
+      # dsntk fork bump, run deliberately, not a per-commit check.
       source "$HOME/.cargo/env"
       cd rbpmn
       just feel-parity

@@ -35,6 +35,29 @@ pub struct Bindings {
     /// (`declare_index`). Entirely optional performance declarations.
     #[serde(default)]
     pub indexes: std::collections::BTreeSet<String>,
+    /// Business-rule task -> the decision it invokes. This is the spot where
+    /// every other engine writes `camunda:decisionRef` into the XML; here it
+    /// is manifest data, versioned with the definition and reviewable in git
+    /// next to it (`docs/dmn.md`, D5).
+    #[serde(default)]
+    pub decisions: BTreeMap<String, DecisionBinding>,
+}
+
+/// Which decision a business-rule task invokes, and where its answer lands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionBinding {
+    /// The invocable's name, as the DMN artifact declares it. Bound by name
+    /// rather than by (namespace, model, name): a deployment's artifacts are
+    /// its own, so the short name is what a modeler knows. Two artifacts
+    /// defining the same name make *this* binding ambiguous, and deploy
+    /// refuses it rather than picking one — `correlate`'s discipline, applied
+    /// to decisions.
+    pub decision: String,
+    /// Where the answer goes in the variable document: a FEEL qualified name
+    /// (`order.discount`), the same syntax correlation keys use. Required —
+    /// a decision whose answer went nowhere would be a task that runs and
+    /// changes nothing.
+    pub result: String,
 }
 
 impl Bindings {
@@ -66,6 +89,24 @@ impl Bindings {
     /// Declare a filterable variables field (optional, performance only).
     pub fn index(mut self, field: impl Into<String>) -> Self {
         self.indexes.insert(field.into());
+        self
+    }
+
+    /// Bind a business-rule task to the decision it invokes and the variable
+    /// path its answer lands on. Registered here, never in the XML.
+    pub fn decision(
+        mut self,
+        element_id: impl Into<String>,
+        decision: impl Into<String>,
+        result: impl Into<String>,
+    ) -> Self {
+        self.decisions.insert(
+            element_id.into(),
+            DecisionBinding {
+                decision: decision.into(),
+                result: result.into(),
+            },
+        );
         self
     }
 }
@@ -189,6 +230,22 @@ pub enum ExecKind {
         kind: WorkKind,
         topic: String,
     },
+    /// Invokes a decision from the deployment's bundled DMN artifacts.
+    ///
+    /// The core never evaluates it: `step` parks here and emits
+    /// `DecisionRequested`, the projection evaluates inside the same
+    /// transaction, and the answer re-enters as `Command::CompleteDecision`.
+    /// That is what keeps this crate free of dsntk *by construction*, and
+    /// what lets a history replay without an evaluator at all — the recorded
+    /// answer is command data, exactly like a handler's merge patch
+    /// (`docs/dmn.md`, D3).
+    BusinessRule {
+        /// The invocable's name, resolved against the bundle at deploy.
+        decision: String,
+        /// Where the answer lands in the variable document, as a parsed FEEL
+        /// qualified name (source text = `result.join(".")`).
+        result: Vec<String>,
+    },
     ExclusiveGateway {
         default_flow: Option<FlowIx>,
     },
@@ -282,6 +339,18 @@ pub enum CompileError {
     MissingCorrelation(Vec<String>),
     #[error("correlation binding on '{element}': {reason}")]
     InvalidCorrelation { element: String, reason: String },
+    /// `decision-has-binding`: a business-rule task says *that* a decision
+    /// happens, never which — that is manifest data, exactly like a topic.
+    /// Unlike a topic there is no sensible default: guessing a decision by
+    /// element id would invoke business logic nobody chose.
+    #[error(
+        "business-rule task(s) without a decision binding: {} — bind each with \
+         Bindings::decision(element_id, decision_name, result_path)",
+        .0.join(", ")
+    )]
+    MissingDecision(Vec<String>),
+    #[error("decision binding on '{element}': {reason}")]
+    InvalidDecision { element: String, reason: String },
     #[error("internal: {0} (lint should have prevented this)")]
     Internal(String),
 }
@@ -363,6 +432,7 @@ impl ExecutableProcess {
                     })
             };
         let mut missing_correlations: Vec<String> = Vec::new();
+        let mut missing_decisions: Vec<String> = Vec::new();
         let mut correlation = |node: &FlowNode| -> Result<Vec<String>, CompileError> {
             let Some(name) = bindings.correlations.get(&node.id) else {
                 missing_correlations.push(node.id.clone());
@@ -453,6 +523,25 @@ impl ExecutableProcess {
                         .cloned()
                         .unwrap_or_else(|| node.id.clone()),
                 },
+                NodeKind::BusinessRuleTask => {
+                    let Some(binding) = bindings.decisions.get(&node.id) else {
+                        missing_decisions.push(node.id.clone());
+                        continue;
+                    };
+                    let result = match rbpmn_model::condition::parse_qname(&binding.result) {
+                        Ok(path) => path,
+                        Err(e) => {
+                            return Err(CompileError::InvalidDecision {
+                                element: node.id.clone(),
+                                reason: e.to_string(),
+                            });
+                        }
+                    };
+                    ExecKind::BusinessRule {
+                        decision: binding.decision.clone(),
+                        result,
+                    }
+                }
                 NodeKind::UserTask => ExecKind::Task {
                     kind: WorkKind::User,
                     topic: bindings
@@ -550,6 +639,9 @@ impl ExecutableProcess {
                 incoming: Vec::new(),
                 outgoing: Vec::new(),
             });
+        }
+        if !missing_decisions.is_empty() {
+            return Err(CompileError::MissingDecision(missing_decisions));
         }
         if !missing_correlations.is_empty() {
             return Err(CompileError::MissingCorrelation(missing_correlations));

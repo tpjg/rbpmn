@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/03-bkm-invocation" name="03-bkm-invocation" id="_03-bkm-invocation">
+  <inputData name="Principal" id="principal">
+    <variable name="Principal" typeRef="number"/>
+  </inputData>
+  <businessKnowledgeModel name="Fee" id="fee">
+    <variable name="Fee" typeRef="number"/>
+    <encapsulatedLogic kind="FEEL">
+      <formalParameter name="p" typeRef="number"/>
+      <literalExpression><text>p * 0.02</text></literalExpression>
+    </encapsulatedLogic>
+  </businessKnowledgeModel>
+  <decision name="TotalFee" id="totalFee">
+    <variable name="TotalFee" typeRef="number"/>
+    <informationRequirement><requiredInput href="#principal"/></informationRequirement>
+    <knowledgeRequirement><requiredKnowledge href="#fee"/></knowledgeRequirement>
+    <invocation>
+      <literalExpression><text>Fee</text></literalExpression>
+      <binding>
+        <parameter name="p" typeRef="number"/>
+        <literalExpression><text>Principal</text></literalExpression>
+      </binding>
+    </invocation>
+  </decision>
+</definitions>

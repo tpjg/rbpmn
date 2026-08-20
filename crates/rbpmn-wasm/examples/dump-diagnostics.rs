@@ -1,35 +1,83 @@
-//! Dumps the whole fixture corpus through both WASM-boundary exports
-//! (`rbpmn_wasm::lint_json` and `rbpmn_wasm::check_json`), using the same
-//! serialization the browser sees. The parity check compares this
-//! byte-for-byte with what the playground's WASM build produces — the
+//! Dumps the fixture corpora through the WASM-boundary exports
+//! (`rbpmn_wasm::lint_json`, `check_json` and, with the `dmn` feature,
+//! `evaluate_json`), using the same serialization the browser sees. The parity
+//! check compares this byte-for-byte with what the WASM build produces — the
 //! guarantee that the playground never lies.
 //!
-//! `check_json` runs with an empty manifest, which is the interesting case:
-//! it drives the compile stage (phase gating, correlation bindings, topic
-//! resolution) that `lint_json` never reaches, so parity covers it too.
+//! `check_json` runs over the BPMN corpus with an empty manifest, which is the
+//! interesting case: it drives the compile stage (phase gating, correlation
+//! bindings, topic resolution) that `lint_json` never reaches.
+//!
+//! It also runs over the **DMN corpus**, one artifact at a time against a
+//! fixed minimal process. Decisions are where native and WASM are most likely
+//! to drift, because that path runs dsntk — including a decimal
+//! implementation this project substituted — so leaving it out of parity
+//! would leave out the only part with a plausible reason to diverge.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// A minimal, valid process to pair every DMN artifact with, so `check_json`
+/// reaches the decision half rather than short-circuiting on the model.
+const HOST_PROCESS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="defs">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:endEvent id="end"><bpmn:incoming>f1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+fn fixtures(dir: &Path, extension: &str) -> Vec<(String, String)> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == extension))
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            (name, fs::read_to_string(&path).expect("fixture readable"))
+        })
+        .collect()
+}
 
 fn main() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rbpmn-model/tests/fixtures");
+    let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let bpmn_root = crates.join("rbpmn-model/tests/fixtures");
+
     let mut lint = BTreeMap::new();
     let mut check = BTreeMap::new();
     for dir in ["accept", "reject"] {
-        let mut paths: Vec<_> = fs::read_dir(root.join(dir))
-            .expect("fixture dir")
-            .map(|e| e.expect("dir entry").path())
-            .filter(|p| p.extension().is_some_and(|ext| ext == "bpmn"))
-            .collect();
-        paths.sort();
-        for path in paths {
-            let name = format!("{dir}/{}", path.file_name().unwrap().to_string_lossy());
-            let xml = fs::read_to_string(&path).expect("fixture readable");
+        for (file, xml) in fixtures(&bpmn_root.join(dir), "bpmn") {
+            let name = format!("{dir}/{file}");
             lint.insert(name.clone(), rbpmn_wasm::lint_json(&xml));
-            check.insert(name, rbpmn_wasm::check_json(&xml, "{}"));
+            check.insert(name, rbpmn_wasm::check_json(&xml, "{}", "[]"));
         }
     }
-    let out = serde_json::json!({ "lint": lint, "check": check });
+
+    // The DMN corpus, each artifact bundled with the same host process.
+    let mut decisions = BTreeMap::new();
+    let dmn_root = crates.join("rbpmn-dmn/tests/fixtures");
+    if dmn_root.is_dir() {
+        for dir in ["accept", "reject"] {
+            for (file, dmn) in fixtures(&dmn_root.join(dir), "dmn") {
+                let bundle = serde_json::to_string(&vec![dmn]).expect("serializes");
+                decisions.insert(
+                    format!("{dir}/{file}"),
+                    rbpmn_wasm::check_json(HOST_PROCESS, "{}", &bundle),
+                );
+            }
+        }
+    }
+
+    let out = serde_json::json!({
+        "lint": lint,
+        "check": check,
+        "decisions": decisions,
+    });
     println!("{}", serde_json::to_string(&out).expect("serializes"));
 }

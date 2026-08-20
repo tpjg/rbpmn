@@ -1,0 +1,24 @@
+{
+  "fixture": "accept/25-business-rule-task.bpmn",
+  "bindings": { "decisions": { "decide": { "decision": "Discount", "result": "order.discount" } } },
+  "variables": { "Amount": 250 },
+  "actions": [{ "decide": "decide", "answer": 25 }],
+  "expect": {
+    "status": "completed",
+    "variables": { "Amount": 250, "order": { "discount": 25 } },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started decide",
+      "decision-requested decide Discount",
+      "decision-evaluated decide",
+      "element-completed decide",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

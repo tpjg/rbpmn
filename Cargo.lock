@@ -92,6 +92,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "antex"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "687780ea2bbba1364204a233437806670f023d79becd25c40abdb2609c6a62ba"
+
+[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -210,6 +216,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bnum"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f781dba93de3a5ef6dc5b17c9958b208f6f3f021623b360fb605ea51ce443f10"
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -273,9 +285,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
+]
+
+[[package]]
+name = "chrono-tz"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
+dependencies = [
+ "chrono",
+ "phf",
 ]
 
 [[package]]
@@ -356,6 +380,15 @@ name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
+
+[[package]]
+name = "convert_case"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "affbf0190ed2caf063e3def54ff444b449371d55c58e513a95ab98eca50adb49"
+dependencies = [
+ "unicode-segmentation",
+]
 
 [[package]]
 name = "core-foundation-sys"
@@ -501,6 +534,158 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "dsntk-common"
+version = "0.3.1-dev"
+source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+dependencies = [
+ "dsntk-macros",
+ "serde",
+ "uriparse",
+ "url",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "dsntk-examples"
+version = "0.3.1-dev"
+source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+
+[[package]]
+name = "dsntk-feel"
+version = "0.3.1-dev"
+source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "dsntk-common",
+ "dsntk-feel-number",
+ "dsntk-feel-temporal",
+ "dsntk-macros",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dsntk-feel-evaluator"
+version = "0.3.1-dev"
+source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+dependencies = [
+ "dsntk-common",
+ "dsntk-feel",
+ "dsntk-feel-parser",
+ "dsntk-feel-regex",
+ "dsntk-feel-temporal",
+ "dsntk-macros",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dsntk-feel-grammar"
+version = "0.3.1-dev"
+source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+dependencies = [
+ "convert_case",
+ "regex",
+]
+
+[[package]]
+name = "dsntk-feel-number"
+version = "0.3.1-dev"
+source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+dependencies = [
+ "dsntk-common",
+ "dsntk-macros",
+ "fastnum",
+]
+
+[[package]]
+name = "dsntk-feel-parser"
+version = "0.3.1-dev"
+source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+dependencies = [
+ "antex",
+ "dsntk-common",
+ "dsntk-feel",
+ "dsntk-feel-grammar",
+ "dsntk-macros",
+]
+
+[[package]]
+name = "dsntk-feel-regex"
+version = "0.3.1-dev"
+source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+dependencies = [
+ "dsntk-common",
+ "dsntk-macros",
+ "regex",
+]
+
+[[package]]
+name = "dsntk-feel-temporal"
+version = "0.3.1-dev"
+source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "dsntk-common",
+ "dsntk-feel-number",
+ "dsntk-macros",
+ "regex",
+]
+
+[[package]]
+name = "dsntk-macros"
+version = "0.3.1-dev"
+source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "dsntk-model"
+version = "0.3.1-dev"
+source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+dependencies = [
+ "dsntk-common",
+ "dsntk-examples",
+ "dsntk-feel",
+ "dsntk-feel-parser",
+ "dsntk-macros",
+ "dsntk-recognizer",
+ "petgraph",
+ "roxmltree 0.21.1",
+]
+
+[[package]]
+name = "dsntk-model-evaluator"
+version = "0.3.1-dev"
+source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+dependencies = [
+ "dsntk-common",
+ "dsntk-feel",
+ "dsntk-feel-evaluator",
+ "dsntk-feel-parser",
+ "dsntk-feel-temporal",
+ "dsntk-macros",
+ "dsntk-model",
+]
+
+[[package]]
+name = "dsntk-recognizer"
+version = "0.3.1-dev"
+source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+dependencies = [
+ "dsntk-common",
+ "dsntk-macros",
+]
+
+[[package]]
 name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -547,6 +732,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastnum"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4089ab2dfd45d8ddc92febb5ca80644389d5ebb954f40231274a3f18341762e2"
+dependencies = [
+ "bnum",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -557,6 +753,12 @@ name = "find-msvc-tools"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26b73573e6edcd2af0cdf47bd6cb58f0b3839491263c314eaad1ccf24430e1de"
+
+[[package]]
+name = "fixedbitset"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
 name = "flume"
@@ -1317,6 +1519,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "petgraph"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
+dependencies = [
+ "fixedbitset",
+ "hashbrown 0.15.5",
+ "indexmap",
+ "serde",
+]
+
+[[package]]
+name = "phf"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
+dependencies = [
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
+dependencies = [
+ "siphasher",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1610,11 +1842,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rbpmn-dmn"
+version = "0.1.0"
+dependencies = [
+ "dsntk-common",
+ "dsntk-feel",
+ "dsntk-feel-parser",
+ "dsntk-feel-temporal",
+ "dsntk-model",
+ "dsntk-model-evaluator",
+ "rbpmn-core",
+ "rbpmn-model",
+ "serde_json",
+]
+
+[[package]]
 name = "rbpmn-engine"
 version = "0.1.0"
 dependencies = [
  "axum",
  "rbpmn-core",
+ "rbpmn-dmn",
  "rbpmn-engine",
  "rbpmn-model",
  "reqwest",
@@ -1632,7 +1880,7 @@ dependencies = [
 name = "rbpmn-model"
 version = "0.1.0"
 dependencies = [
- "roxmltree",
+ "roxmltree 0.20.0",
  "serde",
  "serde_json",
  "thiserror",
@@ -1676,6 +1924,7 @@ name = "rbpmn-wasm"
 version = "0.1.0"
 dependencies = [
  "rbpmn-core",
+ "rbpmn-dmn",
  "rbpmn-model",
  "serde_json",
  "wasm-bindgen",
@@ -1785,6 +2034,15 @@ name = "roxmltree"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+
+[[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "rsa"
@@ -2030,6 +2288,12 @@ dependencies = [
  "digest",
  "rand_core 0.6.4",
 ]
+
+[[package]]
+name = "siphasher"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "slab"
@@ -2665,10 +2929,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
 
 [[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
+name = "uriparse"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0200d0fc04d809396c2ad43f3c95da3582a2556eba8d453c1087f4120ee352ff"
+dependencies = [
+ "fnv",
+ "lazy_static",
+]
 
 [[package]]
 name = "url"
@@ -2681,6 +2961,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utf8_iter"

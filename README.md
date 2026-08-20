@@ -16,7 +16,8 @@ Read it before touching the semantics.
 | `crates/rbpmn-model` | BPMN XML → internal model + the linter + the FEEL-subset parser/evaluator. Dependency-light (no IO, no async, no DB) so it compiles to WASM for the linter playground and the bpmnlint plugin. |
 | `crates/rbpmn-core` | The pure semantic core: `compile` → executable model, tokens, and the `step` function. No IO — the Postgres layer projects it. |
 | `crates/rbpmn-engine` | The PostgreSQL projection: transactional stepping over the core (with `*_in_tx` variants sharing the caller's transaction — process transitions commit atomically with business writes), atomic idempotent deploys, the growing persistent environment, leases, retries with backoff, incidents. |
-| `crates/rbpmn-wasm` | Thin wasm-bindgen surface: `lint(xml)` (model only), `check_deployable(xml, bindings)` (model **and** manifest — everything deploy decides without a database), `catalogue()`. |
+| `crates/rbpmn-dmn` | Decisions: DMN validation and FEEL evaluation over dsntk — from [a fork](https://github.com/tpjg/dsntk) whose defaults are a pure-Rust decimal128 in place of Intel's C library and no HTTP client for FEEL's external-Java bridge. **The one crate where dsntk is allowed** — nothing upstream of it may depend on it, which is what keeps `rbpmn-model` and `rbpmn-core` on wasm32. See [docs/dmn.md](docs/dmn.md). |
+| `crates/rbpmn-wasm` | Thin wasm-bindgen surface: `lint(xml)` (model only), `check_deployable(xml, bindings, decisions)` (model, manifest **and** bundled DMN — everything deploy decides without a database), `evaluate_decision(...)`, `catalogue()`. |
 | `crates/rbpmn-server` | Small standalone HTTP server wrapping the engine. Bearer-token auth, loopback-only by default. See [docs/http-security.md](docs/http-security.md). |
 | `crates/rbpmn-ui` | The two UI documents as self-contained HTML: a read-only instance inspector (`render_inspection`, a pure function over an `InstanceInspection`) and the model+manifest editor. No API, no credentials in the browser. |
 | `playground/` | Local linter playground (bpmn-js + WASM): fixture browser, live re-lint, diagnostics as diagram overlays. `just playground`. |
@@ -32,10 +33,17 @@ definitions, which lint clean today but refuse to compile) and the instance
 migration API, is listed with its status in the design brief's
 [open-items table](bpmn-engine-design.md#everything-still-open--one-visible-list).
 
+**Decisions (DMN) landed after that plan and changed it** — the brief listed
+them as post-v1, and they are in the default build now. A workflow definition
+plus its bindings manifest is meant to be a *fully executable* flow, and a
+decision turned out to be part of that definition rather than an add-on to it.
+[docs/dmn.md](docs/dmn.md) is the record: what was decided, what was measured,
+and what deviates.
+
 ## Status
 
 - [x] **Phase 0 — Parse & reject**: parser, full linter rule catalogue,
-      fixture corpus (24 accept / 34 reject today — every phase adds its
+      fixture corpus (27 accept / 34 reject today — every phase adds its
       own before its code), corpus runner.
 - [x] Server skeleton with the security spine and `POST /v1/definitions/lint`.
 - [x] **Phase 0-B — linter playground (WASM) + bpmnlint plugin**, with a
@@ -68,12 +76,16 @@ migration API, is listed with its status in the design brief's
 - [x] **Phase 4 — user tasks & the task API**: pull-mode `get_task` (FIFO
       default / LIFO opt-in, `SKIP LOCKED`, renewable leases — expired locks
       return without a reaper), `extend_lock` with the typed lock-lost
-      result, owner-checked `complete_task`/`fail_task`, equality filters
-      over the instance's **live** variables, `count_tasks`, and
+      result, owner-checked `complete_task`/`fail_task`/`release_task` (the
+      third exit from a claim: hand it back undecided, claimable again at
+      once instead of after the lease runs out — scoped to the claim's lease
+      epoch, so a retried release cannot free the claim that replaced it),
+      equality filters over the instance's **live** variables, `count_tasks`,
+      and
       `declare_index` (partial expression indexes, also declarable in the
       deploy manifest; index usage verified by test against the real query
       path). Server: `POST /v1/tasks/{get,count}` and
-      `/v1/tasks/{id}/{extend,complete,fail}`.
+      `/v1/tasks/{id}/{extend,release,complete,fail}`.
 - [x] **Phase 5 — rounding out**: the event-stream tailing contract
       (`read_events` / `GET /v1/events`, ordered and cursored by
       `(txid, id)` behind a safe horizon so a cursor cannot miss an event),
@@ -129,6 +141,25 @@ migration API, is listed with its status in the design brief's
       gets `'self'` for that single call and carries no instance data to
       leak. See [docs/http-security.md](docs/http-security.md) for what the
       embedding application still owes its users.
+- [x] Phase 9 — **decisions (DMN + FEEL)**, on by default. A business-rule
+      task parks, the projection evaluates inside the same transaction, and
+      the answer re-enters the pure core as command data — so a replay reads
+      the recorded answer instead of running an evaluator, and the core still
+      cannot evaluate anything. DMN artifacts travel *inside* the deployment
+      (`{bpmn, bindings, decisions}`, one content hash over all three), which
+      is what makes `unresolved-decision` decidable with no environment at
+      all: unlike a topic, a decision cannot be missing at deploy time
+      because it is in the bundle. The wiring stays out of the XML like every
+      other binding. Under it, **dsntk** — 100k lines, DMN 1.3/1.4/1.5, the
+      DMN TCK — reached wasm32 by replacing its decimal128, which binds a C
+      library, with a pure-Rust one; that substitution is *verified* against
+      the library it replaces over 26 300 differential comparisons and 3 391
+      TCK cases, not argued. Its HTTP client is replaced by one that refuses:
+      a decision must not call out, to Java or anything else. The editor
+      authors the whole bundle — dmn-js for the decision, and the same
+      validator deploy runs, in the browser, offline.
+      [docs/dmn.md](docs/dmn.md) has the decisions, the gates and the
+      measured deviations.
 
 ## Rule catalogue
 
@@ -141,21 +172,34 @@ graphs that pass them).
 |---|---|---|
 | `no-inclusive-gateway` | error | Inclusive gateways rejected entirely; rewrite as parallel split + exclusive skip-bypass per branch. |
 | `no-call-activity` | error | Definitions are islands; interact via message throw → message start/catch with correlation keys. |
-| `no-unsupported-element` | error | Anything outside the supported subset (script/send/manual/business-rule tasks, signals, cycles, multi-instance, …). |
+| `no-unsupported-element` | error | Anything outside the supported subset (script/send/manual/abstract tasks, call activities, signals, cycles, multi-instance, …). |
 | `balanced-gateways` | error | Every parallel split has a matching join; branches stay disjoint; nothing enters/escapes the region; each branch delivers exactly one token; no plain end events inside (terminate allowed). |
 | `single-start-event` | error | Exactly one start event per process and per subprocess. |
 | `conditions-feel-subset` | error | Conditions only on exclusive-split flows, in the strict FEEL subset (`name op literal`, `and`/`or`, parentheses); default flow required. Full-FEEL constructs (functions, arithmetic, ranges) are rejected. |
-| `timer-iso8601` | error | Timer definitions must be valid ISO-8601; dates require an explicit UTC offset; component magnitudes bounded. Content marked `xsi:type="bpmn:tFormalExpression"` must instead be a FEEL qualified name. |
+| `timer-iso8601` | error | Timer definitions must be valid ISO-8601 — dates require an explicit UTC offset, component magnitudes bounded — **or**, failing that, a FEEL qualified name naming the deadline in the variable document. Text that is neither is the error. Parse order is the only discriminator: `xsi:type="bpmn:tFormalExpression"` is deliberately ignored, because bpmn-moddle stamps it on every expression object and so every bpmn-js modeler writes it on ordinary literals. |
 | `timer-expression`⁺ | warn | A timer whose deadline is read from the variable document cannot be validated ahead of time — if it does not resolve to a valid ISO-8601 value at arm time, that element raises an incident rather than firing. |
-| `message-has-correlation` | error | Message start/catch/throw must reference a *named* message. The correlation binding itself (a FEEL qualified name) is registered via `map_correlation` and checked at deploy. |
+| `message-has-correlation` | error | Message start/catch/throw must reference a *named* message. The correlation binding itself (a FEEL qualified name) is registered via `Bindings::correlation` and checked at deploy. |
 | `no-foreign-implementation` | warn | Service task carries vendor attributes (`camunda:`, `zeebe:`, …), which rbpmn ignores — topics are bound at registration. |
-| `unresolved-topic` | error | Every service task's topic (via `map_topic`, default: element id) must have a registered handler or a declared external-worker topic. Checked at deploy against registration state — ID reserved now, enforced from phase 2. |
+| `unresolved-topic` | error | Every service task's topic (via `Bindings::topic`, default: element id) must have a registered handler or a declared external-worker topic. Checked at deploy against registration state, so `lint(xml)` alone cannot decide it. |
 | `boundary-on-supported-host` | error | Boundary events only on service/user/receive tasks and subprocesses; error boundaries only where errors can originate. |
 | `no-implicit-split` | error | Activities have at most one outgoing flow; splitting happens at explicit gateways. |
 | `implicit-merge-after-parallel` | warn | Implicit merge receiving concurrent tokens — the "task runs twice" trap (accompanies the balanced-gateways error). |
 | `bpmn-structure` ⁺ | error | Well-formedness: resolvable refs, flow cardinalities, connectivity, unique ids, error definitions. |
 | `no-mixed-gateway` ⁺ | error | A gateway either splits or joins, never both. |
 | `event-gateway-structure` ⁺ | error | Event gateway races ≥2 message/timer catches or receive tasks, each with exactly one incoming flow and no boundary events (the gateway itself is the race). |
+
+DMN rules apply to the decision artifacts a deployment bundles, and are
+implemented in `rbpmn-dmn` — the one crate where dsntk is allowed
+([docs/dmn.md](docs/dmn.md)). They report the same `Diagnostic` type, so a
+decision error and a model error read the same way.
+
+| Rule | Severity | Meaning |
+|---|---|---|
+| `dmn-validates` ⁺ | error | The artifact is DMN and its decision logic builds. A decision that cannot be compiled cannot be deployed. |
+| `feel-parses` ⁺ | error | Every FEEL expression in the artifact parses — literal expressions, decision-table entries, item-definition constraints and the rest. dsntk is the authority here: FEEL names may contain spaces and operators, so parsing needs the model's own scope. |
+| `feel-deterministic` ⁺ | error | No `now()`/`today()` (dsntk answers them from the *node's* local timezone) and no external Java or PMML functions. Time enters a decision as an input, never from a clock. Deliberately conservative: it errs toward refusing. |
+| `decision-has-binding` ⁺ | error | A business-rule task's decision binding lives in the manifest, never in the XML, and must be well-formed: a decision name, and a FEEL qualified name for where the answer lands. |
+| `unresolved-decision` ⁺ | error | Every bound decision names exactly one invocable in the bundled DMN. Unlike `unresolved-topic` this needs no environment — decisions travel *inside* the deployment, so the verdict is complete offline. Ambiguity is refused rather than resolved by picking. |
 
 ### The structural rules have counterexamples, not just rationales
 
@@ -182,11 +226,16 @@ no vendor attributes, ever. Anything that wires a model to its runtime is
 class of guarantee a compiler does: a wiring gap fails loudly at deploy
 instead of "seeming to run" with stuck tokens.
 
+All of it goes through one `Bindings` value — a fluent builder in the library,
+the same struct deserialized from the deploy body's `bindings` JSON on the
+server. Two syntaxes, one manifest, one validation path.
+
 | Wiring | Registration API | Deploy check |
 |---|---|---|
-| Service-task topic | `map_topic(definition_key, element_id, topic)`; default topic = element id; `declare_topic(name)` announces pull-mode workers | `unresolved-topic` |
-| Message correlation | `map_correlation(definition_key, element_id, "order.id")` — FEEL qualified name into the instance variables | `message-has-correlation` |
-| Filterable fields | `declare_index(definition_key, field)` — optional, performance only | — |
+| Service-task topic | `Bindings::topic(element_id, topic)`; default topic = element id. `declare_topic(name)` announces pull-mode workers, and is *environment* rather than manifest | `unresolved-topic` |
+| Message correlation | `Bindings::correlation(element_id, "order.id")` — FEEL qualified name into the instance variables | `message-has-correlation` |
+| Decision | `Bindings::decision(element_id, decision_name, "order.discount")` — which decision a business-rule task invokes, and where its answer lands | `decision-has-binding`, `unresolved-decision` |
+| Filterable fields | `Bindings::index(field)` — optional, performance only | — |
 
 Per-definition wiring deploys **atomically with the definition** as a small
 JSON bindings manifest (`deploy(bpmn_xml, bindings)` in the library, one
@@ -316,6 +365,13 @@ server** and the editor fetches the covered topic **names** and does the
 comparison locally. Your model is never uploaded, so a confidential process
 can be validated against production.
 
+It opens on a worked example rather than an empty canvas: the same deployment
+`just demo` runs, model and manifest and decision table together, because the
+first thing worth showing is that all three are one artifact. The decision is
+live — the try-it pane evaluates it with the engine's own evaluator, offline,
+because a deployment's DMN travels inside it. **New** clears that down to a
+deployable skeleton when you want to model your own.
+
 **The inspector** shows one instance, read-only, addressed by UUID. Its data
 is baked into the document rather than fetched, so it has no API to secure,
 works with the database unreachable, and can be attached to a support ticket.
@@ -354,11 +410,13 @@ to a browser audience are all the application's job.
 
 ## Developing
 
-`.build.yml` runs every check below on sourcehut, one CI task per command, so
-a red build names the discipline that broke rather than "tests failed". The
-benchmarks are deliberately not on CI — they are a separate track that never
-gates on absolute numbers, and a shared builder is the worst machine to
-measure on.
+`.build.yml` runs these on sourcehut, one CI task per command, so a red build
+names the discipline that broke rather than "tests failed". Two exceptions,
+both deliberate and both stated in the table below: the **benchmarks** are a
+separate track that never gates on absolute numbers, and a shared builder is
+the worst machine to measure on; and **`just dmn-tck`** fetches the DMN TCK,
+dsntk's source and a third-party runner from the network, which makes it the
+gate for a dsntk version bump rather than a per-commit check.
 
 CI is the backstop, not the workflow: knowing which command a change *owes*
 is what keeps the loop short, because every one of these guards something
@@ -376,11 +434,14 @@ is what keeps the loop short, because every one of these guards something
 | If you changed | Run | Because |
 |---|---|---|
 | a linter rule, `rbpmn-model`, `rbpmn-core` | `just ui` | the editor embeds the linter; without it the document you serve validates against yesterday's rules, and nothing checks that for you |
+| the dsntk fork's rev | `just number-parity` | its decimal against the C library it replaces, 26 300 comparisons. Runs `just dsntk-rev` first, because a differential against a rev nobody ships proves nothing. Lives outside the workspace and cannot be reached from it |
+| the `dmn` feature, or anything behind it | `just no-dmn` | DMN is on by default; this is the only thing keeping "optional" a fact rather than a claim, and it asserts the dependency graph in *both* directions |
 | anything WASM-facing | `just parity` | byte-parity of native Rust vs WASM over the corpus, for both exports, plus the bpmnlint plugin |
 | lock order, the work-item lease, the scheduler's claim, scope teardown, retention | `just tla` | the specs are hand-written and will not tell you they drifted |
 | the FEEL subset / `condition::eval` | `just feel-parity` | differential against dsntk over ~8k expression/document pairs |
 | the two UI documents | `just ui-test`, `just e2e-ui` | the pure modules under node, then both documents in a real browser (the only place the CSP is enforced) |
 | a fixture without DI | `just fixtures-di` | so it renders in bpmn-js and any standard modeler |
+| the dsntk fork's rev | `just dmn-tck` | the DMN TCK twice — against dsntk as published, and against the fork we ship — compared case by case. Not on CI: it fetches the TCK, dsntk's source and a third-party runner |
 
 **Occasionally, to catch performance regressions** — local only, never on CI
 (a separate track — see [benchmarks/README.md](benchmarks/README.md); none of

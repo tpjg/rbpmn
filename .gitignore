@@ -1,6 +1,10 @@
 /target
 # feel-parity is its own cargo project (outside the workspace), own target dir.
 /feel-parity/target
+# ...and so are the two Gate 0 projects (docs/dmn.md): the differential that
+# links the C decimal library, and the wasm probe that carries the patch.
+/feel-number-parity/target
+/dmn-wasm-probe/target
 **/*.rs.bk
 .DS_Store
 node_modules/
@@ -32,3 +36,22 @@ __pycache__/
 # also churn on every run. Keep the ones you care about outside the repo, or
 # publish them somewhere that records the hardware alongside.
 /benchmarks/results/
+
+# wasm-pack output for the Gate 0b probe — build artifacts, like every other
+# wasm bundle here.
+/dmn-wasm-probe/pkg
+
+# Gate 0c fetches its inputs rather than vendoring them (docs/dmn.md): the
+# DMN TCK corpus is separately OMG-licensed, and the dsntk source and test
+# runner are pinned downloads. All of it is build input, none of it is ours.
+/dmn-tck/tck
+/dmn-tck/runner
+/dmn-tck/patches
+/dmn-tck/*.crate
+/dmn-tck/*.csv
+/dmn-tck/*.log
+/dmn-tck/stock/dsntk-*
+/dmn-tck/patched/dsntk-*
+/dmn-tck/stock/target
+/dmn-tck/patched/target
+/dmn-tck/stock/Cargo.lock

@@ -22,20 +22,43 @@
 (*   - exactly-once is *earned* rather than structural: `Complete` is       *)
 (*     enabled in several states, so the closed-item no-op is what keeps    *)
 (*     the count at one.                                                    *)
+(*                                                                          *)
+(* `Release` (the voluntary hand-back) is a lease transition like any       *)
+(* other and is modelled as one: it is the third way a claim ends, and the  *)
+(* first that returns an item to the queue with nothing having gone wrong.  *)
+(*                                                                          *)
+(* Its first property, `NoForeignHandBack`, was deleted for the same reason *)
+(* as the idealised `Complete` above, from the opposite direction: it said  *)
+(* `(HoldsLive(w) /\ v # w) => ~ReleaseGuard(v)`, which is true by          *)
+(* propositional reasoning in every state, reachable or not, because        *)
+(* `HoldsLive(w)` already carries `owner = w`. It restated the guard's text *)
+(* instead of constraining the protocol's behaviour, so it would have kept  *)
+(* holding had `Release` been given a different guard, or a body that       *)
+(* freed a live holder by some other route. What replaced it is about the   *)
+(* *effect* and needs `lastActor` to say it — see                           *)
+(* `LiveLeaseEndsOnlyByItsHolder`.                                          *)
 (***************************************************************************)
 EXTENDS Naturals
 
 CONSTANTS
     Workers,   \* competing consumers of one topic
     NoOne,     \* the unheld marker
+    NoLease,   \* "this step named no epoch" — a model value, like NoOne
     TTL,       \* lease duration
     Backoff,   \* retry delay after a failure
     Retries,   \* failures before the instance freezes as an incident
-    MaxTime    \* clock bound, to keep the model finite
+    MaxTime,   \* clock bound, to keep the model finite
+    MaxLeases, \* epoch bound, likewise: claim/release can cycle in one instant
+    UncheckedRelease, \* TRUE = drop release_task's owner check (a bug)
+    EpochlessRelease  \* TRUE = drop its lease_no check (the shipped bug)
 
 ASSUME NoOne \notin Workers
+ASSUME NoLease \notin 0..MaxLeases
 ASSUME TTL \in Nat /\ TTL > 0
 ASSUME MaxTime \in Nat
+ASSUME MaxLeases \in Nat /\ MaxLeases > 0
+ASSUME UncheckedRelease \in BOOLEAN
+ASSUME EpochlessRelease \in BOOLEAN
 
 VARIABLES
     state,        \* "available" | "locked" | "done"
@@ -46,10 +69,21 @@ VARIABLES
     active,       \* the owning instance's status is 'active'
     now,          \* database time
     believes,     \* Workers -> BOOLEAN: this worker thinks it holds the item
-    completions   \* how many times the item transitioned to done
+    completions,  \* how many times the item transitioned to done
+    lastActor,    \* who took the step: a worker, or NoOne for the clock
+    leaseNo,      \* rbpmn_work_item.lease_no: bumped by every claim
+    named,        \* the epoch the step's release named; NoLease otherwise
+    issued        \* Workers -> the release requests it has actually sent
 
 vars ==
-    <<state, owner, until, retryAt, retries, active, now, believes, completions>>
+    <<state, owner, until, retryAt, retries, active, now, believes, completions,
+      lastActor, leaseNo, named, issued>>
+
+\* Epochs are bounded only to keep the model finite: Acquire and Release can
+\* cycle any number of times inside one instant, so an unbounded lease_no
+\* would be an infinite state space. Two is already enough to express the
+\* bug (claim, release, re-claim, replay).
+Leases == 0..MaxLeases
 
 Time == 0..MaxTime
 Deadline == 0..(MaxTime + TTL + Backoff)
@@ -79,6 +113,22 @@ GuardAllows(w) == ~(state = "locked" /\ until > now /\ owner # w)
 \* `complete_work_item_in_tx` refuses on a frozen instance (IncidentOpen).
 Completable(w) == state # "done" /\ active /\ GuardAllows(w)
 
+\* Exactly `release_task` (tasks.rs): `lock_owner = $me AND lease_no = $mine
+\* AND state = 'locked'`, for a request naming epoch `e`.
+\*
+\* Note what is deliberately absent — liveness. An expired lease nobody
+\* reclaimed still names its owner, and releasing it only tidies the row; the
+\* clock is not what the guard is for.
+\*
+\* Note what is deliberately present. The owner is redundant for identifying
+\* the claim — the epoch does that alone — and is kept because epochs are
+\* small integers, so without it anyone holding a task id could end a
+\* stranger's claim. Each half has its own counterexample config.
+ReleaseGuard(w, e) ==
+    /\ state = "locked"
+    /\ UncheckedRelease \/ owner = w
+    /\ EpochlessRelease \/ e = leaseNo
+
 TypeOK ==
     /\ state \in {"available", "locked", "done"}
     /\ owner \in Workers \cup {NoOne}
@@ -89,6 +139,10 @@ TypeOK ==
     /\ now \in Time
     /\ believes \in [Workers -> BOOLEAN]
     /\ completions \in 0..2
+    /\ lastActor \in Workers \cup {NoOne}
+    /\ leaseNo \in Leases
+    /\ named \in Leases \cup {NoLease}
+    /\ issued \in [Workers -> SUBSET Leases]
 
 Init ==
     /\ state = "available"
@@ -100,49 +154,121 @@ Init ==
     /\ now = 0
     /\ believes = [w \in Workers |-> FALSE]
     /\ completions = 0
+    /\ lastActor = NoOne
+    /\ leaseNo = 0
+    /\ named = NoLease
+    /\ issued = [w \in Workers |-> {}]
 
 \* Database time advances. Nothing tells a holder its lease lapsed.
 Tick ==
     /\ now < MaxTime
     /\ now' = now + 1
-    /\ UNCHANGED <<state, owner, until, retryAt, retries, active, believes, completions>>
+    /\ lastActor' = NoOne
+    /\ named' = NoLease
+    /\ UNCHANGED <<state, owner, until, retryAt, retries, active, believes,
+                   completions, leaseNo, issued>>
 
 \* get_task / the worker claim: one statement, SKIP LOCKED.
 Acquire(w) ==
     /\ Claimable
+    /\ leaseNo < MaxLeases          \* model bound, not a protocol rule
     /\ state' = "locked"
     /\ owner' = w
     /\ until' = now + TTL
+    \* A claim, and only a claim, mints an epoch. `Extend` renews a lease
+    \* without bumping it: the epoch changes exactly when the right to act
+    \* changes hands, which is what makes a stale request identifiable.
+    /\ leaseNo' = leaseNo + 1
     \* The displaced holder is NOT notified — its belief persists.
     /\ believes' = [believes EXCEPT ![w] = TRUE]
-    /\ UNCHANGED <<retryAt, retries, active, now, completions>>
+    /\ lastActor' = w
+    /\ named' = NoLease
+    /\ UNCHANGED <<retryAt, retries, active, now, completions, issued>>
 
 \* extend_lock: owner and liveness both required.
 Extend(w) ==
     /\ HoldsLive(w)
     /\ until' = now + TTL
-    /\ UNCHANGED <<state, owner, retryAt, retries, active, now, believes, completions>>
+    /\ lastActor' = w
+    /\ named' = NoLease
+    /\ UNCHANGED <<state, owner, retryAt, retries, active, now, believes,
+                   completions, leaseNo, issued>>
 
 \* ...and the typed LockLost when that condition fails.
 ExtendLost(w) ==
     /\ believes[w]
     /\ ~HoldsLive(w)
     /\ believes' = [believes EXCEPT ![w] = FALSE]
-    /\ UNCHANGED <<state, owner, until, retryAt, retries, active, now, completions>>
+    /\ lastActor' = w
+    /\ named' = NoLease
+    /\ UNCHANGED <<state, owner, until, retryAt, retries, active, now,
+                   completions, leaseNo, issued>>
+
+\* release_task: the third exit from a claim. Back to available with no
+\* backoff and no budget spent — unlike Fail, nothing went wrong, so the item
+\* is on offer again at once rather than after a delay or a lease.
+\*
+\* Parameterized by the epoch the *request* carries, which is the whole point:
+\* `e = leaseNo` is a client releasing the claim it is holding, and `e <
+\* leaseNo` is a request issued against an earlier claim arriving late. The
+\* engine cannot tell those apart by looking at the caller, and neither can
+\* this model — only the epoch separates them.
+ReleaseWith(w, e) ==
+    /\ ReleaseGuard(w, e)
+    /\ state' = "available"
+    /\ owner' = NoOne
+    /\ until' = 0
+    /\ believes' = [believes EXCEPT ![w] = FALSE]
+    /\ lastActor' = w
+    /\ named' = e
+    \* The request is now on the wire, and may arrive again.
+    /\ issued' = [issued EXCEPT ![w] = @ \cup {e}]
+    /\ UNCHANGED <<retryAt, retries, active, now, completions, leaseNo>>
+
+\* At-least-once delivery of the client's own requests: a release whose
+\* response never came back arrives a second time. It re-offers exactly the
+\* requests this worker really sent — an earlier draft let it replay any
+\* epoch below the current one, and TLC dutifully produced a counterexample
+\* replaying epoch 0, which no client can ever have been given (an epoch
+\* comes from a claim, and a claim always yields at least 1). A
+\* counterexample nobody can reach is worse than none: it is the config's
+\* documentation, and it must show the bug that actually happens.
+\*
+\* This is the action the model was missing when `release_task` first
+\* shipped. Without it a replay and a fresh release are the same step, and
+\* `just tla` stays green over the whole hazard.
+ReleaseReplay(w) == \E e \in issued[w] : ReleaseWith(w, e)
+
+\* ...and the typed Released::Lost when the statement matches no row. A
+\* replay that names a spent epoch lands here, which is the fix working:
+\* the client is told its claim is gone rather than silently freeing one.
+ReleaseLost(w) ==
+    /\ believes[w]
+    /\ \A e \in Leases : ~ReleaseGuard(w, e)
+    /\ believes' = [believes EXCEPT ![w] = FALSE]
+    /\ lastActor' = w
+    /\ named' = NoLease
+    /\ UNCHANGED <<state, owner, until, retryAt, retries, active, now,
+                   completions, leaseNo, issued>>
 
 Complete(w) ==
     /\ Completable(w)
     /\ state' = "done"
     /\ completions' = completions + 1
     /\ believes' = [believes EXCEPT ![w] = FALSE]
-    /\ UNCHANGED <<owner, until, retryAt, retries, active, now>>
+    /\ lastActor' = w
+    /\ named' = NoLease
+    /\ UNCHANGED <<owner, until, retryAt, retries, active, now, leaseNo, issued>>
 
 \* Refused by the guard: another worker's lease is live.
 CompleteRefused(w) ==
     /\ state # "done"
     /\ ~GuardAllows(w)
     /\ believes' = [believes EXCEPT ![w] = FALSE]
-    /\ UNCHANGED <<state, owner, until, retryAt, retries, active, now, completions>>
+    /\ lastActor' = w
+    /\ named' = NoLease
+    /\ UNCHANGED <<state, owner, until, retryAt, retries, active, now,
+                   completions, leaseNo, issued>>
 
 \* At-least-once delivery: retrying a closed item is the idempotent no-op,
 \* NOT a second state transition. This is what keeps `completions` at one —
@@ -150,7 +276,10 @@ CompleteRefused(w) ==
 CompleteAlreadyClosed(w) ==
     /\ state = "done"
     /\ believes' = [believes EXCEPT ![w] = FALSE]
-    /\ UNCHANGED <<state, owner, until, retryAt, retries, active, now, completions>>
+    /\ lastActor' = w
+    /\ named' = NoLease
+    /\ UNCHANGED <<state, owner, until, retryAt, retries, active, now,
+                   completions, leaseNo, issued>>
 
 \* fail_work_item_in_tx: back to available behind a backoff, budget spent.
 \* Exhausting it raises an incident, which freezes the instance.
@@ -164,7 +293,9 @@ Fail(w) ==
     /\ retryAt' = now + Backoff
     /\ retries' = retries - 1
     /\ believes' = [believes EXCEPT ![w] = FALSE]
-    /\ UNCHANGED <<active, now, completions>>
+    /\ lastActor' = w
+    /\ named' = NoLease
+    /\ UNCHANGED <<active, now, completions, leaseNo, issued>>
 
 FailFinally(w) ==
     /\ state = "locked"
@@ -172,12 +303,15 @@ FailFinally(w) ==
     /\ retries = 0
     /\ active' = FALSE          \* incident: the instance freezes for repair
     /\ believes' = [believes EXCEPT ![w] = FALSE]
-    /\ UNCHANGED <<state, owner, until, retryAt, retries, now, completions>>
+    /\ lastActor' = w
+    /\ named' = NoLease
+    /\ UNCHANGED <<state, owner, until, retryAt, retries, now, completions, leaseNo, issued>>
 
 Next ==
     \/ Tick
     \/ \E w \in Workers :
         \/ Acquire(w) \/ Extend(w) \/ ExtendLost(w)
+        \/ ReleaseWith(w, leaseNo) \/ ReleaseReplay(w) \/ ReleaseLost(w)
         \/ Complete(w) \/ CompleteRefused(w) \/ CompleteAlreadyClosed(w)
         \/ Fail(w) \/ FailFinally(w)
 
@@ -222,6 +356,50 @@ Blocked ==
 
 StrandedOnlyForAStatedReason ==
     Blocked => (retryAt > now \/ ~active)
+
+(***************************************************************************)
+(* What the epoch buys, and it takes a behavioural property to say it: a    *)
+(* release that *lands* named the lease that was actually current. The      *)
+(* engine cannot distinguish a retry from a fresh request by looking at the *)
+(* caller — same task, same owner, same statement — so the only way to      *)
+(* state the difference is to record what the request named and compare it  *)
+(* with what was there when it arrived.                                     *)
+(*                                                                          *)
+(* Note that `LiveLeaseEndsOnlyByItsHolder` cannot catch this, and that is  *)
+(* the point of having both: in the replay the holder *is* the actor. Alice *)
+(* frees Alice's own live claim with Alice's own stale request, so every    *)
+(* property phrased in terms of *who* acted holds while the item is handed  *)
+(* to somebody else. Lease_EpochlessRelease.cfg drops `e = leaseNo` and TLC *)
+(* produces the trace: claim, release, re-claim, retry.                     *)
+(***************************************************************************)
+ReleaseFreesOnlyTheLeaseItNamed ==
+    [][ (state = "locked" /\ state' = "available" /\ named' # NoLease)
+          => named' = leaseNo ]_vars
+
+(***************************************************************************)
+(* A live lease ends by the clock or by its own holder's hand, never by     *)
+(* anyone else's. An **action** property, and it has to be: the thing being *)
+(* ruled out is a transition, not a state — no predicate over a single      *)
+(* state can distinguish "this item became available" from "*someone else*  *)
+(* made this item available", which is why `lastActor` exists.              *)
+(*                                                                          *)
+(* It is not a restatement of any one guard. It quantifies over the whole   *)
+(* of `Next`, so it is the four guards checked *together*: `CLAIMABLE`      *)
+(* keeps `Acquire` off a live lease, `guard_lease` keeps `Complete` and     *)
+(* `Fail` off it, `ReleaseGuard` keeps `Release` off it. Weaken any one of  *)
+(* them, or add a fifth action that frees an item, and this fails —         *)
+(* whereas the guard-restating version it replaced would not have noticed.  *)
+(*                                                                          *)
+(* `now' = now` is the clock's exemption, and it is the whole reason the    *)
+(* lease model works without a reaper: time alone takes a lease away, from  *)
+(* a holder that is never told. Belief cannot state any of this — two       *)
+(* workers believing at once is already reachable and already safe          *)
+(* (DoubleBeliefIsReachable). Lease_UncheckedRelease.cfg drops the owner    *)
+(* check from `Release` alone and TLC produces the trace.                   *)
+(***************************************************************************)
+LiveLeaseEndsOnlyByItsHolder ==
+    [][ \A w \in Workers :
+          (HoldsLive(w) /\ ~HoldsLive(w)' /\ now' = now) => lastActor' = w ]_vars
 
 (***************************************************************************)
 (* Deliberately FALSE — checked by Lease_DoubleBelief.cfg, which expects a  *)

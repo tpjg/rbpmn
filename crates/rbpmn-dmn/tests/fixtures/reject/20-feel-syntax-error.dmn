@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error feel-parses @ broken
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/20-feel-syntax-error" name="20-feel-syntax-error" id="_20-feel-syntax-error">
+  <decision name="Broken" id="broken">
+    <variable name="Broken" typeRef="number"/>
+    <literalExpression><text>1 +</text></literalExpression>
+  </decision>
+</definitions>

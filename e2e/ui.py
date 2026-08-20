@@ -52,6 +52,26 @@ def skip_served(reason):
         print(f"served stack: {reason} — skipping")
 
 
+def is_dark(css_color):
+    """Relative luminance below the midpoint, for a #rgb/#rrggbb token.
+
+    Deliberately crude — the question is "would this read as a white patch on a
+    dark canvas", not colour science. Anything unparseable is *not* dark, so a
+    token that stops being a hex string fails loudly rather than passing by
+    accident.
+    """
+    text = (css_color or "").strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(c * 2 for c in text)
+    if len(text) != 6:
+        return False
+    try:
+        r, g, b = (int(text[i : i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return False
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) < 128
+
+
 def check(condition, message):
     if not condition:
         failures.append(message)
@@ -170,9 +190,30 @@ def check_editor(browser):
     # would before driving them.
     page.evaluate("() => document.querySelectorAll('details.pane').forEach(d => d.open = true)")
 
+    check_example(page)
+
+    # Back to a cleared desk before driving the editor. Everything below
+    # authors a deployment from nothing — empty manifest, `Decision1`,
+    # `Decision2` — and the example would shift every one of those.
+    page.click("text=New")
+    page.wait_for_function(
+        "() => document.querySelector('.decisions').textContent.includes('No decisions')",
+        timeout=20000,
+    )
+    # The skeleton New lands on is deployable too, and with an empty manifest —
+    # a New document that opens already rejected teaches the wrong first
+    # lesson, and now that the *example* is what boot asserts, nothing else
+    # here would notice if the skeleton stopped passing.
+    page.wait_for_function(
+        "() => (document.querySelector('.verdict')?.textContent ?? '').startsWith('valid')",
+        timeout=20000,
+    )
+    empty = page.locator("textarea.code-manifest").input_value().strip()
+    check(empty == "{}", f"New lands on a deployable skeleton needing no manifest ({empty!r})")
+
     # Paste an existing model through the XML pane, then confirm the linter
     # reacts and the wiring pane offers the manifest binding.
-    xml = page.locator("textarea.code").nth(1)
+    xml = page.locator("textarea.code-xml")
     xml.fill(
         (REPO / "crates/rbpmn-model/tests/fixtures/accept/07-task-kinds.bpmn").read_text()
     )
@@ -204,18 +245,402 @@ def check_editor(browser):
     )
     check(True, "binding the correlation in the wiring pane clears the diagnostic")
 
-    manifest = page.locator("textarea.code").first.input_value()
+    manifest = page.locator("textarea.code-manifest").input_value()
     check('"rt": "order.id"' in manifest, f"the manifest JSON updated ({manifest!r})")
 
     SHOTS.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(SHOTS / "ui_editor.png"), full_page=False)
     check_condition_repair(page)
+    check_decisions(page)
+    check_decision_working_set(page)
     # Asserted last: check_condition_repair drives the whole condition-editing
     # flow, and anything it throws — a JS exception in reveal(), a
     # CSP-blocked request — lands in this same list. Checking before it ran
     # meant those passed silently.
     check(not problems, f"no console errors or network requests: {problems}")
     page.close()
+
+
+def check_example(page):
+    """The editor opens on a deployment, not on a diagram.
+
+    Three artifacts, imported into the bundle at build time from the files
+    `e2e/demo.py` deploys: the model, its manifest and its decision. Each is
+    already covered on its own — the fixture corpus lints the model and
+    validates the DMN — so what is asserted here is the only thing those
+    cannot see, which is whether the three still agree *with each other*. The
+    manifest binds a task in the model to a decision in the working set by
+    name, and nothing but this checks that the name still resolves.
+
+    That gap is the whole reason this document exists. An example shipping with
+    it open would be a poor advertisement.
+    """
+    check(
+        page.locator('.djs-element[data-element-id="triage"]').count() == 1,
+        "the example's business-rule task is on the canvas",
+    )
+    names = page.eval_on_selector_all(
+        ".decision-list .btn-link", "els => els.map(e => e.textContent.trim())"
+    )
+    check(names == ["triage.dmn"], f"the example bundles its decision ({names})")
+
+    manifest = page.locator("textarea.code-manifest").input_value()
+    check('"decision": "Triage"' in manifest, f"the manifest binds the task ({manifest!r})")
+    check('"risk-scoring"' in manifest, f"the manifest carries the service topics ({manifest!r})")
+
+    # The bound name resolving against the bundled artifact is decidable
+    # offline — a deployment's decisions travel inside it — so this is a real
+    # verdict with no server involved, and the assertion that fails first if
+    # the manifest and the DMN ever drift apart.
+    diagnostics = page.inner_text(".diagnostics")
+    check(
+        "unresolved-decision" not in diagnostics and "decision-has-binding" not in diagnostics,
+        f"the example's decision binding resolves ({diagnostics!r})",
+    )
+
+    # And it evaluates: the try-it pane runs the engine's own evaluator, so
+    # this is the table the demo instance ran, answering here.
+    page.wait_for_function(
+        "() => document.querySelector('.try-it select') !== null", timeout=15000
+    )
+    page.click("text=Evaluate")
+    page.wait_for_function(
+        "() => (document.querySelector('.try-output')?.textContent ?? '') !== ''",
+        timeout=15000,
+    )
+    answer = page.inner_text(".try-output")
+    # The real answer, not merely that something came back: at a risk score of
+    # 82 the table's first rule matches. A decision that cannot see its
+    # declared input answers null instead, and a null is a legal answer — so
+    # nothing but an assertion on the value would report it.
+    check(
+        answer.strip() == '"review"',
+        f"the bundled table evaluates against the default input ({answer!r})",
+    )
+    # fit-viewport anchors a model at the viewport's top-left, and the palette
+    # floats over exactly that corner — the example's start event rendered
+    # underneath it, on the first screen, before `fitClearOfPalette`. It is
+    # geometry, so it is checkable rather than a screenshot someone has to
+    # remember to look at.
+    box = page.evaluate(
+        "() => {"
+        " const r = e => document.querySelector(e).getBoundingClientRect();"
+        " const canvas = r('.djs-container'), palette = r('.djs-palette');"
+        " const first = r('.djs-element[data-element-id=\"placed\"]');"
+        " const last = r('.djs-element[data-element-id=\"abandoned\"]');"
+        " return {clear: first.left >= palette.right,"
+        "         inside: last.right <= canvas.right && first.top >= canvas.top}; }"
+    )
+    check(box["clear"], "the model is fitted clear of the palette")
+    check(box["inside"], "making room for the palette did not push the model off-canvas")
+
+    SHOTS.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(SHOTS / "ui_editor_example.png"), full_page=False)
+
+
+def check_decisions(page):
+    """Authoring the decision half of a deployment, in the same window.
+
+    The loop this closes: a business-rule task binds a decision by name, and
+    without an editor that knows both halves the name is a guess. Everything
+    here happens with no server — a deployment's DMN artifacts travel inside
+    it, so the verdict on them is complete offline.
+    """
+    # Start from a model with a business-rule task, pasted through the XML
+    # pane the way the earlier checks do.
+    xml = page.locator("textarea.code-xml")
+    xml.fill(
+        (REPO / "crates/rbpmn-model/tests/fixtures/accept/25-business-rule-task.bpmn").read_text()
+    )
+    page.wait_for_function(
+        "() => document.querySelectorAll('.djs-element[data-element-id=\"decide\"]').length > 0",
+        timeout=15000,
+    )
+
+    # With nothing bundled, the task cannot deploy: it has no binding, and
+    # there is no decision to bind it to.
+    page.wait_for_function(
+        "() => document.querySelector('.diagnostics').textContent"
+        ".includes('decision-has-binding')",
+        timeout=15000,
+    )
+    check(True, "a business-rule task with no binding is refused")
+
+    # Author a decision. dmn-js is a second modeler on a second canvas; the
+    # editor switches rather than showing both.
+    page.click("text=New decision")
+    # dmn-js opens on the DRD view: its own container, with a drill-down
+    # overlay per decision leading into the table/expression editors.
+    page.wait_for_selector(".dmn-js-parent .dmn-drd-container", timeout=20000)
+    check(page.locator(".dmn-js-parent .djs-container").count() >= 1,
+          "the decision canvas rendered")
+    check(page.locator(".drill-down-overlay").count() >= 1,
+          "the DRD offers drill-down into the decision's logic")
+    page.screenshot(path=str(SHOTS / "ui_editor_decision.png"), full_page=False)
+
+    # The Element pane reads a bpmn-js selection, so on this canvas it can only
+    # be stale or empty — clicking a DMN shape leaves it saying whatever the
+    # process canvas last said, with nothing to indicate that it is not
+    # answering. It is hidden here rather than left inert.
+    element_pane = page.locator("details.pane:has(.properties)")
+    check(not element_pane.is_visible(), "the Element pane is gone on the decision canvas")
+    check(
+        page.locator("details.pane:has(.try-it)").is_visible(),
+        "the panes that do apply to a decision are still there",
+    )
+
+    check_definitions_header(page)
+
+    # Back to the process: the new decision is now bindable *by name*, which
+    # is the thing no server was asked about.
+    page.click("text=Process")
+    check(element_pane.is_visible(), "the Element pane comes back with the process canvas")
+    page.click('.djs-element[data-element-id="decide"]')
+    page.wait_for_function(
+        "() => document.querySelector('.wiring').textContent.includes('bundled decisions')",
+        timeout=15000,
+    )
+    check(True, "the wiring pane offers the bundled decision")
+
+    inputs = page.locator(".wiring input")
+    inputs.nth(0).fill("Decision1")
+    inputs.nth(0).blur()
+    inputs.nth(1).fill("order.discount")
+    inputs.nth(1).blur()
+    page.wait_for_function(
+        "() => !document.querySelector('.diagnostics').textContent"
+        ".includes('decision-has-binding') && "
+        "!document.querySelector('.diagnostics').textContent"
+        ".includes('unresolved-decision')",
+        timeout=15000,
+    )
+    check(True, "binding the decision clears both decision diagnostics")
+
+    manifest = page.locator("textarea.code-manifest").input_value()
+    check('"decision": "Decision1"' in manifest, f"the manifest carries the binding ({manifest!r})")
+
+    # And the try-it pane runs the same evaluator the engine runs.
+    page.wait_for_function(
+        "() => document.querySelector('.try-it select') !== null", timeout=15000
+    )
+    page.click("text=Evaluate")
+    page.wait_for_function(
+        "() => (document.querySelector('.try-output')?.textContent ?? '') !== ''",
+        timeout=15000,
+    )
+    answer = page.inner_text(".try-output")
+    # A *literal expression* over `order.total` from its declared input, where
+    # `check_example`'s is a decision table — the two halves of dmn-js, both
+    # answering from the same default document, which is why they had to agree
+    # on an input name. Asserting the real answer rather than a constant is the
+    # point: a decision that cannot see its input answers `null`, which is
+    # exactly the trap a starter with no `<inputData>` walked users into.
+    check(
+        answer.strip() == '"large"',
+        f"the try-it pane evaluated the decision against its input ({answer!r})",
+    )
+
+
+DEBOUNCE_MS = 300
+"""dmn-js's definitions header debounces its commit by this much."""
+
+
+def check_definitions_header(page):
+    """Typing into the DRD's definitions header — name and id, top left.
+
+    Two upstream dmn-js bugs, both fixed in `ui/src/editor/dmn-definitions-
+    header.js`, and both needing a *pause* to show up. That is why they were
+    reported by a human and not by this file: every other check here types at
+    full speed, under the 300 ms debounce, where the header behaves perfectly.
+
+    So these deliberately type slowly. It costs a few seconds and it is the
+    only reason a dmn-js upgrade that reintroduces either one would be caught
+    before someone tries to rename a decision.
+    """
+    name = page.locator(".dmn-js-parent .dmn-definitions-name")
+    canvas = page.locator(".dmn-js-parent .dmn-drd-container")
+
+    def retype(locator, text, delay_ms):
+        locator.click()
+        page.keyboard.press("ControlOrMeta+A")
+        page.keyboard.press("Delete")
+        page.wait_for_timeout(DEBOUNCE_MS + 200)
+        for char in text:
+            page.keyboard.type(char)
+            page.wait_for_timeout(delay_ms)
+
+    # 1. Slower than the debounce, so a commit lands between each keystroke.
+    # `update()` rewrote the field's text node every time, which collapses the
+    # caret to offset 0 — so the next character went to the front and "Slow"
+    # came out "wolS".
+    retype(name, "Slow", DEBOUNCE_MS + 150)
+    typed = name.inner_text()
+    check(typed == "Slow", f"typing slowly into the definitions name reads forward ({typed!r})")
+
+    # 2. ...and it reached the model, not just the screen. Blurring makes the
+    # header reconcile itself *from* the business object, so a field that still
+    # says "Slow" after a blur is one whose edit was actually committed. No
+    # export needed: the component's own redraw is the assertion.
+    canvas.click(position={"x": 40, "y": 40})
+    page.wait_for_timeout(DEBOUNCE_MS + 400)
+    kept = name.inner_text()
+    check(kept == "Slow", f"the slow-typed name survives a blur, so the model has it ({kept!r})")
+
+    # 3. Faster than the debounce, then click away inside it. `blur` used to
+    # reconcile the field from the *stale* model and the pending commit then
+    # read back the value it had just reverted — the edit vanished silently.
+    name.click()
+    page.keyboard.press("ControlOrMeta+A")
+    page.keyboard.press("Delete")
+    page.wait_for_timeout(DEBOUNCE_MS + 200)
+    page.keyboard.type("Kept", delay=10)
+    canvas.click(position={"x": 40, "y": 40})
+    page.wait_for_timeout(DEBOUNCE_MS + 400)
+    survived = name.inner_text()
+    check(survived == "Kept", f"an edit finished inside the debounce is not lost ({survived!r})")
+
+    # The id field shares the same code path and must not have been touched by
+    # any of it — `update()` writes both fields on every commit.
+    element_id = page.inner_text(".dmn-js-parent .dmn-definitions-id")
+    check(
+        element_id == "_Decision1",
+        f"editing the name left the definitions id alone ({element_id!r})",
+    )
+
+
+def check_decision_working_set(page):
+    """The working set — where an editor loses work without saying anything.
+
+    None of this is visible from the pure-module tests: it lives in the
+    interaction between one dmn-js instance, an array of artifacts, and an
+    index into that array. Every check here failed before the fix, and failed
+    *silently* — the editor stayed on screen looking correct with the wrong
+    content in it.
+
+    The observable throughout is the try-it pane's invocable list, because it
+    is derived from the compiled DMN rather than from the name beside it in
+    the list: a decision whose XML was overwritten keeps its file name and
+    changes its invocable.
+    """
+    page.click("text=New decision")
+    page.wait_for_function(
+        "() => document.querySelectorAll('.decision-list li').length === 2",
+        timeout=20000,
+    )
+    # Wait for the *verdict* to catch up, not just the list. The invocable
+    # list below is the observable, and it lags a render behind — asserting on
+    # it before the second decision registered would read the previous verdict
+    # and pass whatever happened next.
+    page.wait_for_function(
+        "() => document.querySelectorAll('.try-it select option').length === 2",
+        timeout=20000,
+    )
+    before = page.eval_on_selector_all(
+        ".try-it select option", "els => els.map(e => e.textContent)"
+    )
+    check(before == ["Decision1", "Decision2"],
+          f"both decisions are bundled before the removal ({before})")
+
+    # Show the first, then remove it *while it is on screen*. On the way out
+    # the editor captures the canvas back into the working set — and it used
+    # to capture by index, after the array had already been filtered, so the
+    # removed decision's XML landed on whichever artifact inherited its index.
+    page.click(".decision-list li:nth-child(1) .btn-link")
+    page.wait_for_function(
+        "() => document.querySelector('.decision-list li:nth-child(1)')"
+        ".classList.contains('on')",
+        timeout=20000,
+    )
+    page.click(".decision-list li:nth-child(1) button:text-is('Remove')")
+    page.wait_for_function(
+        "() => document.querySelectorAll('.decision-list li').length === 1",
+        timeout=20000,
+    )
+    page.wait_for_function(
+        "() => document.querySelectorAll('.try-it select option').length === 1",
+        timeout=20000,
+    )
+    names = page.eval_on_selector_all(
+        ".try-it select option", "els => els.map(e => e.textContent)"
+    )
+    check(
+        names == ["Decision2"],
+        f"removing the decision on screen leaves the other one intact ({names})",
+    )
+
+    # "New" empties the manifest, so it means a new *deployment* — and the
+    # decisions are part of one. They used to survive it and travel into the
+    # next bundle.
+    page.click("text=New")
+    page.wait_for_function(
+        "() => document.querySelector('.decisions').textContent"
+        ".includes('No decisions')",
+        timeout=20000,
+    )
+    check(True, "a new diagram starts with no decisions carried over")
+
+    # ...and the canvas goes with them. Forgetting the artifact without
+    # clearing the canvas left dmn-js still rendering the discarded decision,
+    # fully editable, while every keystroke in it went nowhere — nothing was
+    # "current", so nothing was captured.
+    page.click("text=Decisions")
+    page.wait_for_timeout(500)
+    leftover = page.locator(".dmn-js-parent .djs-element").count()
+    check(leftover == 0,
+          f"the discarded decision is off the canvas too ({leftover} elements)")
+    page.click("text=Process")
+
+    # A bundle whose `bindings` is an object but not a manifest passes the
+    # bundle shape check and fails the manifest parse. That threw past the
+    # guard, after the file name had already been replaced: an unhandled
+    # rejection, no diagnostic, and an editor left half-loaded.
+    bad = REPO / "e2e" / "screenshots" / "bad.bundle.json"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text('{"bpmn": "<definitions/>", "bindings": {"topics": 5}}')
+    with page.expect_file_chooser() as fc:
+        page.click("text=Open bundle")
+    fc.value.set_files(str(bad))
+    page.wait_for_function(
+        "() => document.querySelector('.diagnostics').textContent.includes('bundle')",
+        timeout=20000,
+    )
+    check(True, "a bundle with a malformed manifest is refused, not half-loaded")
+    # ...and the editor still works afterwards, which is the half an unhandled
+    # rejection takes away.
+    page.click("text=New decision")
+    page.wait_for_function(
+        "() => document.querySelectorAll('.decision-list li').length === 1",
+        timeout=20000,
+    )
+    check(True, "the editor is still usable after a rejected bundle")
+
+    # A decision that will not parse must not be validated as the *previous*
+    # one. `currentXml` reads the canvas, and a failed import leaves the canvas
+    # on the artifact before it — so substituting the live XML by index put
+    # good bytes in the broken file's place and the verdict came back clean,
+    # for a bundle the server refuses. The verdict split, from the side the
+    # editor exists to prevent.
+    broken = REPO / "e2e" / "screenshots" / "broken.dmn"
+    broken.write_text("<definitions this is not xml at all")
+    with page.expect_file_chooser() as fc:
+        page.click("text=Open .dmn")
+    fc.value.set_files(str(broken))
+    page.wait_for_function(
+        "() => document.querySelectorAll('.decision-list li').length === 2",
+        timeout=20000,
+    )
+    # Give the debounced re-check its turn — the bug showed up *after* it ran,
+    # not before, which is what made it survive the first look.
+    page.wait_for_timeout(1500)
+    verdict = page.inner_text(".verdict")
+    diagnostics = page.inner_text(".diagnostics")
+    check(
+        "valid" not in verdict.lower() or "dmn" in diagnostics.lower(),
+        f"an unparseable decision is not reported as deployable "
+        f"(verdict={verdict!r}, diagnostics={diagnostics!r})",
+    )
+    broken.unlink()
+    bad.unlink()
 
 
 def check_condition_repair(page):
@@ -228,7 +653,7 @@ def check_condition_repair(page):
     at something the panes never showed.
     """
     print("editor.html — repairing a broken split")
-    xml = page.locator("textarea.code").nth(1)
+    xml = page.locator("textarea.code-xml")
     xml.fill(
         (REPO / "crates/rbpmn-model/tests/fixtures/reject/condition-full-feel.bpmn").read_text()
     )
@@ -319,6 +744,37 @@ def check_dark_mode(browser):
             stroke is not None and stroke.lower() not in ("#000", "#000000", "black", "rgb(0, 0, 0)"),
             f"{name}: shapes are not painted black on dark ({stroke})",
         )
+
+        # The libraries' own chrome, which `shared/theme.js` cannot reach — it
+        # only sets renderer options. These are the surfaces a night-time bug
+        # report named: a white palette, an unreadable context pad, and the
+        # loud one, a near-white `--shape-drop-allowed-fill-color` painted
+        # across the whole canvas while dragging a pool.
+        #
+        # Read from the *computed* value rather than asserting a stylesheet
+        # exists, because the failure mode was not a missing rule: the rule was
+        # there and correct, and lost on source order to a second copy of
+        # diagram-js.css that dmn-js ships.
+        chrome = page.evaluate(
+            """(keys) => {
+              const el = document.querySelector('.djs-parent');
+              if (!el) return null;
+              const cs = getComputedStyle(el);
+              return Object.fromEntries(keys.map(k => [k, cs.getPropertyValue(k).trim()]));
+            }""",
+            [
+                "--shape-drop-allowed-fill-color",
+                "--palette-background-color",
+                "--context-pad-entry-background-color",
+                "--popup-background-color",
+            ],
+        )
+        check(chrome is not None, f"{name}: the diagram root exposes its colour tokens")
+        for token, value in (chrome or {}).items():
+            check(
+                is_dark(value),
+                f"{name}: {token} is dark on a dark canvas ({value})",
+            )
         label = page.evaluate(
             "() => { const t = document.querySelector('.djs-label text, .djs-visual text');"
             " return t && (t.getAttribute('fill') || getComputedStyle(t).fill); }"
@@ -390,7 +846,14 @@ def check_served(browser):
         page.goto(f"{base}/ui/inspect/{instance}")
         page.wait_for_selector(".djs-container", timeout=20000)
         diagnosis = page.inner_text(".diagnosis")
-        check("Incident at st" in diagnosis, f"a real frozen instance diagnoses itself ({diagnosis[:60]!r})")
+        # `charge` is the demo model's payment task — see
+        # `accept/28-demo-order.bpmn`. This half shares `e2e/demo.py`'s stack
+        # deliberately, so the model the demo shows off is the model this
+        # asserts on, and a change to one cannot quietly diverge from the other.
+        check(
+            "Incident at charge" in diagnosis,
+            f"a real frozen instance diagnoses itself ({diagnosis[:60]!r})",
+        )
         # Opens on the problem rather than an empty pane.
         pane = page.inner_text(".element-pane")
         check("ServiceTask" in pane and "payments" in pane, "the element pane opens on the incident")

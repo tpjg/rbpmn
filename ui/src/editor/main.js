@@ -11,6 +11,7 @@ import Modeler from 'bpmn-js/lib/Modeler';
 import 'bpmn-js/dist/assets/diagram-js.css';
 import 'bpmn-js/dist/assets/bpmn-js.css';
 import 'bpmn-js/dist/assets/bpmn-font/css/bpmn.css';
+import '../shared/diagram-theme.css';
 import './editor.css';
 
 import { annotate, focus } from '../shared/annotations.js';
@@ -23,18 +24,61 @@ import {
   parseManifest,
   serializeManifest,
   setBinding,
+  setDecisionBinding,
 } from './manifest.js';
-import { checkModel, initValidator } from './validate.js';
+import { checkModel, evaluateDecision, initValidator } from './validate.js';
 import { environmentGaps, wiringState } from './environment.js';
 import { download, manifestNameFor, openFile } from './files.js';
+import { buildBundle, bundleNameFor, decisionFileName, parseBundle } from './bundle.js';
+import { DecisionEditor, addDecision, starterDecision } from './decisions.js';
 import { onThemeChange, rendererColors } from '../shared/theme.js';
 
-/// A *deployable* starting point, not the usual lone start event.
+// The example deployment, imported from the files that *are* it rather than
+// copied into string literals here. All three are the same artifacts
+// `e2e/demo.py` deploys, so the editor opens on a deployment that demonstrably
+// runs — and `cargo test`'s fixture corpus keeps the model lint-clean and the
+// decision valid without this document having to be built to find out.
+//
+// Vite inlines `?raw` at build time, so nothing is fetched: the editor stays
+// one file that works from `file://`. `ui-test`'s node runner never loads this
+// module (it imports bpmn-js), so the non-standard specifier costs it nothing.
+import EXAMPLE_BPMN from '../../../crates/rbpmn-model/tests/fixtures/accept/28-demo-order.bpmn?raw';
+import EXAMPLE_BINDINGS from '../../../crates/rbpmn-model/tests/fixtures/accept/28-demo-order.bindings.json?raw';
+import EXAMPLE_DMN from '../../../crates/rbpmn-dmn/tests/fixtures/accept/09-demo-triage.dmn?raw';
+
+/// What the editor opens on: a whole **deployment**, not a diagram.
 ///
-/// The linter is this project's front door and the editor's whole job is to
-/// show its verdict — so opening a new document on a model that is already
-/// rejected teaches the wrong first lesson. This one passes: one start, one
-/// end, an activity between them.
+/// A lone start event teaches nothing, and the previous starter — start, user
+/// task, end — taught only that the linter is happy. Neither showed the thing
+/// this document exists for, which is that a `.bpmn` is half a deployment: the
+/// other half is a manifest and the DMN artifacts that travel with it, and no
+/// bpmn-io tool has any of it.
+///
+/// So the first screen has all three, already consistent: a business-rule task
+/// bound by name to a decision in the working set, service tasks bound to
+/// topics, an index declared. Every pane in the editor has something in it,
+/// deleting is easier than authoring, and "New" is one click away for someone
+/// who wants the bare skeleton instead.
+///
+/// The manifest goes through `parseManifest` rather than being written as an
+/// object literal, so the example is held to exactly the shape the editor
+/// accepts from a user — a starting point the editor itself would reject is
+/// not a starting point.
+const EXAMPLE = {
+  fileName: 'order.bpmn',
+  bpmn: EXAMPLE_BPMN,
+  bindings: EXAMPLE_BINDINGS,
+  decisions: [{ name: 'triage.dmn', xml: EXAMPLE_DMN }],
+};
+
+/// What **New** gives you: a cleared desk that still passes.
+///
+/// Deliberately not the example. "New" means "I want to model my own thing",
+/// and starting that by deleting twelve elements is worse than starting from
+/// nothing. But it is not nothing either — the linter is this project's front
+/// door and the editor's whole job is to show its verdict, so a new document
+/// that opens already rejected teaches the wrong first lesson. One start, one
+/// end, an activity between them, no manifest needed.
 const STARTER = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
@@ -81,6 +125,16 @@ const STARTER = `<?xml version="1.0" encoding="UTF-8"?>
 
 const state = {
   manifest: emptyManifest(),
+  /// The DMN artifacts this deployment carries: `[{ name, xml }]`. They
+  /// travel *inside* the deployment, which is why the editor can validate
+  /// them completely without a server.
+  decisions: [],
+  /// Which artifact the decision canvas is showing, by index.
+  activeDecision: 0,
+  /// 'process' or 'decisions' — one canvas, two editors. Side by side was
+  /// rejected: a decision is edited *because of* a task in the process, not
+  /// alongside it, and two live canvases double the ways focus can be lost.
+  mode: 'process',
   /// null means "no server consulted" — a different thing from "not covered",
   /// and the UI must never render them the same way.
   covered: null,
@@ -94,7 +148,11 @@ const ui = {};
 
 function button(label, onClick, className = 'btn') {
   const node = el('button', className, label);
-  node.addEventListener('click', onClick);
+  // Guarded here rather than at each call site, because nearly every handler
+  // in this editor is `async` and a promise nobody awaits turns any throw into
+  // an unhandled rejection — invisible to the user, and to the e2e run just a
+  // console error with no indication of which button threw.
+  node.addEventListener('click', () => handle(onClick()));
   return node;
 }
 
@@ -108,14 +166,29 @@ function buildLayout(root) {
     button('Open .bpmn', openBpmn),
     button('Open manifest', openManifest),
     button('Save .bpmn', saveBpmn, 'btn btn-primary'),
-    button('Save manifest', saveManifest, 'btn btn-primary')
+    button('Save manifest', saveManifest, 'btn btn-primary'),
+    button('Export bundle', saveBundle, 'btn btn-primary'),
+    button('Open bundle', openBundle)
   );
   ui.verdict = el('span', 'verdict', 'checking…');
   bar.append(ui.verdict);
 
+  ui.modeProcess = button('Process', () => setMode('process'), 'btn btn-mode');
+  ui.modeDecisions = button(
+    'Decisions',
+    () => goToDecision(state.activeDecision),
+    'btn btn-mode'
+  );
+  bar.append(ui.modeProcess, ui.modeDecisions);
+
   const canvasWrap = el('div', 'canvas-wrap');
   ui.canvas = el('div', 'canvas');
-  canvasWrap.append(ui.canvas);
+  // A second canvas rather than a shared one: dmn-js and bpmn-js both own
+  // their container outright, and handing the same node back and forth is how
+  // you end up with two renderers fighting over it.
+  ui.dmnCanvas = el('div', 'canvas');
+  ui.dmnCanvas.hidden = true;
+  canvasWrap.append(ui.canvas, ui.dmnCanvas);
 
   const side = el('aside', 'side');
 
@@ -125,21 +198,29 @@ function buildLayout(root) {
   side.append(diagnosticsPane);
 
   ui.properties = el('div', 'properties');
-  side.append(pane('Element', ui.properties));
+  // Hidden outright in decisions mode rather than left empty — see `setMode`.
+  ui.elementPane = pane('Element', ui.properties);
+  side.append(ui.elementPane);
 
   ui.wiring = el('div', 'wiring');
   side.append(pane('Wiring (manifest)', ui.wiring));
 
+  ui.decisions = el('div', 'decisions');
+  side.append(pane('Decisions', ui.decisions));
+
+  ui.tryIt = el('div', 'try-it');
+  side.append(pane('Try a decision', ui.tryIt, null, { open: false }));
+
   ui.environment = el('div', 'environment');
   side.append(pane('Environment', ui.environment));
 
-  ui.manifestText = el('textarea', 'code');
+  ui.manifestText = el('textarea', 'code code-manifest');
   ui.manifestText.spellcheck = false;
   ui.manifestError = el('div', 'inline-error');
   ui.manifestError.hidden = true;
   side.append(pane('Manifest JSON', ui.manifestText, ui.manifestError, { open: false }));
 
-  ui.xmlText = el('textarea', 'code');
+  ui.xmlText = el('textarea', 'code code-xml');
   ui.xmlText.spellcheck = false;
   side.append(pane('BPMN XML', ui.xmlText, null, { open: false }));
 
@@ -173,6 +254,25 @@ function wireModeler() {
   });
 }
 
+/// Construct the decision editor, replacing any previous one.
+///
+/// The counterpart to `wireModeler`, and it *destroys* rather than merely
+/// dropping: a theme flip rebuilds both editors, and a dropped dmn-js keeps
+/// its global key bindings and its listeners alive, so each flip would leave
+/// another instance competing for the same keystrokes.
+function mountDecisionEditor() {
+  decisionEditor?.destroy();
+  decisionEditor = new DecisionEditor(ui.dmnCanvas, {
+    colors: rendererColors(),
+    onChange: () => {
+      // An edit in the decision canvas is an edit to the deployment: it can
+      // rename an invocable a manifest binds, so the whole verdict is
+      // recomputed rather than just the DMN half.
+      captureDecisionQueued().then(scheduleCheck);
+    },
+  });
+}
+
 /// Rebuild the modeler for the new theme, keeping the work.
 ///
 /// The model survives (re-imported), the manifest survives (it lives in
@@ -185,9 +285,18 @@ async function remountForTheme() {
   } catch {
     return;
   }
+  // The decision half needs the same treatment as the process half, and did
+  // not have it: `mountDecisionEditor` destroys the old dmn-js, so anything on
+  // that canvas not already written back by an `onChange` capture went with
+  // it — silently, and into a pane left blank in process mode.
+  await captureDecisionQueued();
   modeler.destroy();
   modeler = new Modeler({ container: ui.canvas, bpmnRenderer: rendererColors() });
   wireModeler();
+
+  mountDecisionEditor();
+  setMode('process');
+  renderDecisions();
   await importXml(xml);
 }
 
@@ -210,7 +319,7 @@ async function runCheck({ syncXmlBox = true } = {}) {
   }
   if (syncXmlBox && document.activeElement !== ui.xmlText) ui.xmlText.value = xml;
 
-  const verdict = checkModel(xml, state.manifest);
+  const verdict = checkModel(xml, state.manifest, await decisionXmls());
   state.lastVerdict = verdict;
 
   const diagnostics = [...(verdict.diagnostics ?? [])];
@@ -269,6 +378,7 @@ async function runCheck({ syncXmlBox = true } = {}) {
       }))
   );
   renderWiring();
+  renderTryIt();
 }
 
 function setVerdict(kind, text) {
@@ -329,7 +439,18 @@ function renderWiring() {
   ui.wiring.replaceChildren();
   const element = state.selection;
   if (!element) {
-    ui.wiring.append(el('p', 'empty', 'Select an element to bind it.'));
+    // Named for the canvas in front of you. "Select an element" on the
+    // decision canvas invites a click that does nothing, because the selection
+    // this reads is bpmn-js's.
+    ui.wiring.append(
+      el(
+        'p',
+        'empty',
+        state.mode === 'decisions'
+          ? 'Bindings attach to process elements — pick one under Process.'
+          : 'Select an element to bind it.'
+      )
+    );
     renderIndexes();
     return;
   }
@@ -338,11 +459,12 @@ function renderWiring() {
   const type = bo.$type;
 
   const wantsTopic = type === 'bpmn:ServiceTask';
+  const wantsDecision = type === 'bpmn:BusinessRuleTask';
   const wantsCorrelation =
     type === 'bpmn:ReceiveTask' ||
     (bo.eventDefinitions ?? []).some((d) => d.$type === 'bpmn:MessageEventDefinition');
 
-  if (!wantsTopic && !wantsCorrelation) {
+  if (!wantsTopic && !wantsCorrelation && !wantsDecision) {
     ui.wiring.append(el('p', 'empty', 'this element needs no manifest wiring'));
     renderIndexes();
     return;
@@ -377,6 +499,43 @@ function renderWiring() {
       )
     );
     ui.wiring.append(row);
+  }
+
+  if (wantsDecision) {
+    const bound = state.manifest.decisions[id] ?? { decision: '', result: '' };
+    // The invocables the *bundle* exposes. Unlike topics this needs no
+    // server: the artifacts are part of the deployment, so the editor knows
+    // the whole answer.
+    const invocables = (state.lastVerdict?.invocables ?? []).map((i) => i.name);
+    ui.wiring.append(
+      bindingRow(
+        'decision',
+        bound.decision,
+        invocables[0] ?? 'Discount',
+        (value) => {
+          state.manifest = setDecisionBinding(state.manifest, id, 'decision', value);
+          syncManifestBox();
+          scheduleCheck();
+        },
+        invocables.length
+          ? `bundled decisions: ${invocables.join(', ')}`
+          : 'no DMN artifacts in this deployment yet — add one under Decisions',
+        invocables
+      )
+    );
+    ui.wiring.append(
+      bindingRow(
+        'result path',
+        bound.result,
+        'order.discount',
+        (value) => {
+          state.manifest = setDecisionBinding(state.manifest, id, 'result', value);
+          syncManifestBox();
+          scheduleCheck();
+        },
+        'where the answer lands in the variable document; a FEEL qualified name'
+      )
+    );
   }
 
   if (wantsCorrelation) {
@@ -443,7 +602,12 @@ function renderIndexes() {
   row.append(el('span', 'prop-label', 'indexes'));
   const input = el('input', 'prop-input');
   input.value = (state.manifest.indexes ?? []).join(', ');
-  input.placeholder = 'order.status, customer.tier';
+  // Top-level names only, and the placeholder used to show two dotted paths
+  // that deploy refuses: an index is a single segment (`parse_qname` with
+  // `path.len() == 1`), because it becomes a real database index on one JSONB
+  // field. A placeholder is an example, and an example deploy rejects is a
+  // bug report waiting to happen.
+  input.placeholder = 'status, tier';
   const commit = () => {
     const fields = input.value
       .split(',')
@@ -456,7 +620,7 @@ function renderIndexes() {
   input.addEventListener('blur', commit);
   row.append(input);
   row.append(
-    el('span', 'prop-hint', 'optional: variables fields the application filters tasks by')
+    el('span', 'prop-hint', 'optional: top-level variables fields the application filters tasks by')
   );
   ui.wiring.append(row);
 }
@@ -547,9 +711,44 @@ function renderEnvironment(covered, error) {
 
 // -------------------------------------------------------------------- files
 
+/// Install `EXAMPLE` as the working deployment. Boot only — there is no button
+/// for it, because "get the example back" is a page reload and an affordance
+/// that silently replaces unsaved work is not worth the toolbar space.
+///
+/// Same order as `newDiagram`, and for the same reason: the manifest and the
+/// decisions have to be in place *before* `importXml`, because importing runs
+/// the check, and a check that ran against the old working set would report
+/// this deployment as unbound for one render.
+async function loadExample() {
+  state.fileName = EXAMPLE.fileName;
+  state.manifest = parseManifest(EXAMPLE.bindings);
+  state.decisions = EXAMPLE.decisions.map((d) => ({ ...d }));
+  state.activeDecision = 0;
+  setMode('process');
+  renderDecisions();
+  syncManifestBox();
+  await importXml(EXAMPLE.bpmn);
+}
+
 async function newDiagram() {
   state.fileName = 'process.bpmn';
   state.manifest = emptyManifest();
+  // "New" means a new *deployment*, which is why the manifest is emptied — and
+  // the decisions are part of that deployment, so they go with it. Leaving
+  // them behind put the previous process's decisions into the next bundle.
+  //
+  // `openBpmn` deliberately does the opposite and keeps both: opening a `.bpmn`
+  // replaces the process within the deployment you are holding, which is what
+  // makes re-opening an edited process keep its bindings. Stale bindings and
+  // stale decisions are then a *validation* answer, not a silent reset.
+  //
+  // Note this lands on `STARTER`, not on the example the editor booted with —
+  // see the two constants at the top.
+  decisionEditor?.destroy();
+  state.decisions = [];
+  state.activeDecision = 0;
+  setMode('process');
+  renderDecisions();
   syncManifestBox();
   await importXml(STARTER);
 }
@@ -585,13 +784,106 @@ function saveManifest() {
   download(manifestNameFor(state.fileName), serializeManifest(state.manifest), 'application/json');
 }
 
+/// The whole deployment in one file: exactly the body `POST /v1/definitions`
+/// takes, so what is exported here is what deploy consumes. The individual
+/// files stay the primary artifacts — they are what a git diff can show — and
+/// this is for handing the deployment over.
+async function saveBundle() {
+  await captureDecisionQueued();
+  const { xml } = await modeler.saveXML({ format: true });
+  const bundle = buildBundle({
+    bpmn: xml,
+    manifest: serializeManifest(state.manifest),
+    decisions: state.decisions,
+  });
+  download(bundleNameFor(state.fileName), bundle, 'application/json');
+}
+
+async function openBundle() {
+  const file = await openFile('.json,application/json');
+  if (!file) return;
+  let parsed;
+  let manifest;
+  try {
+    parsed = parseBundle(file.text);
+    // Inside the guard, not after it. `parseBundle` checks that `bindings` is
+    // an *object*; `parseManifest` is what checks it is a manifest, and it
+    // throws — so `{"bpmn": "...", "bindings": {"topics": 5}}` passed the first
+    // and blew up in the second, after `state.fileName` had already moved.
+    // An unhandled rejection is not a diagnostic, and it left the editor
+    // half-loaded with nothing on screen to say so.
+    manifest = parseManifest(parsed.manifest);
+  } catch (e) {
+    setVerdict('error', 'bundle rejected');
+    renderDiagnostics([
+      { severity: 'error', rule: 'bundle', element: file.name, message: e.message },
+    ]);
+    return;
+  }
+  state.fileName = file.name.replace(/\.bundle\.json$/i, '.bpmn');
+  state.manifest = manifest;
+  decisionEditor?.destroy();
+  state.decisions = parsed.decisions.map((d, i) => ({
+    name: d.name || decisionFileName(d.xml, i),
+    xml: d.xml,
+  }));
+  state.activeDecision = 0;
+  syncManifestBox();
+  setMode('process');
+  renderDecisions();
+  await importXml(parsed.bpmn);
+}
+
+/// Fit the model to the canvas with the palette kept off it.
+///
+/// `zoom('fit-viewport')` anchors the model's top-left corner at the
+/// viewport's, and the palette floats over exactly that corner — so the first
+/// element of every model opened here rendered underneath it. The example
+/// deployment is what made it loud, its start event disappearing behind the
+/// palette on the first screen, but it was never specific to that model.
+///
+/// The gutter is measured rather than assumed: the palette lays itself out in
+/// two columns when the canvas is short and one when it is tall, so either
+/// constant would be wrong at one of the two.
+///
+/// `fitted` is the ceiling on the result, and it is load-bearing rather than
+/// defensive: fit-viewport deliberately refuses to zoom *in* past 100%, so a
+/// three-element model sits at 1.0 with room to spare. Recomputing a scale
+/// from the reduced box would blow it up to fill the space instead — clearing
+/// the palette must move a model, never magnify one.
+function fitClearOfPalette() {
+  const canvas = modeler.get('canvas');
+  canvas.zoom('fit-viewport');
+  const palette = ui.canvas.querySelector('.djs-palette');
+  const { inner, outer, scale: fitted } = canvas.viewbox();
+  if (!palette || !inner.width || !inner.height) return;
+  const left = palette.getBoundingClientRect().right - ui.canvas.getBoundingClientRect().left + 16;
+  const top = 16;
+  const scale = Math.min(
+    fitted,
+    (outer.width - left - 24) / inner.width,
+    (outer.height - top - 24) / inner.height
+  );
+  // A hidden canvas measures zero, which is every dimension here at once. It
+  // happens — "Open .bpmn" is in the toolbar and the toolbar is reachable from
+  // the decisions pane — and leaving fit-viewport's own result alone is the
+  // right answer, not a viewbox computed from a negative scale.
+  if (!(scale > 0)) return;
+  canvas.viewbox({
+    x: inner.x - left / scale,
+    y: inner.y - top / scale,
+    width: outer.width / scale,
+    height: outer.height / scale,
+  });
+}
+
 async function importXml(xml) {
   try {
     // Hand-written models carry no diagram; laying one out beats rendering an
     // empty canvas.
     const renderable = await ensureDi(xml);
     await modeler.importXML(renderable);
-    modeler.get('canvas').zoom('fit-viewport');
+    fitClearOfPalette();
   } catch (e) {
     setVerdict('error', 'cannot import');
     renderDiagnostics([
@@ -604,6 +896,294 @@ async function importXml(xml) {
   await runCheck();
 }
 
+
+// ---------------------------------------------------------------- decisions
+//
+// The artifacts a deployment carries. They are edited in the same window as
+// the process because that is where the question comes up — a business-rule
+// task is bound to a decision, and switching apps to answer "what does this
+// decide?" is how a manifest ends up pointing at nothing.
+
+let decisionEditor;
+
+function setMode(mode) {
+  state.mode = mode;
+  ui.canvas.hidden = mode !== 'process';
+  ui.dmnCanvas.hidden = mode !== 'decisions';
+  ui.modeProcess.classList.toggle('btn-mode-on', mode === 'process');
+  ui.modeDecisions.classList.toggle('btn-mode-on', mode === 'decisions');
+
+  // The Element pane reads a *bpmn-js* selection, so on the decision canvas it
+  // is inert: clicking a DMN shape leaves it showing whatever process element
+  // was last selected, or nothing, with no way to tell which. Gone is clearer
+  // than stale — a pane that never answers is worse than one that is not
+  // there. The rest of the column is not process-specific and stays.
+  ui.elementPane.hidden = mode !== 'process';
+  // The wiring pane *does* stay: a decision is usually being edited because of
+  // a business-rule task, and keeping that task's bindings in view is the
+  // point. Only its no-selection line is mode-specific, so re-render it.
+  renderWiring();
+}
+
+/// Switch to the decisions pane *and* show one — the only way in.
+///
+/// `setMode` used to start a `showDecision` of its own, unawaited, so every
+/// caller that then awaited its own `showDecision` had two of them in flight
+/// against one dmn-js: two captures and two imports interleaving, which could
+/// leave the canvas showing one artifact while `current` named another.
+async function goToDecision(index) {
+  setMode('decisions');
+  await showDecision(index);
+}
+
+/// One decision transition at a time.
+///
+/// Every path here imports into a single dmn-js instance and writes the
+/// previous artifact back on the way out, so two overlapping transitions can
+/// interleave a capture with an import and cross-write two artifacts. Clicks
+/// are asynchronous and arrive whenever they like; serialising is cheaper than
+/// proving no pair of callers can ever race.
+let decisionQueue = Promise.resolve();
+function serializeDecisionWork(work) {
+  // `then(work, work)` so a failed transition does not skip the next one, and
+  // the queue itself is the *settled* promise: it must survive a failure —
+  // a decision that will not open is reported, not a reason to wedge every
+  // later switch.
+  const next = decisionQueue.then(work, work);
+  decisionQueue = next.then(
+    () => {},
+    () => {}
+  );
+  return next;
+}
+
+/// Report anything a handler throws, instead of losing it.
+///
+/// Every failure this editor knows how to describe goes through the diagnostics
+/// pane; one that escapes a click handler went nowhere at all.
+function handle(result) {
+  Promise.resolve(result).catch((e) => {
+    setVerdict('error', 'editor error');
+    renderDiagnostics([
+      { severity: 'error', rule: 'editor', element: '', message: String(e?.message ?? e) },
+    ]);
+  });
+}
+
+/// `captureDecision`, queued.
+///
+/// Serialising `showDecision` alone was not enough: a capture reads
+/// `decisionEditor.current` synchronously and *then* awaits `saveXML`, which
+/// reads whatever definitions the canvas holds by the time it runs. Click a
+/// decision and hit Remove before its import resolves and those two disagree —
+/// the new artifact's XML written over the old one's, silently. Every path
+/// that captures outside a transition goes through here.
+function captureDecisionQueued() {
+  return serializeDecisionWork(captureDecision);
+}
+
+/// The current XML of every artifact — the *live* one for whichever is on
+/// screen, so validation sees edits rather than the last import.
+///
+/// Substituted by **identity**, not by index. `currentXml` reads the canvas,
+/// and the canvas holds `decisionEditor.current`, which is not
+/// `state.decisions[state.activeDecision]` whenever an import failed: opening
+/// a malformed `.dmn` moves the index and leaves the canvas on the previous
+/// artifact, and keying by index then validated the previous decision's XML in
+/// the broken one's place. The verdict came back clean and `saveBundle` wrote
+/// the bytes the server refuses — the exact verdict split this editor exists
+/// to prevent.
+async function decisionXmls() {
+  const shown = decisionEditor?.current;
+  if (!shown) return state.decisions.map((d) => d.xml);
+  const live = await decisionEditor.currentXml();
+  return state.decisions.map((d) => (live && d === shown ? live : d.xml));
+}
+
+/// Pull the on-screen artifact's XML back into the working set, so switching
+/// away from a decision does not lose what was typed into it.
+///
+/// It writes to `decisionEditor.current` — the artifact the canvas actually
+/// holds — and deliberately **not** to `state.decisions[state.activeDecision]`.
+/// The two come apart exactly when it matters: removing the decision on screen
+/// filters the array first, so that index then names a *different* artifact,
+/// and the capture copied the removed decision's XML over its neighbour.
+async function captureDecision() {
+  const artifact = decisionEditor?.current;
+  if (!artifact) return;
+  const live = await decisionEditor.currentXml();
+  if (live) artifact.xml = live;
+}
+
+function showDecision(index) {
+  return serializeDecisionWork(() => showDecisionNow(index));
+}
+
+/// The body, for callers already holding the queue. Never call it from outside
+/// one — that is what `showDecision` is for.
+async function showDecisionNow(index) {
+  await captureDecision();
+  state.activeDecision = index;
+  const artifact = state.decisions[index];
+  renderDecisions();
+  if (!artifact) {
+    await decisionEditor?.show(null);
+    return;
+  }
+  try {
+    await decisionEditor.show(artifact);
+  } catch (e) {
+    setVerdict('error', 'decision will not open');
+    renderDiagnostics([
+      { severity: 'error', rule: 'dmn-validates', element: artifact.name, message: e.message },
+    ]);
+  }
+}
+
+function renderDecisions() {
+  ui.decisions.replaceChildren();
+  const list = el('ul', 'decision-list');
+  state.decisions.forEach((artifact, i) => {
+    const item = el('li', i === state.activeDecision ? 'decision on' : 'decision');
+    const open = button(artifact.name, () => goToDecision(i), 'btn btn-link');
+    item.append(open);
+    item.append(
+      button('Save', () => saveDecision(i), 'btn btn-small'),
+      button('Remove', () => removeDecision(i), 'btn btn-small')
+    );
+    list.append(item);
+  });
+  if (!state.decisions.length) {
+    ui.decisions.append(
+      el('p', 'empty', 'No decisions. A business-rule task needs one to bind to.')
+    );
+  } else {
+    ui.decisions.append(list);
+  }
+  const actions = el('div', 'row');
+  actions.append(
+    button('New decision', newDecision, 'btn btn-small'),
+    button('Open .dmn', openDecision, 'btn btn-small')
+  );
+  ui.decisions.append(actions);
+  renderTryIt();
+}
+
+async function newDecision() {
+  const name = `Decision${state.decisions.length + 1}`;
+  state.decisions = addDecision(state.decisions, starterDecision(name), `${name}.dmn`);
+  await goToDecision(state.decisions.length - 1);
+  scheduleCheck();
+}
+
+async function openDecision() {
+  const file = await openFile('.dmn,application/xml,text/xml');
+  if (!file) return;
+  state.decisions = addDecision(state.decisions, file.text, file.name);
+  await goToDecision(state.decisions.length - 1);
+  scheduleCheck();
+}
+
+async function saveDecision(index) {
+  await captureDecisionQueued();
+  const artifact = state.decisions[index];
+  if (artifact) download(artifact.name, artifact.xml, 'application/xml');
+}
+
+async function removeDecision(index) {
+  // The **whole** removal is queued, not just its capture: it rewrites
+  // `state.decisions` and `state.activeDecision`, and a transition still in
+  // flight resolves its own index against that array.
+  await serializeDecisionWork(async () => {
+    // Capture first, while the indices still mean what the canvas means, and
+    // give up the canvas before filtering: the artifact on screen may be the
+    // one being removed, and a capture after the filter wrote its XML into
+    // whatever artifact inherited its index.
+    await captureDecision();
+    const removed = state.decisions[index];
+    if (decisionEditor?.current === removed) decisionEditor.destroy();
+    state.decisions = state.decisions.filter((_, i) => i !== index);
+    state.activeDecision = Math.max(0, Math.min(state.activeDecision, state.decisions.length - 1));
+    if (!state.decisions.length) {
+      setMode('process');
+      renderDecisions();
+    } else {
+      await showDecisionNow(state.activeDecision);
+    }
+  });
+  scheduleCheck();
+}
+
+// ------------------------------------------------------------------ try it
+//
+// The same evaluator the engine runs, against sample input the user types.
+// Not a debugger and not a test runner: one decision, one input, one answer —
+// enough to know whether a table says what its author meant.
+
+function renderTryIt() {
+  ui.tryIt.replaceChildren();
+  const invocables = state.lastVerdict?.invocables ?? [];
+  if (!invocables.length) {
+    ui.tryIt.append(el('p', 'empty', 'No bundled decision to run.'));
+    return;
+  }
+  const select = el('select', 'input');
+  invocables.forEach((i, index) => {
+    const option = el('option', null, i.name);
+    option.value = String(index);
+    select.append(option);
+  });
+  const input = el('textarea', 'code code-small code-try-input');
+  input.spellcheck = false;
+  // Fits *both* decisions the editor can produce without a file being opened:
+  // the example's `Triage` table (`order.total` and `risk.score`) and
+  // `starterDecision`'s literal expression (`order.total`). So Evaluate answers
+  // on the first click either way — a default that does not fit the decision in
+  // front of you answers null, and null is exactly the trap this pane is for.
+  //
+  // Keeping one document is what forced the two to share an input name; the
+  // alternative was a default that silently fits only whichever decision the
+  // list happens to be showing.
+  input.value =
+    ui.tryItInput?.value ?? '{\n  "order": { "total": 250 },\n  "risk": { "score": 82 }\n}';
+  ui.tryItInput = input;
+  const output = el('pre', 'try-output', '');
+  const run = button(
+    'Evaluate',
+    async () => {
+      const invocable = invocables[Number(select.value)];
+      try {
+        const result = evaluateDecision(await decisionXmls(), invocable, input.value);
+        output.className = `try-output try-${result.outcome}`;
+        output.textContent = describeOutcome(result);
+      } catch (e) {
+        output.className = 'try-output try-error';
+        output.textContent = String(e.message ?? e);
+      }
+    },
+    'btn btn-small'
+  );
+  ui.tryIt.append(select, input, run, output);
+}
+
+/// A null is an answer, not a failure — dsntk cannot tell a legal "no rule
+/// matched" from a broken evaluation, so the reason is shown as explanation
+/// and never as a verdict (docs/dmn.md, "What P1 measured").
+function describeOutcome(result) {
+  switch (result.outcome) {
+    case 'value':
+      return JSON.stringify(result.value, null, 2);
+    case 'null':
+      return result.reason
+        ? `null\n\n${result.reason}\n\n(a null is an answer: an incomplete table and a bad input look the same here)`
+        : 'null';
+    case 'unrepresentable':
+      return `no usable answer: ${result.reason}`;
+    default:
+      return result.reason ?? 'no answer';
+  }
+}
+
 // --------------------------------------------------------------------- boot
 
 async function main() {
@@ -613,6 +1193,10 @@ async function main() {
 
   modeler = new Modeler({ container: ui.canvas, bpmnRenderer: rendererColors() });
   wireModeler();
+
+  mountDecisionEditor();
+  setMode('process');
+  renderDecisions();
 
 
   ui.manifestText.addEventListener('input', () => {
@@ -637,8 +1221,7 @@ async function main() {
   onThemeChange(remountForTheme);
 
   await initValidator();
-  syncManifestBox();
-  await importXml(STARTER);
+  await loadExample();
 }
 
 if (document.readyState === 'loading') {

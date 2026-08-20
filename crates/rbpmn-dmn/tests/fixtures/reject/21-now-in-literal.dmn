@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error feel-deterministic @ stamped
+-->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/21-now-in-literal" name="21-now-in-literal" id="_21-now-in-literal">
+  <decision name="Stamped" id="stamped">
+    <variable name="Stamped" typeRef="Any"/>
+    <literalExpression><text>now()</text></literalExpression>
+  </decision>
+</definitions>

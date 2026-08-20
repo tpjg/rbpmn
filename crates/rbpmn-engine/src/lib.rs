@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 mod deploy;
+pub use deploy::Bundle;
 mod error;
 mod events;
 #[cfg(feature = "http")]
@@ -48,7 +49,7 @@ pub use runtime::FailOptions;
 pub use scheduler::SchedulerOptions;
 pub use sqlx::PgPool;
 pub use tasks::{
-    GetTaskOptions, LockExtension, LockedTask, TaskFilter, TaskOrder, declared_index_name,
+    GetTaskOptions, LockExtension, LockedTask, Released, TaskFilter, TaskOrder, declared_index_name,
 };
 pub use worker::WorkerOptions;
 
@@ -105,6 +106,21 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         9,
         "autovacuum",
         include_str!("../migrations/0009_autovacuum.sql"),
+    ),
+    (
+        10,
+        "decisions",
+        include_str!("../migrations/0010_decisions.sql"),
+    ),
+    (
+        11,
+        "pinned_version",
+        include_str!("../migrations/0011_pinned_version.sql"),
+    ),
+    (
+        12,
+        "lease_epoch",
+        include_str!("../migrations/0012_lease_epoch.sql"),
     ),
 ];
 
@@ -195,6 +211,8 @@ impl EngineBuilder {
                 retry_backoff: self.retry_backoff,
                 deferrals: std::sync::Mutex::new(BTreeMap::new()),
                 compiled: RwLock::new(BTreeMap::new()),
+                #[cfg(feature = "dmn")]
+                decisions: RwLock::new(BTreeMap::new()),
                 archive: RwLock::new(self.archive),
             }),
         }
@@ -209,6 +227,13 @@ struct Inner {
     /// [`Deferral`]. Shared by the candidate query and the sleep
     /// computation, which is what keeps the two in agreement.
     deferrals: std::sync::Mutex<BTreeMap<uuid::Uuid, Deferral>>,
+    /// Compiled decision artifacts by definition id, same lifetime and same
+    /// reasoning as `compiled`: building the evaluators parses every FEEL
+    /// expression in every artifact, far too expensive to repeat per
+    /// instance, and a deployed version is immutable so it never needs
+    /// invalidating.
+    #[cfg(feature = "dmn")]
+    decisions: RwLock<BTreeMap<uuid::Uuid, Arc<rbpmn_dmn::Decisions>>>,
     /// Compiled definitions by definition id — immutable rows, cached
     /// forever; definitions are few, growth is bounded by deploys.
     compiled: RwLock<BTreeMap<uuid::Uuid, Arc<rbpmn_core::ExecutableProcess>>>,
@@ -443,6 +468,11 @@ impl Engine {
     /// deletion evicts.
     pub(crate) fn forget_compiled(&self, definition_id: uuid::Uuid) {
         self.inner.compiled.write().unwrap().remove(&definition_id);
+        // A definition's decisions are cached on the same key and are just as
+        // immutable, so they are evicted with it — leaving them behind would
+        // outlive the thing they belong to.
+        #[cfg(feature = "dmn")]
+        self.inner.decisions.write().unwrap().remove(&definition_id);
     }
 
     /// Register (or re-register: latest binding wins) a push-mode handler.
@@ -509,6 +539,32 @@ impl Engine {
             .unwrap()
             .get(&definition_id)
             .cloned()
+    }
+
+    #[cfg(feature = "dmn")]
+    pub(crate) fn cached_decisions(
+        &self,
+        definition_id: uuid::Uuid,
+    ) -> Option<Arc<rbpmn_dmn::Decisions>> {
+        self.inner
+            .decisions
+            .read()
+            .unwrap()
+            .get(&definition_id)
+            .cloned()
+    }
+
+    #[cfg(feature = "dmn")]
+    pub(crate) fn cache_decisions(
+        &self,
+        definition_id: uuid::Uuid,
+        decisions: Arc<rbpmn_dmn::Decisions>,
+    ) {
+        self.inner
+            .decisions
+            .write()
+            .unwrap()
+            .insert(definition_id, decisions);
     }
 
     pub(crate) fn cache_process(

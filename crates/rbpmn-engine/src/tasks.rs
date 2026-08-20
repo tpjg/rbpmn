@@ -13,10 +13,12 @@
 //! Filters compare fields of the owning instance's **live** variables — the
 //! single variable document, never a snapshot that could silently diverge.
 //!
-//! The lease protocol — claim, renew, expire, complete — is model checked in
-//! `spec/Lease.tla`: no double delivery, exactly-once completion under
-//! at-least-once delivery, completion authority following the current lease
-//! rather than the holder's belief, and nothing ever stranded. Changing the
+//! The lease protocol — claim, renew, expire, release, complete — is model
+//! checked in `spec/Lease.tla`: no double delivery, exactly-once completion
+//! under at-least-once delivery, completion authority following the current
+//! lease rather than the holder's belief, a live lease freed by nobody but
+//! its own holder, a release freeing only the lease it named even when the
+//! client retries it, and nothing ever stranded. Changing the
 //! TTL/renewal/ownership rules here means re-running `just tla`.
 //! The filter compiler emits exactly the expression shape that
 //! [`Engine::declare_index`] indexes (`variables->>'field'` with a literal
@@ -94,6 +96,15 @@ pub struct LockedTask {
     pub id: Uuid,
     pub instance_id: Uuid,
     pub definition_key: String,
+    /// The definition the owning instance is pinned to. An instance never
+    /// migrates, so this is the version it will run to completion, not
+    /// `max(version)` of the key: version-pinned per-task metadata on the
+    /// embedding side must resolve against exactly this pair. Both are
+    /// columns of the claimed row (migration 0011), written when the item
+    /// was created and immutable after — the claim reads them, it does not
+    /// look them up.
+    pub definition_id: Uuid,
+    pub definition_version: i32,
     pub element_id: String,
     pub topic: String,
     pub kind: String,
@@ -101,6 +112,12 @@ pub struct LockedTask {
     pub variables: serde_json::Value,
     /// Lease deadline (RFC 3339 UTC, database time). Renew before it.
     pub lock_until: String,
+    /// Which claim this is — the item's lease epoch, bumped by every claim
+    /// and by nothing else (a renewal continues the same one). Hand it back
+    /// to [`Engine::release_task`]: that is what makes a release safe to
+    /// retry, because a replayed request names an epoch that is gone.
+    /// Opaque outside the engine, and the same idea as an ETag.
+    pub lease_no: i64,
 }
 
 /// The typed heartbeat result: a client whose lease was lost must be able to
@@ -111,6 +128,25 @@ pub enum LockExtension {
         until: String,
     },
     /// Owner mismatch, expired lease, or the task is already closed.
+    Lost,
+}
+
+/// The typed release result. Handing a task back is not the same as never
+/// having held it: a frontend that releases on "close without deciding"
+/// must be able to tell "it is back on the queue" from "your lease was
+/// already gone and someone else may hold it now".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Released {
+    /// The row was still locked in our name; the task is `available` again
+    /// and the next claim can take it.
+    Released,
+    /// Nothing was handed back — the lease had been reassigned, the request
+    /// named an epoch that is no longer current (a replay, or a claim the
+    /// caller has since replaced with a newer one), or the task is not
+    /// locked at all any more (completed, failed, cancelled). Like
+    /// [`LockExtension::Lost`], not an error: the client tells its user the
+    /// task moved on, and a retry that reports this has done no harm —
+    /// which is the whole point of the epoch.
     Lost,
 }
 
@@ -217,13 +253,15 @@ impl Engine {
         };
         let sql = format!(
             "update rbpmn_work_item set state = 'locked', lock_owner = $2, \
-             lock_until = now() + make_interval(secs => $3) \
+             lock_until = now() + make_interval(secs => $3), \
+             lease_no = lease_no + 1 \
              where id = (select w.id from rbpmn_work_item w \
                 join rbpmn_instance i on i.id = w.instance_id \
                 where w.topic = $1 and {claimable}{filter_sql} \
                 order by w.created_at {direction}, w.item_no {direction} \
                 limit 1 for update of w skip locked) \
-             returning id, instance_id, definition_key, element_id, topic, kind, \
+             returning id, instance_id, definition_key, definition_id, \
+               definition_version, element_id, topic, kind, lease_no, \
                to_char(lock_until at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
                  as lock_until, \
                (select variables from rbpmn_instance i2 \
@@ -249,11 +287,14 @@ impl Engine {
             id: row.get("id"),
             instance_id,
             definition_key: row.get("definition_key"),
+            definition_id: row.get("definition_id"),
+            definition_version: row.get("definition_version"),
             element_id: row.get("element_id"),
             topic: row.get("topic"),
             kind: row.get("kind"),
             variables,
             lock_until: row.get("lock_until"),
+            lease_no: row.get("lease_no"),
         }))
     }
 
@@ -311,6 +352,86 @@ impl Engine {
                 until: row.get("lock_until"),
             },
             None => LockExtension::Lost,
+        })
+    }
+
+    /// Hand a claimed task back to the queue without deciding it — the
+    /// third exit from a claim, beside [`Engine::complete_task`] and
+    /// [`Engine::fail_task`]. A user opened the task and closed it again;
+    /// nothing happened, and the next claim should be able to take it
+    /// immediately rather than waiting out the lease.
+    ///
+    /// Scoped to one claim: `lease` is the [`LockedTask::lease_no`] the claim
+    /// handed back. That is what makes this verb safe to retry, and it is
+    /// the only verb in the task API that needed the help — `extend_lock`
+    /// carries `lock_until > now()` and a repeated completion converges on
+    /// `AlreadyClosed`, but a replayed release guarded by owner alone could
+    /// land on a *later* claim by the same owner and free a live lease. FIFO
+    /// makes that the likely case rather than a remote one: the item just
+    /// released is the oldest, so it is what the same client's next claim
+    /// returns.
+    ///
+    /// The owner is checked too, though the epoch alone already identifies
+    /// the claim. It is not redundant defence: epochs are small integers and
+    /// therefore guessable, so dropping the owner would let anyone holding a
+    /// task id end a stranger's claim.
+    ///
+    /// A no-op once the claim has moved on — by reassignment or by the
+    /// caller's own later claim — so neither can be unlocked from under its
+    /// holder. It restores claimability, by a different row state than expiry does —
+    /// expiry leaves `locked` with a stale owner and a past deadline, this
+    /// writes `available` with both nulled, and only `CLAIMABLE` reads them
+    /// as the same thing (the `rbpmn_work_item_acquire` partial index does
+    /// not: a released item is in it, an expired one is not). What the two
+    /// share is that neither is a history event, which is why this stays
+    /// silent: push workers pick a released item up the same way they pick
+    /// up an expired lease — on their next poll. This is the same statement
+    /// the push worker runs when it must drop a claim it cannot serve.
+    ///
+    /// Expiry alone is not checked, deliberately: an expired lease nobody
+    /// reclaimed is already claimable, so releasing it only tidies the stale
+    /// `lock_owner` off the row. Once someone *has* reclaimed it, the owner
+    /// no longer matches and the release is the no-op it must be — the guard
+    /// that matters is ownership, not the clock.
+    ///
+    /// Both halves of the guard are load-bearing, and `spec/Lease.tla`
+    /// checks each with its own counterexample config:
+    ///
+    /// * the owner, by `LiveLeaseEndsOnlyByItsHolder` — a live lease ends by
+    ///   the clock or by its own holder's hand, never by anyone else's.
+    ///   Every other route back to the queue already excludes a live holder
+    ///   (a claim needs `CLAIMABLE`, which means the lease lapsed; a
+    ///   completion or failure needs `guard_lease`), so without the owner
+    ///   check this would be the one action able to free an item out from
+    ///   under a worker still working on it (`Lease_UncheckedRelease.cfg`).
+    /// * the epoch, by `ReleaseFreesOnlyTheLeaseItNamed` — a release that
+    ///   lands names the lease that is actually current. The model issues
+    ///   stale requests to check it (`Lease_EpochlessRelease.cfg`); before
+    ///   the epoch existed, neither the model nor a test could see the
+    ///   difference between a replay and a fresh release.
+    pub async fn release_task(
+        &self,
+        task: Uuid,
+        owner: &str,
+        lease: i64,
+    ) -> Result<Released, EngineError> {
+        crate::runtime::reject_nul_text(owner, "owner")?;
+        let released = sqlx::query(
+            "update rbpmn_work_item set state = 'available', lock_owner = null, \
+             lock_until = null where id = $1 and lock_owner = $2 and lease_no = $3 \
+             and state = 'locked'",
+        )
+        .bind(task)
+        .bind(owner)
+        .bind(lease)
+        .execute(self.pool())
+        .await?
+        .rows_affected()
+            > 0;
+        Ok(if released {
+            Released::Released
+        } else {
+            Released::Lost
         })
     }
 

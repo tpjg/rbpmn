@@ -237,7 +237,32 @@ pub async fn run(scenario: &Scenario, options: &RunOptions) -> Result<Option<Run
         // written.
         _ => 0,
     };
-    let measured = options.instances.unwrap_or(scenario.workload.instances);
+    // How many instances the measured pass actually starts. **Mode-dependent**,
+    // and the source of a bug worth naming: `workload.instances` sizes a
+    // saturation backlog, while an open-loop steady pass starts
+    // `arrival_rate x duration_secs`. They are independent numbers in the
+    // scenario file and nothing reconciles them.
+    //
+    // Everything per-instance hangs off this: the correlation keys, and the
+    // `measured_instances` both the harness block and the measurements block
+    // report. When it was unconditionally `workload.instances`, `message-wait`
+    // started 1600 instances against 1000 correlation keys and the 600 without
+    // one waited forever — surfacing 60s later as a stall that blamed the
+    // workers.
+    let measured = match options.mode {
+        Mode::Steady => match (&options.instances, &scenario.steady) {
+            // An explicit `--instances` still wins: it is an override, and
+            // silently ignoring it in one mode is its own trap.
+            (Some(n), _) => *n,
+            (None, Some(steady)) => {
+                (steady.arrival_rate * steady.duration_secs as f64).ceil() as u32
+            }
+            // No [steady] section: `drive` refuses below with a better
+            // message than anything derivable here.
+            (None, None) => scenario.workload.instances,
+        },
+        _ => options.instances.unwrap_or(scenario.workload.instances),
+    };
     let run_id = options
         .run_id
         .clone()
@@ -562,8 +587,10 @@ async fn drive(
     analyze: bool,
     stall_timeout: Duration,
 ) -> Result<Outcome, String> {
-    let keys = correlation_keys(scenario, run_id, phase.count);
-
+    // `phase.count` is how many instances *this pass* starts, which is
+    // mode-dependent — see where `measured` is derived. Both arms size their
+    // correlation keys from it, so a key exists for every instance by
+    // construction rather than by coincidence.
     match mode {
         Mode::Saturation => {
             // ------ generate: park the whole backlog, workers switched off
@@ -592,8 +619,17 @@ async fn drive(
 
             // ------------------------------------- execute: drain and time
             let started = Instant::now();
+            // Saturation parks the whole backlog *before* the workers start, so
+            // every key's instance already exists and its subscription is
+            // armed. Pre-filling is right here, and cheap.
+            let keys = Arc::new(tokio::sync::Mutex::new(correlation_keys(
+                scenario,
+                run_id,
+                phase.count,
+            )));
             let crew = Crew::spawn(engine, scenario, &model.key, counters.clone(), keys);
-            let result = wait_for_drain(pool, &model.key, &phase.marker, stall_timeout).await;
+            let result =
+                wait_for_drain(pool, &model.key, &phase.marker, stall_timeout, scenario).await;
             let wall = started.elapsed();
             crew.stop();
             result?;
@@ -629,10 +665,26 @@ async fn drive(
             if analyze {
                 analyze_before_execute(pool).await?;
             }
-            let crew = Crew::spawn(engine, scenario, &model.key, counters.clone(), keys);
-            let started = Instant::now();
             let interval = Duration::from_secs_f64(1.0 / steady.arrival_rate);
-            let planned = (steady.arrival_rate * steady.duration_secs as f64).ceil() as u32;
+            // `rate x duration`, computed once where `measured` is derived so
+            // that the result file's `measured_instances` and the correlation
+            // keys cannot disagree with the arrival loop.
+            let planned = phase.count;
+            // **Empty, and fed as instances arrive.** Pre-filling all 1600 keys
+            // at t=0 would hand the correlators a queue that is mostly keys for
+            // instances which do not exist yet: each pops, gets
+            // `NoSubscription`, and pushes the key to the *back* of a
+            // 1600-long queue, so it is not retried until a full cycle later.
+            // Measured that way, `message-wait` reported p50 2.8s / max 10.5s
+            // arrival latency — a number describing the harness's queue
+            // discipline, not the engine's correlate path.
+            //
+            // Saturation does not have this problem (its backlog is parked
+            // before the correlators start), which is why it went unnoticed:
+            // steady mode had never completed this scenario at all.
+            let keys = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
+            let crew = Crew::spawn(engine, scenario, &model.key, counters.clone(), keys.clone());
+            let started = Instant::now();
             let mut late = 0u64;
             let mut max_lag = 0.0f64;
             for index in 0..planned {
@@ -650,8 +702,16 @@ async fn drive(
                     }
                 }
                 start_instance(engine, scenario, model, phase, run_id, index).await?;
+                // Offer the key only now that the instance it belongs to
+                // exists, so a `NoSubscription` retry means "the service task
+                // ahead of the catch has not finished yet" — the real window
+                // this scenario says it measures — and nothing else.
+                if let Some(key) = correlation_key(scenario, run_id, index) {
+                    keys.lock().await.push_back(key);
+                }
             }
-            let result = wait_for_drain(pool, &model.key, &phase.marker, stall_timeout).await;
+            let result =
+                wait_for_drain(pool, &model.key, &phase.marker, stall_timeout, scenario).await;
             let wall = started.elapsed();
             crew.stop();
             result?;
@@ -756,14 +816,13 @@ async fn start_instance(
     Ok(())
 }
 
-fn correlation_keys(scenario: &Scenario, run_id: &str, count: u32) -> VecDeque<String> {
-    let Some(correlation) = &scenario.bindings.correlation else {
-        return VecDeque::new();
-    };
-    // The key is *derived* from (run id, index), the same way the variable
-    // document derived it — so the correlator knows what to deliver without
-    // reading anything back, exactly as an application that started the
-    // instance would.
+/// The key for one instance, or `None` when the scenario correlates nothing.
+///
+/// *Derived* from (run id, index), the same way the variable document derived
+/// it — so the correlator knows what to deliver without reading anything back,
+/// exactly as an application that started the instance would.
+fn correlation_key(scenario: &Scenario, run_id: &str, index: u32) -> Option<String> {
+    let correlation = scenario.bindings.correlation.as_ref()?;
     let prefix = scenario
         .workload
         .fields
@@ -774,8 +833,12 @@ fn correlation_keys(scenario: &Scenario, run_id: &str, count: u32) -> VecDeque<S
             _ => None,
         })
         .unwrap_or_default();
+    Some(vars::unique(&prefix, run_id, index))
+}
+
+fn correlation_keys(scenario: &Scenario, run_id: &str, count: u32) -> VecDeque<String> {
     (0..count)
-        .map(|index| vars::unique(&prefix, run_id, index))
+        .filter_map(|index| correlation_key(scenario, run_id, index))
         .collect()
 }
 
@@ -790,7 +853,7 @@ impl Crew {
         scenario: &Scenario,
         definition_key: &str,
         counters: Arc<Counters>,
-        keys: VecDeque<String>,
+        keys: Arc<tokio::sync::Mutex<VecDeque<String>>>,
     ) -> Crew {
         let mut handles = Vec::new();
         for n in 0..scenario.execute.service_workers {
@@ -844,7 +907,7 @@ impl Crew {
         if scenario.execute.correlators > 0
             && let Some(correlation) = scenario.bindings.correlation.clone()
         {
-            let queue = Arc::new(tokio::sync::Mutex::new(keys));
+            let queue = keys;
             for _ in 0..scenario.execute.correlators {
                 let engine = engine.clone();
                 let counters = counters.clone();
@@ -1028,11 +1091,43 @@ async fn live_counts(pool: &PgPool, definition_key: &str) -> Result<(i64, i64), 
 /// incident (the measured system was broken, and averaging over a broken
 /// system is worse than no number), and a stall — no progress for
 /// `stall_timeout`.
+/// What a stall most likely means, given what this scenario needs consumed.
+///
+/// The generic advice ("check that every topic has a worker") was actively
+/// misleading the one time this fired: the workers were all present and the
+/// shortfall was correlation keys. A benchmark that stalls has already cost
+/// the reader a minute of wall clock; it should not also cost them the first
+/// wrong guess.
+fn stall_hint(scenario: &Scenario) -> String {
+    let mut suspects = Vec::new();
+    if scenario.execute.service_workers == 0 {
+        suspects.push("the scenario runs 0 service workers".to_string());
+    }
+    if scenario.bindings.correlation.is_some() {
+        suspects.push(format!(
+            "this scenario waits on a correlated message, so an instance with no key              delivered to it waits forever — check that the correlator queue is sized              from the number of instances the *mode* starts ({} correlators configured)",
+            scenario.execute.correlators
+        ));
+    }
+    if scenario.user_topic().is_some() {
+        suspects.push(format!(
+            "it has a user task, drained by {} inbox worker(s)",
+            scenario.execute.user_workers
+        ));
+    }
+    if suspects.is_empty() {
+        "check that every topic in the scenario has a worker".to_string()
+    } else {
+        suspects.join("; ")
+    }
+}
+
 async fn wait_for_drain(
     pool: &PgPool,
     definition_key: &str,
     marker: &str,
     stall_timeout: Duration,
+    scenario: &Scenario,
 ) -> Result<(), String> {
     let mut last_progress = Instant::now();
     let mut last_active = i64::MAX;
@@ -1052,9 +1147,9 @@ async fn wait_for_drain(
         } else if last_progress.elapsed() > stall_timeout {
             return Err(format!(
                 "stalled: {active} instances still active and none finished for {:?}. \
-                 Something is not being consumed — check that every topic in the \
-                 scenario has a worker.",
-                stall_timeout
+                 Something is not being consumed — {}.",
+                stall_timeout,
+                stall_hint(scenario)
             ));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

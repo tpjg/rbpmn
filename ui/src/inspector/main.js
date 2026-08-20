@@ -10,6 +10,7 @@ import NavigatedViewer from 'bpmn-js/lib/NavigatedViewer';
 import 'bpmn-js/dist/assets/diagram-js.css';
 import 'bpmn-js/dist/assets/bpmn-js.css';
 import 'bpmn-js/dist/assets/bpmn-font/css/bpmn.css';
+import '../shared/diagram-theme.css';
 import './inspector.css';
 
 import { annotate, focus } from '../shared/annotations.js';

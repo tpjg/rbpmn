@@ -14,6 +14,18 @@ if (!entry) {
 }
 
 export default defineConfig({
+  // dmn-js's decision table is built on Inferno, which reads
+  // `process.env.NODE_ENV` *unguarded* at module scope. Vite substitutes that
+  // for app builds but not for library builds, so without this the document
+  // throws `process is not defined` on load and renders nothing at all — the
+  // editor's own e2e caught it, which is the entire reason that check exists.
+  //
+  // Only the one expression is defined. The other `process` reads in the
+  // bundle (semver, a parser's debug logging) are all behind
+  // `typeof process`, which is safe on an undeclared name.
+  define: {
+    'process.env.NODE_ENV': JSON.stringify('production'),
+  },
   build: {
     outDir: resolve(here, 'dist', entry),
     emptyOutDir: true,

@@ -36,6 +36,11 @@ function run(cmd, args, cwd = uiRoot, env = {}) {
 /// glue's async init gets the bytes instead.
 function generateWasmInline() {
   const out = join(uiRoot, 'wasm');
+  // `--features dmn`: the editor validates a bundle's decisions, so its
+  // module carries the DMN validator. Named explicitly although it is the
+  // default, because `just parity` builds the native side the same way — the
+  // two must be the same build, and a mismatch fails per fixture rather than
+  // silently.
   run('wasm-pack', [
     'build',
     join(repoRoot, 'crates', 'rbpmn-wasm'),
@@ -44,6 +49,8 @@ function generateWasmInline() {
     '--out-dir',
     out,
     '--no-typescript',
+    '--features',
+    'dmn',
   ]);
   const bytes = readFileSync(join(out, 'rbpmn_wasm_bg.wasm'));
   const generated = join(uiRoot, 'src', 'generated');
