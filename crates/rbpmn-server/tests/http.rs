@@ -10,6 +10,10 @@ const TOKEN: &str = "test-token-0123456789abcdef-0123456789abcdef";
 const INCLUSIVE_XML: &str =
     include_str!("../../rbpmn-model/tests/fixtures/reject/inclusive-gateway.bpmn");
 const MINIMAL_XML: &str = include_str!("../../rbpmn-model/tests/fixtures/accept/01-minimal.bpmn");
+/// A user task with an interrupting message boundary: the payment that ends
+/// a contested ticket while a clerk holds the task.
+const BOUNDARY_XML: &str =
+    include_str!("../../rbpmn-model/tests/fixtures/accept/29-message-boundary.bpmn");
 
 async fn test_app() -> (axum::Router, TestDb) {
     let db = TestDb::create().await;
@@ -574,7 +578,11 @@ async fn task_api_lifecycle_over_http() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
-    assert_eq!(body_json(resp).await["outcome"], "lockLost");
+    let body = body_json(resp).await;
+    assert_eq!(body["outcome"], "lockLost");
+    // The item's own state, so the client can tell "somebody else has it"
+    // from "the process took it away" — here it is still alice's.
+    assert_eq!(body["state"], "locked");
 
     // Release hands the task back without deciding it — same vocabulary as
     // the heartbeat: a stranger's release is the typed 409 and changes
@@ -590,7 +598,9 @@ async fn task_api_lifecycle_over_http() {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT, "{owner}/{lease}");
-        assert_eq!(body_json(resp).await["outcome"], "lockLost");
+        let body = body_json(resp).await;
+        assert_eq!(body["outcome"], "lockLost", "{owner}/{lease}");
+        assert_eq!(body["state"], "locked", "{owner}/{lease}");
     }
     // The epoch is required, not defaulted: without it the request is a 400,
     // never a release scoped to whatever claim happens to be current.
@@ -666,6 +676,142 @@ async fn task_api_lifecycle_over_http() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["outcome"], "advanced");
+    db.drop().await;
+}
+
+/// The other half of `lockLost`, and the reason it grew a `state`: the
+/// **process** withdrew the task. A payment correlated to the ticket fires
+/// the interrupting boundary while the clerk is holding `handle_contest`, so
+/// every verb the clerk has left answers about a `cancelled` item — the
+/// frontend can say "the ticket was paid" instead of "you were reassigned".
+#[tokio::test]
+async fn a_withdrawn_task_reports_cancelled_on_every_verb() {
+    let (app, db) = test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/definitions",
+            serde_json::json!({
+                "bpmn": BOUNDARY_XML,
+                "bindings": { "correlations": { "paid_during_contest": "ticket.reference" } },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/instances",
+            serde_json::json!({
+                "definitionKey": "ticket",
+                "variables": { "ticket": { "reference": "T-1" } },
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let instance = body_json(resp).await["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/tasks/get",
+            serde_json::json!({ "topic": "handle_contest", "owner": "clerk" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let task = body_json(resp).await["task"].clone();
+    let task_id = task["id"].as_str().unwrap().to_string();
+    let lease_no = task["leaseNo"].as_i64().unwrap();
+
+    // The payment arrives while the clerk holds the task. `POST /v1/messages`
+    // is unchanged in every respect — the boundary subscription is a row like
+    // any other.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/messages",
+            serde_json::json!({ "name": "PAID", "correlationKey": "T-1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["instanceId"], instance.as_str());
+
+    // The heartbeat: 409, and the state says the process took it, not a peer.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/tasks/{task_id}/extend"),
+            serde_json::json!({ "owner": "clerk", "ttlSeconds": 600 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert_eq!(body["outcome"], "lockLost");
+    assert_eq!(body["state"], "cancelled");
+
+    // Handing it back: the same answer. Note the lease columns still name
+    // the clerk — cancellation writes the state column and nothing else —
+    // so the state is the only thing that could have told the truth here.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/tasks/{task_id}/release"),
+            serde_json::json!({ "owner": "clerk", "leaseNo": lease_no }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert_eq!(body["outcome"], "lockLost");
+    assert_eq!(body["state"], "cancelled");
+
+    // And the completion the clerk was about to send: the idempotent
+    // already-closed answer, 200, with the same state — never a 5xx, never
+    // a success that would have applied a patch to a finished ticket.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/tasks/{task_id}/complete"),
+            serde_json::json!({ "owner": "clerk", "patch": { "contest": { "upheld": true } } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["outcome"], "alreadyClosed");
+    assert_eq!(body["state"], "cancelled");
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/v1/instances/{instance}/inspect"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let inspection = body_json(resp).await;
+    assert_eq!(inspection["status"], "completed");
+    assert!(
+        inspection["variables"].get("contest").is_none(),
+        "the refused completion's patch must not have landed: {}",
+        inspection["variables"]
+    );
     db.drop().await;
 }
 

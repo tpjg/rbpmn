@@ -159,6 +159,16 @@ async fn a_storm_holds_every_global_invariant() {
         )
         .await
         .unwrap();
+    // The message-boundary race: a payment arriving while a consumer is
+    // claiming and completing the contest task. Deployed under its own
+    // process id already (`ticket`), so unlike the others it needs no rename.
+    setup
+        .deploy(
+            &fixture("accept/29-message-boundary.bpmn"),
+            &rbpmn_core::Bindings::new().correlation("paid_during_contest", "ticket.reference"),
+        )
+        .await
+        .unwrap();
 
     // Crank with RBPMN_STORM_ROUNDS when hunting; 20 keeps the suite quick.
     let rounds: u32 = std::env::var("RBPMN_STORM_ROUNDS")
@@ -202,7 +212,16 @@ async fn a_storm_holds_every_global_invariant() {
             let options = rbpmn_engine::GetTaskOptions::new(format!("worker-{w}"));
             while !stop.load(Ordering::Relaxed) {
                 let mut idle = true;
-                for topic in ["ta", "tb", "ut", "t_esc", "c", "count", "ship"] {
+                for topic in [
+                    "ta",
+                    "tb",
+                    "ut",
+                    "t_esc",
+                    "c",
+                    "count",
+                    "ship",
+                    "handle_contest",
+                ] {
                     if let Ok(Some(task)) = node.get_task(topic, &options).await {
                         idle = false;
                         // Completion may lose a race with a boundary timer;
@@ -266,6 +285,31 @@ async fn a_storm_holds_every_global_invariant() {
         let vars = serde_json::json!({ "order": { "id": format!("o-{round}") } });
         let id = node.start("msg", None, vars.clone()).await.unwrap().id;
         instances.push((id, vars));
+
+        // The message boundary, driven per instance: two of every three
+        // tickets get their payment *while* the consumers above are claiming
+        // and completing `handle_contest`, in the same loop rather than after
+        // it, so the two verbs really are in flight together. Whichever wins,
+        // the other must be refused typed — and both must happen across the
+        // rounds, which the non-vacuity assertion below insists on.
+        let reference = format!("t-{round}");
+        let vars = serde_json::json!({ "ticket": { "reference": reference.clone() } });
+        let id = node.start("ticket", None, vars.clone()).await.unwrap().id;
+        instances.push((id, vars));
+        if !round.is_multiple_of(3) {
+            match node
+                .correlate("PAID", &reference, serde_json::json!({}))
+                .await
+            {
+                Ok(_) => {}
+                // The consumer got there first: the completion withdrew the
+                // arm (404), or closed the instance under the delivery's
+                // re-check (409). Both are the loser's typed answer.
+                Err(rbpmn_engine::EngineError::NoSubscription { .. })
+                | Err(rbpmn_engine::EngineError::InstanceNotActive(..)) => {}
+                Err(e) => panic!("correlate PAID {reference}: {e}"),
+            }
+        }
     }
     // Deliver every message; each must land on exactly one subscription.
     let mut delivered = 0;
@@ -374,6 +418,27 @@ async fn a_storm_holds_every_global_invariant() {
         "the boundary-timer race never went both ways ({fired} fired, \
          {disarmed} cancelled) — the storm is not exercising the interleaving \
          spec/LockOrder.tla is about"
+    );
+    // ...and the same statement for the message boundary: some tickets were
+    // paid out from under an open task, some were decided before the payment
+    // arrived. One-sided means the workload stopped racing.
+    let boundary_fired = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'message-received' \
+         and element_id = 'paid_during_contest'",
+    )
+    .await;
+    let boundary_withdrawn = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'subscription-cancelled' \
+         and element_id = 'paid_during_contest'",
+    )
+    .await;
+    assert!(
+        boundary_fired > 0 && boundary_withdrawn > 0,
+        "the message-boundary race never went both ways ({boundary_fired} delivered, \
+         {boundary_withdrawn} withdrawn by a completion) — the storm is not \
+         exercising the interleaving spec/BoundaryExit.tla is about"
     );
     let stuck = count(
         &db.pool,

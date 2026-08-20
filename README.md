@@ -76,7 +76,9 @@ and what deviates.
 - [x] **Phase 4 — user tasks & the task API**: pull-mode `get_task` (FIFO
       default / LIFO opt-in, `SKIP LOCKED`, renewable leases — expired locks
       return without a reaper), `extend_lock` with the typed lock-lost
-      result, owner-checked `complete_task`/`fail_task`/`release_task` (the
+      result (carrying the item's state, so a frontend can tell *reassigned*
+      from *withdrawn by the process*), owner-checked
+      `complete_task`/`fail_task`/`release_task` (the
       third exit from a claim: hand it back undecided, claimable again at
       once instead of after the lease runs out — scoped to the claim's lease
       epoch, so a retried release cannot free the claim that replaced it),
@@ -85,7 +87,14 @@ and what deviates.
       `declare_index` (partial expression indexes, also declarable in the
       deploy manifest; index usage verified by test against the real query
       path). Server: `POST /v1/tasks/{get,count}` and
-      `/v1/tasks/{id}/{extend,release,complete,fail}`.
+      `/v1/tasks/{id}/{extend,release,complete,fail}`. A claim is not a
+      promise the process will wait: when the process withdraws a claimed
+      task — an interrupting boundary fired, the instance terminated — the
+      holder's `complete` answers `alreadyClosed` with `state: "cancelled"`
+      and **its patch is not applied**, so an application that wants the
+      holder's decision kept must keep it itself. Nothing is pushed to the
+      holder either: it learns at its next heartbeat, which makes the
+      renewal interval the detection bound.
 - [x] **Phase 5 — rounding out**: the event-stream tailing contract
       (`read_events` / `GET /v1/events`, ordered and cursored by
       `(txid, id)` behind a safe horizon so a cursor cannot miss an event),
@@ -178,7 +187,7 @@ graphs that pass them).
 | `conditions-feel-subset` | error | Conditions only on exclusive-split flows, in the strict FEEL subset (`name op literal`, `and`/`or`, parentheses); default flow required. Full-FEEL constructs (functions, arithmetic, ranges) are rejected. |
 | `timer-iso8601` | error | Timer definitions must be valid ISO-8601 — dates require an explicit UTC offset, component magnitudes bounded — **or**, failing that, a FEEL qualified name naming the deadline in the variable document. Text that is neither is the error. Parse order is the only discriminator: `xsi:type="bpmn:tFormalExpression"` is deliberately ignored, because bpmn-moddle stamps it on every expression object and so every bpmn-js modeler writes it on ordinary literals. |
 | `timer-expression`⁺ | warn | A timer whose deadline is read from the variable document cannot be validated ahead of time — if it does not resolve to a valid ISO-8601 value at arm time, that element raises an incident rather than firing. |
-| `message-has-correlation` | error | Message start/catch/throw must reference a *named* message. The correlation binding itself (a FEEL qualified name) is registered via `Bindings::correlation` and checked at deploy. |
+| `message-has-correlation` | error | Message start/catch/throw events, receive tasks and message **boundary** events must reference a *named* message. The correlation binding itself (a FEEL qualified name) is registered via `Bindings::correlation`, keyed by the element's own id — for a boundary, the boundary's id, never its host's — and checked at deploy. |
 | `no-foreign-implementation` | warn | Service task carries vendor attributes (`camunda:`, `zeebe:`, …), which rbpmn ignores — topics are bound at registration. |
 | `unresolved-topic` | error | Every service task's topic (via `Bindings::topic`, default: element id) must have a registered handler or a declared external-worker topic. Checked at deploy against registration state, so `lint(xml)` alone cannot decide it. |
 | `boundary-on-supported-host` | error | Boundary events only on service/user/receive tasks and subprocesses; error boundaries only where errors can originate. Never on a business rule task: its decision is answered inside the transaction that starts it, so a boundary there is armed and cancelled in one step and can never fire. |
@@ -234,7 +243,7 @@ server. Two syntaxes, one manifest, one validation path.
 | Wiring | Registration API | Deploy check |
 |---|---|---|
 | Service-task topic | `Bindings::topic(element_id, topic)`; default topic = element id. `declare_topic(name)` announces pull-mode workers, and is *environment* rather than manifest | `unresolved-topic` |
-| Message correlation | `Bindings::correlation(element_id, "order.id")` — FEEL qualified name into the instance variables | `message-has-correlation` |
+| Message correlation | `Bindings::correlation(element_id, "order.id")` — FEEL qualified name into the instance variables; a message boundary event is bound by its **own** id, not its host's | `message-has-correlation` |
 | Decision | `Bindings::decision(element_id, decision_name, "order.discount")` — which decision a business-rule task invokes, and where its answer lands | `decision-has-binding`, `unresolved-decision` |
 | Filterable fields | `Bindings::index(field)` — optional, performance only | — |
 

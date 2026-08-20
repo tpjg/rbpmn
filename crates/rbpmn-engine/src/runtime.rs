@@ -246,6 +246,30 @@ impl Engine {
     }
 
     /// [`Engine::correlate`] inside the caller's transaction.
+    ///
+    /// The whole delivery path — resolve without a lock, take the instance
+    /// row, re-check *this* subscription under it — is model checked;
+    /// `just tla` must stay green if its shape changes.
+    ///
+    /// * **The re-check is what makes a late message typed**
+    ///   (`spec/BoundaryExit.tla`, `LateCallsAreTyped`). Delivery and the
+    ///   host's own completion are the two exits from one wait, and exactly
+    ///   one may take it: completion withdraws the arm inside its
+    ///   transaction (`ArmDiesWithTheWait`), and this re-check answers the
+    ///   loser 404 *before* the core is reached.
+    ///   `BoundaryExit_NoRecheck.cfg` drops it and TLC walks a message into
+    ///   `step` on a closed task. `BoundaryExit_AnyRowRecheck.cfg` is the
+    ///   sharper one: it loosens the predicate below to "some subscription
+    ///   is still open" rather than *this* `sub_id`, which is exactly the
+    ///   plausible-looking edit a message boundary makes available — two
+    ///   arms on one token — and TLC shows it lets a withdrawn arm's message
+    ///   through. `StepError::UnknownSubscription` would catch it as an
+    ///   internal error; the contract is a 404, not a 500.
+    /// * **The re-check confirms the row, never its token**
+    ///   (`spec/TimerTeardown.tla` under `spec/SubscriptionTeardown.cfg`,
+    ///   which binds the module's arm rows to subscriptions). That second
+    ///   half is scope teardown's invariant — a reaped token's arms are
+    ///   withdrawn *with* it, in `Advancer::tear_down_scope`.
     pub async fn correlate_in_tx(
         &self,
         tx: &mut PgConnection,
@@ -800,12 +824,24 @@ pub(crate) async fn load_instance_nowait(
                 }
             }
             "work_item" => WaitKind::WorkItem(WorkItemId(row.get::<i64, _>("work_item_no") as u64)),
-            // A token waiting on its own timer/subscription has exactly one,
-            // linked back via token_no — resolved here, never guessed.
+            // A token waiting on its own timer/subscription is matched by
+            // `(token_no, element_id)`, never by token alone: a boundary arm
+            // sits on its *host's* token, so a receive task with a message
+            // boundary has two subscription rows on one token. Resolving by
+            // token alone would take the lowest subscription_no — the host's
+            // today, only because `enter` arms the host before its boundaries.
+            // That is arm order standing in for intent, and it breaks silently
+            // the day anything re-arms or reorders. A token sits at exactly one
+            // element and a boundary's id is never its host's, so the
+            // element-qualified match is unique by construction — the fsck
+            // asserts that ("a message-waiting token has exactly one
+            // subscription at its own element"). The timer arm hosts nothing
+            // today, but carries the same predicate rather than a comment
+            // explaining why it needn't.
             "timer" => WaitKind::Timer(
                 timers
                     .iter()
-                    .find(|(_, t)| t.token == token_no)
+                    .find(|(_, t)| t.token == token_no && t.element == node)
                     .map(|(id, _)| *id)
                     .ok_or_else(|| {
                         internal(format!(
@@ -816,7 +852,7 @@ pub(crate) async fn load_instance_nowait(
             "message" => WaitKind::Message(
                 subscriptions
                     .iter()
-                    .find(|(_, s)| s.token == token_no)
+                    .find(|(_, s)| s.token == token_no && s.element == node)
                     .map(|(id, _)| *id)
                     .ok_or_else(|| {
                         internal(format!(

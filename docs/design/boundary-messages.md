@@ -154,14 +154,39 @@ What the holder sees, each a typed result and none of them a 5xx:
 |---|---|---|
 | `complete_task(id, owner, patch)` | `Completion::AlreadyClosed { state: "cancelled" }` — the patch is **not** applied | `200 {"outcome":"alreadyClosed","state":"cancelled"}` |
 | `fail_task` | `FailOutcome::AlreadyClosed { state: "cancelled" }` | same shape |
-| `extend_lock` | `LockExtension::Lost` | `409 {"outcome":"lockLost"}` |
-| `release_task` | `Released::Lost` | `409 {"outcome":"lockLost"}` |
+| `extend_lock` | `LockExtension::Lost { state: "cancelled" }` | `409 {"outcome":"lockLost","state":"cancelled"}` |
+| `release_task` | `Released::Lost { state: "cancelled" }` | `409 {"outcome":"lockLost","state":"cancelled"}` |
 
-`LockExtension::Lost` and `Released::Lost` do not say *why*. For a timer
-boundary "reassigned" was an adequate story; for a payment it is the wrong
-one ("your task was reassigned" when the truth is "the ticket was paid"). A
-follow-up, not part of any slice here: `Lost { state }`, carrying the row
-state the way `AlreadyClosed` already does. Additive, no contract change.
+Two things to say plainly to application authors, because a frontend meets
+both on day one:
+
+- **The holder's decision is discarded.** A `complete_task` that arrives after
+  the boundary fired returns `AlreadyClosed` and records nothing. If the
+  application wants the lost decision kept, that is the application's own
+  write, made when it sees that outcome — the engine will not invent a place
+  for it. "Never succeed" means exactly that: the patch never reaches the
+  document.
+- **The holder finds out at its next heartbeat.** Nothing pushes a
+  cancellation to a lease holder (pull model; the holder may be a browser
+  tab). The detection bound is the client's renewal interval, which is the
+  same bound the lease already puts on everything else.
+
+`Lost { state }` **shipped in slice 1**, pulled forward from the deferred list
+because "your task was reassigned" is the wrong message when the truth is
+"the ticket was paid". It carries the row's `state` column the way
+`AlreadyClosed` already does, and the vocabulary is deliberately the column's:
+`cancelled` = withdrawn by the process (a boundary, a terminate, a teardown);
+`completed` / `failed` = already decided; `locked` / `available` = the claim
+is not yours any more — *lapsed or reassigned*, which the field does not
+separate (an expired lease nobody reclaimed still reads `locked` with the
+caller as owner), and need not: claim again if you still want it. Two
+statements, not one: the `UPDATE` unchanged, then a plain `SELECT state` on a
+fresh snapshot when it matched nothing — a single-statement CTE would read the
+fallback state from the statement snapshot while the update re-evaluated
+against the latest row version (EvalPlanQual), and report `locked` for an item
+that had just been cancelled underneath the heartbeat. A task id that names no
+row is `UnknownWorkItem` (404) from both verbs now, as it always was from
+`complete`/`fail`.
 
 ### 1.4 The walk-through
 
@@ -189,7 +214,9 @@ end_decided`, with an interrupting message boundary `paid_during_contest`
 If instead the clerk completes first: step 4 runs first and
 `cancel_attachments` withdraws the `PAID` subscription
 (`subscription-cancelled paid_during_contest PAID`); the payment in step 3
-then finds no subscription → 404, which is the correct, loud answer — the
+then finds no subscription → 404 (or, in the narrow window where it resolved
+the row before that commit, `InstanceNotActive` → 409: the status gate runs
+before the subscription re-check — §4.2), which is the correct, loud answer — the
 application decides what a payment against a decided contest means (usually:
 the next wait state, `await_payment` after a rejected contest, is a catch for
 the *same* `PAID` message, armed in the same transaction the contest closed,
@@ -587,7 +614,7 @@ first** and per-instance rows after, the one order engine-wide
 
 | Path | Shape | Outcome when it wins | Outcome when it loses |
 |---|---|---|---|
-| `correlate` (message boundary) | resolve the subscription **without a lock** → `FOR UPDATE` on the instance → re-check the subscription is still in state → step → persist (item → `cancelled`, subscription row deleted) | `200 {instanceId}` | re-check fails → `NoSubscription` (404) — the same answer as a repeat, deliberately |
+| `correlate` (message boundary) | resolve the subscription **without a lock** → `FOR UPDATE` on the instance → re-check the subscription is still in state → step → persist (item → `cancelled`, subscription row deleted) | `200 {instanceId}` | re-check fails → `NoSubscription` (404), the same answer as a repeat, deliberately — or `InstanceNotActive` (409) when the winning completion also *ended the instance*: `correlate_in_tx` gates on instance status before it re-checks the subscription. Typed and pre-mutation either way; the tests accept both |
 | `complete_task` | find the item row (no lock) → `FOR UPDATE` on the instance → `guard_lease` reads the item `FOR UPDATE` → step → persist (subscription row deleted by `subscription-cancelled`) | `Advanced` | `guard_lease` sees `cancelled` → `AlreadyClosed { state: "cancelled" }`, before the core is invoked |
 | scheduler (a timer boundary on the same host) | try-advisory → `FOR UPDATE NOWAIT` on the instance → re-check the timer row → step | fires | re-check fails → `Attempt::Resolved`, move on |
 
@@ -972,9 +999,12 @@ model-checked. The service task costs nothing at all beyond its fixture —
 
 ### Deferred, with the reason
 
+`LockExtension::Lost { state }` / `Released::Lost { state }` **shipped in
+slice 1** — the interrupting boundary is what made "your task was reassigned"
+the wrong story, so the honest answer went in with it rather than after it.
+
 | Item | Why not now |
 |---|---|
-| `LockExtension::Lost { state }` / `Released::Lost { state }` | additive; a UX improvement, not a correctness one; ships when a frontend asks |
 | static detection of duplicate arms on parallel branches | needs the region analysis to reason about concurrency; the runtime freeze is loud meanwhile |
 | calendar-aware cycles (`P1M`, DST-stable local time) | a different arithmetic and a timezone database; fixed-length periods cover the motivating case |
 | cycles on intermediate catches / interrupting boundaries | rejected on purpose — "fire once and ignore the rest" is the silent behaviour this engine refuses |

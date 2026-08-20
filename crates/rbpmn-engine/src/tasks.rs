@@ -121,14 +121,33 @@ pub struct LockedTask {
 }
 
 /// The typed heartbeat result: a client whose lease was lost must be able to
-/// tell its user "this task was reassigned" — never fail silently.
+/// tell its user what happened — never fail silently, and never with the
+/// wrong story.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockExtension {
     Extended {
         until: String,
     },
-    /// Owner mismatch, expired lease, or the task is already closed.
-    Lost,
+    /// The lease is not ours (any more). `state` is the work item's current
+    /// `state` column, and the distinction it exists for is *withdrawn or
+    /// not*:
+    ///
+    /// * `cancelled` — the **process** withdrew the item: an interrupting
+    ///   boundary fired, the instance terminated, an enclosing scope was torn
+    ///   down. There is nothing to go back to. "The ticket was paid", not
+    ///   "your task was reassigned" (docs/design/boundary-messages.md §1.3).
+    /// * `completed` / `failed` — the item was already decided, by a peer or
+    ///   by an earlier call of your own.
+    /// * `locked` / `available` — the claim is simply not yours any more.
+    ///   Deliberately *not* "reassigned": a lease that lapsed with nobody
+    ///   reclaiming it still reads `locked`, with `lock_owner` still naming
+    ///   the caller, so all this says is "claim it again if you still want
+    ///   it". Telling lapsed from reassigned would need the lease columns,
+    ///   and they are not in this answer on purpose — a heartbeat's job is
+    ///   to say whether to keep working, not to narrate the queue.
+    Lost {
+        state: String,
+    },
 }
 
 /// The typed release result. Handing a task back is not the same as never
@@ -143,11 +162,32 @@ pub enum Released {
     /// Nothing was handed back — the lease had been reassigned, the request
     /// named an epoch that is no longer current (a replay, or a claim the
     /// caller has since replaced with a newer one), or the task is not
-    /// locked at all any more (completed, failed, cancelled). Like
-    /// [`LockExtension::Lost`], not an error: the client tells its user the
-    /// task moved on, and a retry that reports this has done no harm —
-    /// which is the whole point of the epoch.
-    Lost,
+    /// locked at all any more. Like [`LockExtension::Lost`], not an error:
+    /// the client tells its user the task moved on, and a retry that reports
+    /// this has done no harm — which is the whole point of the epoch.
+    ///
+    /// `state` carries the same vocabulary as [`LockExtension::Lost`], and
+    /// separates the same thing: `cancelled` is the process having withdrawn
+    /// the item (nothing to hand back, and nothing to re-claim),
+    /// `completed`/`failed` is an item already decided, and
+    /// `locked`/`available` is a claim that is no longer yours — lapsed or
+    /// taken by someone else, which this answer does not distinguish.
+    Lost { state: String },
+}
+
+/// The state column of a work item, read in a statement of its own — what
+/// [`LockExtension::Lost`] and [`Released::Lost`] report. Called only after
+/// an attempt matched no row, and deliberately *after*: a fresh snapshot can
+/// only be more current than the attempt's (see [`Engine::extend_lock`] for
+/// why folding it into the attempt's statement reports a stale state).
+/// `None` — no such row at all — is [`EngineError::UnknownWorkItem`], the
+/// same answer completion and failure give.
+async fn current_item_state(engine: &Engine, task: Uuid) -> Result<String, EngineError> {
+    sqlx::query_scalar("select state from rbpmn_work_item where id = $1")
+        .bind(task)
+        .fetch_optional(engine.pool())
+        .await?
+        .ok_or(EngineError::UnknownWorkItem(task))
 }
 
 /// A lease must be plausible: zero would mint a lock expired at birth (two
@@ -326,8 +366,41 @@ impl Engine {
     }
 
     /// Heartbeat: extend the lease while demonstrably still working. A lost
-    /// lease (owner mismatch, expiry, task closed) is a typed result, not an
-    /// error — the client tells its user "this task was reassigned".
+    /// lease (owner mismatch, expiry, the item closed or withdrawn) is a
+    /// typed result, not an error, and it carries the item's `state` so the
+    /// client can tell its user *which* of those happened — see
+    /// [`LockExtension::Lost`].
+    ///
+    /// The `state = 'locked'` predicate is what turns a withdrawn item into
+    /// a loss: cancellation writes the state column and nothing else (a
+    /// lease is a row value and the process does not take it), so the lease
+    /// columns on a cancelled row still name their holder. The state column
+    /// is therefore the only honest thing to report.
+    ///
+    /// **Two statements, deliberately — do not "optimise" this into one.**
+    /// The obvious single statement is a CTE (`with attempt as (update …
+    /// returning …) select …, (select state from rbpmn_work_item where id =
+    /// $1)`), and it reports the *wrong* state exactly when it matters.
+    /// Under READ COMMITTED an `UPDATE` re-evaluates its predicate against
+    /// the latest committed row version when it blocks on a concurrent
+    /// writer (EvalPlanQual), while every plain sub-select in the same
+    /// statement reads that statement's snapshot. So when a boundary's
+    /// cancellation commits between the snapshot and the update, the update
+    /// correctly matches nothing and the sub-select still says `locked` —
+    /// "your task was reassigned" for an item the process withdrew, which is
+    /// the one answer this field exists to get right.
+    ///
+    /// A second, plain statement takes a fresh snapshot, so what it reports
+    /// is at least as current as the attempt: a transition slipping between
+    /// the two can only make the answer *more* current, never stale. No
+    /// transaction and no `FOR SHARE` around the pair — a lease is a row
+    /// value, and locking it to read it would be the thing this API is not.
+    ///
+    /// A task id that matches nothing at all is [`EngineError::UnknownWorkItem`]
+    /// (404), not a loss — the same answer [`Engine::complete_task`] and
+    /// [`Engine::fail_task`] already give for an unknown id, and a
+    /// deliberate alignment: "your lease is gone" is a claim about a task
+    /// that exists.
     pub async fn extend_lock(
         &self,
         task: Uuid,
@@ -347,12 +420,14 @@ impl Engine {
         .bind(ttl.as_secs_f64())
         .fetch_optional(self.pool())
         .await?;
-        Ok(match row {
-            Some(row) => LockExtension::Extended {
+        match row {
+            Some(row) => Ok(LockExtension::Extended {
                 until: row.get("lock_until"),
-            },
-            None => LockExtension::Lost,
-        })
+            }),
+            None => Ok(LockExtension::Lost {
+                state: current_item_state(self, task).await?,
+            }),
+        }
     }
 
     /// Hand a claimed task back to the queue without deciding it — the
@@ -397,18 +472,31 @@ impl Engine {
     /// Both halves of the guard are load-bearing, and `spec/Lease.tla`
     /// checks each with its own counterexample config:
     ///
-    /// * the owner, by `LiveLeaseEndsOnlyByItsHolder` — a live lease ends by
-    ///   the clock or by its own holder's hand, never by anyone else's.
-    ///   Every other route back to the queue already excludes a live holder
-    ///   (a claim needs `CLAIMABLE`, which means the lease lapsed; a
-    ///   completion or failure needs `guard_lease`), so without the owner
-    ///   check this would be the one action able to free an item out from
-    ///   under a worker still working on it (`Lease_UncheckedRelease.cfg`).
+    /// * the owner, by `LiveLeaseEndsOnlyByItsHolderOrTheProcess` — a live
+    ///   lease ends by the clock, by its own holder's hand, or by the
+    ///   process withdrawing the item, and by no *other worker*. (The
+    ///   property was `LiveLeaseEndsOnlyByItsHolder` until the message
+    ///   boundary round: terminate and the interrupting timer boundary have
+    ///   cancelled leased items since phase 3, so the stronger name was
+    ///   never true of the shipped engine — it held vacuously over an actor
+    ///   `Lease.tla` had no action for.) Every other route back to the queue
+    ///   already excludes a live holder (a claim needs `CLAIMABLE`, which
+    ///   means the lease lapsed; a completion or failure needs
+    ///   `guard_lease`), so without the owner check this would be the one
+    ///   action able to free an item out from under a worker still working
+    ///   on it (`Lease_UncheckedRelease.cfg`).
     /// * the epoch, by `ReleaseFreesOnlyTheLeaseItNamed` — a release that
     ///   lands names the lease that is actually current. The model issues
     ///   stale requests to check it (`Lease_EpochlessRelease.cfg`); before
     ///   the epoch existed, neither the model nor a test could see the
     ///   difference between a replay and a fresh release.
+    ///
+    /// A hand-back that lands on nothing reports the item's `state`, read
+    /// the way [`Engine::extend_lock`] reads it and for the same reasons —
+    /// a second plain statement rather than a sub-select sharing the
+    /// update's snapshot (see there; the reasoning is the load-bearing part,
+    /// not the shape). An unknown id is [`EngineError::UnknownWorkItem`]
+    /// rather than a loss.
     pub async fn release_task(
         &self,
         task: Uuid,
@@ -428,10 +516,11 @@ impl Engine {
         .await?
         .rows_affected()
             > 0;
-        Ok(if released {
-            Released::Released
-        } else {
-            Released::Lost
+        if released {
+            return Ok(Released::Released);
+        }
+        Ok(Released::Lost {
+            state: current_item_state(self, task).await?,
         })
     }
 

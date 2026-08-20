@@ -175,8 +175,8 @@ impl Engine {
                 _ = tokio::time::sleep(renew_every) => {
                     match self.extend_lock(work_item_id, &options.owner, options.lease).await {
                         Ok(crate::LockExtension::Extended { .. }) => {}
-                        Ok(crate::LockExtension::Lost) => {
-                            tracing::warn!(item = %work_item_id, "lease lost during handler execution");
+                        Ok(crate::LockExtension::Lost { state }) => {
+                            tracing::warn!(item = %work_item_id, state = %state, "lease lost during handler execution");
                             // Keep going: completion stays exactly-once — if a
                             // competing claim finished first we get AlreadyClosed.
                         }

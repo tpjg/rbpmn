@@ -13,11 +13,22 @@
 //!       interpreter over the block tree predicts exactly how often each task
 //!       runs; the engine is then driven under the same decisions and must
 //!       agree. Two implementations of BPMN semantics, differentially tested.
+//!
+//! `MsgBoundary` (interrupting message boundary) is in the grammar because a
+//! green run after a new phase is not evidence the phase is covered
+//! (`docs/stress-testing.md` §3-bis). It makes (b) sharper than any other
+//! production: for every activation of a host the oracle must predict *which*
+//! of two mutually exclusive paths ran, and counting either both or neither
+//! shows up immediately as a multiset that no longer matches. That both paths
+//! actually get taken is itself asserted, by
+//! `the_message_boundary_production_goes_both_ways`.
 
 mod modelgen;
 
-use modelgen::{Block, Decisions, Rng, build, decide, expected_executions, run};
+use modelgen::{Block, Decisions, Rng, boundary_hosts, build, decide, expected_executions, run};
 use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::TestRunner;
 use rbpmn_core::{Bindings, ExecutableProcess, InstanceStatus};
 
 /// Widths stay small deliberately: cost is exponential in parallel width
@@ -31,7 +42,8 @@ fn any_block() -> impl Strategy<Value = Block> {
             2 => prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Xor),
             2 => prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Par),
             1 => inner.clone().prop_map(|b| Block::Loop(Box::new(b))),
-            1 => inner.prop_map(|b| Block::Sub(Box::new(b))),
+            1 => inner.clone().prop_map(|b| Block::Sub(Box::new(b))),
+            1 => inner.prop_map(|b| Block::MsgBoundary(Box::new(b))),
         ]
     })
 }
@@ -46,15 +58,19 @@ fn any_block_wide() -> impl Strategy<Value = Block> {
             2 => prop::collection::vec(inner.clone(), 2..5).prop_map(Block::Xor),
             2 => prop::collection::vec(inner.clone(), 2..7).prop_map(Block::Par),
             1 => inner.clone().prop_map(|b| Block::Loop(Box::new(b))),
-            1 => inner.prop_map(|b| Block::Sub(Box::new(b))),
+            1 => inner.clone().prop_map(|b| Block::Sub(Box::new(b))),
+            1 => inner.prop_map(|b| Block::MsgBoundary(Box::new(b))),
         ]
     })
 }
 
-fn compile(xml: &str) -> Result<ExecutableProcess, String> {
+/// The manifest travels with the model: a message boundary's correlation is
+/// `Bindings::correlation` on the boundary's own element id, never an
+/// attribute in the XML, so compiling a generated model needs the bindings
+/// the generator built for it.
+fn compile(xml: &str, bindings: &Bindings) -> Result<ExecutableProcess, String> {
     let defs = rbpmn_model::parse(xml).map_err(|e| format!("parse: {e}"))?;
-    ExecutableProcess::compile(&defs, "p", &Bindings::default())
-        .map_err(|e| format!("compile: {e}"))
+    ExecutableProcess::compile(&defs, "p", bindings).map_err(|e| format!("compile: {e}"))
 }
 
 /// Render the failing model so a falsifying case is a `.bpmn` you can paste
@@ -97,7 +113,7 @@ proptest! {
     #[test]
     fn engine_matches_the_structural_oracle(block in any_block(), seed in any::<u64>()) {
         let g = build(&block);
-        let proc = compile(&g.xml)
+        let proc = compile(&g.xml, &g.bindings)
             .map_err(|e| report("generated model did not compile", &block, &g.xml, &e))
             .unwrap();
 
@@ -116,8 +132,9 @@ proptest! {
                 "{}",
                 report("instance did not complete", &block, &g.xml, &format!("{:?}", actual.status))
             );
-            // Every driver step completes exactly one work item, so the step
-            // count must equal the total executions — a guard against a run
+            // Every driver step is exactly one unit of work — a work item
+            // completed, or a message delivered to a boundary — so the step
+            // count must equal the total executions: a guard against a run
             // that silently did nothing.
             prop_assert_eq!(actual.steps, expected.values().sum::<usize>());
             prop_assert_eq!(
@@ -206,6 +223,72 @@ fn known_shapes_lint_clean_and_match_the_oracle() {
                 Block::Task,
             ]),
         ),
+        // The message boundary in every position the grammar composes it
+        // into: the arm/withdraw interplay with joins, loops and scope
+        // teardown is exactly what a hand-written fixture cannot enumerate.
+        (
+            "message boundary",
+            Block::MsgBoundary(Box::new(Block::Task)),
+        ),
+        (
+            "message boundary in a sequence",
+            Block::Seq(vec![
+                Block::Task,
+                Block::MsgBoundary(Box::new(Block::Task)),
+                Block::Task,
+            ]),
+        ),
+        (
+            "message boundary inside a parallel branch",
+            Block::Par(vec![Block::MsgBoundary(Box::new(Block::Task)), Block::Task]),
+        ),
+        (
+            "message boundary inside an exclusive branch",
+            Block::Xor(vec![Block::MsgBoundary(Box::new(Block::Task)), Block::Task]),
+        ),
+        // Two arms open at once, in sibling branches. They stay legal because
+        // each boundary catches a message of its own — a shared one would be
+        // a duplicate `(message, key)` and freeze the instance.
+        (
+            "two message boundaries armed concurrently",
+            Block::Par(vec![
+                Block::MsgBoundary(Box::new(Block::Task)),
+                Block::MsgBoundary(Box::new(Block::Task)),
+            ]),
+        ),
+        // A fresh subscription per iteration: the previous one is withdrawn
+        // when the host leaves, so the duplicate rule must not trip.
+        (
+            "loop around a message boundary",
+            Block::Loop(Box::new(Block::MsgBoundary(Box::new(Block::Task)))),
+        ),
+        (
+            "loop around a message boundary inside a parallel branch",
+            Block::Par(vec![
+                Block::Loop(Box::new(Block::MsgBoundary(Box::new(Block::Task)))),
+                Block::Task,
+            ]),
+        ),
+        (
+            "subprocess wrapping a message boundary",
+            Block::Sub(Box::new(Block::MsgBoundary(Box::new(Block::Task)))),
+        ),
+        (
+            "message boundary handling a parallel block",
+            Block::MsgBoundary(Box::new(Block::Par(vec![Block::Task, Block::Task]))),
+        ),
+        (
+            "message boundary handling a loop",
+            Block::MsgBoundary(Box::new(Block::Loop(Box::new(Block::Task)))),
+        ),
+        (
+            "message boundary handling a subprocess",
+            Block::MsgBoundary(Box::new(Block::Sub(Box::new(Block::Task)))),
+        ),
+        (
+            "message boundary on the handler of a message boundary",
+            Block::MsgBoundary(Box::new(Block::MsgBoundary(Box::new(Block::Task)))),
+        ),
     ];
 
     for (name, block) in shapes {
@@ -230,7 +313,7 @@ fn known_shapes_lint_clean_and_match_the_oracle() {
             )
         );
 
-        let proc = compile(&g.xml).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let proc = compile(&g.xml, &g.bindings).unwrap_or_else(|e| panic!("{name}: {e}"));
         for seed in 0..8u64 {
             let mut rng = Rng::new(seed);
             let decisions = decide(&g.root, &mut rng, 3);
@@ -281,6 +364,7 @@ fn the_oracle_itself_is_right() {
             Decisions {
                 xor: [("x1".to_string(), 0)].into(),
                 loops: Default::default(),
+                deliver: Default::default(),
             },
             vec![("t1", 1)],
         ),
@@ -289,6 +373,7 @@ fn the_oracle_itself_is_right() {
             Decisions {
                 xor: [("x1".to_string(), 1)].into(),
                 loops: Default::default(),
+                deliver: Default::default(),
             },
             vec![("t2", 1)],
         ),
@@ -298,8 +383,38 @@ fn the_oracle_itself_is_right() {
             Decisions {
                 xor: Default::default(),
                 loops: [("l1".to_string(), 3)].into(),
+                deliver: Default::default(),
             },
             vec![("t2", 3), ("lctl1", 3)],
+        ),
+        // An unscheduled message boundary completes its host, and the
+        // handler never runs.
+        (
+            Block::MsgBoundary(Box::new(Block::Task)),
+            Decisions::default(),
+            vec![("t1", 1)],
+        ),
+        // A delivered one runs the boundary and its handler instead — and the
+        // host counts *not at all*: it started, and was cancelled.
+        (
+            Block::MsgBoundary(Box::new(Block::Task)),
+            Decisions {
+                xor: Default::default(),
+                loops: Default::default(),
+                deliver: [("b1".to_string(), vec![true])].into(),
+            },
+            vec![("b1", 1), ("t2", 1)],
+        ),
+        // Per activation, not per boundary: the first pass is interrupted,
+        // the second completes, and the control task closes both.
+        (
+            Block::Loop(Box::new(Block::MsgBoundary(Box::new(Block::Task)))),
+            Decisions {
+                xor: Default::default(),
+                loops: [("l1".to_string(), 2)].into(),
+                deliver: [("b1".to_string(), vec![true, false])].into(),
+            },
+            vec![("b1", 1), ("t3", 1), ("t2", 1), ("lctl1", 2)],
         ),
     ];
 
@@ -310,6 +425,115 @@ fn the_oracle_itself_is_right() {
             want.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         assert_eq!(got, want, "oracle wrong for {block:?} under {decisions:?}");
     }
+}
+
+/// **Non-vacuity for the message boundary.** A sweep that lints, compiles and
+/// drives a fixed set of generated models, and then insists that the new
+/// production was actually reached *and* that both of its exits were taken.
+///
+/// The reason this is a test and not a comment: everything above stays green
+/// on a grammar that never emits a boundary, on a driver that never delivers,
+/// and on a schedule that happens to say "complete" every time. Each of those
+/// is a silent hole, and this is the storm's "never went both ways" applied to
+/// the generator (`docs/stress-testing.md` §3-bis).
+///
+/// Deterministic on purpose — `TestRunner::deterministic()` and the seeded
+/// `Rng` mean the same models, the same schedules and the same traces on every
+/// run, so a failure here reproduces forever.
+#[test]
+fn the_message_boundary_production_goes_both_ways() {
+    const MODELS: usize = 200;
+    const ROUNDS: u64 = 4;
+
+    let strategy = any_block();
+    let mut runner = TestRunner::deterministic();
+    let (mut with_boundary, mut boundaries) = (0usize, 0usize);
+    let (mut delivered, mut completed) = (0usize, 0usize);
+
+    for i in 0..MODELS {
+        let block = strategy
+            .new_tree(&mut runner)
+            .expect("the block strategy always produces a value")
+            .current();
+        let g = build(&block);
+
+        let checked =
+            rbpmn_model::check(&g.xml).unwrap_or_else(|e| panic!("model {i}: parse: {e}"));
+        assert!(
+            checked.diagnostics.is_empty(),
+            "{}",
+            report(
+                &format!("model {i}: not lint-clean"),
+                &block,
+                &g.xml,
+                &checked
+                    .diagnostics
+                    .iter()
+                    .map(|d| format!(
+                        "[{}] {} on '{}': {}",
+                        d.severity, d.rule, d.element, d.message
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        );
+
+        let hosts = boundary_hosts(&g.root);
+        if !hosts.is_empty() {
+            with_boundary += 1;
+            boundaries += hosts.len();
+        }
+
+        let proc = compile(&g.xml, &g.bindings).unwrap_or_else(|e| panic!("model {i}: {e}"));
+        for round in 0..ROUNDS {
+            let mut rng = Rng::new((i as u64).wrapping_mul(ROUNDS).wrapping_add(round));
+            let decisions = decide(&g.root, &mut rng, 3);
+            let expected = expected_executions(&g.root, &decisions);
+            let actual = run(&proc, &g.root, &decisions, &mut rng, 10_000)
+                .unwrap_or_else(|e| panic!("{}", report("driving failed", &block, &g.xml, &e)));
+
+            assert_eq!(actual.status, InstanceStatus::Completed, "model {i}");
+            assert_eq!(actual.steps, expected.values().sum::<usize>(), "model {i}");
+            assert_eq!(
+                actual.executions,
+                expected,
+                "{}",
+                report(
+                    &format!("model {i}: engine and oracle disagree"),
+                    &block,
+                    &g.xml,
+                    &format!("decisions: {decisions:?}")
+                )
+            );
+            delivered += actual.delivered;
+            completed += actual.hosts_completed;
+        }
+    }
+
+    println!(
+        "{with_boundary}/{MODELS} generated models carried a message boundary \
+         ({boundaries} boundaries in all); across {} runs the message was \
+         delivered {delivered} times and the host completed {completed} times",
+        MODELS * ROUNDS as usize
+    );
+    assert!(
+        with_boundary > 0,
+        "no generated model contained a message boundary — the production is \
+         unreachable in the random walk, so every property above passed \
+         without ever seeing one"
+    );
+    assert!(
+        delivered > 0,
+        "the message was never delivered in {} runs — the completed path is \
+         the only one under test",
+        MODELS * ROUNDS as usize
+    );
+    assert!(
+        completed > 0,
+        "no message-boundary host was ever completed in {} runs — the \
+         interrupted path is the only one under test",
+        MODELS * ROUNDS as usize
+    );
 }
 
 proptest! {
@@ -340,7 +564,7 @@ proptest! {
             )
         );
 
-        let proc = compile(&g.xml)
+        let proc = compile(&g.xml, &g.bindings)
             .map_err(|e| report("wide model did not compile", &block, &g.xml, &e))
             .unwrap();
         let mut rng = Rng::new(seed);
