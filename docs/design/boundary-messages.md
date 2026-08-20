@@ -21,7 +21,7 @@ and 0012, and `spec/`.
 
 ## The motivating case, in one paragraph
 
-Xilium, the first application, runs a *ticket*. A ticket can be contested; the
+The first application, runs a *ticket*. A ticket can be contested; the
 contest parks the instance at a user task `handle_contest`, claimed by a clerk
 under a lease. A `PAID` message — correlated by the ticket reference — must be
 able to arrive *while that task is open* and end the ticket as Paid: withdraw
@@ -157,27 +157,13 @@ What the holder sees, each a typed result and none of them a 5xx:
 | `extend_lock` | `LockExtension::Lost` | `409 {"outcome":"lockLost"}` |
 | `release_task` | `Released::Lost` | `409 {"outcome":"lockLost"}` |
 
-Two things to say plainly to application authors, because Xilium will meet
-both on day one:
-
-- **The clerk's decision is discarded.** A `complete_task` that arrives after
-  the `PAID` boundary fired returns `AlreadyClosed` and records nothing. If
-  the application wants the lost decision kept, that is the application's
-  write, made when it sees that outcome — the engine will not invent a place
-  for it. "Never succeed" means exactly that: the patch never reaches the
-  document.
-- **The holder finds out at its next heartbeat.** Nothing pushes a
-  cancellation to a lease holder (pull model; the holder may be a browser
-  tab). The detection bound is the client's renewal interval, which is the
-  same bound the lease already puts on everything else.
-
 `LockExtension::Lost` and `Released::Lost` do not say *why*. For a timer
 boundary "reassigned" was an adequate story; for a payment it is the wrong
 one ("your task was reassigned" when the truth is "the ticket was paid"). A
 follow-up, not part of any slice here: `Lost { state }`, carrying the row
 state the way `AlreadyClosed` already does. Additive, no contract change.
 
-### 1.4 The Xilium walk-through
+### 1.4 The walk-through
 
 Model (full fixture in Appendix A): `start → handle_contest (user task) →
 end_decided`, with an interrupting message boundary `paid_during_contest`
@@ -631,7 +617,7 @@ already asserts zero.
 Most of it is in §3.5–§3.6; this section is the modeller's view and the two
 rules the timer case adds.
 
-**Xilium's late fee, as it should read** (fixture sketch in Appendix A):
+**Example's late fee, as it should read** (fixture sketch in Appendix A):
 `await_payment` is a receive task for `PAID`; on it, a non-interrupting timer
 boundary `late_fee_due` with `<timeCycle>R/P7D</timeCycle>` leading to a
 service task `add_late_fee` and an end event `fee_added`. The arm happens when
@@ -825,7 +811,7 @@ Accept (`crates/rbpmn-model/tests/fixtures/accept/`):
 
 | Fixture | Slice | What it shows |
 |---|---|---|
-| `29-message-boundary.bpmn` | 1 | the Xilium shape: user task, interrupting `PAID` boundary (Appendix A) |
+| `29-message-boundary.bpmn` | 1 | the Example shape: user task, interrupting `PAID` boundary (Appendix A) |
 | `30-receive-task-message-boundary.bpmn` | 1 | receive task for `PAID` with an interrupting `CANCELLED` boundary — two subscriptions on one token |
 | `31-subprocess-message-boundary.bpmn` | 1 | a subprocess with work inside, interrupted by a message — teardown through the message path |
 | `32-message-and-timer-boundaries.bpmn` | 1 | both kinds on one host; either interrupts, the other is withdrawn |
@@ -855,7 +841,7 @@ corpus): `ambiguous-message-arm` for the three certain shapes, and the
 *negative* — same message, different binding names — accepted.
 
 **Scenarios** (`crates/rbpmn-core/tests/scenarios/`, golden traces; the two
-for the Xilium fixture are written out in Appendix B):
+for the example fixture are written out in Appendix B):
 
 `29-message-boundary-delivered.json`, `29-message-boundary-completed.json`,
 `30-receive-host-delivered.json`, `30-receive-boundary-delivered.json`,
@@ -1001,7 +987,7 @@ model-checked. The service task costs nothing at all beyond its fixture —
 Ready for `just fixtures-di` (no DI here; it adds it). Each carries its
 `expect-diagnostics` comment in the corpus' form.
 
-### `accept/29-message-boundary.bpmn` — the Xilium shape
+### `accept/29-message-boundary.bpmn` — the example shape
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
