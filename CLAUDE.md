@@ -239,10 +239,15 @@ not a per-commit check). CI is the backstop; the point of the table in README's
   demonstration: UI routes are behind the bearer, browsers cannot send it on a
   navigation, and supplying it is the embedding application's job.
 - `just tla` — TLA+ model checking of the concurrency protocol (`spec/`).
-  Thirteen configs; eight are *expected* to fail, each matched against the
+  Nineteen configs; twelve are *expected* to fail, each matched against the
   specific violation it demonstrates (a spec that stops parsing must not read
   as "fails as expected"). Three reproduce bugs that were real. The lock order
-  is checked at two arities. Needs java; the jar is pinned and
+  is checked at two arities. `Lease.tla` models the process withdrawing a
+  leased item (`Cancel`) and `BoundaryExit.tla` the correlate-vs-complete race
+  on one token; both came with message boundaries, and `Lease`'s old
+  "only by its holder" property turned out never to have been true of the
+  shipped engine — a model with no action for an actor proves nothing about
+  it. Needs java; the jar is pinned and
   checksum-verified.
 - `just fixtures-di` — fixtures carry baked-in BPMN DI so they render
   everywhere; new fixtures without a `bpmndi:BPMNDiagram` section get theirs

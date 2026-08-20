@@ -27,6 +27,21 @@
 (* Abort models what DMN added to this path: the claim transaction can now  *)
 (* roll back after the re-check, because the decision it evaluates lives in *)
 (* the same transaction. See the action for why that changes nothing.       *)
+(*                                                                          *)
+(* The module is symbolic over ARM ROWS, and since message boundaries it    *)
+(* has a second instance. `correlate_in_tx` claims an rbpmn_subscription    *)
+(* row exactly as `try_fire` claims an rbpmn_timer row: resolve it with NO  *)
+(* lock (the (message_name, correlation_key) index), take the instance row, *)
+(* re-check that the row is still in the rehydrated state, step. A boundary *)
+(* subscription is armed on a token that scope teardown may reap, so the    *)
+(* same two things hold of it: the re-check sees the row and not the token, *)
+(* and safety rests on teardown withdrawing a reaped token's subscriptions   *)
+(* with it — `withdraw_arms(Some(token))` beside `tokens.remove`, which     *)
+(* handles timers and subscriptions in one place. SubscriptionTeardown.cfg  *)
+(* binds `Timers` to subscription rows and is expected to hold for that     *)
+(* reason; it is the same model, run under the other name so the README can *)
+(* say "no armed row — timer or subscription — outlives its token" and mean *)
+(* something that was checked.                                              *)
 (***************************************************************************)
 EXTENDS Naturals
 
@@ -151,7 +166,8 @@ Spec == Init /\ [][Next]_vars
 (* The invariant teardown must preserve, and the one the whole claim path   *)
 (* actually depends on: no timer row outlives the token it is armed on.     *)
 (* The scheduler's re-check cannot substitute for this — it inspects the    *)
-(* row, not the token.                                                      *)
+(* row, not the token. Read "timer" as "arm row": `correlate`'s re-check    *)
+(* leans on the same invariant for subscription rows.                       *)
 (***************************************************************************)
 ArmedTimersHaveLiveTokens ==
     \A t \in Timers : timerToken[t] # NoToken => timerToken[t] \in tokens
