@@ -342,7 +342,7 @@ does not even allocate a new version. Adopting `shared` is a manifest edit and
 a redeploy. The old index is not removed — if the definition still declares
 the field definition-scoped, it still has it.
 
-### The published read surface: three views
+### The published read surface: four views
 
 Applications legitimately need to *join* rbpmn's state against their own rows.
 A result set of "our tenancy, our ordering, rbpmn's instances" is a SQL join,
@@ -356,11 +356,16 @@ and the `Display` format of `Event`, one per thing an instance can be doing:
 | `rbpmn_v_instance` | what is running, and what does it hold |
 | `rbpmn_v_work_item` | what is waiting to be worked, and how deep is each queue |
 | `rbpmn_v_timer` | when does this next happen |
+| `rbpmn_v_subscription` | what is waiting on this business identifier |
+
+The last three are the three things an instance can be *waiting* on — a
+worker, a clock, a message — so between them there is no wait state an
+application has to read an undocumented table to see.
 
 They compose on `instance_id`, so a statement can group deadlines and queue
-depths by an application's own dimensions at once. The constants
-`rbpmn_engine::{INSTANCE_VIEW, WORK_ITEM_VIEW, TIMER_VIEW}` name them, so a
-rename is a compile error for callers rather than a runtime surprise.
+depths by an application's own dimensions at once. The constants `rbpmn_engine::{INSTANCE_VIEW, WORK_ITEM_VIEW,
+TIMER_VIEW, SUBSCRIPTION_VIEW}` name them, so a rename is a compile error for
+callers rather than a runtime surprise.
 
 **One contract, for all three.** Columns may be added; none will be removed or
 repurposed. Each is deliberately a **plain inlinable projection** — no `WHERE`,
@@ -468,6 +473,57 @@ sequential scans. Measured on a 50 000-instance probe: 6 buffers against 733.
 `Engine::next_due_in` carries the same finding for the scheduler's own query,
 and `Engine::NEXT_DEADLINE_SQL` is the shape written out.
 
+#### `rbpmn_v_subscription`
+
+The question arrives in one shape: someone quotes a business identifier — an
+order number, a ticket reference — and asks what is waiting on it. Nobody asks
+by instance id; if that were known the answer would already be at hand.
+
+| column | |
+|---|---|
+| `instance_id`, `subscription_no` | identity |
+| `definition_key`, `definition_version`, `element_id` | where in which model |
+| `message_name` | the message it is armed for |
+| **`correlation_key`** | **the business identifier it is waiting on** |
+| `instance_status` | whether `correlate` is answering for it |
+| `created_at` | when it was armed |
+
+**The delivery rule, because the view cannot be read correctly without it.**
+`correlate` matches on (`message_name`, `correlation_key`) among **active
+instances only**, and then: exactly one match delivers; none is
+`NoSubscription` (404); two or more is `AmbiguousCorrelation` (409), refused
+rather than delivered to an arbitrary one.
+
+An incident-frozen instance keeps its subscriptions, and they neither answer
+for a key nor block delivery to a live instance sharing it. That is what
+`instance_status` is for — one column between "nothing is waiting" and "the
+thing waiting is frozen", which are opposite answers to give someone.
+
+There is no `deliverable` boolean, for the reason `rbpmn_v_timer` has no
+`overdue`: it would be `instance_status = 'active'` and nothing else.
+
+The one fact that is *not* derivable from a single row is ambiguity — seeing
+it needs an aggregate over the table, which would stop this being an inlinable
+projection. So it is a query, and it is the one to run after a 409
+(`Engine::AMBIGUOUS_CORRELATIONS_SQL`):
+
+```sql
+select message_name, correlation_key, count(*), array_agg(instance_id)
+  from rbpmn_v_subscription
+ where instance_status = 'active'
+ group by 1, 2 having count(*) > 1
+```
+
+⚠️ **Search by `correlation_key` and the engine's own correlate index will
+not serve you well** — `rbpmn_subscription_correlate` is `(message_name,
+correlation_key)`, so a key-only predicate has no leading equality to seek on.
+Skip scan gives it one — on PostgreSQL 18 and up — by seeking once per
+distinct message name, so the cost grows with your model portfolio; below 18
+there is no index path for that predicate at all. Migration 0017 adds
+`rbpmn_subscription_by_key` for exactly this. Measured on 60 000
+subscriptions: 24 buffers at 4 distinct message names, 394 at 400, against 3
+through the explicit index either way.
+
 #### SQL, or a typed call?
 
 Use **SQL against the views** whenever the answer involves your own data:
@@ -485,6 +541,12 @@ Use a **typed call** when you want ids or counts and no join:
   construction; it refuses outright rather than sequential-scanning when no
   shared index for the field exists.
 
+Timers and subscriptions get no typed call at all; what they get instead is
+their query written out — `Engine::NEXT_DEADLINE_SQL`,
+`Engine::WAITING_ON_KEY_SQL`, `Engine::AMBIGUOUS_CORRELATIONS_SQL` — because
+these are queries with no rule in them that an application wants joined to its
+own row anyway.
+
 **The caution that decides between them:** `find_by_shared_index` applies its
 limit *in the database, before you see anything*. An application that then
 filters the result — by tenant, by permission, by anything — is filtering a
@@ -492,9 +554,7 @@ page that was already truncated, and can silently miss rows it was entitled
 to. A call that bounds before you can filter is the wrong tool for a filtered
 result set; express the filter in SQL against the view, where your predicate
 and the bound compose in the right order. `queue_depths` takes no limit for
-exactly this reason, and timers get no typed call at all — "the next deadline
-for this instance" is `order by due_at limit 1`, a query with no rule in it
-that an application wants joined to its own row anyway.
+exactly this reason.
 
 Conditions inside the XML are pure FEEL (a strict subset), so they carry no
 rbpmn-specific syntax either. Null follows FEEL exactly: `x = null` is the

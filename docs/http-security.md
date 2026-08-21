@@ -81,7 +81,7 @@ deliberately not the default posture.
   `find_by_shared_index` embeds it once. Same validator, same guarantee; the
   looked-up value is a bound parameter.
 - **The published views** (`rbpmn_v_instance`, `rbpmn_v_work_item`,
-  `rbpmn_v_timer`) are read-only projections and
+  `rbpmn_v_timer`, `rbpmn_v_subscription`) are read-only projections and
   grant nothing on their own — they are visible to whatever role the
   application's connection already uses, and rbpmn does not manage grants.
   They deliberately carry no row filtering: they are **not** a tenancy
@@ -91,8 +91,11 @@ deliberately not the default posture.
   `lock_owner` and `last_failure` — a handler's error text, which can carry
   whatever a failing integration put in it. `rbpmn_v_timer` exposes `due_spec`,
   which for a variable-sourced deadline is the FEEL path rather than the value,
-  but names a field of the variable document all the same. Who may see any of
-  that is the application's call.
+  but names a field of the variable document all the same. `rbpmn_v_subscription`
+  exposes `correlation_key`, which **is** a business identifier by
+  construction — an order number, a customer reference — and is the most
+  directly identifying column on the whole surface. Who may see any of that is
+  the application's call.
 - **SSRF**: `HttpPostHandler` targets come from operator configuration at
   engine build time, never from request data or model content.
 - **Scoped tokens**: deploy (code-adjacent) vs runtime (start/correlate/

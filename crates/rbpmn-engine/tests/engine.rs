@@ -8211,3 +8211,359 @@ async fn the_timer_view_composes_with_the_instance_view() {
     );
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// The published subscription view: rbpmn_v_subscription, the fourth wait state.
+// ---------------------------------------------------------------------------
+
+/// How many live subscriptions the view shows for one (message, key) — the
+/// number `correlate`'s three-way answer turns on.
+async fn view_live_matches(pool: &PgPool, message: &str, key: &str) -> i64 {
+    sqlx::query_scalar(&format!(
+        "select count(*) from {} where message_name = $1 and correlation_key = $2 \
+           and instance_status = 'active'",
+        rbpmn_engine::SUBSCRIPTION_VIEW
+    ))
+    .bind(message)
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_published_subscription_view_has_the_documented_shape() {
+    let db = TestDb::create().await;
+    let _engine = engine(&db).await;
+
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        "select column_name::text, data_type::text from information_schema.columns \
+         where table_name = 'rbpmn_v_subscription' order by ordinal_position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        vec![
+            ("instance_id".into(), "uuid".into()),
+            ("subscription_no".into(), "bigint".into()),
+            ("definition_key".into(), "text".into()),
+            ("definition_version".into(), "integer".into()),
+            ("element_id".into(), "text".into()),
+            ("message_name".into(), "text".into()),
+            ("correlation_key".into(), "text".into()),
+            ("instance_status".into(), "text".into()),
+            ("created_at".into(), "timestamp with time zone".into()),
+        ],
+        "rbpmn_v_subscription is public API"
+    );
+
+    let barrier: Option<Vec<String>> = sqlx::query_scalar(
+        "select reloptions from pg_class where relname = 'rbpmn_v_subscription'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(barrier.is_none(), "must carry no reloptions: {barrier:?}");
+    db.drop().await;
+}
+
+/// **The differential**: what the view shows live for a (message, key) must
+/// predict which of `correlate`'s three answers you get — deliver on exactly
+/// one, `NoSubscription` on none, `AmbiguousCorrelation` on two or more. A
+/// support surface that disagreed with the verb it exists to explain would be
+/// worse than reading the table directly.
+#[tokio::test]
+async fn the_view_predicts_correlates_three_way_answer() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/17-message-catch.bpmn"),
+            &Bindings::new().correlation("c", "order.id"),
+        )
+        .await
+        .unwrap();
+    let start = |key: &str| {
+        let engine = engine.clone();
+        let key = key.to_string();
+        async move {
+            engine
+                .start("p", None, serde_json::json!({ "order": { "id": key } }))
+                .await
+                .unwrap()
+                .id
+        }
+    };
+
+    // none armed
+    assert_eq!(
+        view_live_matches(&db.pool, "WarehouseAck", "absent").await,
+        0
+    );
+    assert!(matches!(
+        engine
+            .correlate("WarehouseAck", "absent", serde_json::json!({}))
+            .await,
+        Err(rbpmn_engine::EngineError::NoSubscription { .. })
+    ));
+
+    // exactly one armed
+    start("solo").await;
+    assert_eq!(view_live_matches(&db.pool, "WarehouseAck", "solo").await, 1);
+    assert!(
+        engine
+            .correlate("WarehouseAck", "solo", serde_json::json!({}))
+            .await
+            .is_ok()
+    );
+    // ...and consumed, so the view and the verb agree on the way back down too
+    assert_eq!(view_live_matches(&db.pool, "WarehouseAck", "solo").await, 0);
+    assert!(matches!(
+        engine
+            .correlate("WarehouseAck", "solo", serde_json::json!({}))
+            .await,
+        Err(rbpmn_engine::EngineError::NoSubscription { .. })
+    ));
+
+    // two armed
+    start("dup").await;
+    start("dup").await;
+    assert_eq!(view_live_matches(&db.pool, "WarehouseAck", "dup").await, 2);
+    assert!(matches!(
+        engine
+            .correlate("WarehouseAck", "dup", serde_json::json!({}))
+            .await,
+        Err(rbpmn_engine::EngineError::AmbiguousCorrelation { .. })
+    ));
+    db.drop().await;
+}
+
+/// A frozen instance keeps its subscriptions, and `correlate` ignores them —
+/// so the view must show the row *and* say why it is not answering. This is
+/// what `instance_status` is for: one column between "nothing is waiting" and
+/// "the thing waiting is frozen", which are opposite support answers.
+#[tokio::test]
+async fn a_frozen_instances_subscription_is_visible_but_not_answering() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/17-message-catch.bpmn"),
+            &Bindings::new().correlation("c", "order.id"),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({ "order": { "id": "o-9" } }))
+        .await
+        .unwrap();
+    sqlx::query("update rbpmn_instance set status = 'failed' where id = $1")
+        .bind(started.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Visible, with the reason attached.
+    let row: (uuid::Uuid, String, String) = sqlx::query_as(&format!(
+        "select instance_id, message_name, instance_status from {} \
+           where correlation_key = $1",
+        rbpmn_engine::SUBSCRIPTION_VIEW
+    ))
+    .bind("o-9")
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (started.id, "WarehouseAck".to_string(), "failed".to_string())
+    );
+
+    // And correlate does not see it, exactly as the view's live count says.
+    assert_eq!(view_live_matches(&db.pool, "WarehouseAck", "o-9").await, 0);
+    assert!(matches!(
+        engine
+            .correlate("WarehouseAck", "o-9", serde_json::json!({}))
+            .await,
+        Err(rbpmn_engine::EngineError::NoSubscription { .. })
+    ));
+    db.drop().await;
+}
+
+/// The 409 diagnostic: the documented ambiguity query must name exactly the
+/// pairs `correlate` refuses — no more (a frozen duplicate is not a conflict)
+/// and no fewer.
+#[tokio::test]
+async fn the_ambiguity_query_names_exactly_what_correlate_refuses() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/17-message-catch.bpmn"),
+            &Bindings::new().correlation("c", "order.id"),
+        )
+        .await
+        .unwrap();
+    for key in ["clash", "clash", "lonely", "frozen-dup", "frozen-dup"] {
+        engine
+            .start("p", None, serde_json::json!({ "order": { "id": key } }))
+            .await
+            .unwrap();
+    }
+    // One of the frozen-dup pair freezes, which makes it no longer a conflict.
+    sqlx::query(
+        "update rbpmn_instance set status = 'failed' where id = \
+         (select instance_id from rbpmn_subscription where correlation_key = 'frozen-dup' \
+           order by created_at limit 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let conflicts: Vec<(String, String, i64)> = sqlx::query_as(&format!(
+        "select message_name, correlation_key, waiting from ({}) q order by correlation_key",
+        rbpmn_engine::Engine::AMBIGUOUS_CORRELATIONS_SQL
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        conflicts,
+        vec![("WarehouseAck".to_string(), "clash".to_string(), 2)],
+        "only the live duplicate is a conflict"
+    );
+
+    // Which is exactly what the verb does.
+    assert!(matches!(
+        engine
+            .correlate("WarehouseAck", "clash", serde_json::json!({}))
+            .await,
+        Err(rbpmn_engine::EngineError::AmbiguousCorrelation { .. })
+    ));
+    assert!(
+        engine
+            .correlate("WarehouseAck", "frozen-dup", serde_json::json!({}))
+            .await
+            .is_ok(),
+        "one live half of a frozen pair still delivers"
+    );
+    assert!(
+        engine
+            .correlate("WarehouseAck", "lonely", serde_json::json!({}))
+            .await
+            .is_ok()
+    );
+    db.drop().await;
+}
+
+/// A subscription leaves the view with its token when the wait ends — here
+/// because the message arrived.
+#[tokio::test]
+async fn a_subscription_leaves_the_view_when_its_wait_ends() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/17-message-catch.bpmn"),
+            &Bindings::new().correlation("c", "order.id"),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({ "order": { "id": "o-1" } }))
+        .await
+        .unwrap();
+    let rows = |id: uuid::Uuid| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(&format!(
+                "select count(*) from {} where instance_id = $1",
+                rbpmn_engine::SUBSCRIPTION_VIEW
+            ))
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(rows(started.id).await, 1);
+    engine
+        .correlate("WarehouseAck", "o-1", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(rows(started.id).await, 0, "gone with its token");
+    db.drop().await;
+}
+
+/// The support question — "what is waiting on this order number?" — planned
+/// THROUGH the view, and the reason `rbpmn_subscription_by_key` exists.
+///
+/// The correlate index is `(message_name, correlation_key)`, so a predicate on
+/// the second column with nothing on the first has no leading equality to seek
+/// on. Skip scan gives it one from PostgreSQL 18, by seeking once per distinct
+/// message name — which is why this names `rbpmn_subscription_by_key`
+/// specifically rather than settling for "an index was used". The looser
+/// assertion would pass on a development 18 while the same query has no index
+/// path at all on the 15 CI runs, and would still pass on 18 while costing one
+/// seek per name in the deployment's model portfolio. Measured on 60 000
+/// subscriptions: 24 buffers at 4 message names, 394 at 400, against 3 here.
+#[tokio::test]
+async fn the_business_identifier_lookup_is_index_driven() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/17-message-catch.bpmn"),
+            &Bindings::new().correlation("c", "order.id"),
+        )
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({ "order": { "id": "ORD-1" } }))
+        .await
+        .unwrap();
+    // Statistics, not history — same reasoning as `bulk_work_items`.
+    bulk_instances(&db.pool, "p", "S-", 20_000).await;
+    sqlx::query(
+        "insert into rbpmn_subscription \
+           (instance_id, subscription_no, token_no, element_id, message_name, correlation_key) \
+         select i.id, 1, 1, 'c', 'MSG-' || (i.definition_version * 7 % 400), \
+                'ORD-' || i.id \
+           from rbpmn_instance i where i.definition_key = 'p' \
+             and not exists (select 1 from rbpmn_subscription s where s.instance_id = i.id)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("analyze rbpmn_subscription")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    analyze(&db.pool).await;
+
+    let plan = explain_prepared(
+        &db.pool,
+        "waiting",
+        &format!(
+            "prepare waiting(text) as {}",
+            rbpmn_engine::Engine::WAITING_ON_KEY_SQL
+        ),
+        "execute waiting('ORD-1')",
+    )
+    .await;
+    assert!(
+        plan.contains("rbpmn_subscription_by_key"),
+        "the business-identifier lookup must use its own index rather than \
+         skip-scanning the correlate index once per message name:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Seq Scan on rbpmn_subscription"),
+        "and must not scan every armed subscription:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Subquery Scan"),
+        "the view must be inlined:\n{plan}"
+    );
+    db.drop().await;
+}

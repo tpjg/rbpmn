@@ -27,6 +27,7 @@ mod listen;
 mod retention;
 mod runtime;
 mod scheduler;
+mod subscriptions;
 mod tasks;
 #[cfg(feature = "test-util")]
 pub mod testing;
@@ -52,6 +53,7 @@ pub use retention::{
 pub use runtime::FailOptions;
 pub use scheduler::SchedulerOptions;
 pub use sqlx::PgPool;
+pub use subscriptions::SUBSCRIPTION_VIEW;
 pub use tasks::{
     DeclaredIndex, GetTaskOptions, LockExtension, LockedTask, Released, TaskFilter, TaskOrder,
     declared_index_name, shared_index_name,
@@ -148,6 +150,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         16,
         "timer_view",
         include_str!("../migrations/0016_timer_view.sql"),
+    ),
+    (
+        17,
+        "subscription_view",
+        include_str!("../migrations/0017_subscription_view.sql"),
     ),
 ];
 
