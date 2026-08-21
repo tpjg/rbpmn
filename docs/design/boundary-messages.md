@@ -73,6 +73,48 @@ Worth stating before the design, because each one shaped a recommendation:
    item" has been true by code, not by check. The exactly-once property the
    brief asks for belongs there, as a `Cancel` action.
 
+## What shipped, and what building it changed
+
+A running log, newest last. Each line is something the design above did
+not say, or said differently.
+
+- **Slice 1 shipped** (interrupting message boundaries on all four hosts,
+  `Lost { state }` pulled forward). The loader gap was latent rather than
+  live — `enter` arms the host before its boundaries, so the old lookup
+  picked the host by arm order — and the test that makes the fix
+  load-bearing renumbers the two rows the other way round, a state the fsck
+  permits. The correlate loser is `InstanceNotActive` (409) when the winning
+  completion also ended the instance, because the status gate precedes the
+  subscription re-check (§4.2). `Lost { state }` is two statements, not one
+  (§1.3). `spec/Lease.tla`'s "only by its holder" property was never true of
+  the shipped engine; it is "…or the process" now, with `Cancel` modelled.
+- **Slice 2 shipped** (non-interrupting message and single-shot timer
+  boundaries). Two things the design had not anticipated. A non-interrupting
+  *message* boundary re-arms, so the reachable state space of a model with
+  one is infinite; the explorer bounds it with `MAX_SIDE_TOKENS = 2` (a
+  delivery or fire on a non-interrupting boundary is offered only while fewer
+  than two tokens stand on its side path — the same shape as its finite
+  patch alphabet). And the region-analysis change (walk only interrupting
+  pseudo-edges) has a measured counterexample: fixture
+  `37-side-path-inside-a-parallel-block` fails `balanced-gateways` with the
+  old walk. `boundary-side-path` reports one diagnostic per boundary (the
+  first offending node, named), not one per downstream node; the rule also
+  needed a three-line module in `bpmnlint-plugin-rbpmn` for `just parity`,
+  which gates on the plugin covering every L1 rule. `side-path-into-join`
+  run without the lint gate produces the join `Invariant`, as predicted.
+- **The generator found a hole the day its side-path production landed.** A
+  parallel block *directly on* a side path passed every rule and failed on 59
+  of 200 interleavings: the boundary re-arms, two activations' tokens share
+  the host's scope, and the block's join double-counts. §2.3 and §5 had said
+  "joins inside a side path are ordinary blocks" — false. Decided: lint
+  (`boundary-side-path` refuses a parallel gateway on the path; a subprocess
+  on the path is the repair, one scope per activation), plus the warning
+  `side-path-message-arm`⁺ for the same root cause on message arms. The
+  explorer's bound moved from 2 to 4 side tokens, because at 2 one activation
+  of a two-wide block already saturated it and the mutation table would have
+  called the shape clean. `reject/side-path-parallel-block` is the row;
+  `accept/38` is the repaired model with two interleaved activations.
+
 ---
 
 ## 0. Recommendations at a glance
@@ -290,8 +332,20 @@ the side path is **disjoint from everything else in the scope**. It ends at
 its own end event(s) — a plain end is *required*, because that is where the
 side token is consumed; a terminate end is *allowed*, because "on the fifth
 reminder, cancel the whole thing" is a legitimate escape and scope-local
-terminate already exists. It may contain its own split/join blocks,
-subprocesses and boundaries; those are checked as usual inside `P`.
+terminate already exists. It may contain subprocesses, loops, exclusive
+gateways and boundaries of its own — but **not a parallel block directly on
+the path**, and that is the correction building it forced (see the log at
+the top): a side path is a *multi-token* region, because the boundary can
+fire again while an earlier side token is still on it, and a parallel join
+counts one token per incoming flow *per scope* — both activations' tokens run
+in the host's scope, so the second activation's token arrives on a flow the
+first already covered and trips the join's `Invariant`. A subprocess mints a
+scope per entry, so a parallel block *inside a subprocess on the side path*
+is fine, and that is the rewrite hint. The same reasoning makes a message arm
+on a side path suspect — armed once per activation, a duplicate
+`(message, key)` freeze at the second unless each activation changes the key
+(a delivery patch can) — which is not always wrong, so it is the warning
+`side-path-message-arm`⁺ rather than an error.
 
 Message, for the modeller: *a non-interrupting boundary starts a side path
 that must end on its own — it cannot rejoin the flow after `handle_contest`
@@ -656,8 +710,11 @@ still open keeps the instance alive until it completes. Anchored form for
 `R/2026-08-31T00:00:00+02:00/P7D` — first due the first Monday at or after the
 arm, with the DST caveat of §2.5.
 
-**Join semantics.** There are none to add: a side path never reaches a join
-(`boundary-side-path`), and joins inside a side path are ordinary blocks.
+**Join semantics.** A side path never reaches a join outside itself
+(`boundary-side-path`), and a join *on* the path is refused too: two
+activations share the host's scope, so only a subprocess on the path — one
+scope per entry — can carry a parallel block. Inside that subprocess, joins
+are ordinary blocks.
 
 **Arming table for cycles.**
 

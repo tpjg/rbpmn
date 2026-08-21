@@ -139,6 +139,22 @@ variable went unconstrained exactly when it should have become TRUE, and the
 first run of `BoundaryExit_AnyRowRecheck` reported the wrong invariant. The
 parentheses are in the file with a comment pointing here.
 
+### Slice 2 (non-interrupting boundaries): re-read, nothing to model
+
+A non-interrupting boundary spawns a *sibling* token and leaves the host
+untouched. Re-read against `step.rs::spawn_side_token` (pure: a new token id,
+`element-started`/`element-completed` on the boundary, `leave_single`) and
+`persist_step` (tokens are written as a snapshot under the instance row lock,
+like every token): no new lock enters the order at either arity, so
+`LockOrder` is unchanged. `BoundaryExit` is unaffected for a different
+reason: a non-interrupting boundary never competes with the host's
+completion — the item stays open, both verbs succeed, and the only exit race
+is still the interrupting one. The message re-arm is a new arm row on the
+same token, written in the delivering transaction (there is never a
+committed state with a live host and no arm), and teardown withdraws it with
+the token like any other row — `SubscriptionTeardown.cfg` already covers
+that shape.
+
 ## What the failures show
 
 `LockOrderHistorical` restores the originally sketched timer claim — timer row

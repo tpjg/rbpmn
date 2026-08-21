@@ -15,12 +15,24 @@
 //!   * loops may only wrap the whole block (a flow from inside the region
 //!     back into S is rejected).
 //!
-//! Boundary events participate through host->boundary pseudo-edges: a
-//! boundary path is part of its host's branch and must merge back before J
-//! (or terminate) like any other path.
+//! **Interrupting** boundary events participate through host->boundary
+//! pseudo-edges ([`Graph::region_succs`]): such a boundary continues its
+//! host's token, so its path is part of the host's branch and must merge back
+//! before J (or terminate) like any other path.
+//!
+//! A **non-interrupting** boundary is walked by nothing here, deliberately. It
+//! spawns a *sibling* token rather than continuing the host's, so its path is
+//! not part of any branch, delivers nothing to J, and its end events are not
+//! "a plain end inside the region" — reading it as a branch would count a
+//! token the branch never carries. What keeps that sound is
+//! `boundary-side-path`: a side path is disjoint from everything else in the
+//! scope and ends on its own. It is an *error*, and this analysis runs only on
+//! an error-free scope, so it may assume the disjointness rather than re-check
+//! it.
 //!
 //! This runs only on scopes with no other errors, so it may assume: gateways
-//! are pure splits or joins, all flows resolve, every node reaches an end.
+//! are pure splits or joins, all flows resolve, every node reaches an end,
+//! and every non-interrupting boundary path is a disjoint side path.
 
 use super::structure::Graph;
 use crate::diagnostics::{Diagnostic, rule};
@@ -110,7 +122,7 @@ fn join_candidates(g: &Graph, s: usize, joins: &[usize]) -> Vec<usize> {
     let mut queue = VecDeque::from([s]);
     seen[s] = true;
     while let Some(v) = queue.pop_front() {
-        for w in g.succs(v) {
+        for w in g.region_succs(v) {
             if !seen[w] {
                 seen[w] = true;
                 if joins.contains(&w) {
@@ -157,7 +169,7 @@ fn check_region(g: &Graph, s: usize, j: usize) -> RegionCheck {
             match branch[v] {
                 None => {
                     branch[v] = Some(bi);
-                    for w in g.succs(v) {
+                    for w in g.region_succs(v) {
                         queue.push_back(w);
                     }
                 }

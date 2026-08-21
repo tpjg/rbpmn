@@ -169,6 +169,24 @@ async fn a_storm_holds_every_global_invariant() {
         )
         .await
         .unwrap();
+    // The *non-interrupting* boundary (slice 2), whose race is a different
+    // one: a note never competes with the review for the token, it competes
+    // with the review's **arm**. So what varies per instance is whether the
+    // delivery arrives before a consumer decides the review — and every
+    // delivery that does land leaves a sibling token behind, which is how the
+    // storm gets two tokens in one scope, a re-armed subscription, and a
+    // completion that has to wait for work its host knows nothing about. The
+    // side path's service task is claimed by the same pull consumers, so its
+    // topic is declared rather than handled. Process id is already
+    // `casefile`; no rename.
+    setup.declare_topic("file_note").await.unwrap();
+    setup
+        .deploy(
+            &fixture("accept/33-non-interrupting-message-boundary.bpmn"),
+            &rbpmn_core::Bindings::new().correlation("note_received", "case.id"),
+        )
+        .await
+        .unwrap();
 
     // Crank with RBPMN_STORM_ROUNDS when hunting; 20 keeps the suite quick.
     let rounds: u32 = std::env::var("RBPMN_STORM_ROUNDS")
@@ -221,6 +239,8 @@ async fn a_storm_holds_every_global_invariant() {
                     "count",
                     "ship",
                     "handle_contest",
+                    "review",
+                    "file_note",
                 ] {
                     if let Ok(Some(task)) = node.get_task(topic, &options).await {
                         idle = false;
@@ -275,6 +295,7 @@ async fn a_storm_holds_every_global_invariant() {
     // The workload: instances of all three definitions, started concurrently
     // from every node, with correlations chasing the message ones.
     let mut instances: Vec<(Uuid, serde_json::Value)> = Vec::new();
+    let (mut notes_delivered, mut notes_refused) = (0u32, 0u32);
     for round in 0..rounds {
         let node = &nodes[round as usize % nodes.len()];
         let empty = serde_json::json!({});
@@ -308,6 +329,31 @@ async fn a_storm_holds_every_global_invariant() {
                 Err(rbpmn_engine::EngineError::NoSubscription { .. })
                 | Err(rbpmn_engine::EngineError::InstanceNotActive(..)) => {}
                 Err(e) => panic!("correlate PAID {reference}: {e}"),
+            }
+        }
+
+        // The non-interrupting boundary, driven the same way: zero, one or
+        // two notes per case, delivered while the consumers above are
+        // claiming and completing `review`. A note does not close the host,
+        // so the second one exercises the *re-arm* — without it the delivery
+        // that consumed the first subscription would have left the boundary
+        // dead and this would be a 404. Every third case takes no note at
+        // all, which is what keeps both sides of the non-vacuity assertion
+        // below present rather than assumed.
+        let case = format!("c-{round}");
+        let vars = serde_json::json!({ "case": { "id": case.clone() } });
+        let id = node.start("casefile", None, vars.clone()).await.unwrap().id;
+        instances.push((id, vars));
+        for _ in 0..(round % 3) {
+            match node.correlate("NOTE", &case, serde_json::json!({})).await {
+                Ok(_) => notes_delivered += 1,
+                // The reviewer decided first: the completion withdrew the arm
+                // (404), or closed the instance under the delivery's re-check
+                // (409). Legal outcomes, and the reason the counts below are
+                // read from the log rather than from this loop.
+                Err(rbpmn_engine::EngineError::NoSubscription { .. })
+                | Err(rbpmn_engine::EngineError::InstanceNotActive(..)) => notes_refused += 1,
+                Err(e) => panic!("correlate NOTE {case}: {e}"),
             }
         }
     }
@@ -440,6 +486,67 @@ async fn a_storm_holds_every_global_invariant() {
          {boundary_withdrawn} withdrawn by a completion) — the storm is not \
          exercising the interleaving spec/BoundaryExit.tla is about"
     );
+
+    // ...and the same statement for the *non-interrupting* boundary, whose
+    // two sides are different events. A note that landed while the review was
+    // open is a `message-received` at the boundary; a review decided without
+    // one is a completed case whose arm was withdrawn and that never received
+    // anything. One-sided means the driver stopped racing the arm — and a run
+    // in which no note ever landed would leave the re-arm, the sibling token
+    // and "the instance outlives its host" entirely untested while staying
+    // green.
+    let notes = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'message-received' \
+         and element_id = 'note_received'",
+    )
+    .await;
+    let quiet_cases = count(
+        &db.pool,
+        "select count(*) from rbpmn_instance i where i.definition_key = 'casefile' \
+           and i.status = 'completed' \
+           and exists (select 1 from rbpmn_event e where e.instance_id = i.id \
+                 and e.kind = 'subscription-cancelled' and e.element_id = 'note_received') \
+           and not exists (select 1 from rbpmn_event e where e.instance_id = i.id \
+                 and e.kind = 'message-received')",
+    )
+    .await;
+    assert!(
+        notes > 0 && quiet_cases > 0,
+        "the non-interrupting boundary never went both ways ({notes} notes landed \
+         on an open review, {quiet_cases} reviews decided without one) — nothing \
+         here exercised the re-arm or the sibling token"
+    );
+
+    // Two exact identities, which is what a non-interrupting boundary lets a
+    // storm assert that an interrupting one cannot. One side token per
+    // delivery — no more (a delivery that also interrupted would leave the
+    // host's continuation *and* the sibling) and no fewer. And one arm per
+    // review entered plus exactly one re-arm per note: a boundary that failed
+    // to re-arm, or re-armed twice, is off by the number of notes.
+    let side_paths = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'element-started' \
+         and element_id = 'file_note'",
+    )
+    .await;
+    assert_eq!(side_paths, notes, "one side token per delivered note");
+    let cases = count(
+        &db.pool,
+        "select count(*) from rbpmn_instance where definition_key = 'casefile'",
+    )
+    .await;
+    let arms = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'message-subscribed' \
+         and element_id = 'note_received'",
+    )
+    .await;
+    assert_eq!(
+        arms,
+        cases + notes,
+        "one arm per review entered ({cases}) plus one re-arm per note ({notes})"
+    );
     let stuck = count(
         &db.pool,
         "select count(*) from rbpmn_instance where status = 'active'",
@@ -512,6 +619,11 @@ async fn a_storm_holds_every_global_invariant() {
         instances.len(),
         completed.load(Ordering::Relaxed),
         tailed.len()
+    );
+    println!(
+        "  notes:    {notes_delivered} delivered, {notes_refused} refused by a \
+         decided review; {notes} landed per the log, {quiet_cases} quiet cases, \
+         {arms} arms over {cases} cases"
     );
     println!(
         "  statuses: {:?}",

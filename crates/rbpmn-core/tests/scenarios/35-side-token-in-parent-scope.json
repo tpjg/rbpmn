@@ -1,0 +1,52 @@
+{
+  "fixture": "accept/35-non-interrupting-on-subprocess.bpmn",
+  "actions": [
+    {
+      "fire": "taking_long"
+    },
+    {
+      "complete": "pack"
+    },
+    {
+      "complete": "warn_customer"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started sp",
+      "timer-armed taking_long PT4H",
+      "element-started s2",
+      "element-completed s2",
+      "flow-taken fi1",
+      "element-started pack",
+      "work-item-created pack user pack",
+      "timer-fired taking_long",
+      "element-started taking_long",
+      "element-completed taking_long",
+      "flow-taken f3",
+      "element-started warn_customer",
+      "work-item-created warn_customer service warn_customer",
+      "work-item-completed pack",
+      "element-completed pack",
+      "flow-taken fi2",
+      "element-started packed",
+      "element-completed packed",
+      "element-completed sp",
+      "flow-taken f2",
+      "element-started shipped",
+      "element-completed shipped",
+      "work-item-completed warn_customer",
+      "element-completed warn_customer",
+      "flow-taken f4",
+      "element-started warned",
+      "element-completed warned",
+      "instance-completed"
+    ]
+  }
+}

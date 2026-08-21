@@ -622,6 +622,85 @@ fn multiple_timer_boundaries_first_fires_wins() {
     assert_eq!(state.timers().count(), 0);
 }
 
+/// The non-interrupting half, and the exact inverse of the property above:
+/// on this host there is no exit at all, only a *sibling*. The delivery must
+/// leave the host's work item open and its token parked, and it must leave
+/// **exactly one** subscription at the boundary — the re-armed one, a new id,
+/// because a live host is never without its boundary. The clerk's
+/// `CompleteWorkItem` afterwards therefore succeeds, which is the sentence
+/// "the host is untouched" actually means.
+#[test]
+fn a_non_interrupting_delivery_leaves_the_host_open_and_re_arms() {
+    let defs = load("accept/33-non-interrupting-message-boundary.bpmn");
+    let bindings = Bindings::new().correlation("note_received", "case.id");
+    let proc = ExecutableProcess::compile(&defs, "casefile", &bindings).unwrap();
+    let (host, boundary, side) = (
+        proc.node_by_id("review").unwrap(),
+        proc.node_by_id("note_received").unwrap(),
+        proc.node_by_id("file_note").unwrap(),
+    );
+
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({"case": {"id": "c-33"}}),
+        },
+    )
+    .unwrap();
+    let item = state.open_work_item_at(host).unwrap();
+    let first = state.armed_subscription_at(boundary).unwrap();
+
+    step(
+        &proc,
+        &mut state,
+        Command::DeliverMessage {
+            id: first,
+            patch: json!({}),
+        },
+    )
+    .unwrap();
+
+    // The host: still open, still parked behind the same work item.
+    assert_eq!(state.status, InstanceStatus::Active);
+    assert_eq!(state.open_work_item_at(host), Some(item));
+    // The sibling: a *second* token, in the same scope, at the side path.
+    assert_eq!(state.tokens().count(), 2);
+    assert!(state.open_work_item_at(side).is_some());
+    // The arm: exactly one, at the boundary, on the host's token, new id.
+    let subs: Vec<_> = state.subscriptions().collect();
+    assert_eq!(subs.len(), 1, "expected exactly the re-armed subscription");
+    let (id, sub) = subs[0];
+    assert_ne!(
+        id, first,
+        "the re-arm must be a new subscription, not the old"
+    );
+    assert_eq!(sub.element, boundary);
+    assert_eq!(
+        sub.token,
+        state
+            .work_items()
+            .find(|(i, _)| *i == item)
+            .unwrap()
+            .1
+            .token
+    );
+
+    // And the exit the interrupting case refuses is available here.
+    step(
+        &proc,
+        &mut state,
+        Command::CompleteWorkItem {
+            id: item,
+            patch: json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(state.status, InstanceStatus::Active); // the sibling is still working
+    assert_eq!(state.subscriptions().count(), 0); // the host took its arm with it
+}
+
 /// The core-level statement of `spec/BoundaryExit.tla`: on one host with one
 /// message boundary there is **exactly one exit**. Whichever of
 /// `CompleteWorkItem` and `DeliverMessage` runs first resolves the host; the

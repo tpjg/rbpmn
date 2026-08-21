@@ -22,6 +22,8 @@ export default {
         'rbpmn/message-has-correlation': 'error',
         'rbpmn/no-foreign-implementation': 'warn',
         'rbpmn/boundary-on-supported-host': 'error',
+        'rbpmn/boundary-side-path': 'error',
+        'rbpmn/side-path-message-arm': 'warn',
         'rbpmn/no-implicit-split': 'error',
         'rbpmn/implicit-merge-after-parallel': 'warn',
         'rbpmn/bpmn-structure': 'error',

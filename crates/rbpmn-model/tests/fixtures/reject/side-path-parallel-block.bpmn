@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error boundary-side-path @ b1
+-->
+<!-- A parallel block directly on a non-interrupting side path. Every other
+     rule is satisfied — the path is disjoint, ends at its own end, and the
+     block is well-formed — yet the boundary re-arms, so a second NOTE
+     while the first side token is still inside the block puts two
+     activations' tokens in one scope, and the join collects a second token
+     on one incoming flow (tests/mutation.rs runs it without the gate and
+     shows the Invariant; the model generator found it first, on 59 of 200
+     interleavings). The fix is a subprocess around the block, which gives
+     each activation its own scope: accept/38 is this model, repaired. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:message id="m_note" name="NOTE" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:userTask id="t1" name="Review">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:boundaryEvent id="b1" cancelActivity="false" attachedToRef="t1">
+      <bpmn:outgoing>f3</bpmn:outgoing>
+      <bpmn:messageEventDefinition messageRef="m_note" />
+    </bpmn:boundaryEvent>
+    <bpmn:parallelGateway id="ps3">
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+      <bpmn:outgoing>f5</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:userTask id="t2" name="File">
+      <bpmn:incoming>f4</bpmn:incoming>
+      <bpmn:outgoing>f6</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="t3" name="Acknowledge">
+      <bpmn:incoming>f5</bpmn:incoming>
+      <bpmn:outgoing>f7</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:parallelGateway id="pj3">
+      <bpmn:incoming>f6</bpmn:incoming>
+      <bpmn:incoming>f7</bpmn:incoming>
+      <bpmn:outgoing>f8</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:endEvent id="e_side" name="Note handled">
+      <bpmn:incoming>f8</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="end" name="Reviewed">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="t1" />
+    <bpmn:sequenceFlow id="f2" sourceRef="t1" targetRef="end" />
+    <bpmn:sequenceFlow id="f3" sourceRef="b1" targetRef="ps3" />
+    <bpmn:sequenceFlow id="f4" sourceRef="ps3" targetRef="t2" />
+    <bpmn:sequenceFlow id="f5" sourceRef="ps3" targetRef="t3" />
+    <bpmn:sequenceFlow id="f6" sourceRef="t2" targetRef="pj3" />
+    <bpmn:sequenceFlow id="f7" sourceRef="t3" targetRef="pj3" />
+    <bpmn:sequenceFlow id="f8" sourceRef="pj3" targetRef="e_side" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_p">
+    <bpmndi:BPMNPlane id="BPMNPlane_p" bpmnElement="p">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="t1_di" bpmnElement="t1">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="b1_di" bpmnElement="b1">
+        <dc:Bounds x="207" y="92" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+        <dc:Bounds x="357" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ps3_di" bpmnElement="ps3">
+        <dc:Bounds x="350" y="185" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="t2_di" bpmnElement="t2">
+        <dc:Bounds x="475" y="170" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="pj3_di" bpmnElement="pj3">
+        <dc:Bounds x="650" y="185" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="e_side_di" bpmnElement="e_side">
+        <dc:Bounds x="807" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="t3_di" bpmnElement="t3">
+        <dc:Bounds x="475" y="310" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="357" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
+        <di:waypoint x="225" y="128" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="350" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4">
+        <di:waypoint x="400" y="210" />
+        <di:waypoint x="475" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f5_di" bpmnElement="f5">
+        <di:waypoint x="375" y="235" />
+        <di:waypoint x="375" y="350" />
+        <di:waypoint x="475" y="350" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f6_di" bpmnElement="f6">
+        <di:waypoint x="575" y="210" />
+        <di:waypoint x="650" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f8_di" bpmnElement="f8">
+        <di:waypoint x="700" y="210" />
+        <di:waypoint x="807" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f7_di" bpmnElement="f7">
+        <di:waypoint x="575" y="350" />
+        <di:waypoint x="675" y="350" />
+        <di:waypoint x="675" y="235" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

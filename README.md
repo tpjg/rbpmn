@@ -169,6 +169,23 @@ and what deviates.
       validator deploy runs, in the browser, offline.
       [docs/dmn.md](docs/dmn.md) has the decisions, the gates and the
       measured deviations.
+- [x] Phase 10 — **boundary events beyond v1**, in slices. *Interrupting
+      message boundary events* on user, service and receive tasks and on
+      embedded subprocesses: a message correlated to an instance parked at a
+      task withdraws the task and takes the boundary path; a holder who had
+      the task claimed gets `alreadyClosed` with `state: "cancelled"` and its
+      patch is never applied, and `lockLost` now carries the item's state so a
+      frontend can tell *withdrawn by the process* from *reassigned*. Then
+      *non-interrupting* boundary events — message, and single-shot timers —
+      which start a sibling token while the host keeps running, under the new
+      rule `boundary-side-path` (a side path ends at its own end event and
+      never merges back: it would run the continuation twice, or deliver a
+      second token to a join). Repeating timers (`timeCycle`) follow.
+      [docs/design/boundary-messages.md](docs/design/boundary-messages.md)
+      is the record — including the two things building it found that the
+      design had not: a timer boundary on a business-rule task was a dead arm
+      lint accepted, and a re-arming boundary makes the explorer's state space
+      infinite without a bound.
 
 ## Rule catalogue
 
@@ -191,6 +208,8 @@ graphs that pass them).
 | `no-foreign-implementation` | warn | Service task carries vendor attributes (`camunda:`, `zeebe:`, …), which rbpmn ignores — topics are bound at registration. |
 | `unresolved-topic` | error | Every service task's topic (via `Bindings::topic`, default: element id) must have a registered handler or a declared external-worker topic. Checked at deploy against registration state, so `lint(xml)` alone cannot decide it. |
 | `boundary-on-supported-host` | error | Boundary events only on service/user/receive tasks and subprocesses; error boundaries only where errors can originate. Never on a business rule task: its decision is answered inside the transaction that starts it, so a boundary there is armed and cancelled in one step and can never fire. |
+| `boundary-side-path` ⁺ | error | A non-interrupting boundary spawns a *second* token beside its host's, and no block-structure proof covers it — it entered through no split. So its path must be a **side path**: disjoint from everything else in the scope, ending at its own plain end event (a terminate end is allowed too). It may not rejoin the flow after the host (the rest would run twice) or reach a parallel join (which would collect a second token on one incoming flow), and it may not carry a parallel block of its own: the boundary can fire again while an earlier side token is still inside it, and both activations run in the host's scope — wrap the block in an embedded subprocess, which gives each activation its own scope. For "remind, then wait again", use an interrupting boundary and a loop. |
+| `side-path-message-arm` ⁺ | warn | A message arm (catch, receive task, message boundary) on a side path is armed once per activation of its non-interrupting boundary, and an earlier activation's arm may still be open: unless each activation changes the correlation key (a delivery patch can), the second arm freezes the instance — `duplicate-subscription`, loud, at arm time. |
 | `ambiguous-message-arm` ⁺ | error | Two message arms for the same message *and* the same correlation binding that can be live at once — two message boundaries on one host, a receive task and its own boundary, a subprocess boundary and a catch inside it. Every delivery would be ambiguous, so deploy refuses it. Decided at L2 (`check_deployable`), because with different bindings both arms are legitimate and only the manifest knows. |
 | `no-implicit-split` | error | Activities have at most one outgoing flow; splitting happens at explicit gateways. |
 | `implicit-merge-after-parallel` | warn | Implicit merge receiving concurrent tokens — the "task runs twice" trap (accompanies the balanced-gateways error). |

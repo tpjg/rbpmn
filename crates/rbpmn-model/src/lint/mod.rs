@@ -53,6 +53,7 @@ fn lint_scope(
         condition_rules(&g, out);
         event_gateway_rules(&g, out);
         boundary_rules(defs, &g, out);
+        side_path_rules(&g, out);
 
         let scope_clean = !out[start..].iter().any(|d| d.severity == Severity::Error);
         if scope_clean {
@@ -243,17 +244,33 @@ fn element_rules(
                 )),
             },
             NodeKind::Boundary(b) => {
-                if !b.cancel_activity {
-                    out.push(Diagnostic::error(
-                        rule::NO_UNSUPPORTED_ELEMENT,
-                        id,
-                        "non-interrupting boundary events are not supported in v1 \
-                         (planned for v2)",
-                    ));
-                }
                 match &b.trigger {
+                    // Non-interrupting is accepted for timers and messages:
+                    // both spawn a sibling token onto a side path
+                    // (`boundary-side-path`) and leave the host alone. A
+                    // `timeCycle` is still refused wherever it appears —
+                    // `check_timer` says so — so a non-interrupting timer is
+                    // single-shot until slice 3.
                     BoundaryTrigger::Timer(spec) => check_timer(id, spec, out),
-                    BoundaryTrigger::Error { .. } => {}
+                    // An error boundary is interrupting by definition: the
+                    // activity that raised the error has already ended, so
+                    // there is nothing left to run beside the handler.
+                    // BPMN 2.0 fixes `cancelActivity="true"` for it, and
+                    // "keeps running" is not a thing a failed activity can
+                    // do — so this is malformed BPMN, not a phase
+                    // restriction.
+                    BoundaryTrigger::Error { .. } => {
+                        if !b.cancel_activity {
+                            out.push(Diagnostic::error(
+                                rule::BPMN_STRUCTURE,
+                                id,
+                                "error boundary events are always interrupting — the \
+                                 activity that raised the error has already ended, so \
+                                 there is no host left to keep running. Remove \
+                                 cancelActivity=\"false\"",
+                            ));
+                        }
+                    }
                     // A message boundary is a message element like any other:
                     // the XML says *which* message is caught here, and the
                     // correlation key is manifest data checked at L2 against
@@ -694,6 +711,164 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
                     },
                 },
             }
+        }
+    }
+}
+
+/// `boundary-side-path`: a non-interrupting boundary's path must be a **side
+/// path** — disjoint from everything else in the scope, ending at its own end
+/// event.
+///
+/// Why it is an error and not a warning. An interrupting boundary *continues*
+/// its host's token: whatever block structure proved about that token still
+/// holds on the boundary path, which is why the pseudo-edge model works. A
+/// non-interrupting one spawns a **second** token that entered through no
+/// split, so nothing was ever proved about it. Let that token reach a
+/// parallel join and the join collects two tokens on one incoming flow — the
+/// `Invariant` the `side-path-into-join` fixture demonstrates. Let it merge
+/// into the host's continuation and everything after the host runs once per
+/// trigger *plus* once for the host: the "task runs twice" trap, silently.
+///
+/// The rule, from `docs/design/boundary-messages.md` §2.3: let `P` be the
+/// nodes reachable from the boundary `B` over sequence flows, plus the
+/// pseudo-edges of boundaries attached to activities already in `P`. Every
+/// node in `P \ {B}` must have **all** its predecessors (flows and host
+/// pseudo-edges) inside `P`. A plain end event in `P` is required — that is
+/// where the side token is consumed — and a terminate end is allowed, because
+/// "on the fifth reminder, cancel the whole thing" is a legitimate escape.
+///
+/// One diagnostic per boundary, on the boundary: the offending node is named
+/// in the message, and a merge reported at every node downstream of it would
+/// be the same fix repeated.
+fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
+    for b in 0..g.scope.nodes.len() {
+        let NodeKind::Boundary(data) = &g.node(b).kind else {
+            continue;
+        };
+        // An unresolvable `attachedToRef` is `bpmn-structure`'s to report;
+        // without a host there is no "beside the host" to describe.
+        let (false, Some(host)) = (data.cancel_activity, g.host_of[b]) else {
+            continue;
+        };
+        let boundary_id = &g.node(b).id;
+        let host_id = &g.node(host).id;
+
+        // P: forward closure from B over flows and every boundary pseudo-edge
+        // (a boundary on an activity of the side path belongs to it too).
+        let mut in_path = vec![false; g.scope.nodes.len()];
+        in_path[b] = true;
+        let mut queue = vec![b];
+        while let Some(v) = queue.pop() {
+            for w in g.succs(v) {
+                if !in_path[w] {
+                    in_path[w] = true;
+                    queue.push(w);
+                }
+            }
+        }
+
+        // Disjointness: nothing outside the side path may reach into it. `B`
+        // itself is exempt and is the only exemption — its one predecessor is
+        // the host pseudo-edge, which is how the side path starts.
+        let intruder = (0..g.scope.nodes.len())
+            .filter(|&v| in_path[v] && v != b)
+            .find_map(|v| {
+                g.preds(v)
+                    .into_iter()
+                    .find(|&u| !in_path[u])
+                    .map(|u| (v, u))
+            });
+        if let Some((v, u)) = intruder {
+            out.push(Diagnostic::error(
+                rule::BOUNDARY_SIDE_PATH,
+                boundary_id,
+                format!(
+                    "non-interrupting boundary '{boundary_id}' starts a side path, but \
+                     '{}' on it is also reached from '{}' outside it. A side path runs \
+                     a *second* token beside '{host_id}' and must end on its own: it \
+                     cannot rejoin the flow after '{host_id}' (the rest of the process \
+                     would run twice) and it cannot reach a parallel join (which would \
+                     collect a second token on one incoming flow). If you want \
+                     'remind, then wait again', use an interrupting boundary and a loop",
+                    g.node(v).id,
+                    g.node(u).id,
+                ),
+            ));
+            continue;
+        }
+
+        // A side path is a *multi-token* region: the boundary can fire again
+        // while an earlier side token is still on it, so every per-scope
+        // singleton inside it collides. A parallel join counts one token per
+        // incoming flow *per scope*, and both side tokens live in the host's
+        // scope — the second activation's token trips the join's Invariant.
+        // The model generator found it the day the production landed (59 of
+        // 200 interleavings on the minimal shape). A subprocess mints a scope
+        // per entry, which is why a block inside one is fine: its body is
+        // another scope and is not in P.
+        let parallel = (0..g.scope.nodes.len())
+            .find(|&v| in_path[v] && v != b && matches!(g.node(v).kind, NodeKind::ParallelGateway));
+        if let Some(pg) = parallel {
+            out.push(Diagnostic::error(
+                rule::BOUNDARY_SIDE_PATH,
+                boundary_id,
+                format!(
+                    "non-interrupting boundary '{boundary_id}' can fire again while an \
+                     earlier side token is still inside the parallel block at '{}': two \
+                     activations' tokens would meet at its join, which counts one token \
+                     per incoming flow per scope — and both run in '{host_id}''s scope. \
+                     Wrap the block in an embedded subprocess, which gives each \
+                     activation its own scope",
+                    g.node(pg).id,
+                ),
+            ));
+            continue;
+        }
+
+        // Message arms on the side path are armed once per activation, and
+        // an earlier activation's arm may still be open. Unless the
+        // activation changed the key — a delivery patch can — the second arm
+        // is the duplicate-(message, key) freeze. Sometimes right, so a
+        // warning with the consequence named; the freeze is the loud backstop.
+        for v in (0..g.scope.nodes.len()).filter(|&v| in_path[v] && v != b) {
+            let message_arm = match &g.node(v).kind {
+                NodeKind::Catch(CatchTrigger::Message(_)) | NodeKind::ReceiveTask { .. } => true,
+                NodeKind::Boundary(other) => matches!(other.trigger, BoundaryTrigger::Message(_)),
+                _ => false,
+            };
+            if message_arm {
+                out.push(Diagnostic::warn(
+                    rule::SIDE_PATH_MESSAGE_ARM,
+                    &g.node(v).id,
+                    format!(
+                        "'{}' is armed once per activation of non-interrupting boundary \
+                         '{boundary_id}', and an earlier activation's arm may still be \
+                         open: unless each activation changes its correlation key, the \
+                         second arm freezes the instance (duplicate-subscription)",
+                        g.node(v).id
+                    ),
+                ));
+            }
+        }
+
+        // The side token has to be consumed somewhere: a terminate end takes
+        // the whole scope with it, so only a plain end ends the side path.
+        let plain_end = (0..g.scope.nodes.len()).any(|v| {
+            in_path[v]
+                && matches!(&g.node(v).kind, NodeKind::End(k) if !matches!(k, EndKind::Terminate))
+        });
+        if !plain_end {
+            out.push(Diagnostic::error(
+                rule::BOUNDARY_SIDE_PATH,
+                boundary_id,
+                format!(
+                    "non-interrupting boundary '{boundary_id}' starts a side path with no \
+                     plain end event: the sibling token it spawns beside '{host_id}' has \
+                     nowhere to be consumed, and the instance can never complete. End the \
+                     path at its own end event (a terminate end is allowed, and cancels \
+                     the whole scope)"
+                ),
+            ));
         }
     }
 }

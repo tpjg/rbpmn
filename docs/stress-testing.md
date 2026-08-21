@@ -185,6 +185,21 @@ both ways" applied to the generator — and it is the only test here that
 notices any of those, which was verified by making the schedule say "complete"
 every time and watching every other property stay green.
 
+`SideBoundary` — the non-interrupting message boundary — followed in the same
+round, and is the production that earned the tier its keep: the driver
+delivers 0–2 messages per activation (a schedule, like `MsgBoundary`'s), the
+host always counts and the side body counts once per delivery, and the
+instance must stay open until every side item is done. On the day it landed it
+found a lint-clean model that executes wrongly: a parallel block *directly on*
+the side path, where two activations' tokens share the host's scope and the
+block's join double-counts — 59 of 200 interleavings on the minimal shape,
+clean under a subprocess (one scope per activation), clean for `Xor` and
+`Loop`. That became a clause of `boundary-side-path` and the warning
+`side-path-message-arm`, with `reject/side-path-parallel-block` as the
+counterexample in `tests/mutation.rs`; the generator's side-path body emits
+`Par` only under a `Sub` and carries no message arm, which is the rule as
+lint now states it.
+
 Not yet generated, and why: error and timer boundaries, and `EventGateway`.
 The message boundary's merge-back settles the structural question for all of
 them, but each still owes the oracle a stimulus the driver can supply —

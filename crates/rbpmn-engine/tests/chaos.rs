@@ -162,6 +162,21 @@ async fn the_engine_converges_through_chaos() {
         )
         .await
         .unwrap();
+    // The non-interrupting boundary (slice 2). What it adds here is a
+    // delivery whose transaction does *more* than close a token: it consumes
+    // an arm, opens a new one and spawns a sibling, all in the one step a
+    // terminated backend can interrupt. A half-applied version of that would
+    // be a case with two subscriptions, or with none and a live review — both
+    // of which the fsck below names. Its topic is declared, not handled: the
+    // pull consumers claim the side path's task like any other.
+    setup.declare_topic("file_note").await.unwrap();
+    setup
+        .deploy(
+            &fixture("accept/33-non-interrupting-message-boundary.bpmn"),
+            &rbpmn_core::Bindings::new().correlation("note_received", "case.id"),
+        )
+        .await
+        .unwrap();
 
     let deadlocks_before = deadlocks(&db.pool).await;
     let rounds: u32 = std::env::var("RBPMN_CHAOS_ROUNDS")
@@ -257,6 +272,8 @@ async fn the_engine_converges_through_chaos() {
                     "pack",
                     "backorder",
                     "handle_contest",
+                    "review",
+                    "file_note",
                 ] {
                     if let Ok(Some(task)) = engine.get_task(topic, &options).await {
                         idle = false;
@@ -346,6 +363,25 @@ async fn the_engine_converges_through_chaos() {
                 Err(rbpmn_engine::EngineError::NoSubscription { .. })
                 | Err(rbpmn_engine::EngineError::InstanceNotActive(..)) => {}
                 Err(e) => panic!("correlate PAID {reference}: {e}"),
+            }
+        }
+        // The non-interrupting one, driven the same way: zero, one or two
+        // notes per case, so the re-arm runs while backends are being killed
+        // and every third case is left for the consumers to decide alone.
+        let case = format!("c-{round}");
+        let vars = serde_json::json!({ "case": { "id": case.clone() } });
+        let id = setup
+            .start("casefile", None, vars.clone())
+            .await
+            .unwrap()
+            .id;
+        instances.push((id, vars));
+        for _ in 0..(round % 3) {
+            match setup.correlate("NOTE", &case, serde_json::json!({})).await {
+                Ok(_) => {}
+                Err(rbpmn_engine::EngineError::NoSubscription { .. })
+                | Err(rbpmn_engine::EngineError::InstanceNotActive(..)) => {}
+                Err(e) => panic!("correlate NOTE {case}: {e}"),
             }
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -473,6 +509,44 @@ async fn the_engine_converges_through_chaos() {
         boundary_fired > 0 && boundary_withdrawn > 0,
         "the message-boundary race never went both ways ({boundary_fired} delivered, \
          {boundary_withdrawn} withdrawn by a completion)"
+    );
+
+    // The non-interrupting boundary's own two sides, through the crashes: a
+    // note that landed on an open review, and a review decided without one.
+    // The second identity is the sharper of the two — one side token per
+    // delivered note — because a step that half-committed its spawn would
+    // leave the counts apart, and a killed backend is exactly what could do
+    // that.
+    let notes = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'message-received' \
+         and element_id = 'note_received'",
+    )
+    .await;
+    let quiet_cases = count(
+        &db.pool,
+        "select count(*) from rbpmn_instance i where i.definition_key = 'casefile' \
+           and i.status = 'completed' \
+           and exists (select 1 from rbpmn_event e where e.instance_id = i.id \
+                 and e.kind = 'subscription-cancelled' and e.element_id = 'note_received') \
+           and not exists (select 1 from rbpmn_event e where e.instance_id = i.id \
+                 and e.kind = 'message-received')",
+    )
+    .await;
+    assert!(
+        notes > 0 && quiet_cases > 0,
+        "the non-interrupting boundary never went both ways through chaos \
+         ({notes} notes landed, {quiet_cases} reviews decided without one)"
+    );
+    let side_paths = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'element-started' \
+         and element_id = 'file_note'",
+    )
+    .await;
+    assert_eq!(
+        side_paths, notes,
+        "one side token per delivered note, crashes included"
     );
 
     let statuses: Vec<(String, i64)> = sqlx::query(

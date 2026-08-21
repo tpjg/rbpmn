@@ -5241,3 +5241,681 @@ async fn a_heartbeat_blocked_by_a_cancellation_reports_the_new_state() {
     assert_fsck_clean(&db.pool).await;
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Non-interrupting boundary events, slice 2
+// (docs/design/boundary-messages.md §3.5 and §5)
+//
+// The claim these hold the projection to is a negative one: a side token is an
+// *ordinary* token and needed no engine code. So every assertion below is
+// really "the thing that would have needed special-casing did not happen" —
+// the host's lease survived, the re-arm is a new row, the sibling lives in the
+// host token's scope, a teardown reaps it like anything else, and the instance
+// stays alive until the last token is consumed whichever one that is.
+// ---------------------------------------------------------------------------
+
+/// Fixture 33's wiring: the boundary carries the correlation, exactly as a
+/// catch does, and the side path's service task takes the default topic. As
+/// ever, none of it is in the XML.
+fn casefile_bindings() -> Bindings {
+    Bindings::new().correlation("note_received", "case.id")
+}
+
+/// A migrated engine with fixture 33 deployed and its side path's topic
+/// declared — `file_note` is a service task, so the environment must cover it
+/// before `unresolved-topic` will let the deploy through.
+async fn casefile_engine(db: &TestDb) -> Engine {
+    let engine = engine(db).await;
+    engine.declare_topic("file_note").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/33-non-interrupting-message-boundary.bpmn"),
+            &casefile_bindings(),
+        )
+        .await
+        .unwrap();
+    engine
+}
+
+async fn status_of(pool: &PgPool, instance: uuid::Uuid) -> String {
+    sqlx::query_scalar("select status from rbpmn_instance where id = $1")
+        .bind(instance)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The armed subscriptions of an instance, in allocation order:
+/// `(subscription_no, element_id, correlation_key)`.
+async fn subscriptions_of(pool: &PgPool, instance: uuid::Uuid) -> Vec<(i64, String, String)> {
+    sqlx::query(
+        "select subscription_no, element_id, correlation_key from rbpmn_subscription \
+         where instance_id = $1 order by subscription_no",
+    )
+    .bind(instance)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| {
+        (
+            r.get::<i64, _>("subscription_no"),
+            r.get::<String, _>("element_id"),
+            r.get::<String, _>("correlation_key"),
+        )
+    })
+    .collect()
+}
+
+/// Every live token's scope, by element. Enough for the fixtures here, where
+/// no element holds two tokens at once.
+async fn token_scopes(
+    pool: &PgPool,
+    instance: uuid::Uuid,
+) -> std::collections::BTreeMap<String, i64> {
+    sqlx::query("select element_id, scope_no from rbpmn_token where instance_id = $1")
+        .bind(instance)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("element_id"),
+                r.get::<i64, _>("scope_no"),
+            )
+        })
+        .collect()
+}
+
+/// Backdate one armed timer so the scheduler will pick *it* next.
+///
+/// The alternative — rewriting the duration literal to `PT0S` before deploy,
+/// as `boundary_timer_xml` and `racing_timer_xml` do — cannot order two
+/// timers on one instance against each other, and it changes the history
+/// (`timer-armed` prints the spec the model carries), which would put the
+/// golden trace out of reach. This changes neither.
+async fn make_due(pool: &PgPool, instance: uuid::Uuid, element: &str) {
+    let rows = sqlx::query(
+        "update rbpmn_timer set due_at = now() - interval '1 second' \
+         where instance_id = $1 and element_id = $2",
+    )
+    .bind(instance)
+    .bind(element)
+    .execute(pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(rows, 1, "no timer armed at '{element}' to make due");
+}
+
+/// The whole of slice 2 in one instance: a note arrives while the reviewer is
+/// holding the task under a live lease, and *nothing* of the reviewer's is
+/// touched. The lease heartbeats, the item stays `locked`, the boundary is
+/// re-armed in the same transaction that consumed it — a new row, so a second
+/// note has somewhere to land — and each delivery leaves a sibling token
+/// behind that keeps the instance alive after the review is decided.
+///
+/// The contrast with `message_boundary_interrupts_a_leased_user_task` is the
+/// point: same verbs, same lease, opposite answers, and the only difference in
+/// the model is `cancelActivity="false"`.
+#[tokio::test]
+async fn a_non_interrupting_message_leaves_the_lease_alive() {
+    let db = TestDb::create().await;
+    let engine = casefile_engine(&db).await;
+    let started = engine
+        .start(
+            "casefile",
+            None,
+            serde_json::json!({ "case": { "id": "c-33" } }),
+        )
+        .await
+        .unwrap();
+
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("reviewer"))
+        .await
+        .unwrap()
+        .expect("the reviewer's task");
+    let armed = subscriptions_of(&db.pool, started.id).await;
+    assert_eq!(armed.len(), 1, "{armed:?}");
+    assert_eq!(
+        (armed[0].1.as_str(), armed[0].2.as_str()),
+        ("note_received", "c-33")
+    );
+
+    // The note. Empty patches throughout: the golden trace this run is held
+    // to records none, and `step` emits one `variables-patched` per patch.
+    engine
+        .correlate("NOTE", "c-33", serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // The reviewer notices nothing. A heartbeat still extends — the verb that
+    // answered `Lost { state: "cancelled" }` for the interrupting boundary —
+    // and the item is still `locked` in the reviewer's name.
+    assert!(
+        matches!(
+            engine
+                .extend_lock(task.id, "reviewer", Duration::from_secs(600))
+                .await
+                .unwrap(),
+            LockExtension::Extended { .. }
+        ),
+        "the host's lease must survive a non-interrupting delivery"
+    );
+    assert_eq!(item_state(&db.pool, started.id, "review").await, "locked");
+
+    // Exactly one subscription at the boundary between deliveries, and a
+    // *different* one: the delivery consumed the arm and the re-arm opened a
+    // new row in the same transaction, so the host is never observably
+    // without its boundary.
+    let rearmed = subscriptions_of(&db.pool, started.id).await;
+    assert_eq!(rearmed.len(), 1, "{rearmed:?}");
+    assert_eq!(
+        (rearmed[0].1.as_str(), rearmed[0].2.as_str()),
+        ("note_received", "c-33")
+    );
+    assert!(
+        rearmed[0].0 > armed[0].0,
+        "the re-arm must be a new subscription, not the consumed one \
+         ({armed:?} -> {rearmed:?})"
+    );
+
+    // The side token's work item is an ordinary one: claimable on its own
+    // topic, leasable, handed back like any other.
+    let side = engine
+        .get_task("file_note", &GetTaskOptions::new("filer"))
+        .await
+        .unwrap()
+        .expect("the side path's service task");
+    assert_eq!(
+        (side.element_id.as_str(), side.kind.as_str()),
+        ("file_note", "service")
+    );
+    assert_eq!(
+        engine
+            .release_task(side.id, "filer", side.lease_no)
+            .await
+            .unwrap(),
+        Released::Released
+    );
+
+    // A second note, on the re-armed subscription. Without the re-arm this is
+    // a 404 and the rest of this test never happens.
+    engine
+        .correlate("NOTE", "c-33", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 1);
+
+    // The review is decided. Its arm goes with it — but the two notes it let
+    // through are tokens of their own, and the instance is not finished.
+    let done = engine
+        .complete_task(task.id, "reviewer", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(matches!(done, Completion::Advanced(_)), "{done:?}");
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 0);
+    assert_eq!(
+        status_of(&db.pool, started.id).await,
+        "active",
+        "the instance must outlive its host: two side tokens are still open"
+    );
+
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["file_note", "file_note"],
+        "one side token per delivery"
+    );
+    engine
+        .complete_work_item(open[0].0, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        status_of(&db.pool, started.id).await,
+        "active",
+        "one side token still to be consumed"
+    );
+    engine
+        .complete_work_item(open[1].0, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+
+    assert_eq!(
+        variables_of(&db.pool, started.id).await,
+        serde_json::json!({ "case": { "id": "c-33" } })
+    );
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("33-non-interrupting-delivered-twice-then-host-completes.json")
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// The other order. Host completion withdraws the arm exactly as an
+/// interrupting one's would — non-interrupting says what a delivery *does*,
+/// never how long the boundary lives — so a note arriving afterwards is the
+/// same loud 404, and no side path ever ran.
+#[tokio::test]
+async fn host_completion_withdraws_a_non_interrupting_arm() {
+    let db = TestDb::create().await;
+    let engine = casefile_engine(&db).await;
+    let started = engine
+        .start(
+            "casefile",
+            None,
+            serde_json::json!({ "case": { "id": "c-33" } }),
+        )
+        .await
+        .unwrap();
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("reviewer"))
+        .await
+        .unwrap()
+        .expect("the reviewer's task");
+
+    let done = engine
+        .complete_task(task.id, "reviewer", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(matches!(done, Completion::Advanced(_)), "{done:?}");
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(
+        event_count(&db.pool, started.id, "subscription-cancelled").await,
+        1
+    );
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 0);
+
+    let late = engine
+        .correlate("NOTE", "c-33", serde_json::json!({}))
+        .await;
+    assert!(
+        matches!(late, Err(rbpmn_engine::EngineError::NoSubscription { .. })),
+        "{late:?}"
+    );
+    // The side path never existed: no token took it, so no item was created.
+    let items: i64 = sqlx::query_scalar(
+        "select count(*) from rbpmn_work_item where instance_id = $1 and element_id = 'file_note'",
+    )
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(items, 0);
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("33-host-completes-first.json")
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// The reminder shape, through the scheduler: a timer fires beside an open
+/// approval instead of taking it away. Both directions in one test, because
+/// the interesting pair is "fired, host untouched" against "host first, arm
+/// withdrawn" — the same two the golden traces pin.
+#[tokio::test]
+async fn a_non_interrupting_timer_spawns_a_reminder() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    // Due at once so the scheduler can fire it here — the same rewrite
+    // `boundary_timer_xml` and `racing_timer_xml` use, and the one literal the
+    // golden trace has to be mapped through below.
+    let xml = fixture("accept/34-non-interrupting-timer-boundary.bpmn").replace("PT1H", "PT0S");
+    engine.deploy(&xml, &Bindings::default()).await.unwrap();
+    let ping = |trace: Vec<String>| -> Vec<String> {
+        trace
+            .into_iter()
+            .map(|e| e.replace("timer-armed bt PT1H", "timer-armed bt PT0S"))
+            .collect()
+    };
+
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(timer_rows(&db.pool, started.id).await, 1);
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    // The reminder ran *beside* the approval. The clerk's item was never
+    // touched: still available, still claimable, still the same item.
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["ut", "t_ping"],
+        "the host's item and the side token's, together"
+    );
+    assert_eq!(item_state(&db.pool, started.id, "ut").await, "available");
+    let approval = engine
+        .get_task("ut", &GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .expect("the approval is still claimable");
+    assert_eq!(
+        (approval.id, approval.element_id.as_str()),
+        (open[0].0, "ut")
+    );
+
+    // The host completes; the reminder keeps the instance alive on its own.
+    assert!(matches!(
+        engine
+            .complete_task(approval.id, "clerk", serde_json::json!({}))
+            .await
+            .unwrap(),
+        Completion::Advanced(_)
+    ));
+    assert_eq!(status_of(&db.pool, started.id).await, "active");
+    engine
+        .complete_work_item(open[1].0, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        ping(golden_trace("34-reminder-fires-then-approved.json"))
+    );
+
+    // The mirror: the clerk is quicker than the deadline. The arm goes with
+    // the host, and there is nothing left for the scheduler to find — a
+    // reminder for a decision already made would be the bug.
+    let quick = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(timer_rows(&db.pool, quick.id).await, 1);
+    let (item, _) = open_items(&db.pool, quick.id).await[0].clone();
+    engine
+        .complete_work_item(item, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, quick.id, "completed").await;
+    assert_eq!(timer_rows(&db.pool, quick.id).await, 0);
+    assert_eq!(event_count(&db.pool, quick.id, "timer-cancelled").await, 1);
+    assert!(
+        !engine.fire_due_timer().await.unwrap(),
+        "the withdrawn arm must leave the scheduler nothing to fire"
+    );
+    assert_eq!(
+        event_trace(&db.pool, quick.id).await,
+        ping(golden_trace("34-host-completes-before-reminder.json"))
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// Scheduler liveness, and the guard against a re-arm sneaking into the
+/// single-shot path. A `timeDuration` boundary fires once — that is what the
+/// spec it carries says — so after the fire the whole database has nothing
+/// armed and `next_due_in` must be `None`.
+///
+/// A boundary that quietly re-armed itself would not fail any trace assertion
+/// above: it would show up here, as a scheduler that never sleeps again. The
+/// repeating form (`timeCycle`) is refused everywhere and is slice 3's.
+#[tokio::test]
+async fn a_single_shot_side_timer_leaves_the_scheduler_idle() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let xml = fixture("accept/34-non-interrupting-timer-boundary.bpmn").replace("PT1H", "PT0S");
+    engine.deploy(&xml, &Bindings::default()).await.unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(
+        engine.next_due_in().await.unwrap().is_some(),
+        "the boundary is armed and overdue"
+    );
+
+    assert!(engine.fire_due_timer().await.unwrap());
+    assert_eq!(
+        engine.next_due_in().await.unwrap(),
+        None,
+        "the single-shot boundary re-armed itself — the scheduler will now spin"
+    );
+    assert!(!engine.fire_due_timer().await.unwrap());
+    assert_eq!(timer_rows(&db.pool, started.id).await, 0);
+    assert_eq!(event_count(&db.pool, started.id, "timer-armed").await, 1);
+    assert_eq!(event_count(&db.pool, started.id, "timer-fired").await, 1);
+
+    // ...and the host is still open with the reminder beside it, so this is
+    // an idle scheduler over live work, not over a finished instance.
+    for (item, _) in open_items(&db.pool, started.id).await {
+        engine
+            .complete_work_item(item, serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(engine.next_due_in().await.unwrap(), None);
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// A non-interrupting boundary on a *subprocess*: the escalation runs beside
+/// the work, in the parent scope, because that is where the boundary's
+/// outgoing flow lives. The projection is what makes this checkable — the
+/// side token's `scope_no` is a column — and it is the one place where
+/// "the host token's scope" and "the host's own scope" are different answers.
+#[tokio::test]
+async fn a_side_token_on_a_subprocess_host_runs_in_the_parent_scope() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("warn_customer").await.unwrap();
+    let xml = fixture("accept/35-non-interrupting-on-subprocess.bpmn").replace("PT4H", "PT0S");
+    engine.deploy(&xml, &Bindings::default()).await.unwrap();
+    let started = engine
+        .start("shipment", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        scope_rows(&db.pool, started.id).await,
+        vec![(1, 0, "sp".to_string())]
+    );
+
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    // The three tokens, and the whole claim of §3.5 in one assertion: the
+    // sibling is in the *parent* scope beside the parked subprocess token,
+    // while the work inside the subprocess keeps its child scope.
+    let scopes = token_scopes(&db.pool, started.id).await;
+    assert_eq!(scopes.get("warn_customer"), Some(&0), "{scopes:?}");
+    assert_eq!(scopes.get("sp"), Some(&0), "the parked host token");
+    assert_eq!(scopes.get("pack"), Some(&1), "{scopes:?}");
+
+    // The subprocess finishes on its own — the boundary took nothing from it
+    // — and the escalation then keeps the instance alive after its host's
+    // scope has closed.
+    let (pack, _) = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .find(|(_, e)| e == "pack")
+        .unwrap();
+    engine
+        .complete_work_item(pack, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(
+        scope_rows(&db.pool, started.id).await.is_empty(),
+        "the subprocess completed with the side token outside it"
+    );
+    assert_eq!(status_of(&db.pool, started.id).await, "active");
+
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["warn_customer"]
+    );
+    engine
+        .complete_work_item(open[0].0, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    let expected: Vec<String> = golden_trace("35-side-token-in-parent-scope.json")
+        .into_iter()
+        .map(|e| {
+            e.replace(
+                "timer-armed taking_long PT4H",
+                "timer-armed taking_long PT0S",
+            )
+        })
+        .collect();
+    assert_eq!(event_trace(&db.pool, started.id).await, expected);
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// Teardown reaps side tokens, and nothing special-cases them. A side path
+/// runs *inside* a subprocess; the deadline on that subprocess then tears the
+/// whole scope down, and the sibling goes with everything else in it — its
+/// work item cancelled, its token gone, no scope row left behind.
+///
+/// Both timers are driven by backdating their rows rather than by rewriting
+/// literals: two arms on one instance have to fire in a defined order, and
+/// this keeps the history identical to the golden one.
+#[tokio::test]
+async fn teardown_reaps_side_tokens() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/36-side-token-reaped.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("claim", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    make_due(&db.pool, started.id, "nudge").await;
+    assert!(engine.fire_due_timer().await.unwrap());
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["assess", "chase"]
+    );
+    // The sibling is inside the subprocess' scope, beside its host: the
+    // boundary is on `assess`, whose token lives there.
+    let scopes = token_scopes(&db.pool, started.id).await;
+    assert_eq!(scopes.get("chase"), Some(&1), "{scopes:?}");
+    assert_eq!(scopes.get("assess"), Some(&1), "{scopes:?}");
+
+    make_due(&db.pool, started.id, "deadline").await;
+    assert!(engine.fire_due_timer().await.unwrap());
+    wait_for_status(&db.pool, started.id, "completed").await;
+
+    // Nothing of the side path survived, and nothing of it was treated
+    // differently from the host's own work.
+    assert!(scope_rows(&db.pool, started.id).await.is_empty());
+    assert!(open_items(&db.pool, started.id).await.is_empty());
+    assert_eq!(item_state(&db.pool, started.id, "chase").await, "cancelled");
+    assert_eq!(
+        item_state(&db.pool, started.id, "assess").await,
+        "cancelled"
+    );
+    assert_eq!(timer_rows(&db.pool, started.id).await, 0);
+    assert!(token_scopes(&db.pool, started.id).await.is_empty());
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("36-teardown-reaps-a-side-token.json")
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// The re-arm is an **arm**, and arms evaluate at arm time: the new
+/// subscription's key is read from the document the delivery just patched,
+/// not from the one the first arm saw. Nothing else in the corpus shows this
+/// — every other slice-2 delivery carries an empty patch — and it is visible
+/// only here, as the `correlation_key` column of a row the core asked for.
+///
+/// The trace slice at the end pins §3.5's emission order: delivery, its
+/// patch, **then** the re-arm, and only then the sibling's first move. A live
+/// host is never observably without its boundary.
+#[tokio::test]
+async fn a_re_arm_reads_its_key_from_the_patched_document() {
+    let db = TestDb::create().await;
+    let engine = casefile_engine(&db).await;
+    let started = engine
+        .start(
+            "casefile",
+            None,
+            serde_json::json!({ "case": { "id": "c-old" } }),
+        )
+        .await
+        .unwrap();
+    engine
+        .correlate(
+            "NOTE",
+            "c-old",
+            serde_json::json!({ "case": { "id": "c-new" } }),
+        )
+        .await
+        .unwrap();
+
+    let rearmed = subscriptions_of(&db.pool, started.id).await;
+    assert_eq!(rearmed.len(), 1, "{rearmed:?}");
+    assert_eq!(
+        rearmed[0].2, "c-new",
+        "the re-arm must evaluate its key at arm time, against the patched document"
+    );
+    let trace = event_trace(&db.pool, started.id).await;
+    let at = trace
+        .iter()
+        .position(|e| e == "message-received note_received NOTE")
+        .expect("the delivery");
+    assert_eq!(
+        &trace[at..at + 4],
+        [
+            "message-received note_received NOTE",
+            "variables-patched",
+            "message-subscribed note_received NOTE c-new",
+            "element-started note_received",
+        ]
+    );
+
+    // So the old key is nobody's any more, and the new one delivers.
+    let stale = engine
+        .correlate("NOTE", "c-old", serde_json::json!({}))
+        .await;
+    assert!(
+        matches!(stale, Err(rbpmn_engine::EngineError::NoSubscription { .. })),
+        "{stale:?}"
+    );
+    engine
+        .correlate("NOTE", "c-new", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        event_count(&db.pool, started.id, "message-received").await,
+        2
+    );
+
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("reviewer"))
+        .await
+        .unwrap()
+        .expect("the reviewer's task");
+    engine
+        .complete_task(task.id, "reviewer", serde_json::json!({}))
+        .await
+        .unwrap();
+    for (item, _) in open_items(&db.pool, started.id).await {
+        engine
+            .complete_work_item(item, serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(
+        variables_of(&db.pool, started.id).await,
+        serde_json::json!({ "case": { "id": "c-new" } })
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}

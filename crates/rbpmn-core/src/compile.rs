@@ -266,19 +266,16 @@ pub enum ExecKind {
         message: String,
         key: Vec<String>,
     },
-    /// Interrupting timer boundary: armed on the host's token, entered only
-    /// by its timer firing — never via a sequence flow.
+    /// Timer boundary: armed on the host's token, entered only by its timer
+    /// firing — never via a sequence flow.
     TimerBoundary {
         due: TimerSource,
+        interrupting: bool,
     },
     /// Message boundary: a subscription armed on the *host's* token, entered
     /// only by its own delivery — never via a sequence flow. `key` is the
     /// parsed correlation qualified name bound to the **boundary's** element
     /// id, never the host's.
-    ///
-    /// `interrupting` is `true` for everything this phase compiles (lint
-    /// still refuses `cancelActivity="false"`); the field is here so the
-    /// non-interrupting arm is an added match, not a re-shaped variant.
     MessageBoundary {
         message: String,
         key: Vec<String>,
@@ -310,6 +307,22 @@ impl ExecKind {
                 Some((message.as_str(), key.as_slice()))
             }
             _ => None,
+        }
+    }
+
+    /// Does triggering this boundary cancel its host?
+    ///
+    /// `cancelActivity` for a timer or a message boundary, straight from the
+    /// model. An error boundary is always interrupting — the activity that
+    /// raised the error has already ended — and lint refuses the XML that
+    /// says otherwise. Anything else answers `true` because nothing else is
+    /// ever asked: the callers are the two arm paths in `step`, which reach
+    /// this only for a boundary that just fired.
+    pub fn boundary_interrupts(&self) -> bool {
+        match self {
+            ExecKind::TimerBoundary { interrupting, .. }
+            | ExecKind::MessageBoundary { interrupting, .. } => *interrupting,
+            _ => true,
         }
     }
 }
@@ -701,8 +714,13 @@ impl ExecutableProcess {
                                 })?;
                             ExecKind::ErrorBoundary { code }
                         }
+                        // `cancelActivity` for both kinds, and lint is what
+                        // makes reading it safe: only a timer (non-cycle) or
+                        // a message boundary may be non-interrupting, an
+                        // error boundary never is.
                         BoundaryTrigger::Timer(spec) => ExecKind::TimerBoundary {
                             due: timer_due(node, spec)?,
+                            interrupting: b.cancel_activity,
                         },
                         // The correlation binding is the *boundary's* own element
                         // id, exactly as a catch's is its own: the XML says which
@@ -710,11 +728,7 @@ impl ExecutableProcess {
                         BoundaryTrigger::Message(message_ref) => ExecKind::MessageBoundary {
                             message: message_name(node, message_ref)?,
                             key: correlation(node)?,
-                            // Not `b.cancel_activity`: lint refuses the
-                            // non-interrupting form, and reading the attribute
-                            // here would make `compile_without_lint` execute one
-                            // as if it interrupted.
-                            interrupting: true,
+                            interrupting: b.cancel_activity,
                         },
                         _ => {
                             return Err(CompileError::Internal(format!(
