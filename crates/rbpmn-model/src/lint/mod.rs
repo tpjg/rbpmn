@@ -217,7 +217,7 @@ fn element_rules(
                 CatchTrigger::Message(message_ref) => {
                     check_message(defs, id, message_ref.as_deref(), out)
                 }
-                CatchTrigger::Timer(spec) => check_timer(id, spec, false, out),
+                CatchTrigger::Timer(spec) => check_timer(id, spec, node.kind.executes_cycle(), out),
                 CatchTrigger::Unsupported { tag } => out.push(Diagnostic::error(
                     rule::NO_UNSUPPORTED_ELEMENT,
                     id,
@@ -246,13 +246,15 @@ fn element_rules(
                 match &b.trigger {
                     // Non-interrupting is accepted for timers and messages:
                     // both spawn a sibling token onto a side path
-                    // (`boundary-side-path`) and leave the host alone. A
-                    // `timeCycle` is still refused wherever it appears —
-                    // `check_timer` says so — so a non-interrupting timer is
-                    // single-shot until slice 3.
-                    // A repeating timer only makes sense where the first
-                    // occurrence does not end the wait.
-                    BoundaryTrigger::Timer(spec) => check_timer(id, spec, !b.cancel_activity, out),
+                    // (`boundary-side-path`) and leave the host alone. It is
+                    // also the one place a repeating `timeCycle` executes —
+                    // `executes_cycle` is the single predicate saying so, and
+                    // the compiler's chokepoint asks the same one — because a
+                    // repeat only makes sense where the first occurrence does
+                    // not end the wait.
+                    BoundaryTrigger::Timer(spec) => {
+                        check_timer(id, spec, node.kind.executes_cycle(), out)
+                    }
                     // An error boundary is interrupting by definition: the
                     // activity that raised the error has already ended, so
                     // there is nothing left to run beside the handler.
@@ -351,12 +353,14 @@ fn unsupported_message(tag: &str) -> String {
 /// (`P30X` is a mistyped duration *and* a syntactically valid qualified
 /// name). That is what keeps a typo legible: the author reads why it is not a
 /// duration and what it will be treated as instead, in one line.
-fn check_timer(id: &str, spec: &TimerSpec, cycle_allowed: bool, out: &mut Vec<Diagnostic>) {
+fn check_timer(id: &str, spec: &TimerSpec, executes_cycle: bool, out: &mut Vec<Diagnostic>) {
     // A cycle is executed on a non-interrupting boundary and nowhere else: on
     // an intermediate catch or an interrupting boundary the first occurrence
     // ends the wait, and "fire once, drop the rest" is the silent
-    // reinterpretation other engines ship and this one refuses.
-    if matches!(spec, TimerSpec::Cycle(_)) && !cycle_allowed {
+    // reinterpretation other engines ship and this one refuses. The caller
+    // answers with `NodeKind::executes_cycle`, which is also what the
+    // compiler's chokepoint asks — one predicate, two readers.
+    if matches!(spec, TimerSpec::Cycle(_)) && !executes_cycle {
         out.push(Diagnostic::error(
             rule::NO_UNSUPPORTED_ELEMENT,
             id,
@@ -370,7 +374,13 @@ fn check_timer(id: &str, spec: &TimerSpec, cycle_allowed: bool, out: &mut Vec<Di
         out.push(Diagnostic::error(
             rule::TIMER_ISO8601,
             id,
-            "timer event definition needs a timeDate or timeDuration",
+            if executes_cycle {
+                "timer event definition needs a timeDate, a timeDuration or a timeCycle"
+            } else {
+                // A cycle would be refused here anyway (the branch above), so
+                // offering one as a repair would be a round trip.
+                "timer event definition needs a timeDate or timeDuration"
+            },
         ));
         return;
     };
@@ -823,17 +833,32 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
         // activation changed the key — a delivery patch can — the second arm
         // is the duplicate-(message, key) freeze. Sometimes right, so a
         // warning with the consequence named; the freeze is the loud backstop.
+        //
+        // Including the arms inside an embedded subprocess on the path, at
+        // any depth. A subprocess mints a scope per entry and that is what
+        // makes a *parallel block* safe there — the repair this very rule
+        // recommends — but a subscription is keyed by (message, key) across
+        // the whole instance, so a scope of its own buys an arm nothing.
+        // `lint_scope` reaches that body on its own, with no idea it sits on
+        // a side path, which is why the walk happens from here.
         for v in (0..g.scope.nodes.len()).filter(|&v| in_path[v] && v != b) {
+            let mut arms: Vec<&FlowNode> = Vec::new();
             if g.node(v).kind.is_message_arm() {
+                arms.push(g.node(v));
+            }
+            if let NodeKind::SubProcess(sp) = &g.node(v).kind {
+                message_arms_within(&sp.body, &mut arms);
+            }
+            for arm in arms {
                 out.push(Diagnostic::warn(
                     rule::SIDE_PATH_MESSAGE_ARM,
-                    &g.node(v).id,
+                    &arm.id,
                     format!(
                         "'{}' is armed once per activation of non-interrupting boundary \
                          '{boundary_id}', and an earlier activation's arm may still be \
                          open: unless each activation changes its correlation key, the \
                          second arm freezes the instance (duplicate-subscription)",
-                        g.node(v).id
+                        arm.id
                     ),
                 ));
             }
@@ -857,6 +882,21 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
                      the whole scope)"
                 ),
             ));
+        }
+    }
+}
+
+/// Every message arm inside a scope's bodies, at any depth — the arms
+/// `side_path_rules` cannot see because they live one scope down from the
+/// path it walks. Boundary arms included: a message boundary inside the body
+/// is armed once per activation exactly like a catch is.
+fn message_arms_within<'a>(scope: &'a FlowScope, out: &mut Vec<&'a FlowNode>) {
+    for node in &scope.nodes {
+        if node.kind.is_message_arm() {
+            out.push(node);
+        }
+        if let NodeKind::SubProcess(sp) = &node.kind {
+            message_arms_within(&sp.body, out);
         }
     }
 }

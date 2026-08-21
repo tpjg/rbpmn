@@ -590,8 +590,19 @@ impl ExecutableProcess {
             let kind = match spec {
                 TimerSpec::Duration(_) => TimerKind::Duration,
                 TimerSpec::Date(_) => TimerKind::Date,
-                // Lint admits a cycle on a non-interrupting boundary only;
-                // the callers refuse it anywhere else as "survived lint".
+                // The one place a cycle is admitted, asking the same
+                // predicate lint accepted the element with: everywhere else
+                // the first occurrence ends the wait, so a cycle that got
+                // this far is a linter that stopped agreeing with the model.
+                // Guarding here rather than at each call site is the point —
+                // every armed timer resolves through `timer_due`, so there is
+                // exactly one place to keep in step.
+                TimerSpec::Cycle(_) if !node.kind.executes_cycle() => {
+                    return Err(CompileError::Internal(format!(
+                        "timer '{}' with a cycle where it cannot repeat survived lint",
+                        node.id
+                    )));
+                }
                 TimerSpec::Cycle(_) => TimerKind::Cycle,
                 TimerSpec::Missing => {
                     return Err(CompileError::Internal(format!(
@@ -690,17 +701,9 @@ impl ExecutableProcess {
                 }
                 NodeKind::ParallelGateway => ExecKind::ParallelGateway,
                 NodeKind::EventBasedGateway => ExecKind::EventBasedGateway,
-                NodeKind::Catch(CatchTrigger::Timer(spec)) => {
-                    if matches!(spec, TimerSpec::Cycle(_)) {
-                        return Err(CompileError::Internal(format!(
-                            "timer catch '{}' with a cycle survived lint",
-                            node.id
-                        )));
-                    }
-                    ExecKind::TimerCatch {
-                        due: timer_due(node, spec)?,
-                    }
-                }
+                NodeKind::Catch(CatchTrigger::Timer(spec)) => ExecKind::TimerCatch {
+                    due: timer_due(node, spec)?,
+                },
                 NodeKind::Catch(CatchTrigger::Message(message_ref)) => ExecKind::MessageCatch {
                     message: message_name(node, message_ref)?,
                     key: correlation(node)?,
@@ -748,21 +751,14 @@ impl ExecutableProcess {
                             ExecKind::ErrorBoundary { code }
                         }
                         // `cancelActivity` for both kinds, and lint is what
-                        // makes reading it safe: only a timer (non-cycle) or
-                        // a message boundary may be non-interrupting, an
-                        // error boundary never is.
-                        BoundaryTrigger::Timer(spec) => {
-                            if b.cancel_activity && matches!(spec, TimerSpec::Cycle(_)) {
-                                return Err(CompileError::Internal(format!(
-                                    "interrupting boundary '{}' with a cycle survived lint",
-                                    node.id
-                                )));
-                            }
-                            ExecKind::TimerBoundary {
-                                due: timer_due(node, spec)?,
-                                interrupting: b.cancel_activity,
-                            }
-                        }
+                        // makes reading it safe: only a timer or a message
+                        // boundary may be non-interrupting, an error boundary
+                        // never is. Whether *this* timer may repeat is
+                        // `timer_due`'s single guard, not a second one here.
+                        BoundaryTrigger::Timer(spec) => ExecKind::TimerBoundary {
+                            due: timer_due(node, spec)?,
+                            interrupting: b.cancel_activity,
+                        },
                         // The correlation binding is the *boundary's* own element
                         // id, exactly as a catch's is its own: the XML says which
                         // message is caught here, the manifest says by which key.
@@ -909,7 +905,9 @@ impl ExecutableProcess {
         // node pass (a business-rule task without a binding) already returned
         // above with `MissingDecision`.
         let owning_scope: Vec<ScopeIx> = flat.iter().map(|(s, _)| *s).collect();
-        if let Some(e) = ambiguous_message_arm(&nodes, &boundaries, &owning_scope, &child_scope) {
+        if let Some(e) =
+            ambiguous_message_arm(&nodes, &flows, &boundaries, &owning_scope, &child_scope)
+        {
             return Err(e);
         }
 
@@ -1013,14 +1011,27 @@ impl ExecutableProcess {
 
 /// `ambiguous-message-arm` (docs/design/boundary-messages.md §2.4).
 ///
-/// Three shapes are certain the moment the manifest is known: two message
+/// Four shapes are certain the moment the manifest is known: two message
 /// boundaries on one host, a message boundary on a receive task catching the
-/// host's own message, and a message boundary on a subprocess with a catch of
-/// the same message anywhere inside its body. Certain because those arms are
-/// live over exactly the same span — the host's wait — so *every* delivery
-/// would be ambiguous, not merely some interleaving of them. The runtime
-/// duplicate rule (a second open `(message, key)` freezes the instance) stays
-/// the backstop for everything else.
+/// host's own message, a message boundary on a subprocess with a catch of
+/// the same message anywhere inside its body, and a **non-interrupting**
+/// message boundary whose own side path carries an arm for the same pair.
+/// Certain because those arms are live over exactly the same span — the
+/// host's wait — so *every* delivery would be ambiguous, not merely some
+/// interleaving of them. The runtime duplicate rule (a second open
+/// `(message, key)` freezes the instance) stays the backstop for everything
+/// else.
+///
+/// The side path is certain for a reason of its own, and it is the *first*
+/// delivery that freezes: a non-interrupting boundary re-arms itself and
+/// then spawns the side token **in the same step**, so the new arm is
+/// already open when the side token reaches the catch. The host is untouched
+/// and still parked, so its own arm and its other boundaries' arms are open
+/// too — which is why the side path joins the host's group rather than
+/// forming one of its own. `side-path-message-arm` warns about the *other*
+/// half of the same shape (an arm colliding with an earlier activation's,
+/// which only the manifest's key can rule out); this refuses the half that
+/// cannot come out any other way.
 ///
 /// The same message with a **different** binding is accepted: the two resolve
 /// to different keys and both may legitimately be live. That is the whole
@@ -1028,6 +1039,7 @@ impl ExecutableProcess {
 /// and the manifest is never in the XML.
 fn ambiguous_message_arm(
     nodes: &[ExecNode],
+    flows: &[ExecFlow],
     boundaries: &BTreeMap<NodeIx, Vec<NodeIx>>,
     owning_scope: &[ScopeIx],
     child_scope: &BTreeMap<NodeIx, ScopeIx>,
@@ -1050,6 +1062,43 @@ fn ambiguous_message_arm(
             }
         }
     };
+    // Everything inside a subprocess's body, at any depth — the scope-parent
+    // chain, so one subprocess covers its whole subtree.
+    let body_of = |activity: NodeIx| -> Vec<NodeIx> {
+        child_scope.get(&activity).map_or_else(Vec::new, |&body| {
+            (0..nodes.len())
+                .filter(|&n| inside(owning_scope[n], body))
+                .collect()
+        })
+    };
+    // The forward closure from a non-interrupting boundary: its side path
+    // over sequence flows, the boundaries attached to activities on it, and
+    // the bodies of the subprocesses on it. The same set `boundary-side-path`
+    // reasons about in the linter, computed here over the compiled graph —
+    // and it must include the subprocess bodies, because "put it in a
+    // subprocess" is a repair that rule itself recommends.
+    let side_path = |seed: NodeIx| -> Vec<NodeIx> {
+        let mut seen = vec![false; nodes.len()];
+        let mut queue = vec![seed];
+        seen[seed] = true;
+        let mut reached = Vec::new();
+        while let Some(v) = queue.pop() {
+            reached.push(v);
+            let onward = nodes[v]
+                .outgoing
+                .iter()
+                .map(|&fi| flows[fi].target)
+                .chain(boundaries.get(&v).into_iter().flatten().copied())
+                .chain(body_of(v));
+            for w in onward {
+                if !seen[w] {
+                    seen[w] = true;
+                    queue.push(w);
+                }
+            }
+        }
+        reached
+    };
     let mut found: Vec<AmbiguousArms> = Vec::new();
     for (&host, attached) in boundaries {
         let mut live: Vec<NodeIx> = attached
@@ -1067,9 +1116,26 @@ fn ambiguous_message_arm(
         }
         // A subprocess boundary is armed before the body starts and withdrawn
         // when it ends, so it overlaps every arm inside, at any depth.
-        if let Some(&body) = child_scope.get(&host) {
-            live.extend((0..nodes.len()).filter(|&n| inside(owning_scope[n], body)));
-        }
+        live.extend(body_of(host));
+        // A non-interrupting message boundary re-arms and *then* spawns the
+        // side token, so its next arm is open while the side path runs beside
+        // the still-parked host: every arm on that path is live with the
+        // host's own.
+        let side_arms: Vec<NodeIx> = attached
+            .iter()
+            .copied()
+            .filter(|&b| {
+                matches!(
+                    nodes[b].kind,
+                    ExecKind::MessageBoundary {
+                        interrupting: false,
+                        ..
+                    }
+                )
+            })
+            .flat_map(&side_path)
+            .collect();
+        live.extend(side_arms);
         live.sort_unstable();
         live.dedup();
 

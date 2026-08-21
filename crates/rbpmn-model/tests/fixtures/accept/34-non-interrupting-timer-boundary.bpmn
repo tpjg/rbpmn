@@ -4,9 +4,10 @@
 <!-- The reminder shape, and the smallest non-interrupting boundary there is:
      while the approval is open a timer fires once, spawns a *sibling* token
      that sends one reminder and ends on its own, and leaves the clerk's task
-     exactly where it was. A single-shot timeDuration does not re-arm — a
-     repeating timeCycle is still refused everywhere (slice 3) — so this
-     reminds once, which is what the boundary says. The side path
+     exactly where it was. A single-shot timeDuration does not re-arm, so
+     this reminds once, which is what the boundary says; a repeating
+     timeCycle on this very boundary would keep reminding, and accept/40 is
+     that model. The side path
      (bt -> t_ping -> e2) touches nothing else in the scope, which is
      boundary-side-path's whole demand. -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">

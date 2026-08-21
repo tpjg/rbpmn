@@ -464,6 +464,99 @@ mod tests {
   </bpmn:process>
 </bpmn:definitions>"#;
 
+    /// A non-interrupting NOTE boundary whose side path waits for NOTE
+    /// again, under the same key. The boundary re-arms and spawns the side
+    /// token in one step, so the catch subscribes into an arm that is
+    /// already open: the *first* delivery freezes the instance.
+    ///
+    /// `{ARM}` is the side path's waiting element and `{ARM_BINDING}` the key
+    /// it is bound to, so the three tests below differ by one substitution
+    /// each rather than by a copy of the whole model.
+    const SIDE_PATH_ARM: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="defs">
+  <bpmn:message id="m" name="NOTE" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:userTask id="ut"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:userTask>
+    <bpmn:boundaryEvent id="b" cancelActivity="false" attachedToRef="ut">
+      <bpmn:outgoing>f3</bpmn:outgoing><bpmn:messageEventDefinition messageRef="m" />
+    </bpmn:boundaryEvent>
+    {ARM}
+    <bpmn:endEvent id="end"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="e1"><bpmn:incoming>f4</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ut" />
+    <bpmn:sequenceFlow id="f2" sourceRef="ut" targetRef="end" />
+    <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="{ENTRY}" />
+    <bpmn:sequenceFlow id="f4" sourceRef="{EXIT}" targetRef="e1" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    /// The catch sits directly on the side path.
+    const FLAT_ARM: &str = r#"<bpmn:intermediateCatchEvent id="catch_ack">
+      <bpmn:incoming>f3</bpmn:incoming><bpmn:outgoing>f4</bpmn:outgoing>
+      <bpmn:messageEventDefinition messageRef="m" />
+    </bpmn:intermediateCatchEvent>"#;
+
+    /// ...and the same catch one scope down, inside a subprocess on the side
+    /// path — which is the repair `boundary-side-path` recommends for a
+    /// parallel block, so it must not be a way to smuggle the arm past this.
+    const NESTED_ARM: &str = r#"<bpmn:subProcess id="sp">
+      <bpmn:incoming>f3</bpmn:incoming><bpmn:outgoing>f4</bpmn:outgoing>
+      <bpmn:startEvent id="s2"><bpmn:outgoing>g1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:intermediateCatchEvent id="catch_ack">
+        <bpmn:incoming>g1</bpmn:incoming><bpmn:outgoing>g2</bpmn:outgoing>
+        <bpmn:messageEventDefinition messageRef="m" />
+      </bpmn:intermediateCatchEvent>
+      <bpmn:endEvent id="e2"><bpmn:incoming>g2</bpmn:incoming></bpmn:endEvent>
+      <bpmn:sequenceFlow id="g1" sourceRef="s2" targetRef="catch_ack" />
+      <bpmn:sequenceFlow id="g2" sourceRef="catch_ack" targetRef="e2" />
+    </bpmn:subProcess>"#;
+
+    fn side_path_model(arm: &str, entry: &str) -> String {
+        SIDE_PATH_ARM
+            .replace("{ARM}", arm)
+            .replace("{ENTRY}", entry)
+            .replace("{EXIT}", entry)
+    }
+
+    #[test]
+    fn a_side_path_arm_for_the_boundary_s_own_pair_is_ambiguous() {
+        let d = ambiguity(
+            &side_path_model(FLAT_ARM, "catch_ack"),
+            &Bindings::new()
+                .correlation("b", "case.id")
+                .correlation("catch_ack", "case.id"),
+        );
+        let elements: Vec<&str> = d.iter().map(|d| d.element.as_str()).collect();
+        assert_eq!(elements, vec!["b", "catch_ack"], "{d:?}");
+    }
+
+    /// The negative, and the same one that makes the rule L2: a different
+    /// binding is a different key, and "each activation acknowledges its own
+    /// note" is exactly how this shape is meant to be written.
+    #[test]
+    fn a_side_path_arm_under_a_different_binding_is_fine() {
+        let c = checked(
+            &side_path_model(FLAT_ARM, "catch_ack"),
+            &Bindings::new()
+                .correlation("b", "case.id")
+                .correlation("catch_ack", "note.id"),
+        );
+        assert!(c.ok(), "{:?}", c.diagnostics);
+    }
+
+    #[test]
+    fn a_side_path_arm_inside_a_subprocess_is_ambiguous_too() {
+        let d = ambiguity(
+            &side_path_model(NESTED_ARM, "sp"),
+            &Bindings::new()
+                .correlation("b", "case.id")
+                .correlation("catch_ack", "case.id"),
+        );
+        let elements: Vec<&str> = d.iter().map(|d| d.element.as_str()).collect();
+        assert_eq!(elements, vec!["b", "catch_ack"], "{d:?}");
+    }
+
     fn ambiguity(xml: &str, bindings: &Bindings) -> Vec<Diagnostic> {
         let c = checked(xml, bindings);
         c.diagnostics

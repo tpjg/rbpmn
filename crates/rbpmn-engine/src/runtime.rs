@@ -742,9 +742,20 @@ pub(crate) async fn load_instance_nowait(
             "cycle" => TimerDue::Cycle(spec),
             other => return Err(internal(format!("unknown timer due kind '{other}'"))),
         };
-        let remaining = row
-            .get::<Option<i32>, _>("remaining")
-            .map(|r| r.max(0) as u32);
+        // A cycle's fire count is positive or absent — the core drops the
+        // timer rather than re-arming at zero, and the column checks it.
+        // Clamping a corrupt value to zero would arm an occurrence that can
+        // never fire and say nothing; reject the row instead.
+        let remaining = match row.get::<Option<i32>, _>("remaining") {
+            Some(r) if r > 0 => Some(r as u32),
+            Some(r) => {
+                return Err(internal(format!(
+                    "timer '{element_id}' has remaining = {r}; a cycle's fire \
+                     count is positive, and every other kind's is absent"
+                )));
+            }
+            None => None,
+        };
         timers.push((
             TimerId(row.get::<i64, _>("timer_no") as u64),
             TimerState {
@@ -1294,9 +1305,16 @@ pub(crate) async fn persist_step(
 /// `timestamptz + interval '1 day'` is a calendar day in the session's time
 /// zone — which `P1D` in a cycle is not, across a daylight-saving change:
 ///
-/// * a re-arm (`previous_due` is the fired occurrence's due): *that* due plus
-///   the period — never the time the fire happened to run, so a scheduler
-///   that was late does not drift the schedule;
+/// * a re-arm (`previous_due` is the fired occurrence's due): the grid of
+///   *that* due — `previous_due + period · k` — at the first occurrence at or
+///   after now. The grid is the previous due's, never the time the fire
+///   happened to run, so a scheduler an hour late on a weekly cycle still
+///   re-arms at previous due + 7 d and the schedule does not drift. `k` is at
+///   least 1, so a re-arm is always in the future: an engine that was down
+///   for a day on an `R/PT15M` boundary re-arms at the next quarter hour, not
+///   96 times back to back. Occurrences missed while it was down are
+///   **skipped, never replayed** — and because a bounded `R<n>` counts
+///   *fires*, skipping one costs it nothing;
 /// * a first arm with an anchor: the anchor fixes the *phase* — the first
 ///   occurrence at or after now, a future anchor being itself the first due.
 ///   Occurrences already in the past are never replayed: a definition
@@ -1335,7 +1353,9 @@ async fn insert_timer(
          values ($1, $2, $3, $4, $5, $6, $7, case \
            when $5 = 'duration' then clock_timestamp() + $6::interval \
            when $5 = 'date' then $6::timestamptz \
-           when $8::float8 is not null then to_timestamp($8::float8 + $9::float8) \
+           when $8::float8 is not null then to_timestamp( \
+             $8::float8 + $9::float8 * greatest(1, ceil( \
+               (extract(epoch from clock_timestamp()) - $8::float8) / $9::float8))) \
            when $10::timestamptz is not null then to_timestamp( \
              extract(epoch from $10::timestamptz) \
              + $9::float8 * ceil(greatest(0, extract(epoch from clock_timestamp()) \

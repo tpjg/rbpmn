@@ -157,6 +157,23 @@ impl NodeKind {
         }
     }
 
+    /// Where a repeating `timeCycle` is actually executed: a **non-interrupting
+    /// timer boundary**, and nowhere else. On an intermediate catch or an
+    /// interrupting boundary the first occurrence ends the wait, so "fire
+    /// once, drop the rest" would be the silent reinterpretation this linter
+    /// exists to refuse.
+    ///
+    /// **The** answer, for the same reason as
+    /// [`Self::is_supported_boundary_host`]: the linter's `check_timer` asks
+    /// it to decide whether to accept the element, and the compiler asks it
+    /// at its one timer chokepoint to decide whether a cycle survived lint.
+    /// Written twice, the two drift, and the drift is a `timeCycle` that
+    /// deploys and then fires once.
+    pub fn executes_cycle(&self) -> bool {
+        matches!(self, NodeKind::Boundary(b)
+            if !b.cancel_activity && matches!(b.trigger, BoundaryTrigger::Timer(_)))
+    }
+
     /// Activities that can host boundary events (v1 subset). **The** answer:
     /// the linter asks it, and so does the compiler's guard, against this
     /// same model kind.

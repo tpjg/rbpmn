@@ -383,17 +383,26 @@ pub fn step(
                 // "an arm on a parked token fired" is one thing whichever
                 // kind of arm it was.
                 //
-                // Non-interrupting: the host is left exactly as it was and a
+                // Non-interrupting: `side_path_triggered`, the other half of
+                // that pairing — the host is left exactly as it was and a
                 // sibling token takes the path instead. A single-shot timer
                 // does **not** re-arm — it fired once, which is what a
-                // `timeDuration`/`timeDate` says; a cycle re-arms its next
-                // occurrence first, while fires remain.
+                // `timeDuration`/`timeDate` says, and `rearm_cycle` returns
+                // having done nothing; a cycle re-arms its next occurrence
+                // first, while fires remain.
                 WaitKind::WorkItem(_) | WaitKind::Message(_) | WaitKind::Scope(_) => {
                     if proc.node(timer.element).kind.boundary_interrupts() {
                         adv.interrupt_host(state, timer.token, timer.element)?;
                     } else {
-                        adv.rearm_cycle(state, id, &timer);
-                        adv.spawn_side_token(state, timer.token, timer.element)?;
+                        adv.side_path_triggered(
+                            state,
+                            timer.token,
+                            timer.element,
+                            |adv, state| {
+                                adv.rearm_cycle(state, id, &timer);
+                                true
+                            },
+                        )?;
                     }
                     adv.run(state)
                 }
@@ -469,14 +478,16 @@ pub fn step(
                 // process.
                 //
                 // The non-interrupting one leaves the host alone and spawns a
-                // sibling — and **re-arms first**. Delivery consumed the
-                // subscription, and the boundary must stay active for as long
-                // as its host is, so a new one is opened immediately: a new
-                // id, and the key re-evaluated against the now-patched
-                // document, because this is an arm and arms evaluate at arm
-                // time. The old row is already gone, so the duplicate check
-                // cannot trip on itself; a key that has become unusable
-                // freezes exactly as it would have at the first arm.
+                // sibling — and **re-arms first**, through the same
+                // `side_path_triggered` a non-interrupting timer boundary
+                // uses. Delivery consumed the subscription, and the boundary
+                // must stay active for as long as its host is, so a new one
+                // is opened immediately: a new id, and the key re-evaluated
+                // against the now-patched document, because this is an arm and
+                // arms evaluate at arm time. The old row is already gone, so
+                // the duplicate check cannot trip on itself; a key that has
+                // become unusable freezes exactly as it would have at the
+                // first arm, and the helper stops before the side token.
                 //
                 // The emission order is the one the golden traces pin:
                 // `message-received`, `variables-patched`, **then** the
@@ -486,15 +497,9 @@ pub fn step(
                     if proc.node(sub.element).kind.boundary_interrupts() {
                         adv.interrupt_host(state, sub.token, sub.element)?;
                     } else {
-                        // The host's scope, before anything can freeze in it:
-                        // a re-arm that cannot resolve its key parks the host
-                        // as an incident, and an advancer still pointing at
-                        // the root would file it in the wrong scope.
-                        adv.scope = token.scope;
-                        if adv.subscribe(state, sub.token, sub.element).is_none() {
-                            return adv.run(state); // frozen on the re-arm
-                        }
-                        adv.spawn_side_token(state, sub.token, sub.element)?;
+                        adv.side_path_triggered(state, sub.token, sub.element, |adv, state| {
+                            adv.subscribe(state, sub.token, sub.element).is_some()
+                        })?;
                     }
                     adv.run(state)
                 }
@@ -1012,6 +1017,23 @@ impl<'a> Advancer<'a> {
                 .and_then(|parts| parts.repeats),
             _ => None,
         };
+        Some(self.record_timer(state, token, element, due, remaining, None))
+    }
+
+    /// Allocate a timer and say so: the tail both arming paths share, so a
+    /// field added to [`TimerState`] or to `timer-armed` lands in one place
+    /// rather than in one place and a half. `continues` is the only thing
+    /// that differs between a first arm (`None`) and a cycle's next
+    /// occurrence.
+    fn record_timer(
+        &mut self,
+        state: &mut InstanceState,
+        token: TokenId,
+        element: NodeIx,
+        due: TimerDue,
+        remaining: Option<u32>,
+        continues: Option<TimerId>,
+    ) -> TimerId {
         let id = state.alloc_timer(TimerState {
             element,
             token,
@@ -1023,10 +1045,10 @@ impl<'a> Advancer<'a> {
             element: self.proc.node_id(element).to_string(),
             due,
             token,
-            continues: None,
+            continues,
             remaining,
         });
-        Some(id)
+        id
     }
 
     /// A cycle fired: arm the next occurrence, unless that was the last.
@@ -1044,20 +1066,14 @@ impl<'a> Advancer<'a> {
         if left == Some(0) {
             return;
         }
-        let next = state.alloc_timer(TimerState {
-            element: timer.element,
-            token: timer.token,
-            due: timer.due.clone(),
-            remaining: left,
-        });
-        self.events.push(Event::TimerArmed {
-            id: next,
-            element: self.proc.node_id(timer.element).to_string(),
-            due: timer.due.clone(),
-            token: timer.token,
-            continues: Some(fired),
-            remaining: left,
-        });
+        self.record_timer(
+            state,
+            timer.token,
+            timer.element,
+            timer.due.clone(),
+            left,
+            Some(fired),
+        );
     }
 
     /// An interrupting boundary fired on a waiting host: end the host's own
@@ -1146,32 +1162,65 @@ impl<'a> Advancer<'a> {
         true
     }
 
-    /// Non-interrupting boundary triggered: the host's token is **untouched**
-    /// — still parked, its work item / own subscription / child scope intact,
-    /// its other arms still armed — and a fresh sibling token leaves along
-    /// the boundary's single outgoing flow.
+    /// A non-interrupting boundary triggered on a parked host: keep its arm
+    /// alive, then run the side path. The mirror of [`Self::interrupt_host`],
+    /// and one helper for both arms for the same reason — what a
+    /// non-interrupting boundary does is one thing whichever kind of arm woke
+    /// it, and the two copies had already drifted on the scope.
     ///
-    /// The sibling starts in the **host token's scope**, which for a
-    /// subprocess host is the *parent* scope: the boundary's flow lives
-    /// beside the parked subprocess token, not inside the body. Nothing else
-    /// is special about it. It is a token: the scope completes when its last
-    /// one is consumed (a host that finished first keeps the instance alive
-    /// until the side work does), a teardown reaps it with everything else in
-    /// its scope, and a terminate takes it. That is why scope and instance
-    /// completion need no code here.
-    fn spawn_side_token(
+    /// The order is the whole content of this function, and the golden traces
+    /// pin it:
+    ///
+    /// 1. the **host's scope**, before anything can freeze in it: a re-arm
+    ///    that cannot resolve its key parks the host as an incident, and an
+    ///    advancer still pointing at the root would file it in the wrong
+    ///    scope;
+    /// 2. the **re-arm** — a fresh subscription for a message boundary, the
+    ///    next occurrence for a cycle, nothing at all for a single-shot timer
+    ///    (it fired once, which is what a `timeDuration` says). `false` means
+    ///    the re-arm failed and already froze the instance, so there is no
+    ///    side path to run: the caller flushes the events it produced;
+    /// 3. the **side token**. A live host is never observably without its
+    ///    boundary, which is what puts the re-arm ahead of this.
+    fn side_path_triggered(
         &mut self,
         state: &mut InstanceState,
         host: TokenId,
         boundary: NodeIx,
+        rearm: impl FnOnce(&mut Self, &mut InstanceState) -> bool,
     ) -> Result<(), StepError> {
-        let scope = state.tokens.get(&host).map(|t| t.scope).ok_or_else(|| {
+        self.scope = state.tokens.get(&host).map(|t| t.scope).ok_or_else(|| {
             StepError::Invariant(format!(
                 "boundary '{}' host token {host:?} does not exist",
                 self.proc.node_id(boundary)
             ))
         })?;
-        self.scope = scope;
+        if !rearm(self, state) {
+            return Ok(()); // frozen on the re-arm
+        }
+        self.spawn_side_token(state, boundary)
+    }
+
+    /// The side path itself: the host's token is **untouched** — still
+    /// parked, its work item / own subscription / child scope intact, its
+    /// other arms still armed — and a fresh sibling token leaves along the
+    /// boundary's single outgoing flow.
+    ///
+    /// The sibling starts in the **host token's scope**, which for a
+    /// subprocess host is the *parent* scope: the boundary's flow lives
+    /// beside the parked subprocess token, not inside the body.
+    /// [`Self::side_path_triggered`] has already set it — the one lookup, so
+    /// a re-arm and its side token cannot end up in different scopes.
+    /// Nothing else is special about the sibling. It is a token: the scope
+    /// completes when its last one is consumed (a host that finished first
+    /// keeps the instance alive until the side work does), a teardown reaps
+    /// it with everything else in its scope, and a terminate takes it. That
+    /// is why scope and instance completion need no code here.
+    fn spawn_side_token(
+        &mut self,
+        state: &mut InstanceState,
+        boundary: NodeIx,
+    ) -> Result<(), StepError> {
         let sibling = state.next_token_id();
         self.element_started(boundary);
         self.element_completed(boundary);

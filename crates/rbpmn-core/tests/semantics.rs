@@ -701,6 +701,60 @@ fn a_non_interrupting_delivery_leaves_the_host_open_and_re_arms() {
     assert_eq!(state.subscriptions().count(), 0); // the host took its arm with it
 }
 
+/// ...and the one way that delivery can still fail. The re-arm evaluates the
+/// key against the **patched** document, so a delivery that spoils the key
+/// freezes the instance — and it must freeze *before* the side token, which
+/// is the early return in `side_path_triggered`. A sibling spawned into a
+/// failed instance would be a token nothing can ever advance.
+#[test]
+fn a_re_arm_that_cannot_resolve_its_key_freezes_before_the_side_token() {
+    let defs = load("accept/33-non-interrupting-message-boundary.bpmn");
+    let bindings = Bindings::new().correlation("note_received", "case.id");
+    let proc = ExecutableProcess::compile(&defs, "casefile", &bindings).unwrap();
+    let (boundary, side) = (
+        proc.node_by_id("note_received").unwrap(),
+        proc.node_by_id("file_note").unwrap(),
+    );
+
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({"case": {"id": "c-33"}}),
+        },
+    )
+    .unwrap();
+    let first = state.armed_subscription_at(boundary).unwrap();
+
+    // A float key can never match (no canonical spelling across a jsonb
+    // round-trip), so the re-arm cannot be made.
+    let events = step(
+        &proc,
+        &mut state,
+        Command::DeliverMessage {
+            id: first,
+            patch: json!({"case": {"id": 1.5}}),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(state.status, InstanceStatus::Failed);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.to_string() == "correlation-failed note_received case.id"),
+        "{events:?}"
+    );
+    // No sibling: one token, parked at the boundary that could not re-arm.
+    assert_eq!(state.tokens().count(), 1);
+    assert!(state.open_work_item_at(side).is_none());
+    let (_, token) = state.tokens().next().unwrap();
+    assert_eq!(token.wait, WaitKind::Incident);
+    assert_eq!(token.node, boundary);
+    assert_eq!(state.subscriptions().count(), 0);
+}
+
 /// The core-level statement of `spec/BoundaryExit.tla`: on one host with one
 /// message boundary there is **exactly one exit**. Whichever of
 /// `CompleteWorkItem` and `DeliverMessage` runs first resolves the host; the

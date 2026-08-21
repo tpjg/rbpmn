@@ -122,14 +122,34 @@ not say, or said differently.
   nullable `remaining`. The instant arithmetic is in epoch seconds, not
   `interval`: `timestamptz + interval '1 day'` is a calendar day in the
   session's time zone, and a fixed-length `P1D` is 86 400 s — so the re-arm
-  is `to_timestamp(previous_due + period)`, and the `timer-fired` delete
-  returns the due for the `timer-armed` that `continues` it, in the same
-  persist pass. The `timer-armed` payload carries `continues` and
-  `remaining`; `Display` is the literal (`timer-armed late_fee_due R/P7D`,
-  on every arm). The editor offers `timeCycle` only where lint executes it.
+  steps along the previous due's grid to the first occurrence at or after now
+  (`previous_due + period · max(1, ceil((now − previous_due) / period))`), and
+  the `timer-fired` delete returns the due for the `timer-armed` that
+  `continues` it, in the same persist pass. The `timer-armed` payload
+  carries `continues` and `remaining`; `Display` is the literal
+  (`timer-armed late_fee_due R/P7D`, on every arm). The editor offers
+  `timeCycle` only where lint executes it.
   Verified against the engine: a scheduler an hour late re-arms at *previous
   due + 7 d*, a past anchor yields one phase-aligned occurrence and no
-  catch-up burst, `R2` leaves the scheduler idle over live work.
+  catch-up burst, `R2` leaves the scheduler idle over live work, and an
+  engine down across three periods re-arms once rather than three times.
+- **The review after slice 3 found two holes, both in the shape this document
+  keeps warning about — a path nobody walked.** The re-arm was a plain
+  `previous_due + period`, which is correct for a scheduler minutes late and
+  wrong for an engine that was *down*: the re-arm landed in the past, and
+  because `drain_due_timers` picks the earliest due row and `Drain::Fired`
+  loops without sleeping, 24 h of downtime on an `R/PT15M` boundary replayed
+  as 96 fires and 96 side tokens. The fix is the `max(1, ceil(…))` above —
+  missed occurrences are skipped, never replayed, and a bounded cycle is
+  untouched because it counts fires. And `ambiguous-message-arm` did not look
+  at a **side path**: it compared the arms live at one wait state and never
+  the ones a non-interrupting boundary's own path can add, so two arms for
+  the same message and binding could still both be live. The period also
+  gained a one-minute floor and `R<n>` a one-million cap at lint, and
+  `remaining` a CHECK constraint plus a loader that rejects a non-positive
+  count instead of clamping it — a projection that silently reads `0` as
+  "nothing left" is exactly the silent reinterpretation the ground rules
+  forbid.
 
 ---
 
@@ -425,7 +445,13 @@ R[n]/<datetime with offset>/P…   n fires, phase anchored at the datetime
 ```
 
 - `n` absent = unbounded (bounded by the host's life, which is why it is only
-  allowed on a non-interrupting boundary). `R0/…` is an error: it never fires.
+  allowed on a non-interrupting boundary). `R0/…` is an error: it never fires,
+  and `n` is capped at **1 000 000** — a repeat count is a schedule, not a
+  counter, and `remaining` round-trips through the database as an `int`.
+- The period has a floor of **one minute**. Anything shorter is a poll loop
+  wearing a boundary event's clothes: the scheduler would re-arm faster than
+  it can drain, and the side tokens would outrun the host. Both the floor and
+  the cap are `timer-iso8601` errors, at lint, with fixtures.
 - The period must be **fixed-length**: weeks, days, hours, minutes, seconds.
   `P1M` and `P1Y` are errors under `timer-iso8601` ("a repeating period must
   have a fixed length; months and years do not"). The projection computes
@@ -444,13 +470,18 @@ Semantics of the anchor — decided here, and different from a strict reading
 of ISO 8601, so said out loud: **the anchor fixes the phase, not the set of
 instants.** The first due instant is the first `anchor + k·period ≥ arm
 time`; `n` counts fires from there; occurrences before arm time are never
-replayed (no catch-up burst). A strict reading makes `R3/2026-08-27…/P7D`
-three fixed instants, which would turn every instance started after 2026-09-10
-into one whose boundary silently never arms — a definition outlives its
-anchor, and "every Monday at 00:00 local" is what a modeller means by an
-anchored cycle. Daylight-saving caveat, also said out loud: periods are
-fixed-length, so `P1D` anchored at `00:00+02:00` drifts an hour after the
-clocks change. Calendar-aware schedules are not in this round.
+replayed (no catch-up burst). **A re-arm obeys the same rule**, with the
+previous due in the anchor's place: the next due is the first
+`previous due + k·period ≥ now` with `k ≥ 1` — so the grid never shifts to
+the fire time, and an outage's missed occurrences are skipped rather than replayed. Because `n`
+counts fires, skipping costs a bounded cycle nothing. A strict reading makes
+`R3/2026-08-27…/P7D` three fixed instants, which would turn every instance
+started after 2026-09-10 into one whose boundary silently never arms — a
+definition outlives its anchor, and "every Monday at 00:00 local" is what a
+modeller means by an anchored cycle. Daylight-saving caveat, also said out
+loud: periods are fixed-length, so `P1D` anchored at `00:00+02:00` drifts an
+hour after the clocks change. Calendar-aware schedules are not in this
+round.
 
 ### 2.6 Catalogue additions
 
@@ -616,15 +647,28 @@ The core never interprets time; it must not start now. Division of labour:
   knowing what time it was.
 - **The projection owns every instant.** On the first arm of a cycle it
   computes `due_at` from database time: `clock_timestamp() + period` for
-  `R/P…`; for an anchored cycle `anchor + ceil((clock_timestamp() − anchor) /
-  period) · period` (epoch arithmetic, which is why periods are fixed-length).
-  On a re-arm it computes `previous due_at + period` — from the **previous
-  due**, not from when the fire actually ran, so a scheduler that was late does
-  not drift the schedule. `persist_step` handles events in emission order, so
-  `TimerFired` (a `delete … returning due_at`) precedes the `TimerArmed` that
-  `continues` it; the returned instant is threaded to the insert inside the
-  same loop. No instant is ever stored in the core's state, and none reaches
-  the event payload except in the existing `due_at` column.
+  `R/P…`; for an anchored cycle `anchor + ceil((clock_timestamp() − anchor)
+  / period) · period` (epoch arithmetic, which is why periods are
+  fixed-length). On a re-arm it stays on the **grid of the previous due**
+  and lands on the first occurrence at or after now: `previous due_at +
+  period · max(1, ceil((now − previous due_at) / period))`. Two things in
+  one expression. The grid is the previous due's, not the fire's, so a
+  scheduler an hour late on `R/P7D` re-arms at *previous due + 7 d* and the
+  schedule does not drift. And `k ≥ 1` puts the re-arm strictly in the
+  future, so **occurrences missed while the engine was down are skipped,
+  never replayed**: an engine down 24 h on an `R/PT15M` boundary re-arms at
+  the next quarter hour, not 96 times back to back — a plain `previous +
+  period` re-arms into the past, `drain_due_timers` picks it on the very
+  next pass, and `Drain::Fired` never sleeps, so the outage comes back as a
+  burst of 96 side tokens. A bounded `R<n>` counts **fires**, not
+  occurrences, so what the outage skipped costs it nothing (`R2` down for
+  three periods still has two fires). This is the same rule as the anchored
+  first arm, one line up, with the previous due in the anchor's place.
+  `persist_step` handles events in emission order, so `TimerFired` (a
+  `delete … returning due_at`) precedes the `TimerArmed` that `continues`
+  it; the returned instant is threaded to the insert inside the same loop.
+  No instant is ever stored in the core's state, and none reaches the event
+  payload except in the existing `due_at` column.
 - **`Display` stays the literal.** `timer-armed late_fee R/P7D` on every
   arm; `remaining` and `continues` are payload, like every reason and every
   answer before them. A golden trace for `R3/P7D` therefore shows three

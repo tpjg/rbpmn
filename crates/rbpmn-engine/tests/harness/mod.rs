@@ -169,6 +169,17 @@ const FSCK: &[(&str, &str)] = &[
          where state = 'locked' and (lock_owner is null or lock_until is null)",
     ),
     (
+        // Same shape as the foreign key below: the CHECK constraints are
+        // *what makes* a cycle's fire count positive and confined to a cycle
+        // row, so the invariant worth asserting is that they are still there.
+        // The loader refuses such a row rather than clamping it, and a
+        // database with the checks dropped is the only way one could exist.
+        "a rbpmn_timer.remaining check constraint is missing",
+        "select c.name::text from (values ('rbpmn_timer_remaining_check'), \
+                                          ('rbpmn_timer_remaining_kind_check')) as c(name) \
+         where not exists (select 1 from pg_constraint where conname = c.name)",
+    ),
+    (
         // The constraint, not an anti-join over the largest table in the
         // schema: the FK is *what makes* "no event outlives its instance"
         // true, so scanning rbpmn_event to re-derive a constant answer buys

@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  warn side-path-message-arm @ wait_ack
+-->
+<!-- accept/39, one scope deeper. The reminder's side path runs an embedded
+     subprocess, and the wait for ACK sits inside it — which is exactly the
+     repair boundary-side-path recommends for a *parallel block* on a side
+     path, because a subprocess mints a scope per activation. A scope buys a
+     message arm nothing: subscriptions are keyed by (message, key) across the
+     whole instance, so a second reminder before the first ACK still arms
+     (ACK, key) twice. The warning has to reach in here, or the recommended
+     repair would be the way to lose it.
+     Bindings: {"correlations": {"wait_ack": "note.id"}} -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:message id="m_ack" name="ACK" />
+  <bpmn:process id="casefile" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:userTask id="review" name="Review the case">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:boundaryEvent id="remind" name="Daily" cancelActivity="false" attachedToRef="review">
+      <bpmn:outgoing>f3</bpmn:outgoing>
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration>P1D</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:subProcess id="chase" name="Chase the reviewer">
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+      <bpmn:startEvent id="chase_start">
+        <bpmn:outgoing>g1</bpmn:outgoing>
+      </bpmn:startEvent>
+      <bpmn:serviceTask id="send_nudge" name="Send the nudge">
+        <bpmn:incoming>g1</bpmn:incoming>
+        <bpmn:outgoing>g2</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:intermediateCatchEvent id="wait_ack" name="Nudge acknowledged">
+        <bpmn:incoming>g2</bpmn:incoming>
+        <bpmn:outgoing>g3</bpmn:outgoing>
+        <bpmn:messageEventDefinition messageRef="m_ack" />
+      </bpmn:intermediateCatchEvent>
+      <bpmn:endEvent id="chase_end">
+        <bpmn:incoming>g3</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="g1" sourceRef="chase_start" targetRef="send_nudge" />
+      <bpmn:sequenceFlow id="g2" sourceRef="send_nudge" targetRef="wait_ack" />
+      <bpmn:sequenceFlow id="g3" sourceRef="wait_ack" targetRef="chase_end" />
+    </bpmn:subProcess>
+    <bpmn:endEvent id="chased" name="Chased">
+      <bpmn:incoming>f4</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="reviewed" name="Reviewed">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="review" />
+    <bpmn:sequenceFlow id="f2" sourceRef="review" targetRef="reviewed" />
+    <bpmn:sequenceFlow id="f3" sourceRef="remind" targetRef="chase" />
+    <bpmn:sequenceFlow id="f4" sourceRef="chase" targetRef="chased" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_casefile">
+    <bpmndi:BPMNPlane id="BPMNPlane_casefile" bpmnElement="casefile">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="review_di" bpmnElement="review">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="remind_di" bpmnElement="remind">
+        <dc:Bounds x="207" y="92" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="reviewed_di" bpmnElement="reviewed">
+        <dc:Bounds x="357" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="chase_di" bpmnElement="chase">
+        <dc:Bounds x="325" y="170" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="chased_di" bpmnElement="chased">
+        <dc:Bounds x="507" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="357" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
+        <di:waypoint x="225" y="128" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="325" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4">
+        <di:waypoint x="425" y="210" />
+        <di:waypoint x="507" y="210" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_chase">
+    <bpmndi:BPMNPlane id="BPMNPlane_chase" bpmnElement="chase">
+      <bpmndi:BPMNShape id="chase_start_di" bpmnElement="chase_start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="send_nudge_di" bpmnElement="send_nudge">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="wait_ack_di" bpmnElement="wait_ack">
+        <dc:Bounds x="357" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="chase_end_di" bpmnElement="chase_end">
+        <dc:Bounds x="507" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="g1_di" bpmnElement="g1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="g2_di" bpmnElement="g2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="357" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="g3_di" bpmnElement="g3">
+        <di:waypoint x="393" y="70" />
+        <di:waypoint x="507" y="70" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

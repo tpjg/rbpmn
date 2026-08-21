@@ -5654,7 +5654,9 @@ async fn a_non_interrupting_timer_spawns_a_reminder() {
 ///
 /// A boundary that quietly re-armed itself would not fail any trace assertion
 /// above: it would show up here, as a scheduler that never sleeps again. The
-/// repeating form (`timeCycle`) is refused everywhere and is slice 3's.
+/// repeating form (`timeCycle`) is the one that re-arms, and it is a separate
+/// path — this is the guard that it stayed separate (the cycle tests at the
+/// end of this file check the other side of the same line).
 #[tokio::test]
 async fn a_single_shot_side_timer_leaves_the_scheduler_idle() {
     let db = TestDb::create().await;
@@ -5947,15 +5949,22 @@ async fn db_epoch(pool: &PgPool, expr: &str) -> f64 {
         .unwrap()
 }
 
-/// A scheduler that is an hour late: the armed occurrence is overdue by the
-/// time anyone looks. The golden traces are untouched by this — only the
-/// instant moves, and the instant is the projection's.
-async fn backdate_timers(pool: &PgPool, instance: uuid::Uuid) {
-    sqlx::query("update rbpmn_timer set due_at = now() - interval '1 hour' where instance_id = $1")
+/// Push every armed occurrence of an instance `ago` into the past. The golden
+/// traces are untouched by this — only the instant moves, and the instant is
+/// the projection's.
+async fn backdate_timers_by(pool: &PgPool, instance: uuid::Uuid, ago: &str) {
+    sqlx::query("update rbpmn_timer set due_at = now() - $2::interval where instance_id = $1")
         .bind(instance)
+        .bind(ago)
         .execute(pool)
         .await
         .unwrap();
+}
+
+/// A scheduler that is an hour late: the armed occurrence is overdue by the
+/// time anyone looks, but by less than one period.
+async fn backdate_timers(pool: &PgPool, instance: uuid::Uuid) {
+    backdate_timers_by(pool, instance, "1 hour").await;
 }
 
 async fn late_fee_engine(db: &TestDb) -> (Engine, uuid::Uuid) {
@@ -6035,6 +6044,97 @@ async fn a_cycle_rearms_from_its_previous_due() {
         Some(first_no),
         "the re-arm names the occurrence it continues"
     );
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// **Downtime is not a backlog.** A re-arm lands on the grid of the previous
+/// due at the first occurrence *at or after* now, so an engine that was down
+/// across three periods re-arms *once*, at the next occurrence. Stepping
+/// blindly to `previous due + period` would leave the re-arm already past,
+/// and nothing would slow the replay down: `drain_due_timers` picks it on the
+/// very next pass and `Drain::Fired` never sleeps, so a day of downtime on an
+/// `R/PT15M` boundary would spawn 96 side tokens back to back.
+///
+/// The occurrences the outage missed are skipped, never replayed — and
+/// because a bounded `R<n>` counts *fires*, skipping them costs it nothing.
+#[tokio::test]
+async fn a_re_arm_skips_occurrences_missed_while_down() {
+    let db = TestDb::create().await;
+    let (engine, instance) = late_fee_engine(&db).await;
+
+    // Down for three periods and a bit, on `R/P7D`.
+    backdate_timers_by(&db.pool, instance, "22 days").await;
+    let (_, overdue, _) = timer_dues(&db.pool, instance).await[0];
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    let next = timer_dues(&db.pool, instance).await;
+    assert_eq!(
+        next.len(),
+        1,
+        "one occurrence armed, not one per missed period"
+    );
+    let (_, due, remaining) = next[0];
+    assert!(remaining.is_none(), "R/… is unbounded");
+    let now = db_epoch(&db.pool, "clock_timestamp()").await;
+    assert!(
+        due > now && due <= now + WEEK,
+        "the re-arm is the next occurrence, not a past one: due {due}, now {now}"
+    );
+    let periods = (due - overdue) / WEEK;
+    assert!(
+        (periods - periods.round()).abs() < 1e-6,
+        "still on the previous due's grid, not on now's: {periods} periods on"
+    );
+    assert_eq!(
+        periods.round(),
+        4.0,
+        "the first whole period at or after now"
+    );
+
+    // The burst, in the one place it would show: a second pass finds nothing
+    // due, and exactly one side token was spawned.
+    assert!(
+        !engine.fire_due_timer().await.unwrap(),
+        "the scheduler has nothing left to fire — no catch-up burst"
+    );
+    let open = open_items(&db.pool, instance).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["add_late_fee"],
+        "one fire, one late fee — not one per missed week"
+    );
+    assert_eq!(event_count(&db.pool, instance, "timer-fired").await, 1);
+
+    // A bounded cycle spends its count on fires. The same outage over `R2`
+    // leaves one fire left, not none.
+    engine.declare_topic("nudge").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/41-anchored-cycle.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let bounded = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(timer_dues(&db.pool, bounded.id).await[0].2, Some(2));
+    backdate_timers_by(&db.pool, bounded.id, "22 days").await;
+    assert!(engine.fire_due_timer().await.unwrap());
+    let after = timer_dues(&db.pool, bounded.id).await;
+    assert_eq!(after.len(), 1, "R2 re-armed once");
+    assert_eq!(
+        after[0].2,
+        Some(1),
+        "the fire spent one; the three occurrences the outage skipped spent nothing"
+    );
+    assert!(
+        !engine.fire_due_timer().await.unwrap(),
+        "and no burst on the bounded cycle either"
+    );
+
     assert!(harness::fsck(&db.pool).await.is_empty());
     db.drop().await;
 }
