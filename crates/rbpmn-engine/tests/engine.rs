@@ -7796,3 +7796,418 @@ async fn the_two_views_compose_on_instance_id() {
     );
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// The published timer view: rbpmn_v_timer, the third wait state.
+// ---------------------------------------------------------------------------
+
+/// The soonest armed timer the view reports, restricted to live instances the
+/// way the scheduler's own candidate query is. `order by due_at limit 1`,
+/// never `min(due_at)` — see the migration comment.
+async fn view_next_due(pool: &PgPool) -> Option<(uuid::Uuid, i64)> {
+    sqlx::query(&format!(
+        "select instance_id, timer_no from {} \
+          where instance_status = 'active' order by due_at limit 1",
+        rbpmn_engine::TIMER_VIEW
+    ))
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+    .map(|r| (r.get("instance_id"), r.get("timer_no")))
+}
+
+async fn timer_still_armed(pool: &PgPool, instance: uuid::Uuid, timer_no: i64) -> bool {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "select count(*) from {} where instance_id = $1 and timer_no = $2",
+        rbpmn_engine::TIMER_VIEW
+    ))
+    .bind(instance)
+    .bind(timer_no)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+        > 0
+}
+
+/// Public API, asserted the way the other two views' shapes are.
+#[tokio::test]
+async fn the_published_timer_view_has_the_documented_shape() {
+    let db = TestDb::create().await;
+    let _engine = engine(&db).await;
+
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        "select column_name::text, data_type::text from information_schema.columns \
+         where table_name = 'rbpmn_v_timer' order by ordinal_position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        vec![
+            ("instance_id".into(), "uuid".into()),
+            ("timer_no".into(), "bigint".into()),
+            ("definition_key".into(), "text".into()),
+            ("definition_version".into(), "integer".into()),
+            ("element_id".into(), "text".into()),
+            ("due_kind".into(), "text".into()),
+            ("due_spec".into(), "text".into()),
+            ("due_at".into(), "timestamp with time zone".into()),
+            ("remaining".into(), "integer".into()),
+            ("instance_status".into(), "text".into()),
+            ("created_at".into(), "timestamp with time zone".into()),
+        ],
+        "rbpmn_v_timer is public API"
+    );
+
+    let barrier: Option<Vec<String>> =
+        sqlx::query_scalar("select reloptions from pg_class where relname = 'rbpmn_v_timer'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(barrier.is_none(), "must carry no reloptions: {barrier:?}");
+    db.drop().await;
+}
+
+/// **The property that matters**, and the timer analogue of the work-item
+/// view's claimability differential: what the view calls the next due timer
+/// must be the timer the scheduler actually fires next.
+///
+/// Walked one firing at a time rather than checked at the endpoints — a read
+/// model that agreed only about the first and last pick would be no use — and
+/// with **distinct** due instants on purpose: the scheduler orders by `due_at`
+/// with no tie-break, so among equal instants "next" is genuinely
+/// unspecified and asserting a particular row would be asserting an accident.
+#[tokio::test]
+async fn the_views_next_due_is_the_timer_the_scheduler_fires() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT0S</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+
+    const N: i64 = 8;
+    let mut started = Vec::new();
+    for _ in 0..N {
+        started.push(
+            engine
+                .start("pt", None, serde_json::json!({}))
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    // Distinct, all in the past, and deliberately not in creation order — so
+    // agreeing means agreeing about `due_at`, not about insertion order.
+    for (i, instance) in started.iter().enumerate() {
+        let offset = ((i * 7) % 8) as i64 + 1;
+        sqlx::query(&format!(
+            "update rbpmn_timer set due_at = now() - interval '{offset} hours' \
+             where instance_id = $1"
+        ))
+        .bind(instance)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    for fired in 0..N {
+        let (instance, timer_no) = view_next_due(&db.pool)
+            .await
+            .unwrap_or_else(|| panic!("the view ran out of timers after {fired} firing(s)"));
+        assert!(
+            engine.fire_due_timer().await.unwrap(),
+            "the scheduler found nothing while the view named one"
+        );
+        assert!(
+            !timer_still_armed(&db.pool, instance, timer_no).await,
+            "firing {} of {N}: the scheduler fired something other than the timer \
+             the view named ({instance} #{timer_no} is still armed)",
+            fired + 1
+        );
+    }
+
+    assert_eq!(view_next_due(&db.pool).await, None, "the view is empty too");
+    assert!(
+        !engine.fire_due_timer().await.unwrap(),
+        "and so is the scheduler"
+    );
+    db.drop().await;
+}
+
+/// A frozen instance's timer is armed and overdue and will never fire — the
+/// distinction the health question turns on, and the reason `instance_status`
+/// is a column rather than a second join.
+#[tokio::test]
+async fn a_frozen_instances_timer_is_armed_but_not_the_scheduler_being_behind() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT0S</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    sqlx::query("update rbpmn_timer set due_at = now() - interval '1 day'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("update rbpmn_instance set status = 'failed' where id = $1")
+        .bind(started.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Still armed, still overdue, and still visible — support needs to see it.
+    let row: (String, bool) = sqlx::query_as(&format!(
+        "select instance_status, due_at < now() from {} where instance_id = $1",
+        rbpmn_engine::TIMER_VIEW
+    ))
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row, ("failed".to_string(), true));
+
+    // But it is not the scheduler being behind, and the view says which.
+    assert_eq!(view_next_due(&db.pool).await, None);
+    assert!(!engine.fire_due_timer().await.unwrap());
+    db.drop().await;
+}
+
+/// A cycle is one row at a time, and the view must never show two "next"
+/// occurrences for one arm — an application rendering a date would have to
+/// guess which one it had. Firing replaces the row rather than adding to it.
+#[tokio::test]
+async fn a_cycle_shows_one_next_occurrence_not_a_series() {
+    let db = TestDb::create().await;
+    let (engine, instance) = late_fee_engine(&db).await;
+
+    let armed: Vec<(i64, f64, Option<i32>, String, String)> = sqlx::query_as(&format!(
+        "select timer_no, extract(epoch from due_at)::float8, remaining, due_kind, due_spec \
+           from {} where instance_id = $1 and element_id = 'late_fee_due'",
+        rbpmn_engine::TIMER_VIEW
+    ))
+    .bind(instance)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(armed.len(), 1, "one occurrence at a time: {armed:?}");
+    let (first_no, _pre_backdate_due, remaining, kind, spec) = armed[0].clone();
+    assert_eq!(kind, "cycle");
+    // The period lives inside the spec: there is no period column, and this
+    // is the reason `due_spec` is the load-bearing one.
+    assert_eq!(spec, "R/P7D");
+    assert_eq!(remaining, None, "R/… is unbounded");
+
+    backdate_timers(&db.pool, instance).await;
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    let after: Vec<(i64, f64)> = sqlx::query_as(&format!(
+        "select timer_no, extract(epoch from due_at)::float8 from {} \
+           where instance_id = $1 and element_id = 'late_fee_due'",
+        rbpmn_engine::TIMER_VIEW
+    ))
+    .bind(instance)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(after.len(), 1, "still one occurrence, not two: {after:?}");
+    assert_ne!(after[0].0, first_no, "a new row, not the old one re-dated");
+    // Still renderable as "next": in the future. The grid arithmetic itself —
+    // that it steps from the *previous due* and not from now — is
+    // `a_cycle_rearms_from_its_previous_due`'s job, not this one's; here the
+    // property is only that an application never has two rows to choose
+    // between. (`_pre_backdate_due` is deliberately not compared against:
+    // `backdate_timers` rewrites due_at absolutely, so the occurrence that
+    // actually fired was an hour ago, not a week hence.)
+    let now = db_epoch(&db.pool, "clock_timestamp()").await;
+    assert!(
+        after[0].1 > now,
+        "the next occurrence must still be ahead ({} vs {now})",
+        after[0].1
+    );
+    db.drop().await;
+}
+
+/// A timer disappears with its token when the wait ends another way — here a
+/// boundary timer on a task that completed first. The view is a projection of
+/// what is armed, so "nothing armed" has to mean nothing armed.
+#[tokio::test]
+async fn a_timer_leaves_the_view_when_its_wait_ends() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &boundary_timer_xml("<bpmn:timeDuration>PT1H</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pb", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let rows = |id: uuid::Uuid| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(&format!(
+                "select count(*) from {} where instance_id = $1",
+                rbpmn_engine::TIMER_VIEW
+            ))
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(rows(started.id).await, 1, "armed while the task is open");
+
+    let (item, _) = open_items(&db.pool, started.id).await[0].clone();
+    engine
+        .complete_work_item(item, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(rows(started.id).await, 0, "and gone with its token");
+    db.drop().await;
+}
+
+/// Both questions the view exists for, planned THROUGH it. No new index was
+/// added for either: the scheduler's own already serve them, and this is what
+/// says so out loud rather than leaving it to be re-derived.
+#[tokio::test]
+async fn the_timer_queries_are_index_driven() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT1H</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    // Enough rows that an index is the cheaper answer; inserted as SQL for the
+    // same reason `bulk_work_items` is — a plan test needs statistics, not
+    // engine history.
+    bulk_instances(&db.pool, "pt", "T-", 20_000).await;
+    sqlx::query(
+        "insert into rbpmn_timer \
+           (instance_id, timer_no, token_no, element_id, due_kind, due_spec, due_at) \
+         select i.id, 1, 1, 'c', 'duration', 'PT1H', \
+                now() + make_interval(secs => (i.definition_version * 37 + g) * 60) \
+           from rbpmn_instance i, generate_series(1, 1) g \
+          where i.definition_key = 'pt' and i.id <> $1",
+    )
+    .bind(started.id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    analyze(&db.pool).await;
+    sqlx::query("analyze rbpmn_timer")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // "What is armed for this instance" -> the primary key's leading column.
+    let per_instance = explain_prepared(
+        &db.pool,
+        "armed",
+        &format!(
+            "prepare armed(uuid) as select due_at, element_id, due_spec from {} \
+               where instance_id = $1 order by due_at limit 1",
+            rbpmn_engine::TIMER_VIEW
+        ),
+        &format!("execute armed('{}')", started.id),
+    )
+    .await;
+    assert!(
+        per_instance.contains("rbpmn_timer_pkey"),
+        "the per-instance lookup must use the timer primary key:\n{per_instance}"
+    );
+    assert!(
+        !per_instance.contains("Seq Scan on rbpmn_timer"),
+        "and must not scan every armed timer:\n{per_instance}"
+    );
+    assert!(
+        !per_instance.contains("Subquery Scan"),
+        "the view must be inlined:\n{per_instance}"
+    );
+
+    // "Everything overdue right now" -> the scheduler's due index.
+    let overdue = explain_prepared(
+        &db.pool,
+        "overdue",
+        &format!(
+            "prepare overdue as select count(*) from {} where due_at < now()",
+            rbpmn_engine::TIMER_VIEW
+        ),
+        "execute overdue",
+    )
+    .await;
+    assert!(
+        overdue.contains("rbpmn_timer_due"),
+        "the overdue sweep must use the scheduler's due index:\n{overdue}"
+    );
+    assert!(
+        !overdue.contains("Seq Scan on rbpmn_timer"),
+        "and must not scan every armed timer:\n{overdue}"
+    );
+    db.drop().await;
+}
+
+/// The three published views compose on `instance_id`: an application groups
+/// deadlines by its own dimension — a tenant hoisted into the variable
+/// document — in one statement, and can ask about queues in the same breath.
+#[tokio::test]
+async fn the_timer_view_composes_with_the_instance_view() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT1H</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    for i in 0..6 {
+        engine
+            .start(
+                "pt",
+                None,
+                serde_json::json!({ "tenant": if i % 2 == 0 { "acme" } else { "globex" } }),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+        "select i.variables->>'tenant' as tenant, count(*) as deadlines \
+           from {timer} t join {inst} i on i.id = t.instance_id \
+          where t.due_at > now() group by 1 order by 1",
+        timer = rbpmn_engine::TIMER_VIEW,
+        inst = rbpmn_engine::INSTANCE_VIEW,
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![("acme".to_string(), 3), ("globex".to_string(), 3)]
+    );
+    db.drop().await;
+}

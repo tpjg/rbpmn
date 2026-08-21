@@ -30,6 +30,7 @@ mod scheduler;
 mod tasks;
 #[cfg(feature = "test-util")]
 pub mod testing;
+mod timers;
 mod work_items;
 mod worker;
 
@@ -55,6 +56,7 @@ pub use tasks::{
     DeclaredIndex, GetTaskOptions, LockExtension, LockedTask, Released, TaskFilter, TaskOrder,
     declared_index_name, shared_index_name,
 };
+pub use timers::TIMER_VIEW;
 pub use work_items::{QueueDepth, WORK_ITEM_VIEW};
 pub use worker::WorkerOptions;
 
@@ -141,6 +143,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         15,
         "work_item_view",
         include_str!("../migrations/0015_work_item_view.sql"),
+    ),
+    (
+        16,
+        "timer_view",
+        include_str!("../migrations/0016_timer_view.sql"),
     ),
 ];
 

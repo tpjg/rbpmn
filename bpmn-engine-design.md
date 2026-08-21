@@ -505,6 +505,17 @@ current registration state** and fails loudly with the same rule id
   shapes were reproduced as real Postgres deadlocks. The hazard predates
   scoped indexes: two definitions deploying at once already both index
   `rbpmn_instance`. See `spec/README.md`'s lock inventory.
+- **`rbpmn_v_timer`** completes the read surface: the third wait state, and
+  the one asked *when does this next happen?* — a deadline an application
+  renders next to its own row. No new index: the scheduler's
+  `rbpmn_timer_pkey` and `rbpmn_timer_due` already serve both questions, which
+  the migration says out loud so it is not re-derived. No `overdue` column
+  either, and the asymmetry with `claimable` is the argument: `claimable`
+  encodes a rule, `overdue` would be `due_at < now()`. What it does carry is
+  `due_spec` — an operator asking *why is it due then* needs the source of the
+  instant — and `instance_status`, so "scheduler behind" and "instance frozen"
+  are one query apart. The `min()`-over-a-join trap `next_due_in` records
+  survives the view and is documented on it.
 - **`rbpmn_v_work_item`** is the queue half of the published read surface, and
   it exists for a query `count_tasks` could only answer T×D times: "for every
   queue this user can work, how many are waiting?". Its `claimable` column is
@@ -1241,6 +1252,7 @@ question is purely internal.
 | DMN / business-rule task via dsntk | Decisions as models rather than handler code | Medium-high | **Shipped, and in the default build** — see "Decisions" below and `docs/dmn.md`. Landed larger than this row implies: the editor authors DMN too, which forced dsntk onto wasm32 |
 | Cross-definition instance resolver | The `correlate()`-shaped lookup the shared index exists for: exactly one match, loud on none, 409 with the candidate ids for several. `find_by_shared_index` deliberately answers the *list* question instead, and the view answers the join question | Low | Queued — see "Business-key addressing"; the index half shipped with declared-index scopes |
 | `undeclare_index` | Nothing drops a declared index, so a field removed from a manifest orphans one forever. `declared_indexes()` makes them visible; removing them is still by hand | Low | Queued — wants `undeclare_topic`'s "prove it unneeded" guard, which is harder for a shared index |
+| Subscriptions in the read surface | Message subscriptions are the fourth wait state and the only one still without a view; "what is this instance waiting for a message about" is a real support question | Low | Queued — the shape is settled by the other three, so this is mostly a decision about exposing correlation keys |
 | Queue depth over time | The views answer "how deep is this queue *now*"; trend, throughput and time-in-queue need the event stream, not a projection of current state | Medium | Queued — needs a design round on whether that is a materialized rollup or a query over `rbpmn_event` |
 | `undeclare_topic`-style guard for the depth index | `rbpmn_work_item_depth` is a plain migration index, so unlike a declared one it is not the application's to remove; noted only so the asymmetry is on the record | Trivial | Not a problem yet |
 | Manifests in the parity corpus | `just parity` passes `{}` for bindings on every fixture, so the manifest surface — including index scopes — has never been differentialled native vs WASM | Trivial | Queued; noticed while adding index scopes |

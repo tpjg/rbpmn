@@ -342,15 +342,47 @@ does not even allocate a new version. Adopting `shared` is a manifest edit and
 a redeploy. The old index is not removed — if the definition still declares
 the field definition-scoped, it still has it.
 
-### The published read surface: two views
+### The published read surface: three views
 
-#### `rbpmn_v_instance` — the instance side
+Applications legitimately need to *join* rbpmn's state against their own rows.
+A result set of "our tenancy, our ordering, rbpmn's instances" is a SQL join,
+and no API returning data instead of SQL does it as well. The answer to "stop
+reading my schema" is not to stop reading; it is to publish the surface. So
+rbpmn publishes three views as **public API**, on the same footing as rule ids
+and the `Display` format of `Event`, one per thing an instance can be doing:
 
-Applications legitimately need to *join* rbpmn's instances against their own
-rows — a result set of "our tenancy, our ordering, rbpmn's instances" is a SQL
-join, and no API returning data instead of SQL does it as well. So rbpmn
-publishes `rbpmn_v_instance` as **public API**, on the same footing as rule ids
-and the `Display` format of `Event`:
+| view | the question it answers |
+|---|---|
+| `rbpmn_v_instance` | what is running, and what does it hold |
+| `rbpmn_v_work_item` | what is waiting to be worked, and how deep is each queue |
+| `rbpmn_v_timer` | when does this next happen |
+
+They compose on `instance_id`, so a statement can group deadlines and queue
+depths by an application's own dimensions at once. The constants
+`rbpmn_engine::{INSTANCE_VIEW, WORK_ITEM_VIEW, TIMER_VIEW}` name them, so a
+rename is a compile error for callers rather than a runtime surprise.
+
+**One contract, for all three.** Columns may be added; none will be removed or
+repurposed. Each is deliberately a **plain inlinable projection** — no `WHERE`,
+no `LIMIT`, no `DISTINCT`, no `ORDER BY`, no aggregate, no volatile function
+(`now()` is STABLE, which is what makes time-dependent columns legal), and
+explicitly **not** `security_barrier`. A barrier view refuses to push an
+outside predicate below itself unless the operators are leakproof, and
+`jsonb ->>` is not one, so every declared variable index would sit unused
+beneath a full scan. Each has an EXPLAIN-based test asserting the *plan*
+through the view, not just its shape.
+
+**None of them is a tenancy boundary.** They do no row filtering and rbpmn
+manages no grants: what a connection can see, it can see. An application that
+needs a boundary expresses it in its own query, which is the whole reason this
+surface is SQL.
+
+**And none of them is a claim.** They are read models: a value is true when it
+was measured. A depth of five does not reserve five items, an armed timer is
+not a promise about when it fires, and the only way to *hold* work is
+`get_task`.
+
+#### `rbpmn_v_instance`
 
 | column | |
 |---|---|
@@ -361,24 +393,12 @@ and the `Display` format of `Event`:
 | `variables` | the whole live variable document |
 | `created_at`, `completed_at` | |
 
-Columns may be added; none will be removed or repurposed. The view is
-deliberately a **plain inlinable projection** — one table, no `WHERE`, no
-volatile function, and explicitly not `security_barrier` — so predicates push
-below it and declared variable indexes still apply. (A barrier view would not
-push `variables->>'f' = $1` down, because `jsonb ->>` is not leakproof, and
-every declared index would sit unused beneath a full scan. There is an
-EXPLAIN-based test asserting the plan through the view, not just its shape.)
+#### `rbpmn_v_work_item`
 
-#### `rbpmn_v_work_item` — the queue side
-
-The same reasoning, sharpened by a query every user issues on the first screen
-they load: *for every queue this user can work, how many items are waiting
-right now?*, busiest first. `count_tasks(topic, filter)` answers it one queue
-at a time — one topic, one definition-scoped filter — so a dashboard covering
-T topics across D deployed definitions costs T×D round trips. Through the view
-it is one statement, and it joins `rbpmn_v_instance` on `instance_id`, so
-depths can be grouped by an application's own dimensions (a tenant in the
-definition key, a hoisted variable) in that same statement.
+The question is a triage screen's first paint: *for every queue this user can
+work, how many items are waiting right now?* `count_tasks(topic, filter)`
+answers it one queue at a time, so a dashboard covering T topics across D
+definitions cost T×D round trips. Here it is one statement.
 
 | column | |
 |---|---|
@@ -392,52 +412,89 @@ definition key, a hoisted variable) in that same statement.
 | `retry_at`, `retries`, `failures`, `last_failure` | why it is stuck |
 | `created_at` | |
 
-**`claimable` is computed by the engine, and that is the point of the whole
-surface.** It is not `state = 'available'`. It has to account for a lapsed
-lease (claimable again), a live lease (not), retry backoff not yet due (not),
-closed states (never), and an instance frozen on an incident (never — which is
-why the view joins instances at all). If the view exposed only raw columns,
-every application would re-derive that rule, and a dashboard whose depths
-disagree with what `get_task` actually hands out is worse than no dashboard.
-The expression is the same text the claim path uses, and a test differentials
-the two row for row over a corpus containing every one of those edges.
+**`claimable` is computed by the engine**, and that is the point of the
+column. It is not `state = 'available'`: it accounts for a lapsed lease
+(claimable again), a live lease (not), retry backoff not yet due (not), closed
+states (never), and an instance frozen on an incident (never — which is why
+the view joins instances). A dashboard whose depths disagree with what
+`get_task` hands out is worse than no dashboard, so it is the same expression
+the claim path uses, and a test differentials the two row for row.
 
-`in_progress` is deliberately about the **lease alone**, so `waiting +
-in_progress` is not "every open item" — work belonging to a frozen instance is
-in neither bucket. That gap is information: 0 waiting with 5 in progress is a
-different situation from 0 and 0, and both differ from 0, 0 and a pile of
-frozen work.
+`in_progress` is about the **lease alone**, so `waiting + in_progress` is not
+"every open item" — work belonging to a frozen instance is in neither bucket.
+That gap is information, not an omission.
 
-**What the view does not promise.** It is a read model, not a claim. A depth
-is true when it was measured and can be stale by the time it is rendered; two
-dashboards both seeing 5 waiting does not mean ten items exist. The only way
-to hold an item is `get_task`, which arbitrates with `FOR UPDATE SKIP LOCKED`.
-Reading a depth reserves nothing.
+#### `rbpmn_v_timer`
 
-#### SQL or a typed call?
+The question is *when does this next happen?* — a renewal date, a payment
+reminder, an escalation that has not fired yet.
+
+| column | |
+|---|---|
+| `instance_id`, `timer_no` | identity |
+| `definition_key`, `definition_version`, `element_id` | where in which model |
+| `due_at` | the instant it is armed for |
+| `due_kind` | `duration` / `date` / `cycle` |
+| **`due_spec`** | **the literal or variable path the arm resolved from** |
+| `remaining` | fires left on a cycle, including this one; null when unbounded and on non-cycles |
+| `instance_status` | so "scheduler behind" and "instance frozen" are one query apart |
+| `created_at` | when it was armed |
+
+`due_spec` is the load-bearing column. An operator asking *why is it due
+then* needs the source of the instant, not the instant — and for a cycle it
+carries the period too, inside the repetition (`R/P7D`).
+
+**A row is what is armed, not a promise about when it fires.** A `due_at` in
+the past means "due and not yet fired", not "late": the scheduler runs on its
+own cadence and fires at most one timer per pass. Whether it takes this one
+next also depends on the instance being active (hence `instance_status`) and
+on a node's transient, in-process deferral set, which no view can see.
+
+**For a cycle the row is the next occurrence, never the series.** Firing
+deletes the row and inserts the next in the same transaction, so there is
+exactly one row per armed cycle and an application rendering a date never has
+to guess which one it has.
+
+There is deliberately **no `overdue` boolean.** It would be legal, but unlike
+`claimable` it encodes no rule — it is `due_at < now()` and nothing else.
+Compare `due_at` directly, which also gets you the range queries a boolean
+cannot express ("due in the next hour", "due before this invoice date") from
+the same index.
+
+⚠️ **Ask for the soonest deadline with `order by due_at limit 1`, never
+`min(due_at)`.** The aggregate-to-index-scan rewrite is refused across a join,
+before indexes are considered, so `min()` plans a hash join over two
+sequential scans. Measured on a 50 000-instance probe: 6 buffers against 733.
+`Engine::next_due_in` carries the same finding for the scheduler's own query,
+and `Engine::NEXT_DEADLINE_SQL` is the shape written out.
+
+#### SQL, or a typed call?
 
 Use **SQL against the views** whenever the answer involves your own data:
 joining your rows, filtering by your tenancy, grouping by your dimensions,
-ordering by your rules. That is a join, and it is the reason the surface is
-SQL rather than an API.
+ordering by your rules. That is a join, and it is why the surface is SQL.
 
-Use the **typed calls** when you want ids or counts and no join:
+Use a **typed call** when you want ids or counts and no join:
 
-- `Engine::queue_depths(definition_keys) -> Vec<QueueDepth { definition_key,
-  topic, waiting, in_progress }>` — the dashboard query, busiest first. The key
-  set is an argument bound into the statement, and there is deliberately no
-  limit at all, so nothing is truncated before your filter can compose with it.
-  An empty slice matches no keys and returns no rows — plain SQL set semantics.
-- `Engine::find_by_shared_index(field, value, limit)` — below.
+- `Engine::queue_depths(definition_keys)` — the dashboard query, busiest
+  first. The key set is an argument bound into the statement, and there is
+  deliberately **no limit at all**, so nothing is truncated before your filter
+  can compose with it. An empty slice matches no keys and returns no rows —
+  plain SQL set semantics.
+- `Engine::find_by_shared_index(field, value, limit)` — index-backed by
+  construction; it refuses outright rather than sequential-scanning when no
+  shared index for the field exists.
 
-For the simple case there is `Engine::find_by_shared_index(field, value,
-limit)`, which writes the query for you and is index-backed by construction —
-it refuses outright rather than sequential-scanning when no shared index for
-the field exists. It is **not a search primitive**: the limit is applied by the
-database before the caller sees anything, so an application that then filters
-the result by tenant or permission is filtering an already-truncated page.
-Those queries belong in SQL against the view, where the application's own
-predicate and the limit compose in the right order.
+**The caution that decides between them:** `find_by_shared_index` applies its
+limit *in the database, before you see anything*. An application that then
+filters the result — by tenant, by permission, by anything — is filtering a
+page that was already truncated, and can silently miss rows it was entitled
+to. A call that bounds before you can filter is the wrong tool for a filtered
+result set; express the filter in SQL against the view, where your predicate
+and the bound compose in the right order. `queue_depths` takes no limit for
+exactly this reason, and timers get no typed call at all — "the next deadline
+for this instance" is `order by due_at limit 1`, a query with no rule in it
+that an application wants joined to its own row anyway.
 
 Conditions inside the XML are pure FEEL (a strict subset), so they carry no
 rbpmn-specific syntax either. Null follows FEEL exactly: `x = null` is the
