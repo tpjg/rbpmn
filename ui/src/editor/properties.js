@@ -76,7 +76,7 @@ export function timerKinds(bo, current) {
     ['timeDuration', 'duration (ISO-8601, e.g. P3D)'],
     ['timeDate', 'date (ISO-8601 with UTC offset)'],
   ];
-  if (bo?.$type === 'bpmn:BoundaryEvent' && bo.cancelActivity === false) {
+  if (boundaryInterrupting(bo)?.interrupting === false) {
     kinds.push(['timeCycle', 'cycle (R/P7D, R3/P1D, or anchored R/2026-08-31T00:00:00+02:00/P7D)']);
   } else if (current === 'timeCycle') {
     kinds.push(['timeCycle', 'cycle (only executed on a non-interrupting boundary)']);

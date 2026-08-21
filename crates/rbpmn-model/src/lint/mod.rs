@@ -11,10 +11,9 @@ mod structure;
 
 use crate::condition;
 use crate::diagnostics::{Diagnostic, Severity, rule};
-use crate::iso8601;
 use crate::model::*;
 use std::collections::BTreeMap;
-use structure::Graph;
+use structure::{Graph, reach};
 
 pub fn lint(defs: &Definitions) -> Vec<Diagnostic> {
     let mut out = Vec::new();
@@ -353,33 +352,27 @@ fn unsupported_message(tag: &str) -> String {
 /// name). That is what keeps a typo legible: the author reads why it is not a
 /// duration and what it will be treated as instead, in one line.
 fn check_timer(id: &str, spec: &TimerSpec, cycle_allowed: bool, out: &mut Vec<Diagnostic>) {
-    let (what, text, literal) = match spec {
-        TimerSpec::Date(s) => ("timeDate", s, iso8601::validate_datetime(s)),
-        TimerSpec::Duration(s) => ("timeDuration", s, iso8601::validate_duration(s)),
-        // A cycle is executed on a non-interrupting boundary and nowhere
-        // else: on an intermediate catch or an interrupting boundary the
-        // first occurrence ends the wait, and "fire once, drop the rest" is
-        // the silent reinterpretation other engines ship and this one
-        // refuses. The cycle's own grammar is checked like any other literal.
-        TimerSpec::Cycle(s) if cycle_allowed => ("timeCycle", s, iso8601::validate_cycle(s)),
-        TimerSpec::Cycle(_) => {
-            out.push(Diagnostic::error(
-                rule::NO_UNSUPPORTED_ELEMENT,
-                id,
-                "a repeating timer (timeCycle) is only executed on a non-interrupting \
-                 boundary event — here the first occurrence ends the wait, so write a \
-                 timeDuration or timeDate instead",
-            ));
-            return;
-        }
-        TimerSpec::Missing => {
-            out.push(Diagnostic::error(
-                rule::TIMER_ISO8601,
-                id,
-                "timer event definition needs a timeDate or timeDuration",
-            ));
-            return;
-        }
+    // A cycle is executed on a non-interrupting boundary and nowhere else: on
+    // an intermediate catch or an interrupting boundary the first occurrence
+    // ends the wait, and "fire once, drop the rest" is the silent
+    // reinterpretation other engines ship and this one refuses.
+    if matches!(spec, TimerSpec::Cycle(_)) && !cycle_allowed {
+        out.push(Diagnostic::error(
+            rule::NO_UNSUPPORTED_ELEMENT,
+            id,
+            "a repeating timer (timeCycle) is only executed on a non-interrupting \
+             boundary event — here the first occurrence ends the wait, so write a \
+             timeDuration or timeDate instead",
+        ));
+        return;
+    }
+    let Some((what, text, literal)) = spec.literal_check() else {
+        out.push(Diagnostic::error(
+            rule::TIMER_ISO8601,
+            id,
+            "timer event definition needs a timeDate or timeDuration",
+        ));
+        return;
     };
     let Err(why) = literal else { return };
     match condition::parse_qname(text) {
@@ -763,18 +756,9 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
         let host_id = &g.node(host).id;
 
         // P: forward closure from B over flows and every boundary pseudo-edge
-        // (a boundary on an activity of the side path belongs to it too).
-        let mut in_path = vec![false; g.scope.nodes.len()];
-        in_path[b] = true;
-        let mut queue = vec![b];
-        while let Some(v) = queue.pop() {
-            for w in g.succs(v) {
-                if !in_path[w] {
-                    in_path[w] = true;
-                    queue.push(w);
-                }
-            }
-        }
+        // (a boundary on an activity of the side path belongs to it too) —
+        // the same traversal connectivity uses, so the two cannot disagree.
+        let in_path = reach(g.scope.nodes.len(), &[b], |v| g.succs(v));
 
         // Disjointness: nothing outside the side path may reach into it. `B`
         // itself is exempt and is the only exemption — its one predecessor is
@@ -840,12 +824,7 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
         // is the duplicate-(message, key) freeze. Sometimes right, so a
         // warning with the consequence named; the freeze is the loud backstop.
         for v in (0..g.scope.nodes.len()).filter(|&v| in_path[v] && v != b) {
-            let message_arm = match &g.node(v).kind {
-                NodeKind::Catch(CatchTrigger::Message(_)) | NodeKind::ReceiveTask { .. } => true,
-                NodeKind::Boundary(other) => matches!(other.trigger, BoundaryTrigger::Message(_)),
-                _ => false,
-            };
-            if message_arm {
+            if g.node(v).kind.is_message_arm() {
                 out.push(Diagnostic::warn(
                     rule::SIDE_PATH_MESSAGE_ARM,
                     &g.node(v).id,

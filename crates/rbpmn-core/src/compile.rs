@@ -137,6 +137,27 @@ pub enum TimerKind {
     Cycle,
 }
 
+impl TimerKind {
+    /// Is `text` a valid literal of this kind? The compiled-side counterpart
+    /// of `rbpmn_model::TimerSpec::literal_check`, over the same validators.
+    pub fn validate(self, text: &str) -> Result<(), String> {
+        match self {
+            TimerKind::Duration => rbpmn_model::iso8601::validate_duration(text),
+            TimerKind::Date => rbpmn_model::iso8601::validate_datetime(text),
+            TimerKind::Cycle => rbpmn_model::iso8601::validate_cycle(text),
+        }
+    }
+
+    /// The resolved form of a validated `text`.
+    pub fn due(self, text: &str) -> TimerDue {
+        match self {
+            TimerKind::Duration => TimerDue::Duration(text.to_string()),
+            TimerKind::Date => TimerDue::Date(text.to_string()),
+            TimerKind::Cycle => TimerDue::Cycle(text.to_string()),
+        }
+    }
+}
+
 /// A compiled timer spec: a literal validated at deploy, or a FEEL qualified
 /// name read from the variable document when the timer is armed.
 ///
@@ -170,17 +191,8 @@ impl TimerSource {
                 describe(value)
             ));
         };
-        let checked = match kind {
-            TimerKind::Duration => rbpmn_model::iso8601::validate_duration(text),
-            TimerKind::Date => rbpmn_model::iso8601::validate_datetime(text),
-            TimerKind::Cycle => rbpmn_model::iso8601::validate_cycle(text),
-        };
-        match checked {
-            Ok(()) => Ok(match kind {
-                TimerKind::Duration => TimerDue::Duration(text.clone()),
-                TimerKind::Date => TimerDue::Date(text.clone()),
-                TimerKind::Cycle => TimerDue::Cycle(text.clone()),
-            }),
+        match kind.validate(text) {
+            Ok(()) => Ok(kind.due(text)),
             Err(why) => Err(format!("'{name}' is \"{text}\", which is not valid: {why}")),
         }
     }
@@ -575,35 +587,29 @@ impl ExecutableProcess {
                         ))
                     })
             };
-            match spec {
-                TimerSpec::Duration(s) => {
-                    if rbpmn_model::iso8601::validate_duration(s).is_ok() {
-                        Ok(TimerSource::Literal(TimerDue::Duration(s.clone())))
-                    } else {
-                        from_variable(TimerKind::Duration, s)
-                    }
+            let kind = match spec {
+                TimerSpec::Duration(_) => TimerKind::Duration,
+                TimerSpec::Date(_) => TimerKind::Date,
+                // Lint admits a cycle on a non-interrupting boundary only;
+                // the callers refuse it anywhere else as "survived lint".
+                TimerSpec::Cycle(_) => TimerKind::Cycle,
+                TimerSpec::Missing => {
+                    return Err(CompileError::Internal(format!(
+                        "timer '{}' with a missing definition survived lint",
+                        node.id
+                    )));
                 }
-                TimerSpec::Date(s) => {
-                    if rbpmn_model::iso8601::validate_datetime(s).is_ok() {
-                        Ok(TimerSource::Literal(TimerDue::Date(s.clone())))
-                    } else {
-                        from_variable(TimerKind::Date, s)
-                    }
-                }
-                // Same literal-first rule as the other two. Lint admits a
-                // cycle on a non-interrupting boundary only; the callers
-                // below refuse it anywhere else as "survived lint".
-                TimerSpec::Cycle(s) => {
-                    if rbpmn_model::iso8601::validate_cycle(s).is_ok() {
-                        Ok(TimerSource::Literal(TimerDue::Cycle(s.clone())))
-                    } else {
-                        from_variable(TimerKind::Cycle, s)
-                    }
-                }
-                TimerSpec::Missing => Err(CompileError::Internal(format!(
-                    "timer '{}' with a missing definition survived lint",
-                    node.id
-                ))),
+            };
+            // Literal first, by the same table lint consulted to accept this
+            // element — so the two cannot disagree about what is a literal
+            // and what is a variable name.
+            let (_, text, literal) = spec
+                .literal_check()
+                .expect("a missing definition returned above");
+            if literal.is_ok() {
+                Ok(TimerSource::Literal(kind.due(text)))
+            } else {
+                from_variable(kind, text)
             }
         };
 

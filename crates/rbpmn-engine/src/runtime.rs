@@ -1139,54 +1139,28 @@ pub(crate) async fn persist_step(
                 continues,
                 remaining,
             } => {
-                let token_no = token.0 as i64;
-                match due {
-                    TimerDue::Duration(_) | TimerDue::Date(_) => {
-                        let (due_kind, spec) = match due {
-                            TimerDue::Duration(s) => ("duration", s),
-                            TimerDue::Date(s) => ("date", s),
-                            TimerDue::Cycle(_) => unreachable!("matched above"),
-                        };
-                        // due_at from database time — the design's clock
-                        // authority. Both ISO-8601 forms cast natively.
-                        sqlx::query(
-                            "insert into rbpmn_timer \
-                             (instance_id, timer_no, token_no, element_id, due_kind, \
-                              due_spec, due_at) \
-                             values ($1, $2, $3, $4, $5, $6, case when $5 = 'duration' \
-                             then clock_timestamp() + $6::interval else $6::timestamptz end)",
-                        )
-                        .bind(instance_id)
-                        .bind(id.0 as i64)
-                        .bind(token_no)
-                        .bind(element)
-                        .bind(due_kind)
-                        .bind(spec)
-                        .execute(&mut *tx)
-                        .await?;
-                    }
-                    TimerDue::Cycle(text) => {
-                        arm_cycle(
-                            tx,
-                            instance_id,
-                            *id,
-                            token_no,
-                            element,
-                            text,
-                            *remaining,
-                            continues.map(|prev| {
-                                deleted_due.get(&prev).copied().ok_or_else(|| {
-                                    internal(format!(
-                                        "cycle '{element}' continues timer {} which this \
-                                         step did not fire",
-                                        prev.0
-                                    ))
-                                })
-                            }),
-                        )
-                        .await?;
-                    }
-                }
+                // A cycle's re-arm steps from the due of the occurrence it
+                // continues, which this step deleted a few events ago.
+                let previous = match continues {
+                    Some(prev) => Some(deleted_due.get(prev).copied().ok_or_else(|| {
+                        internal(format!(
+                            "cycle '{element}' continues timer {} which this step did not fire",
+                            prev.0
+                        ))
+                    })?),
+                    None => None,
+                };
+                insert_timer(
+                    tx,
+                    instance_id,
+                    *id,
+                    token.0 as i64,
+                    element,
+                    due,
+                    *remaining,
+                    previous,
+                )
+                .await?;
                 armed_timer = true;
             }
             Event::TimerFired { id, .. } | Event::TimerCancelled { id, .. } => {
@@ -1307,67 +1281,78 @@ pub(crate) async fn persist_step(
     Ok(())
 }
 
-/// Insert the row for one occurrence of a cycle.
+/// The one insert for `rbpmn_timer`, whatever kind of timer it is — one
+/// column list, one `due_at` expression with a branch per kind, so the next
+/// column cannot be added to the duration path and forgotten on the cycle
+/// path (which far fewer scenarios arm).
 ///
-/// The instant is the projection's to compute, and it is computed in **epoch
-/// seconds** because lint made the period fixed-length: `timestamptz +
-/// interval '1 day'` is a calendar day in the session's time zone and would
-/// slide an hour across a daylight-saving change, which is not what `P1D`
-/// means in a cycle. Three cases, one per kind of arm:
+/// `due_at` is database time, the design's clock authority. A duration is
+/// `clock_timestamp() + interval` and a date casts; both are the stable
+/// text-input casts PostgreSQL will not fold at plan time, which is what
+/// keeps the untaken branches of the CASE harmless. A cycle is computed in
+/// **epoch seconds**, because lint made its period fixed-length and
+/// `timestamptz + interval '1 day'` is a calendar day in the session's time
+/// zone — which `P1D` in a cycle is not, across a daylight-saving change:
 ///
-/// * a re-arm (`previous` is the fired occurrence's due): *that* due plus the
-///   period — never the time the fire happened to run, so a scheduler that
-///   was late does not drift the schedule;
+/// * a re-arm (`previous_due` is the fired occurrence's due): *that* due plus
+///   the period — never the time the fire happened to run, so a scheduler
+///   that was late does not drift the schedule;
 /// * a first arm with an anchor: the anchor fixes the *phase* — the first
-///   occurrence at or after now (`anchor + ceil((now − anchor)/period) ·
-///   period`, clamped so a future anchor is itself the first due). Occurrences
-///   already in the past are never replayed: a definition outlives its anchor;
+///   occurrence at or after now, a future anchor being itself the first due.
+///   Occurrences already in the past are never replayed: a definition
+///   outlives its anchor;
 /// * a first arm without one: now plus the period.
 #[allow(clippy::too_many_arguments)]
-async fn arm_cycle(
+async fn insert_timer(
     tx: &mut PgConnection,
     instance_id: Uuid,
     id: TimerId,
     token_no: i64,
     element: &str,
-    text: &str,
+    due: &TimerDue,
     remaining: Option<u32>,
-    previous: Option<Result<f64, EngineError>>,
+    previous_due: Option<f64>,
 ) -> Result<(), EngineError> {
-    // Validated at lint (a literal) or at arm time (a variable), with this
-    // same function; failing here means a row the core never produced.
-    let parts = rbpmn_model::iso8601::split_cycle(text)
-        .map_err(|e| internal(format!("cycle '{text}' on '{element}' is not valid: {e}")))?;
-    let period = rbpmn_model::iso8601::fixed_length_seconds(&parts.period)
-        .map_err(|e| internal(format!("cycle '{text}' on '{element}': {e}")))?;
-    let previous_due = match previous {
-        Some(p) => Some(p?),
-        None => None,
+    let (due_kind, spec) = match due {
+        TimerDue::Duration(s) => ("duration", s),
+        TimerDue::Date(s) => ("date", s),
+        TimerDue::Cycle(s) => ("cycle", s),
     };
-    // One statement for the three cases, so every parameter is always bound:
-    // $7 the fired occurrence's due (a re-arm), $9 the anchor (a first arm
-    // with a phase), neither (a first arm from now). All in epoch seconds.
+    // Validated at lint (a literal) or at arm time (a variable) with this
+    // same function; failing here means a row the core never produced.
+    let (period, anchor) = match due {
+        TimerDue::Cycle(text) => {
+            let parts = rbpmn_model::iso8601::split_cycle(text).map_err(|e| {
+                internal(format!("cycle '{text}' on '{element}' is not valid: {e}"))
+            })?;
+            (parts.period_seconds, parts.anchor)
+        }
+        _ => (0.0, None),
+    };
     sqlx::query(
         "insert into rbpmn_timer \
          (instance_id, timer_no, token_no, element_id, due_kind, due_spec, remaining, due_at) \
-         values ($1, $2, $3, $4, 'cycle', $5, $6, case \
-           when $7::float8 is not null then to_timestamp($7::float8 + $8::float8) \
-           when $9::timestamptz is not null then to_timestamp( \
-             extract(epoch from $9::timestamptz) \
-             + $8::float8 * ceil(greatest(0, extract(epoch from clock_timestamp()) \
-                                          - extract(epoch from $9::timestamptz)) / $8::float8)) \
-           else to_timestamp(extract(epoch from clock_timestamp()) + $8::float8) \
+         values ($1, $2, $3, $4, $5, $6, $7, case \
+           when $5 = 'duration' then clock_timestamp() + $6::interval \
+           when $5 = 'date' then $6::timestamptz \
+           when $8::float8 is not null then to_timestamp($8::float8 + $9::float8) \
+           when $10::timestamptz is not null then to_timestamp( \
+             extract(epoch from $10::timestamptz) \
+             + $9::float8 * ceil(greatest(0, extract(epoch from clock_timestamp()) \
+                                          - extract(epoch from $10::timestamptz)) / $9::float8)) \
+           else to_timestamp(extract(epoch from clock_timestamp()) + $9::float8) \
          end)",
     )
     .bind(instance_id)
     .bind(id.0 as i64)
     .bind(token_no)
     .bind(element)
-    .bind(text)
+    .bind(due_kind)
+    .bind(spec)
     .bind(remaining.map(|r| r as i32))
     .bind(previous_due)
     .bind(period)
-    .bind(parts.anchor.as_deref())
+    .bind(anchor.as_deref())
     .execute(&mut *tx)
     .await?;
     Ok(())

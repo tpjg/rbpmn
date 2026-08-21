@@ -328,7 +328,11 @@ pub fn check(g: &Graph, owner: &str, out: &mut Vec<Diagnostic>) {
 /// Set of nodes reachable from `seeds` under `neighbors` (mark-before-push,
 /// seeds pre-marked). Shared by forward and backward connectivity so the two
 /// checks can never disagree about traversal semantics.
-fn reach(n: usize, seeds: &[usize], neighbors: impl Fn(usize) -> Vec<usize>) -> Vec<bool> {
+pub(super) fn reach(
+    n: usize,
+    seeds: &[usize],
+    neighbors: impl Fn(usize) -> Vec<usize>,
+) -> Vec<bool> {
     let mut visited = vec![false; n];
     let mut queue: Vec<usize> = seeds.to_vec();
     for &s in seeds {

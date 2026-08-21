@@ -94,9 +94,29 @@ pub fn validate_datetime(s: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The components of one duration, as [`validate_duration`] accepted them.
+/// One tokenizer for the two questions ever asked of a duration — "is it
+/// valid?" and "how many seconds is it?" — so the linter and the projection's
+/// cycle arithmetic can never read the same text differently.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct DurationParts {
+    weeks: f64,
+    years: f64,
+    months: f64,
+    days: f64,
+    hours: f64,
+    minutes: f64,
+    seconds: f64,
+}
+
 /// `PnW` or `PnYnMnDTnHnMnS` with at least one component; fraction only on
 /// seconds; components in order, each at most once.
 pub fn validate_duration(s: &str) -> Result<(), String> {
+    duration_parts(s).map(|_| ())
+}
+
+fn duration_parts(s: &str) -> Result<DurationParts, String> {
+    let mut parts = DurationParts::default();
     let b = s.as_bytes();
     if b.first() != Some(&b'P') {
         return Err(format!("duration must start with 'P': '{s}'"));
@@ -152,8 +172,9 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
         if component_value(&s[1..j]) * 7.0 > MAX_TOTAL_DAYS {
             return Err(total_too_large(s));
         }
+        parts.weeks = component_value(&s[1..j]);
         return if j + 1 == b.len() {
-            Ok(())
+            Ok(parts)
         } else {
             Err(format!(
                 "'W' cannot be combined with other components: '{s}'"
@@ -173,7 +194,13 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
                         "fractions are only allowed on the seconds component: '{s}'"
                     ));
                 }
-                total_days += component_value(&s[start..i]) * days_per;
+                let value = component_value(&s[start..i]);
+                total_days += value * days_per;
+                match unit {
+                    b'Y' => parts.years = value,
+                    b'M' => parts.months = value,
+                    _ => parts.days = value,
+                }
                 i += 1;
                 components += 1;
             } else {
@@ -199,7 +226,13 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
                             "fractions are only allowed on the seconds component: '{s}'"
                         ));
                     }
-                    total_days += component_value(&s[start..i]) * days_per;
+                    let value = component_value(&s[start..i]);
+                    total_days += value * days_per;
+                    match unit {
+                        b'H' => parts.hours = value,
+                        b'M' => parts.minutes = value,
+                        _ => parts.seconds = value,
+                    }
                     i += 1;
                     time_components += 1;
                 } else {
@@ -222,7 +255,7 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
     if total_days > MAX_TOTAL_DAYS {
         return Err(total_too_large(s));
     }
-    Ok(())
+    Ok(parts)
 }
 
 /// The pieces of a validated cycle, for the two places that need them: the
@@ -236,6 +269,8 @@ pub struct CycleParts {
     pub anchor: Option<String>,
     /// The ISO-8601 period, already known to be fixed-length.
     pub period: String,
+    /// ...and its length, the one number the projection steps by.
+    pub period_seconds: f64,
 }
 
 /// `R[n]/P…` or `R[n]/<datetime>/P…`: `n` fires (absent = unbounded, zero
@@ -303,62 +338,31 @@ pub fn split_cycle(s: &str) -> Result<CycleParts, String> {
              'Rn/<datetime>/P…': '{s}'"
         ));
     }
-    validate_duration(period)?;
-    fixed_length_seconds(period)?;
+    let period_seconds = fixed_length_seconds(period)?;
     Ok(CycleParts {
         repeats,
         anchor,
         period: period.to_string(),
+        period_seconds,
     })
 }
 
 /// A duration as a number of seconds, for durations that *have* one: weeks,
 /// days, hours, minutes, seconds. `P1M` and `P1Y` are refused — their length
 /// depends on where in the calendar they land, which is exactly what a cycle
-/// stepped by epoch arithmetic cannot honour. Assumes [`validate_duration`]
-/// has passed; the magnitude caps there keep this finite.
+/// stepped by epoch arithmetic cannot honour. Validates on the way (the same
+/// tokenizer as [`validate_duration`]), so it cannot be handed text the
+/// linter never saw.
 pub fn fixed_length_seconds(period: &str) -> Result<f64, String> {
-    let body = period.strip_prefix('P').unwrap_or(period);
-    if let Some(weeks) = body.strip_suffix('W') {
-        return Ok(component_value(weeks) * 604_800.0);
+    let p = duration_parts(period)?;
+    if p.years > 0.0 || p.months > 0.0 {
+        return Err(format!(
+            "a repeating period must have a fixed length — months and years \
+             do not (use weeks or days): '{period}'"
+        ));
     }
-    let (date, time) = match body.split_once('T') {
-        Some((d, t)) => (d, t),
-        None => (body, ""),
-    };
-    let mut secs = 0f64;
-    let mut num = String::new();
-    for c in date.chars() {
-        if c.is_ascii_digit() || c == '.' {
-            num.push(c);
-            continue;
-        }
-        match c {
-            'D' => secs += component_value(&num) * 86_400.0,
-            'Y' | 'M' => {
-                return Err(format!(
-                    "a repeating period must have a fixed length — months and years \
-                     do not (use weeks or days): '{period}'"
-                ));
-            }
-            _ => return Err(format!("unexpected '{c}' in period '{period}'")),
-        }
-        num.clear();
-    }
-    for c in time.chars() {
-        if c.is_ascii_digit() || c == '.' {
-            num.push(c);
-            continue;
-        }
-        let per = match c {
-            'H' => 3_600.0,
-            'M' => 60.0,
-            'S' => 1.0,
-            _ => return Err(format!("unexpected '{c}' in period '{period}'")),
-        };
-        secs += component_value(&num) * per;
-        num.clear();
-    }
+    let secs =
+        p.weeks * 604_800.0 + p.days * 86_400.0 + p.hours * 3_600.0 + p.minutes * 60.0 + p.seconds;
     if secs <= 0.0 {
         return Err(format!("a repeating period must be positive: '{period}'"));
     }
@@ -498,7 +502,7 @@ mod tests {
             let parts = split_cycle(s).unwrap_or_else(|e| panic!("{s}: {e}"));
             assert_eq!(parts.repeats, repeats, "{s}");
             assert_eq!(parts.anchor.is_some(), anchored, "{s}");
-            assert_eq!(fixed_length_seconds(&parts.period).unwrap(), secs, "{s}");
+            assert_eq!(parts.period_seconds, secs, "{s}");
         }
     }
 
