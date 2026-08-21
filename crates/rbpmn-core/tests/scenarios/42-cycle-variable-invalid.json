@@ -1,0 +1,21 @@
+{
+  "fixture": "accept/42-cycle-from-variable.bpmn",
+  "bindings": {},
+  "variables": { "contract": { "reminderCycle": "every monday" } },
+  "actions": [],
+  "expect": {
+    "status": "failed",
+    "variables": { "contract": { "reminderCycle": "every monday" } },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started sign",
+      "work-item-created sign user sign",
+      "timer-resolve-failed remind_due contract.reminderCycle",
+      "work-item-cancelled sign",
+      "incident-raised remind_due"
+    ]
+  }
+}

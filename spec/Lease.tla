@@ -27,6 +27,20 @@
 (* other and is modelled as one: it is the third way a claim ends, and the  *)
 (* first that returns an item to the queue with nothing having gone wrong.  *)
 (*                                                                          *)
+(* `Cancel` is the fourth, and the one this model lacked longest: the       *)
+(* *process* withdrawing the item — an interrupting boundary, a terminate,  *)
+(* a scope teardown. Terminate and the interrupting timer boundary have     *)
+(* cancelled leased items since phase 3, so the shipped engine never had    *)
+(* the property this file used to state, `LiveLeaseEndsOnlyByItsHolder`: a  *)
+(* live lease has always been ended by the process as well. The model had   *)
+(* no action for it, so the property held — vacuously over the one actor it *)
+(* left out. Message boundaries (docs/design/boundary-messages.md §8) made  *)
+(* that actor a human-triggered one and the omission worth closing. The     *)
+(* property is now `LiveLeaseEndsOnlyByItsHolderOrTheProcess`, which is the *)
+(* honest one, and what the lease actually buys is stated by what Cancel    *)
+(* must NOT do: the holder's later verbs all land as typed answers          *)
+(* (`AlreadyClosed`, `Lost`), never as a completion (`NoCompletionAfterCancel`). *)
+(*                                                                          *)
 (* Its first property, `NoForeignHandBack`, was deleted for the same reason *)
 (* as the idealised `Complete` above, from the opposite direction: it said  *)
 (* `(HoldsLive(w) /\ v # w) => ~ReleaseGuard(v)`, which is true by          *)
@@ -36,13 +50,14 @@
 (* holding had `Release` been given a different guard, or a body that       *)
 (* freed a live holder by some other route. What replaced it is about the   *)
 (* *effect* and needs `lastActor` to say it — see                           *)
-(* `LiveLeaseEndsOnlyByItsHolder`.                                          *)
+(* `LiveLeaseEndsOnlyByItsHolderOrTheProcess`.                              *)
 (***************************************************************************)
 EXTENDS Naturals
 
 CONSTANTS
     Workers,   \* competing consumers of one topic
     NoOne,     \* the unheld marker
+    Process,   \* the actor when the engine itself withdraws the item
     NoLease,   \* "this step named no epoch" — a model value, like NoOne
     TTL,       \* lease duration
     Backoff,   \* retry delay after a failure
@@ -50,9 +65,12 @@ CONSTANTS
     MaxTime,   \* clock bound, to keep the model finite
     MaxLeases, \* epoch bound, likewise: claim/release can cycle in one instant
     UncheckedRelease, \* TRUE = drop release_task's owner check (a bug)
-    EpochlessRelease  \* TRUE = drop its lease_no check (the shipped bug)
+    EpochlessRelease, \* TRUE = drop its lease_no check (the shipped bug)
+    CompleteIgnoresClosed \* TRUE = drop completion's AlreadyClosed check (a bug)
 
 ASSUME NoOne \notin Workers
+ASSUME Process \notin Workers /\ Process # NoOne
+ASSUME CompleteIgnoresClosed \in BOOLEAN
 ASSUME NoLease \notin 0..MaxLeases
 ASSUME TTL \in Nat /\ TTL > 0
 ASSUME MaxTime \in Nat
@@ -61,7 +79,7 @@ ASSUME UncheckedRelease \in BOOLEAN
 ASSUME EpochlessRelease \in BOOLEAN
 
 VARIABLES
-    state,        \* "available" | "locked" | "done"
+    state,        \* "available" | "locked" | "done" | "cancelled" | "failed"
     owner,        \* the lock_owner column
     until,        \* lock_until
     retryAt,      \* retry_at: set on failure, blocks claiming until due
@@ -70,7 +88,7 @@ VARIABLES
     now,          \* database time
     believes,     \* Workers -> BOOLEAN: this worker thinks it holds the item
     completions,  \* how many times the item transitioned to done
-    lastActor,    \* who took the step: a worker, or NoOne for the clock
+    lastActor,    \* who took the step: a worker, NoOne for the clock, Process for the engine
     leaseNo,      \* rbpmn_work_item.lease_no: bumped by every claim
     named,        \* the epoch the step's release named; NoLease otherwise
     issued        \* Workers -> the release requests it has actually sent
@@ -110,8 +128,17 @@ Claimable ==
 \* required — that the caller holds anything at all.
 GuardAllows(w) == ~(state = "locked" /\ until > now /\ owner # w)
 
-\* `complete_work_item_in_tx` refuses on a frozen instance (IncidentOpen).
-Completable(w) == state # "done" /\ active /\ GuardAllows(w)
+\* `complete_work_item_in_tx`: the AlreadyClosed no-op comes first — only an
+\* `available` or `locked` item is completed; `completed`, `cancelled` and
+\* `failed` all answer AlreadyClosed before the core is invoked — then the
+\* frozen-instance refusal (IncidentOpen), then guard_lease. `state # "done"`
+\* was enough while the only closed state was `done`; `Cancel` makes the
+\* transcription matter, and `CompleteIgnoresClosed` drops it to show why.
+Completable(w) ==
+    /\ IF CompleteIgnoresClosed THEN state # "done"
+                               ELSE state \in {"available", "locked"}
+    /\ active
+    /\ GuardAllows(w)
 
 \* Exactly `release_task` (tasks.rs): `lock_owner = $me AND lease_no = $mine
 \* AND state = 'locked'`, for a request naming epoch `e`.
@@ -130,7 +157,7 @@ ReleaseGuard(w, e) ==
     /\ EpochlessRelease \/ e = leaseNo
 
 TypeOK ==
-    /\ state \in {"available", "locked", "done"}
+    /\ state \in {"available", "locked", "done", "cancelled", "failed"}
     /\ owner \in Workers \cup {NoOne}
     /\ until \in Deadline
     /\ retryAt \in Deadline
@@ -139,7 +166,7 @@ TypeOK ==
     /\ now \in Time
     /\ believes \in [Workers -> BOOLEAN]
     /\ completions \in 0..2
-    /\ lastActor \in Workers \cup {NoOne}
+    /\ lastActor \in Workers \cup {NoOne, Process}
     /\ leaseNo \in Leases
     /\ named \in Leases \cup {NoLease}
     /\ issued \in [Workers -> SUBSET Leases]
@@ -273,8 +300,10 @@ CompleteRefused(w) ==
 \* At-least-once delivery: retrying a closed item is the idempotent no-op,
 \* NOT a second state transition. This is what keeps `completions` at one —
 \* the property is earned here rather than being structurally impossible.
+\* A cancelled item answers the same way: `AlreadyClosed { state: "cancelled" }`
+\* is what a lease holder gets after the process withdrew its task.
 CompleteAlreadyClosed(w) ==
-    /\ state = "done"
+    /\ state \in {"done", "cancelled", "failed"}
     /\ believes' = [believes EXCEPT ![w] = FALSE]
     /\ lastActor' = w
     /\ named' = NoLease
@@ -297,18 +326,47 @@ Fail(w) ==
     /\ named' = NoLease
     /\ UNCHANGED <<active, now, completions, leaseNo, issued>>
 
+\* RaiseError: the core emits WorkItemFailed and persist_step writes
+\* `state = 'failed'` — the state column and nothing else, like Cancel. This
+\* model used to leave the item `locked` here, which the engine never does;
+\* a finally-failed item answers AlreadyClosed { state: "failed" } exactly as
+\* a cancelled one does, and is closed, not stranded.
 FailFinally(w) ==
     /\ state = "locked"
     /\ GuardAllows(w)
     /\ retries = 0
+    /\ state' = "failed"
     /\ active' = FALSE          \* incident: the instance freezes for repair
     /\ believes' = [believes EXCEPT ![w] = FALSE]
     /\ lastActor' = w
     /\ named' = NoLease
-    /\ UNCHANGED <<state, owner, until, retryAt, retries, now, completions, leaseNo, issued>>
+    /\ UNCHANGED <<owner, until, retryAt, retries, now, completions, leaseNo, issued>>
+
+\* The process withdraws the item: an interrupting boundary on the host, a
+\* terminate end, the teardown of an enclosing scope. Transcribed from
+\* `persist_step`'s handling of `WorkItemCancelled` — `set_work_item_state(...,
+\* 'cancelled')` — which changes the state column and nothing else: the lease
+\* columns keep whatever they held, and nobody is told (`believes` stands).
+\* There is deliberately NO liveness clause and NO owner check: a lease is a
+\* row value that protects a holder from *other workers*, never from the
+\* process. It needs an active instance, because every path that cancels is
+\* a step, and a frozen instance takes no steps.
+\*
+\* A cancelled item is terminal: no action below moves it (the guards of
+\* Acquire, Extend, Release, Complete and Fail all exclude it), which is the
+\* second legitimate end state these configs run with `-deadlock` for.
+Cancel ==
+    /\ state \in {"available", "locked"}
+    /\ active
+    /\ state' = "cancelled"
+    /\ lastActor' = Process
+    /\ named' = NoLease
+    /\ UNCHANGED <<owner, until, retryAt, retries, active, now, believes,
+                   completions, leaseNo, issued>>
 
 Next ==
     \/ Tick
+    \/ Cancel
     \/ \E w \in Workers :
         \/ Acquire(w) \/ Extend(w) \/ ExtendLost(w)
         \/ ReleaseWith(w, leaseNo) \/ ReleaseReplay(w) \/ ReleaseLost(w)
@@ -344,18 +402,28 @@ NoLiveForeignCompletion ==
     (state = "done" /\ owner \in Workers /\ until > now) => completions = 1
 
 (***************************************************************************)
-(* An item can be neither claimable nor completable — but only for a stated *)
-(* reason: it is inside its retry backoff, or its instance froze as an      *)
-(* incident. The earlier `NeverStranded` asserted this could not happen at  *)
-(* all, which was only true because the model had no failure path.          *)
+(* An OPEN item is always claimable or completable. This property has gone  *)
+(* back and forth, and the history is the lesson: `NeverStranded` was first *)
+(* deleted as holding only because the model had no failure path, and       *)
+(* replaced by `StrandedOnlyForAStatedReason == Blocked => (retryAt > now   *)
+(* \/ ~active)`. Transcribing FailFinally as the engine writes it (`failed`, *)
+(* a closed item) removed the `~active` case, and checking the other one    *)
+(* showed it had never been reachable either: an `available` item inside    *)
+(* its retry backoff is *completable* — `guard_lease` never reads           *)
+(* `retry_at`; only claiming does — so `Blocked` was satisfied by nothing   *)
+(* but the `locked`-after-failure artefact. A property whose antecedent is  *)
+(* unreachable proves nothing, so it is the positive statement again, now   *)
+(* with its antecedent reachable from the initial state.                    *)
+(*                                                                          *)
+(* What it does not say: the engine does have stranded items — a SIBLING    *)
+(* branch's open task on an instance this item froze — and a one-item model *)
+(* cannot express that. It would need a second item and a property about    *)
+(* `~active` on it; until then this is the one-item truth, not the whole.   *)
 (***************************************************************************)
-Blocked ==
-    /\ state # "done"
-    /\ ~Claimable
-    /\ ~(\E w \in Workers : Completable(w))
+Open == state \in {"available", "locked"}
 
-StrandedOnlyForAStatedReason ==
-    Blocked => (retryAt > now \/ ~active)
+NeverStranded ==
+    Open => (Claimable \/ \E w \in Workers : Completable(w))
 
 (***************************************************************************)
 (* What the epoch buys, and it takes a behavioural property to say it: a    *)
@@ -365,7 +433,7 @@ StrandedOnlyForAStatedReason ==
 (* state the difference is to record what the request named and compare it  *)
 (* with what was there when it arrived.                                     *)
 (*                                                                          *)
-(* Note that `LiveLeaseEndsOnlyByItsHolder` cannot catch this, and that is  *)
+(* `LiveLeaseEndsOnlyByItsHolderOrTheProcess` cannot catch this, and that is *)
 (* the point of having both: in the replay the holder *is* the actor. Alice *)
 (* frees Alice's own live claim with Alice's own stale request, so every    *)
 (* property phrased in terms of *who* acted holds while the item is handed  *)
@@ -396,10 +464,34 @@ ReleaseFreesOnlyTheLeaseItNamed ==
 (* workers believing at once is already reachable and already safe          *)
 (* (DoubleBeliefIsReachable). Lease_UncheckedRelease.cfg drops the owner    *)
 (* check from `Release` alone and TLC produces the trace.                   *)
+(*                                                                          *)
+(* `Process` is the second exemption, and it was missing until message      *)
+(* boundaries: the process withdrawing a leased item (Cancel) ends a live   *)
+(* lease by neither the clock nor its holder. Stated as "OnlyByItsHolder"   *)
+(* this property was never true of the shipped engine — terminate and the   *)
+(* interrupting timer boundary have done exactly that since phase 3 — and   *)
+(* it held only because the model had no action for the process. Adding     *)
+(* Cancel is what exposed it; the name now says what is actually promised.  *)
 (***************************************************************************)
-LiveLeaseEndsOnlyByItsHolder ==
+LiveLeaseEndsOnlyByItsHolderOrTheProcess ==
     [][ \A w \in Workers :
-          (HoldsLive(w) /\ ~HoldsLive(w)' /\ now' = now) => lastActor' = w ]_vars
+          (HoldsLive(w) /\ ~HoldsLive(w)' /\ now' = now)
+              => lastActor' \in {w, Process} ]_vars
+
+(***************************************************************************)
+(* What the lease does NOT protect against, and what it still guarantees    *)
+(* once the process has acted. A cancelled item is never completed: the     *)
+(* holder's later `complete_task` lands as `AlreadyClosed`, its `extend`    *)
+(* and `release` as `Lost`. The invariant states the terminal state; the    *)
+(* action property is the one with teeth, because a completion that ignored *)
+(* the closed-item check would move the row to "done" and the invariant     *)
+(* would never see the state it guards. Lease_CancelIgnoresGuard.cfg drops  *)
+(* the check and TLC produces the trace: cancel, then complete.             *)
+(***************************************************************************)
+CancelledIsNeverCompleted == state = "cancelled" => completions = 0
+
+NoCompletionAfterCancel ==
+    [][ state = "cancelled" => completions' = completions ]_vars
 
 (***************************************************************************)
 (* Deliberately FALSE — checked by Lease_DoubleBelief.cfg, which expects a  *)

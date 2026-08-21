@@ -134,6 +134,36 @@ inclusive gateway, block structure, messages-only interaction, build order).
   helped a downstream consumer of those crates standalone, and the machinery to
   keep it honest — a second toolchain, its own recipe, its own CI task — cost
   more than that was worth. Don't reintroduce it without such a consumer.
+- **Declared indexes carry a scope, and nothing ever drops one.**
+  `definition` (partial on `definition_key`, the default, byte-identical to
+  what shipped before) or `shared` (one index per field across definitions,
+  partial on `(variables->>'f') is not null`, named from the field alone so N
+  definitions converge on one index). A shared declaration asserts the field
+  means the same thing everywhere — rbpmn cannot check that and does not
+  pretend to; a cross-definition scope conflict is a `tracing::warn!`, never a
+  `Diagnostic`, because it is an operator fact about *other* definitions that
+  no offline surface can reproduce. Nothing drops a declared index of either
+  scope — not `delete_definition`, not retention, not dropping the field from
+  a manifest — deliberately, because a shared index belongs to no definition;
+  `declared_indexes()` is the read-only audit that keeps orphans visible.
+  **Index builds are serialized by a `pg_try_advisory_lock` poll, keyed by the
+  *table*.** Do not "simplify" it to a blocking lock: `CREATE INDEX
+  CONCURRENTLY` waits for every concurrent snapshot, and a session blocked on
+  a lock is a session holding one — both the blocking-lock and the no-lock
+  versions were reproduced as real Postgres deadlocks, and the no-lock one is
+  a bug that predates scopes (two definitions deploying at once both index
+  `rbpmn_instance`). The session must be **idle** between attempts; that is
+  what lets the holder's build drain.
+- **`rbpmn_v_instance` is public API and must stay a plain inlinable
+  projection.** One table, no WHERE, no volatile function, and above all not
+  `security_barrier` — a barrier view refuses to push `variables->>'f' = $1`
+  below itself (`jsonb ->>` is not leakproof), which would strand every
+  declared index beneath a full scan. Columns may be added, never removed or
+  repurposed. It is not a tenancy boundary and does no row filtering: an
+  application's own predicate belongs in the application's own query, which is
+  the whole reason the surface is SQL rather than an API. `find_by_shared_index`
+  is the no-SQL convenience beside it and is explicitly not a search
+  primitive — its limit lands before any caller-side filter.
 - The UI documents inline business data into HTML, which makes **escaping our
   problem** — one mistake ships to every embedder at once. The rule:
   `escape_json_for_html` for the data block, `textContent` (never
@@ -239,10 +269,15 @@ not a per-commit check). CI is the backstop; the point of the table in README's
   demonstration: UI routes are behind the bearer, browsers cannot send it on a
   navigation, and supplying it is the embedding application's job.
 - `just tla` — TLA+ model checking of the concurrency protocol (`spec/`).
-  Thirteen configs; eight are *expected* to fail, each matched against the
+  Nineteen configs; twelve are *expected* to fail, each matched against the
   specific violation it demonstrates (a spec that stops parsing must not read
   as "fails as expected"). Three reproduce bugs that were real. The lock order
-  is checked at two arities. Needs java; the jar is pinned and
+  is checked at two arities. `Lease.tla` models the process withdrawing a
+  leased item (`Cancel`) and `BoundaryExit.tla` the correlate-vs-complete race
+  on one token; both came with message boundaries, and `Lease`'s old
+  "only by its holder" property turned out never to have been true of the
+  shipped engine — a model with no action for an actor proves nothing about
+  it. Needs java; the jar is pinned and
   checksum-verified.
 - `just fixtures-di` — fixtures carry baked-in BPMN DI so they render
   everywhere; new fixtures without a `bpmndi:BPMNDiagram` section get theirs
@@ -285,6 +320,11 @@ So: **touching any of these means re-reading `spec/` and re-running
   voluntary hand-back (`release_task`), the `guard_lease` predicate
 - the scheduler's claim path (`try_fire`) — pick, NOWAIT, re-check, and the
   in-transaction decision evaluation that can now abort a claim already made
+- `correlate_in_tx`'s resolve → lock → re-check (`runtime.rs`): the re-check
+  confirms *this* subscription row is still in the rehydrated state, never
+  "some open subscription" (`spec/BoundaryExit.tla`, `LateCallsAreTyped` —
+  `BoundaryExit_AnyRowRecheck.cfg` is the loosened form failing), and like the
+  timer claim it sees the row, never its token (`SubscriptionTeardown.cfg`)
 - what scope teardown reaps (`step.rs::tear_down_scope`) — specifically that
   a reaped token's arms are withdrawn *with* it
 - retention's plan/archive/execute split, the DUE re-check under the row
@@ -302,9 +342,10 @@ survived, never that its *token* did — that half is teardown's invariant.
   BPMN files are 100% standard-namespace: no rbpmn extension attributes, no
   vendor attributes, ever. It is always tempting to "just add a hint in the
   XML" — don't. Wiring lives in code at registration time — one `Bindings`
-  value (`topic`, `correlation`, `decision`, `index`), plus `declare_topic`
-  and `declare_index` for the *environment* half — and is validated at deploy
-  like a compiler validates types: fail early, never "seems to run". This held
+  value (`topic`, `correlation`, `decision`, `index`/`shared_index`), plus
+  `declare_topic` and `declare_index` for the *environment* half — and is
+  validated at deploy like a compiler validates types: fail early, never
+  "seems to run". This held
   through DMN, which was the strongest pull yet: a business-rule task's
   decision name and result path are a `Bindings::decision` call, not an
   attribute, and the DMN artifacts travel in the deploy bundle beside the

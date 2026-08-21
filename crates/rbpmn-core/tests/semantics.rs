@@ -622,6 +622,303 @@ fn multiple_timer_boundaries_first_fires_wins() {
     assert_eq!(state.timers().count(), 0);
 }
 
+/// The non-interrupting half, and the exact inverse of the property above:
+/// on this host there is no exit at all, only a *sibling*. The delivery must
+/// leave the host's work item open and its token parked, and it must leave
+/// **exactly one** subscription at the boundary — the re-armed one, a new id,
+/// because a live host is never without its boundary. The clerk's
+/// `CompleteWorkItem` afterwards therefore succeeds, which is the sentence
+/// "the host is untouched" actually means.
+#[test]
+fn a_non_interrupting_delivery_leaves_the_host_open_and_re_arms() {
+    let defs = load("accept/33-non-interrupting-message-boundary.bpmn");
+    let bindings = Bindings::new().correlation("note_received", "case.id");
+    let proc = ExecutableProcess::compile(&defs, "casefile", &bindings).unwrap();
+    let (host, boundary, side) = (
+        proc.node_by_id("review").unwrap(),
+        proc.node_by_id("note_received").unwrap(),
+        proc.node_by_id("file_note").unwrap(),
+    );
+
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({"case": {"id": "c-33"}}),
+        },
+    )
+    .unwrap();
+    let item = state.open_work_item_at(host).unwrap();
+    let first = state.armed_subscription_at(boundary).unwrap();
+
+    step(
+        &proc,
+        &mut state,
+        Command::DeliverMessage {
+            id: first,
+            patch: json!({}),
+        },
+    )
+    .unwrap();
+
+    // The host: still open, still parked behind the same work item.
+    assert_eq!(state.status, InstanceStatus::Active);
+    assert_eq!(state.open_work_item_at(host), Some(item));
+    // The sibling: a *second* token, in the same scope, at the side path.
+    assert_eq!(state.tokens().count(), 2);
+    assert!(state.open_work_item_at(side).is_some());
+    // The arm: exactly one, at the boundary, on the host's token, new id.
+    let subs: Vec<_> = state.subscriptions().collect();
+    assert_eq!(subs.len(), 1, "expected exactly the re-armed subscription");
+    let (id, sub) = subs[0];
+    assert_ne!(
+        id, first,
+        "the re-arm must be a new subscription, not the old"
+    );
+    assert_eq!(sub.element, boundary);
+    assert_eq!(
+        sub.token,
+        state
+            .work_items()
+            .find(|(i, _)| *i == item)
+            .unwrap()
+            .1
+            .token
+    );
+
+    // And the exit the interrupting case refuses is available here.
+    step(
+        &proc,
+        &mut state,
+        Command::CompleteWorkItem {
+            id: item,
+            patch: json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(state.status, InstanceStatus::Active); // the sibling is still working
+    assert_eq!(state.subscriptions().count(), 0); // the host took its arm with it
+}
+
+/// ...and the one way that delivery can still fail. The re-arm evaluates the
+/// key against the **patched** document, so a delivery that spoils the key
+/// freezes the instance — and it must freeze *before* the side token, which
+/// is the early return in `side_path_triggered`. A sibling spawned into a
+/// failed instance would be a token nothing can ever advance.
+#[test]
+fn a_re_arm_that_cannot_resolve_its_key_freezes_before_the_side_token() {
+    let defs = load("accept/33-non-interrupting-message-boundary.bpmn");
+    let bindings = Bindings::new().correlation("note_received", "case.id");
+    let proc = ExecutableProcess::compile(&defs, "casefile", &bindings).unwrap();
+    let (boundary, side) = (
+        proc.node_by_id("note_received").unwrap(),
+        proc.node_by_id("file_note").unwrap(),
+    );
+
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({"case": {"id": "c-33"}}),
+        },
+    )
+    .unwrap();
+    let first = state.armed_subscription_at(boundary).unwrap();
+
+    // A float key can never match (no canonical spelling across a jsonb
+    // round-trip), so the re-arm cannot be made.
+    let events = step(
+        &proc,
+        &mut state,
+        Command::DeliverMessage {
+            id: first,
+            patch: json!({"case": {"id": 1.5}}),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(state.status, InstanceStatus::Failed);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.to_string() == "correlation-failed note_received case.id"),
+        "{events:?}"
+    );
+    // No sibling: one token, parked at the boundary that could not re-arm.
+    assert_eq!(state.tokens().count(), 1);
+    assert!(state.open_work_item_at(side).is_none());
+    let (_, token) = state.tokens().next().unwrap();
+    assert_eq!(token.wait, WaitKind::Incident);
+    assert_eq!(token.node, boundary);
+    assert_eq!(state.subscriptions().count(), 0);
+}
+
+/// The core-level statement of `spec/BoundaryExit.tla`: on one host with one
+/// message boundary there is **exactly one exit**. Whichever of
+/// `CompleteWorkItem` and `DeliverMessage` runs first resolves the host; the
+/// loser is refused with a typed error *before any mutation*, which is what
+/// lets the engine answer a late caller `AlreadyClosed` / 404 instead of
+/// stepping a second exit into the instance.
+///
+/// Two models, because the fixture cannot show both halves: on fixture 29
+/// either exit runs the instance to completion, so the loser meets the
+/// instance-status guard first. The inline model below leaves an open task on
+/// *both* continuations, so the loser meets the element-level guard — the one
+/// the engine maps to `AlreadyClosed { state: "cancelled" }` and 404.
+#[test]
+fn a_message_boundary_and_its_host_have_exactly_one_exit() {
+    let defs = load("accept/29-message-boundary.bpmn");
+    let bindings = Bindings::new().correlation("paid_during_contest", "ticket.reference");
+    let proc = ExecutableProcess::compile(&defs, "ticket", &bindings).unwrap();
+    let started = |proc: &ExecutableProcess, host: &str, boundary: &str| {
+        let mut state = InstanceState::new();
+        step(
+            proc,
+            &mut state,
+            Command::Start {
+                variables: json!({"ticket": {"reference": "T-2026-0042"}}),
+            },
+        )
+        .unwrap();
+        let item = state
+            .open_work_item_at(proc.node_by_id(host).unwrap())
+            .unwrap();
+        let sub = state
+            .armed_subscription_at(proc.node_by_id(boundary).unwrap())
+            .unwrap();
+        (state, item, sub)
+    };
+
+    // The clerk wins: the boundary's subscription went with the completion,
+    // so the payment has nothing left to be delivered to.
+    let (mut state, item, sub) = started(&proc, "handle_contest", "paid_during_contest");
+    step(
+        &proc,
+        &mut state,
+        Command::CompleteWorkItem {
+            id: item,
+            patch: json!({}),
+        },
+    )
+    .unwrap();
+    assert_eq!(state.subscriptions().count(), 0);
+    let before = state.clone();
+    let err = step(
+        &proc,
+        &mut state,
+        Command::DeliverMessage {
+            id: sub,
+            patch: json!({"payment": {"amount": 60}}),
+        },
+    );
+    assert_eq!(
+        err,
+        Err(StepError::InstanceNotActive(InstanceStatus::Completed))
+    );
+    assert_eq!(state, before, "the refused delivery mutated the instance");
+
+    // The payment wins: the work item was cancelled, not completed, and the
+    // clerk's patch never lands.
+    let (mut state, item, sub) = started(&proc, "handle_contest", "paid_during_contest");
+    step(
+        &proc,
+        &mut state,
+        Command::DeliverMessage {
+            id: sub,
+            patch: json!({"payment": {"amount": 60}}),
+        },
+    )
+    .unwrap();
+    let before = state.clone();
+    let err = step(
+        &proc,
+        &mut state,
+        Command::CompleteWorkItem {
+            id: item,
+            patch: json!({"contest": {"upheld": true}}),
+        },
+    );
+    assert_eq!(
+        err,
+        Err(StepError::InstanceNotActive(InstanceStatus::Completed))
+    );
+    assert_eq!(state, before, "the refused completion mutated the instance");
+    assert_eq!(state.variables["contest"], Value::Null);
+
+    // Same race, with work waiting on both continuations so the instance is
+    // still active when the loser calls: now the refusal is the element's own.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m_paid" name="PAID" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:userTask id="handle_contest"/>
+    <bpmn:boundaryEvent id="paid_during_contest" attachedToRef="handle_contest">
+      <bpmn:messageEventDefinition messageRef="m_paid"/>
+    </bpmn:boundaryEvent>
+    <bpmn:userTask id="t_decided"/>
+    <bpmn:userTask id="t_paid"/>
+    <bpmn:endEvent id="end_decided"/>
+    <bpmn:endEvent id="end_paid"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="handle_contest"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="handle_contest" targetRef="t_decided"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="paid_during_contest" targetRef="t_paid"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="t_decided" targetRef="end_decided"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="t_paid" targetRef="end_paid"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let defs = rbpmn_model::parse(xml).unwrap();
+    let proc = ExecutableProcess::compile(&defs, "p", &bindings).unwrap();
+
+    let (mut state, item, sub) = started(&proc, "handle_contest", "paid_during_contest");
+    step(
+        &proc,
+        &mut state,
+        Command::CompleteWorkItem {
+            id: item,
+            patch: json!({}),
+        },
+    )
+    .unwrap();
+    let before = state.clone();
+    let err = step(
+        &proc,
+        &mut state,
+        Command::DeliverMessage {
+            id: sub,
+            patch: json!({"payment": {"amount": 60}}),
+        },
+    );
+    assert_eq!(err, Err(StepError::UnknownSubscription(sub)));
+    assert_eq!(state, before, "the refused delivery mutated the instance");
+
+    let (mut state, item, sub) = started(&proc, "handle_contest", "paid_during_contest");
+    step(
+        &proc,
+        &mut state,
+        Command::DeliverMessage {
+            id: sub,
+            patch: json!({}),
+        },
+    )
+    .unwrap();
+    let before = state.clone();
+    let err = step(
+        &proc,
+        &mut state,
+        Command::CompleteWorkItem {
+            id: item,
+            patch: json!({"contest": {"upheld": true}}),
+        },
+    );
+    assert_eq!(err, Err(StepError::WorkItemNotOpen(item)));
+    assert_eq!(state, before, "the refused completion mutated the instance");
+    assert_eq!(state.variables["contest"], Value::Null);
+}
+
 /// Token conservation across a mid-advance freeze: a parallel sibling still
 /// queued when the incident fires must park (Incident wait at its target),
 /// never silently vanish — a frozen instance that lost a branch could never

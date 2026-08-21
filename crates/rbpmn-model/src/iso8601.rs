@@ -2,8 +2,10 @@
 //!
 //! Deliberately strict: datetimes require an explicit UTC offset ('Z' or
 //! ±hh:mm) so a timer never depends on server-local time. Cycles (repeating
-//! timers) are rejected at the lint layer until v2, so no cycle validator
-//! exists yet.
+//! timers, `timeCycle`) are a deliberate subset of ISO 8601's recurring
+//! intervals — `R[n]/P…` and `R[n]/<datetime>/P…` with a **fixed-length**
+//! period — and only a non-interrupting boundary may carry one
+//! (docs/design/boundary-messages.md §2.5).
 
 /// `YYYY-MM-DDThh:mm:ss[.fff](Z|±hh:mm)`
 pub fn validate_datetime(s: &str) -> Result<(), String> {
@@ -92,9 +94,29 @@ pub fn validate_datetime(s: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The components of one duration, as [`validate_duration`] accepted them.
+/// One tokenizer for the two questions ever asked of a duration — "is it
+/// valid?" and "how many seconds is it?" — so the linter and the projection's
+/// cycle arithmetic can never read the same text differently.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct DurationParts {
+    weeks: f64,
+    years: f64,
+    months: f64,
+    days: f64,
+    hours: f64,
+    minutes: f64,
+    seconds: f64,
+}
+
 /// `PnW` or `PnYnMnDTnHnMnS` with at least one component; fraction only on
 /// seconds; components in order, each at most once.
 pub fn validate_duration(s: &str) -> Result<(), String> {
+    duration_parts(s).map(|_| ())
+}
+
+fn duration_parts(s: &str) -> Result<DurationParts, String> {
+    let mut parts = DurationParts::default();
     let b = s.as_bytes();
     if b.first() != Some(&b'P') {
         return Err(format!("duration must start with 'P': '{s}'"));
@@ -150,8 +172,9 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
         if component_value(&s[1..j]) * 7.0 > MAX_TOTAL_DAYS {
             return Err(total_too_large(s));
         }
+        parts.weeks = component_value(&s[1..j]);
         return if j + 1 == b.len() {
-            Ok(())
+            Ok(parts)
         } else {
             Err(format!(
                 "'W' cannot be combined with other components: '{s}'"
@@ -171,7 +194,13 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
                         "fractions are only allowed on the seconds component: '{s}'"
                     ));
                 }
-                total_days += component_value(&s[start..i]) * days_per;
+                let value = component_value(&s[start..i]);
+                total_days += value * days_per;
+                match unit {
+                    b'Y' => parts.years = value,
+                    b'M' => parts.months = value,
+                    _ => parts.days = value,
+                }
                 i += 1;
                 components += 1;
             } else {
@@ -197,7 +226,13 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
                             "fractions are only allowed on the seconds component: '{s}'"
                         ));
                     }
-                    total_days += component_value(&s[start..i]) * days_per;
+                    let value = component_value(&s[start..i]);
+                    total_days += value * days_per;
+                    match unit {
+                        b'H' => parts.hours = value,
+                        b'M' => parts.minutes = value,
+                        _ => parts.seconds = value,
+                    }
                     i += 1;
                     time_components += 1;
                 } else {
@@ -220,7 +255,144 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
     if total_days > MAX_TOTAL_DAYS {
         return Err(total_too_large(s));
     }
-    Ok(())
+    Ok(parts)
+}
+
+/// The pieces of a validated cycle, for the two places that need them: the
+/// core reads `repeats` when it arms, the projection reads `anchor` and the
+/// period when it computes an instant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CycleParts {
+    /// `None` for `R/…`: unbounded, ended by the host.
+    pub repeats: Option<u32>,
+    /// The phase-fixing datetime of `R[n]/<datetime>/P…`, if any.
+    pub anchor: Option<String>,
+    /// The ISO-8601 period, already known to be fixed-length.
+    pub period: String,
+    /// ...and its length, the one number the projection steps by.
+    pub period_seconds: f64,
+}
+
+/// `R[n]/P…` or `R[n]/<datetime>/P…`: `n` fires (absent = unbounded, zero
+/// refused), an optional anchor that fixes the *phase*, and a period that is
+/// fixed-length — weeks, days, hours, minutes, seconds — and at least a
+/// minute long ([`MIN_CYCLE_SECONDS`]). Months and years are refused: the
+/// projection steps a cycle with epoch arithmetic, the previous due plus the
+/// period, and a month is not a number of seconds. The `R/<start>/<end>` and
+/// `R/P…/<end>` forms are refused too; the subset is stated rather than
+/// silently narrowed.
+pub fn validate_cycle(s: &str) -> Result<(), String> {
+    split_cycle(s).map(|_| ())
+}
+
+/// [`validate_cycle`], handing back the parts. Errors are the same text lint
+/// shows, so an arm-time failure on a variable-sourced cycle reads the same.
+pub fn split_cycle(s: &str) -> Result<CycleParts, String> {
+    let Some(rest) = s.strip_prefix('R') else {
+        return Err(format!("a repeating timer starts with 'R': '{s}'"));
+    };
+    let digits_end = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let repeats = if digits_end == 0 {
+        None
+    } else {
+        // The same cap as a duration component (one million): the count is
+        // stored in an `int` column and counted down by the core, and a
+        // value that fits u32 but not i32 would wrap to "fire once" on its
+        // way through the row. Nobody will outlive a million occurrences.
+        let n = rest[..digits_end]
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n <= MAX_COMPONENT_VALUE)
+            .ok_or_else(|| format!("repeat count too large (max {MAX_COMPONENT_VALUE}) in '{s}'"))?
+            as u32;
+        if n == 0 {
+            return Err(format!(
+                "'R0' repeats zero times and would never fire: '{s}'"
+            ));
+        }
+        Some(n)
+    };
+    let Some(rest) = rest[digits_end..].strip_prefix('/') else {
+        return Err(format!("expected '/' after the repeat count in '{s}'"));
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    // Before the shapes below get to guess: an empty component matches the
+    // *arity* of a form it is not. `R/P7D/` has two parts and would be read
+    // as the 'R/duration/end' form, `R//P7D` as an anchor that is not a
+    // datetime — both true of the arity and both misleading about the text.
+    if parts.iter().any(|p| p.is_empty()) {
+        return Err(format!("empty component in '{s}'"));
+    }
+    let (anchor, period) = match parts.as_slice() {
+        [period] => (None, *period),
+        [anchor, period] => {
+            if validate_datetime(anchor).is_err() {
+                if validate_duration(anchor).is_ok() {
+                    return Err(format!(
+                        "the 'R/duration/end' form is not supported — rbpmn accepts \
+                         'Rn/P…' and 'Rn/<datetime>/P…': '{s}'"
+                    ));
+                }
+                return Err(format!(
+                    "the anchor of a repeating timer must be a datetime with an \
+                     explicit UTC offset: '{s}'"
+                ));
+            }
+            (Some(anchor.to_string()), *period)
+        }
+        _ => {
+            return Err(format!(
+                "a repeating timer has at most an anchor and a period — rbpmn accepts \
+                 'Rn/P…' and 'Rn/<datetime>/P…': '{s}'"
+            ));
+        }
+    };
+    if validate_datetime(period).is_ok() {
+        return Err(format!(
+            "the 'R/start/end' form is not supported — rbpmn accepts 'Rn/P…' and \
+             'Rn/<datetime>/P…': '{s}'"
+        ));
+    }
+    let period_seconds = fixed_length_seconds(period)?;
+    // The floor belongs *here* and not in `fixed_length_seconds`, which is a
+    // generic "how long is this duration" and has no business refusing a
+    // short one: only a *repeating* period turns the scheduler into a hot
+    // loop, and only a repeating period spawns a token per fire.
+    if period_seconds < MIN_CYCLE_SECONDS {
+        return Err(format!(
+            "a repeating period must be at least one minute (PT1M): anything \
+             shorter turns the scheduler into a hot loop, spawning a token per \
+             fire — '{s}'"
+        ));
+    }
+    Ok(CycleParts {
+        repeats,
+        anchor,
+        period: period.to_string(),
+        period_seconds,
+    })
+}
+
+/// A duration as a number of seconds, for durations that *have* one: weeks,
+/// days, hours, minutes, seconds. `P1M` and `P1Y` are refused — their length
+/// depends on where in the calendar they land, which is exactly what a cycle
+/// stepped by epoch arithmetic cannot honour. Validates on the way (the same
+/// tokenizer as [`validate_duration`]), so it cannot be handed text the
+/// linter never saw.
+pub fn fixed_length_seconds(period: &str) -> Result<f64, String> {
+    let p = duration_parts(period)?;
+    if p.years > 0.0 || p.months > 0.0 {
+        return Err(format!(
+            "a repeating period must have a fixed length — months and years \
+             do not (use weeks or days): '{period}'"
+        ));
+    }
+    let secs =
+        p.weeks * 604_800.0 + p.days * 86_400.0 + p.hours * 3_600.0 + p.minutes * 60.0 + p.seconds;
+    if secs <= 0.0 {
+        return Err(format!("a repeating period must be positive: '{period}'"));
+    }
+    Ok(secs)
 }
 
 /// Per-component value bound. This must reject at lint time everything the
@@ -231,6 +403,14 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
 /// int32 months/days and int64 microseconds while allowing multi-millennium
 /// timers nobody will outlive.
 const MAX_COMPONENT_VALUE: u64 = 1_000_000;
+
+/// The other end of the same argument, for cycles only: a repeating period
+/// must be at least one minute. `R/PT0.001S` is a valid ISO-8601 recurrence
+/// and a hot loop — the scheduler would fire it as fast as it can claim it,
+/// spawning a token per fire, and every one of those tokens is a row. A
+/// minute is the shortest period a boundary event is ever a sensible way to
+/// express; anything below it wanted a worker loop, not a model.
+const MIN_CYCLE_SECONDS: f64 = 60.0;
 /// Fraction digits carry no magnitude; bound them for sanity only.
 const MAX_COMPONENT_DIGITS: usize = 9;
 
@@ -339,6 +519,78 @@ mod tests {
             "P", "PT", "15M", "P1.5D", "P3W2D", "PT5X", "P1D2H", "PT1H!", "soon",
         ] {
             assert!(validate_duration(s).is_err(), "{s} should be rejected");
+        }
+    }
+
+    #[test]
+    fn valid_cycles() {
+        for (s, repeats, anchored, secs) in [
+            ("R/P7D", None, false, 604_800.0),
+            ("R3/P7D", Some(3), false, 604_800.0),
+            ("R/2026-08-31T00:00:00+02:00/P7D", None, true, 604_800.0),
+            ("R2/2026-08-31T00:00:00Z/P1W", Some(2), true, 604_800.0),
+            ("R/PT90M", None, false, 5_400.0),
+            ("R/P1DT12H", None, false, 129_600.0),
+            ("R/PT1M", None, false, 60.0), // exactly the floor
+            ("R1000000/P7D", Some(1_000_000), false, 604_800.0),
+        ] {
+            let parts = split_cycle(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+            assert_eq!(parts.repeats, repeats, "{s}");
+            assert_eq!(parts.anchor.is_some(), anchored, "{s}");
+            assert_eq!(parts.period_seconds, secs, "{s}");
+        }
+    }
+
+    #[test]
+    fn invalid_cycles() {
+        for s in [
+            "P7D",                                         // no R
+            "R0/P7D",                                      // never fires
+            "R/P1M",                                       // not fixed-length
+            "R/P1Y",                                       // not fixed-length
+            "R/P7D/2026-12-31T00:00:00Z",                  // duration/end form
+            "R/2026-08-31T00:00:00Z/2026-12-31T00:00:00Z", // start/end form
+            "R/2026-08-31T00:00:00/P7D",                   // anchor without offset
+            "R/",                                          // nothing to repeat
+            "R3P7D",                                       // missing slash
+            "R/P7D/P1D/P1D",                               // too many parts
+            "R/PT0S",                                      // zero period
+            "R99999999999/P7D",                            // repeat count overflow
+            "R1000001/P7D",                                // over the component cap
+            "R4294967295/P7D",                             // fits u32, not the int column
+            "R/PT0.5S",                                    // under the one-minute floor
+            "R/PT59S",                                     // just under it
+            "R/PT0.001S",                                  // the hot loop itself
+            "R/P7D/",                                      // empty period
+            "R//P7D",                                      // empty anchor
+        ] {
+            assert!(validate_cycle(s).is_err(), "{s} should be rejected");
+        }
+    }
+
+    /// A repeating period below the floor is a hot loop: the scheduler fires
+    /// it as fast as it can claim it and each fire spawns a token. The
+    /// complaint has to name the floor, because the text is valid ISO-8601
+    /// and the author has no other way to learn why it was refused.
+    #[test]
+    fn a_cycle_period_has_a_one_minute_floor() {
+        let why = validate_cycle("R/PT0.001S").unwrap_err();
+        assert!(why.contains("at least one minute (PT1M)"), "{why}");
+        // The floor is a *cycle* rule, not a duration one: PT1S is a
+        // perfectly good single-shot timer and stays one.
+        assert!(validate_duration("PT1S").is_ok());
+        assert!(fixed_length_seconds("PT1S").is_ok());
+    }
+
+    /// An empty component matches the arity of a form it is not: `R/P7D/`
+    /// has two parts and used to be reported as the 'R/duration/end' form,
+    /// `R//P7D` as an anchor that is not a datetime. Both were true of the
+    /// shape and misleading about the text.
+    #[test]
+    fn an_empty_cycle_component_says_so() {
+        for s in ["R/P7D/", "R//P7D", "R3//"] {
+            let why = validate_cycle(s).unwrap_err();
+            assert!(why.contains("empty component"), "{s}: {why}");
         }
     }
 

@@ -25,7 +25,7 @@
 mod explorer;
 mod modelgen;
 
-use modelgen::{Block, Builder, Kind, Rng, build};
+use modelgen::{Block, Builder, Decisions, Kind, Rng, build, initial_variables};
 use proptest::prelude::*;
 use rbpmn_core::{Bindings, CompileError, ExecutableProcess};
 use serde_json::json;
@@ -47,13 +47,22 @@ enum Outcome {
 }
 
 /// Compile (gate already passed) and explore exhaustively.
-fn execute(xml: &str) -> Outcome {
+///
+/// The manifest is the *generator's*, not `Bindings::default()`, and the
+/// exploration starts from the generator's own document rather than `{}`.
+/// Both were load-bearing omissions: a model carrying a message boundary
+/// cannot compile without its correlation binding and cannot arm without the
+/// key in the variables, so `MsgBoundary` shapes were unreachable here by
+/// construction. A mutation may of course leave a binding naming an element
+/// that is no longer a boundary — compile only consults the ones it needs, so
+/// a stale entry is inert, which is the right answer for a mutant.
+fn execute(xml: &str, bindings: &Bindings) -> Outcome {
     let defs = match rbpmn_model::parse(xml) {
         Ok(d) => d,
         // Lint ran on a parsed document, so this cannot happen.
         Err(e) => return Outcome::Hazard(format!("lint-clean model failed to parse: {e}")),
     };
-    let proc = match ExecutableProcess::compile(&defs, "p", &Bindings::default()) {
+    let proc = match ExecutableProcess::compile(&defs, "p", bindings) {
         Ok(p) => p,
         // "lint should have prevented this" — by its own words, a linter hole.
         Err(CompileError::Internal(m)) => {
@@ -72,7 +81,7 @@ fn execute(xml: &str) -> Outcome {
         // hazard, just nothing to run.
         Err(_) => return Outcome::Inconclusive,
     };
-    let report = explorer::explore(&proc, json!({}), &[]);
+    let report = explorer::explore(&proc, initial_variables(&Decisions::default()), &[]);
     if !report.violations.is_empty() {
         return Outcome::Hazard(report.violations.join("; "));
     }
@@ -83,7 +92,7 @@ fn execute(xml: &str) -> Outcome {
 }
 
 /// Lint, then execute if the linter allows it.
-fn judge(xml: &str) -> Outcome {
+fn judge(xml: &str, bindings: &Bindings) -> Outcome {
     let checked = match rbpmn_model::check(xml) {
         Ok(c) => c,
         Err(_) => return Outcome::Rejected, // unparseable is a loud refusal too
@@ -104,7 +113,7 @@ fn judge(xml: &str) -> Outcome {
         }
         return Outcome::Rejected;
     }
-    execute(xml)
+    execute(xml, bindings)
 }
 
 // ------------------------------------------------------------------ mutations
@@ -283,7 +292,12 @@ fn any_block() -> impl Strategy<Value = Block> {
             prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Seq),
             prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Xor),
             prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Par),
-            inner.prop_map(|b| Block::Sub(Box::new(b))),
+            inner.clone().prop_map(|b| Block::Sub(Box::new(b))),
+            // Reachable only now that `execute` takes the generator's
+            // manifest: a mutation that moves the boundary's flow, or its
+            // host's, is the shape `boundary-side-path` and the boundary
+            // rules are being asked about.
+            inner.prop_map(|b| Block::MsgBoundary(Box::new(b))),
         ]
     })
 }
@@ -315,7 +329,7 @@ proptest! {
             return Ok(()); // nothing applicable to this shape
         };
 
-        match judge(&xml) {
+        match judge(&xml, &g.bindings) {
             Outcome::Rejected | Outcome::Survived | Outcome::Inconclusive => {}
             Outcome::Hazard(detail) => prop_assert!(
                 false,
@@ -347,6 +361,9 @@ fn mutation_fuzz_is_not_vacuous() {
         // Scoped: retargeting a flow here can produce a cross-scope flow,
         // a rule the flat grammar cannot reach at all.
         Block::Sub(Box::new(Block::Par(vec![Block::Task, Block::Task]))),
+        // A message boundary and its handler: mutations here move a boundary
+        // path, which is where the boundary rules earn their keep.
+        Block::MsgBoundary(Box::new(Block::Task)),
     ];
 
     let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
@@ -367,7 +384,7 @@ fn mutation_fuzz_is_not_vacuous() {
                 continue;
             }
             *applied_per_mutation.entry(name).or_default() += 1;
-            let outcome = judge(&xml);
+            let outcome = judge(&xml, &g.bindings);
             let key = match &outcome {
                 Outcome::Rejected => "rejected",
                 Outcome::Survived => "survived",
@@ -421,12 +438,24 @@ enum Consequence {
 }
 
 fn consequence_of(xml: &str) -> (Consequence, String) {
+    consequence_with(xml, &Bindings::default(), json!({}))
+}
+
+/// A rejected fixture with a message arm needs its manifest and a document
+/// holding the key, exactly as deploy would — `Bindings::default()` would
+/// refuse it at compile and the row would read `CompileRefused` for a reason
+/// that has nothing to do with the rule under test.
+fn consequence_with(
+    xml: &str,
+    bindings: &Bindings,
+    variables: serde_json::Value,
+) -> (Consequence, String) {
     let defs = rbpmn_model::parse(xml).expect("fixture parses");
-    let proc = match ExecutableProcess::compile_without_lint(&defs, "p", &Bindings::default()) {
+    let proc = match ExecutableProcess::compile_without_lint(&defs, "p", bindings) {
         Ok(p) => p,
         Err(e) => return (Consequence::CompileRefused, e.to_string()),
     };
-    let report = explorer::explore(&proc, json!({}), &[]);
+    let report = explorer::explore(&proc, variables, &[]);
     if !report.violations.is_empty() {
         return (Consequence::Hazard, report.violations.join("; "));
     }
@@ -472,6 +501,25 @@ fn structural_rules_prevent_a_real_hazard() {
             Consequence::Hazard,
         ),
         ("implicit-split", "no-implicit-split", Consequence::Hazard),
+        // The non-interrupting counterpart of `cross-branch-merge`: the
+        // second token is spawned by a boundary rather than by a split, and
+        // it reaches the region's join on a flow a branch token already
+        // carries.
+        (
+            "side-path-into-join",
+            "boundary-side-path",
+            Consequence::Hazard,
+        ),
+        // A parallel block *on* a side path: the boundary re-arms, so two
+        // activations' tokens share the host's scope and meet at the block's
+        // join. The generator found this one the day non-interrupting
+        // boundaries landed (59 of 200 interleavings); see the focused test
+        // below for the manifest it needs.
+        (
+            "side-path-parallel-block",
+            "boundary-side-path",
+            Consequence::Hazard,
+        ),
         (
             "entry-into-region",
             "balanced-gateways",
@@ -506,7 +554,15 @@ fn structural_rules_prevent_a_real_hazard() {
                 .collect::<Vec<_>>()
         );
 
-        let (got, detail) = consequence_of(&xml);
+        let (got, detail) = if *fixture == "side-path-parallel-block" {
+            consequence_with(
+                &xml,
+                &parallel_block_manifest(),
+                json!({"case": {"id": "c"}}),
+            )
+        } else {
+            consequence_of(&xml)
+        };
         println!("{fixture:<24} [{rule}] -> {got:?}: {detail}");
         if got != *expected {
             wrong.push(format!(
@@ -530,6 +586,56 @@ fn structural_rules_prevent_a_real_hazard() {
         hazards >= 5,
         "only {hazards} structural rules demonstrate a hazard — the \
          'restrictions earn their keep' claim no longer holds"
+    );
+}
+
+/// `boundary-side-path`'s counterexample, called out on its own for the same
+/// reason as the one below: the rule claims a specific hazard, so the hazard
+/// is executed rather than asserted. A non-interrupting boundary's side token
+/// entered through no split, so nothing was ever proved about it — let it
+/// merge back into the branch and the region's join collects two tokens on
+/// flow `f4`, which is the exact `Invariant` local counting exists to make
+/// impossible.
+#[test]
+fn a_side_path_reaching_a_join_double_counts() {
+    let xml = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rbpmn-model/tests/fixtures/reject/side-path-into-join.bpmn"),
+    )
+    .unwrap();
+    let (consequence, detail) = consequence_of(&xml);
+    assert_eq!(consequence, Consequence::Hazard);
+    assert!(
+        detail.contains("second token arrived at join 'pj' via flow 'f4'"),
+        "expected the join double-count on f4, got: {detail}"
+    );
+}
+
+fn parallel_block_manifest() -> Bindings {
+    Bindings::new().correlation("b1", "case.id")
+}
+
+/// The multi-token counterpart: a parallel block on a side path is clean for
+/// one activation and wrong for two, because the join counts per scope and
+/// both activations run in the host's. The explorer needs `MAX_SIDE_TOKENS`
+/// at four to reach it (two activations of a two-wide block), which is why
+/// the bound is four.
+#[test]
+fn a_parallel_block_on_a_side_path_double_counts() {
+    let xml = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rbpmn-model/tests/fixtures/reject/side-path-parallel-block.bpmn"),
+    )
+    .unwrap();
+    let (consequence, detail) = consequence_with(
+        &xml,
+        &parallel_block_manifest(),
+        json!({"case": {"id": "c"}}),
+    );
+    assert_eq!(consequence, Consequence::Hazard, "{detail}");
+    assert!(
+        detail.contains("second token arrived at join 'pj3'"),
+        "expected the join double-count at pj3, got: {detail}"
     );
 }
 

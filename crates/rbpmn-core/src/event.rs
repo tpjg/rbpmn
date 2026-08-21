@@ -117,6 +117,18 @@ pub enum Event {
         element: String,
         due: TimerDue,
         token: crate::state::TokenId,
+        /// A cycle re-arming after a fire names the timer it continues: the
+        /// projection computes the next instant as *that timer's due + the
+        /// period*, never from the time the fire happened to run, so a late
+        /// scheduler does not drift the schedule. `None` for a first arm,
+        /// which is computed from database time. Payload, not `Display`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continues: Option<TimerId>,
+        /// A cycle's fires left, the armed one included; carried here for
+        /// the same reason as `token`: a timer armed and withdrawn in one
+        /// step is gone from the state by the time the row is written.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remaining: Option<u32>,
     },
     TimerFired {
         id: TimerId,

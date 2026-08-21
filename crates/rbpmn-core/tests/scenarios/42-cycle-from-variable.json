@@ -1,0 +1,42 @@
+{
+  "fixture": "accept/42-cycle-from-variable.bpmn",
+  "bindings": {},
+  "variables": { "contract": { "reminderCycle": "R/P3D" } },
+  "actions": [
+    { "fire": "remind_due" },
+    { "complete": "remind" },
+    { "complete": "sign" }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": { "contract": { "reminderCycle": "R/P3D" } },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started sign",
+      "work-item-created sign user sign",
+      "timer-armed remind_due R/P3D",
+      "timer-fired remind_due",
+      "timer-armed remind_due R/P3D",
+      "element-started remind_due",
+      "element-completed remind_due",
+      "flow-taken f3",
+      "element-started remind",
+      "work-item-created remind service remind",
+      "work-item-completed remind",
+      "element-completed remind",
+      "flow-taken f4",
+      "element-started reminded",
+      "element-completed reminded",
+      "work-item-completed sign",
+      "timer-cancelled remind_due",
+      "element-completed sign",
+      "flow-taken f2",
+      "element-started signed",
+      "element-completed signed",
+      "instance-completed"
+    ]
+  }
+}

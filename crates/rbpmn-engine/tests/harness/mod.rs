@@ -82,6 +82,36 @@ const FSCK: &[(&str, &str)] = &[
          where k.token_no is null",
     ),
     (
+        // What makes the loader's element-qualified lookup sound
+        // (`load_instance_nowait`, the `message` arm): a waiting token is
+        // matched to its arm by `(token_no, element_id)`, so *exactly one*
+        // row must answer that — zero would leave the token unresolvable,
+        // several would make the resolution a guess. Counting only rows at
+        // the token's own element is the point: a message boundary puts a
+        // second subscription on the same token, legitimately, and this must
+        // not read that as a violation.
+        "a message-waiting token has no unique subscription at its own element",
+        "select t.instance_id::text from rbpmn_token t \
+         left join rbpmn_subscription s \
+           on s.instance_id = t.instance_id and s.token_no = t.token_no \
+              and s.element_id = t.element_id \
+         where t.wait_kind = 'message' \
+         group by t.instance_id, t.token_no having count(s.subscription_no) <> 1",
+    ),
+    (
+        // The same statement for timers. A timer catch hosts nothing, so
+        // there has only ever been one row — the invariant is stated anyway,
+        // because the lookup is element-qualified either way and an
+        // unstated invariant is one nothing checks.
+        "a timer-waiting token has no unique timer at its own element",
+        "select t.instance_id::text from rbpmn_token t \
+         left join rbpmn_timer m \
+           on m.instance_id = t.instance_id and m.token_no = t.token_no \
+              and m.element_id = t.element_id \
+         where t.wait_kind = 'timer' \
+         group by t.instance_id, t.token_no having count(m.timer_no) <> 1",
+    ),
+    (
         // Per *scope instance* since phase 6: joins count within their scope,
         // so the same join element may legitimately hold tokens in two live
         // scopes. Grouping without scope_no would be a false positive the day
@@ -137,6 +167,17 @@ const FSCK: &[(&str, &str)] = &[
         "a work item is locked without a live lease or an owner",
         "select id::text from rbpmn_work_item \
          where state = 'locked' and (lock_owner is null or lock_until is null)",
+    ),
+    (
+        // Same shape as the foreign key below: the CHECK constraints are
+        // *what makes* a cycle's fire count positive and confined to a cycle
+        // row, so the invariant worth asserting is that they are still there.
+        // The loader refuses such a row rather than clamping it, and a
+        // database with the checks dropped is the only way one could exist.
+        "a rbpmn_timer.remaining check constraint is missing",
+        "select c.name::text from (values ('rbpmn_timer_remaining_check'), \
+                                          ('rbpmn_timer_remaining_kind_check')) as c(name) \
+         where not exists (select 1 from pg_constraint where conname = c.name)",
     ),
     (
         // The constraint, not an anti-join over the largest table in the

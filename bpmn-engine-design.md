@@ -477,6 +477,42 @@ current registration state** and fails loudly with the same rule id
   `indexes` entries, validated before anything persists and applied after
   the commit. JSONB stays opaque: the engine never interprets variables, it
   only indexes fields the application names.
+- **Scope, added later.** The partial `definition_key` predicate is right for
+  `TaskFilter` and wrong for the cross-definition lookup — Postgres proves a
+  partial predicate only from an equality against a constant, so
+  `definition_key = any($1)` cannot use those indexes at all (measured: bitmap
+  scan on the definition-key index, hoisted field demoted to a recheck
+  filter). So a declaration carries a scope: `definition` (the default,
+  unchanged) or `shared`, which drops the key predicate, derives its name from
+  the **field alone** so N definitions converge on one index, and is partial on
+  `(variables->>'f') is not null` instead — an equality is strict and implies
+  it, so the index stays usable while definitions that never carry the field
+  stay out of it. The manifest keeps the string spelling verbatim and adds
+  `{"field": …, "scope": "shared"}`. What the engine cannot check, and says so
+  in the README: that the field *means* the same thing in every definition
+  declaring it.
+- **Nothing drops a declared index**, of either scope — not
+  `delete_definition`, not retention, not removing the field from a manifest.
+  Deliberate: a shared index belongs to no definition, so one going away says
+  nothing about whether another needs it, and reference counting races a
+  concurrent deploy. `declared_indexes()` is the read-only audit that makes
+  orphans visible instead of silent.
+- **Index builds are serialized by a try-lock, and the try is load-bearing.**
+  Two `CREATE INDEX CONCURRENTLY` on one table deadlock — each waits for the
+  other's snapshot while the other waits for ShareUpdateExclusive — and a
+  *blocking* advisory lock does not fix it, it only moves the cycle onto the
+  advisory lock, because the waiter holds a snapshot while it waits. Both
+  shapes were reproduced as real Postgres deadlocks. The hazard predates
+  scoped indexes: two definitions deploying at once already both index
+  `rbpmn_instance`. See `spec/README.md`'s lock inventory.
+- **`rbpmn_v_instance`** is the published read-only projection of the instance
+  table — public API, because an application joining its own rows against
+  instances is doing something no data-returning API does as well. Plain and
+  inlinable by construction (no `security_barrier`: `jsonb ->>` is not
+  leakproof, and a barrier would strand every declared index beneath a full
+  scan). `find_by_shared_index` is the no-SQL convenience beside it, bounded
+  and index-backed by construction — and explicitly not a search primitive,
+  since its limit lands before any application-level filter.
 - `get_task_filtered(topic, filter, ttl)` — the filter compiler MUST emit exactly
   the indexed expression shape (`variables->>'field'` + literal definition_id) so
   declared indexes are actually used. EXPLAIN-based integration test: index usage
@@ -1075,6 +1111,15 @@ treated like a database extract.
   409 with the candidate ids for several — plus an index. Not in v1: the
   application already holds the UUID it was given.
 
+  **Partly overtaken.** The "plus an index" half shipped, for *variables*
+  rather than `business_key`: a shared declared index is exactly that index,
+  and it is the better target because the identifier applications actually
+  quote lives in the variable document, hoisted there by the application. What
+  did **not** ship is the resolver's discipline — `find_by_shared_index`
+  answers "which instances carry this?" with a bounded list, which is a
+  different and easier question than "exactly one, or say why not". That
+  remains a design round; see the open-items table.
+
 ## Decisions — FEEL / DMN via dsntk (**shipped**; was "post-v1")
 
 Written as a post-v1 sketch, delivered as a phase. `docs/dmn.md` is the full
@@ -1173,8 +1218,8 @@ question is purely internal.
 | **Authoring & inspection surfaces** | A `.bpmn` is half-deployable without its manifest, and nothing outside this repo knows the manifest exists; the project's own debugger is dev-only | Medium | **v1, phase 8 — shipped** |
 | Event-stream read horizon | Hold history for a registered slow consumer *beyond* the nominal retention age | Low | Roadmap — purely additive over the phase-7 floor; see phase 7 for why the age subsumes it otherwise |
 | `rbpmn_event` time partitioning | Turns retention into `DROP PARTITION` at very large scale | Medium | Roadmap — physical only, no contract change; see phase 7 |
-| Non-interrupting boundary events | "Every 30 days while this runs"; rides on scope machinery | Medium | v2 — held out of v1 so it does not double phase 6's risk. **Designed**: slices 2–3 of [docs/design/boundary-messages.md](docs/design/boundary-messages.md) (side-path lint rule, `timeCycle` with the anchor as phase) |
-| Message boundary events | Xilium's payment-during-contest: a `PAID` correlated to a ticket parked at a user task is refused with `NoSubscription` today | Medium | **Design round done** — [docs/design/boundary-messages.md](docs/design/boundary-messages.md). Slice 1 is the interrupting form on all four hosts; also names a dead arm lint accepts today (a timer boundary on a business-rule task) and a loader gap (two subscriptions on one token) |
+| Non-interrupting boundary events | "Every 30 days while this runs"; rides on scope machinery | Medium | **Shipped** as slices 2–3 of [docs/design/boundary-messages.md](docs/design/boundary-messages.md): a side path under `boundary-side-path`, and `timeCycle` with the anchor as phase |
+| Message boundary events | Example: payment-during-contest: a `PAID` correlated to a ticket parked at a user task is refused with `NoSubscription` today | Medium | **Shipped, all three slices** — the interrupting form on all four hosts, with `Lost { state }` pulled forward so a frontend can tell *withdrawn* from *reassigned*; the non-interrupting form (message, and single-shot timers) under `boundary-side-path`; and `timeCycle` on non-interrupting boundaries, stepped from the previous due with the anchor as phase. [docs/design/boundary-messages.md](docs/design/boundary-messages.md) is the record, including what building it found: a dead arm lint accepted (a timer boundary on a business-rule task), a loader that resolved a token's subscription by token alone, and a parallel block on a side path that the generator caught the day it could |
 | Expression-valued timers | Deadlines from the variable document; standard `tFormalExpression`, no extension needed | Small | **Shipped** — see the roadmap entry for the rulings taken |
 | Link events | Diagram hygiene once big models are common | Trivial | v2 |
 | Event subprocesses | "Cancel my order at any point" without boundary spaghetti | Medium | v3 |
@@ -1183,6 +1228,9 @@ question is purely internal.
 | Cross-definition messaging (message start/throw) | Model fidelity for choreography; exactly-once emission for remote callers | Medium | **Needs a design round** — buffering, dead-lettering, message-start versioning |
 | Instance migration API | Long-lived instances pin their version forever; a five-year process can never get a fix | Very high | **Design only in v1**, needs its own round |
 | DMN / business-rule task via dsntk | Decisions as models rather than handler code | Medium-high | **Shipped, and in the default build** — see "Decisions" below and `docs/dmn.md`. Landed larger than this row implies: the editor authors DMN too, which forced dsntk onto wasm32 |
+| Cross-definition instance resolver | The `correlate()`-shaped lookup the shared index exists for: exactly one match, loud on none, 409 with the candidate ids for several. `find_by_shared_index` deliberately answers the *list* question instead, and the view answers the join question | Low | Queued — see "Business-key addressing"; the index half shipped with declared-index scopes |
+| `undeclare_index` | Nothing drops a declared index, so a field removed from a manifest orphans one forever. `declared_indexes()` makes them visible; removing them is still by hand | Low | Queued — wants `undeclare_topic`'s "prove it unneeded" guard, which is harder for a shared index |
+| Manifests in the parity corpus | `just parity` passes `{}` for bindings on every fixture, so the manifest surface — including index scopes — has never been differentialled native vs WASM | Trivial | Queued; noticed while adding index scopes |
 | Upgrade escape hatch | Retroactively-stricter lint can refuse to boot with the deploy API unreachable | Low | Queued; matters at the first real upgrade |
 | Restricted inclusive gateway | More than the Camunda 7 lineage ever shipped | Moderate | Someday; revisit when fixture discipline is mature |
 

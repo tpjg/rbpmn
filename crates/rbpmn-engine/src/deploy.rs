@@ -9,12 +9,22 @@
 //! "one `DeploymentManifest` struct internally").
 
 use crate::{DeployError, Deployment, Engine};
-use rbpmn_core::{Bindings, ExecutableProcess};
+use rbpmn_core::{Bindings, ExecutableProcess, IndexScope};
 use rbpmn_model::{Diagnostic, Severity, rule};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use uuid::Uuid;
+
+/// Definitions whose manifests still matter: the latest version of every
+/// key, plus any version with active instances — the same set startup
+/// re-validation and `undeclare_topic` reason over. Bindings only; no
+/// `bpmn_xml`, because nothing here compiles.
+pub(crate) const RELEVANT_DEFINITIONS: &str = "select d.key, d.version, d.bindings from rbpmn_definition d \
+     where d.id in (select definition_id from rbpmn_instance where status = 'active') \
+        or (d.key, d.version) in \
+           (select key, max(version) from rbpmn_definition group by key) \
+     order by d.key, d.version";
 
 /// Everything one deploy carries. Serializes 1:1 to `POST /v1/definitions`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -91,10 +101,8 @@ impl Engine {
         // Manifest index declarations are validated up front (fail early,
         // before anything persists) and applied after the commit — a
         // CONCURRENTLY build cannot run inside the deploy transaction.
-        for field in &bindings.indexes {
-            crate::tasks::validate_index_declaration(&key, field)
-                .map_err(|e| DeployError::InvalidManifest(e.to_string()))?;
-        }
+        crate::tasks::validate_index_declarations(&key, &bindings.indexes)
+            .map_err(|e| DeployError::InvalidManifest(e.to_string()))?;
 
         if !checked.ok() {
             return Err(DeployError::Rejected(checked.diagnostics));
@@ -197,16 +205,88 @@ impl Engine {
     /// Build the manifest's declared indexes, after the deploy commit
     /// (CONCURRENTLY cannot run in a transaction). Everything here is
     /// idempotent, so a failure is safely retried by re-deploying.
+    ///
+    /// One field at a time: each build takes its own advisory lock and
+    /// releases it before the next, so two locks are never held at once.
     async fn apply_manifest_indexes(
         &self,
         key: &str,
         bindings: &Bindings,
     ) -> Result<(), DeployError> {
-        for field in &bindings.indexes {
-            self.declare_index(key, field).await.map_err(|e| match e {
+        if bindings.indexes.is_empty() {
+            return Ok(());
+        }
+        self.warn_on_index_scope_conflicts(key, bindings).await?;
+        for decl in &bindings.indexes {
+            let built = match decl.scope {
+                IndexScope::Definition => self.declare_index(key, &decl.field).await,
+                IndexScope::Shared => self.declare_shared_index(&decl.field).await,
+            };
+            built.map_err(|e| match e {
                 crate::EngineError::Db(db) => DeployError::Db(db),
                 other => DeployError::InvalidManifest(other.to_string()),
             })?;
+        }
+        Ok(())
+    }
+
+    /// The one thing rbpmn *can* observe about a shared declaration: another
+    /// definition indexing the same field at the other scope.
+    ///
+    /// A log line, deliberately — not a `Diagnostic` and never an error. It
+    /// is not an error because the configuration is legal and sometimes
+    /// optimal: measured, a `TaskFilter` served only by a shared index
+    /// degrades to a `BitmapAnd` against the definition-key index, so a
+    /// definition that also filters internally has a real reason to declare
+    /// both. And it is not a `Diagnostic` because diagnostics carry an
+    /// element id and feed a rule catalogue the playground reproduces from
+    /// XML alone — this is an operator fact about *other* deployed
+    /// definitions, which no offline surface can ever see.
+    ///
+    /// What it cannot see at all is the thing actually worth worrying about:
+    /// whether the field *means* the same in both. Nothing can.
+    async fn warn_on_index_scope_conflicts(
+        &self,
+        key: &str,
+        bindings: &Bindings,
+    ) -> Result<(), DeployError> {
+        let ours: std::collections::BTreeMap<&str, IndexScope> = bindings
+            .indexes
+            .iter()
+            .map(|d| (d.field.as_str(), d.scope))
+            .collect();
+        for row in sqlx::query(RELEVANT_DEFINITIONS)
+            .fetch_all(self.pool())
+            .await?
+        {
+            let other_key: String = row.get("key");
+            // Our own superseded versions are not a conflict: the deploy in
+            // hand supersedes them, and warning about them would fire on
+            // every redeploy of a definition that changed its own scope.
+            if other_key == key {
+                continue;
+            }
+            let Ok(other) = serde_json::from_value::<Bindings>(row.get("bindings")) else {
+                // An unreadable manifest is `check_active_definitions`'
+                // problem, not a reason to fail a deploy over a log line.
+                continue;
+            };
+            let version: i32 = row.get("version");
+            for decl in &other.indexes {
+                if let Some(&scope) = ours.get(decl.field.as_str())
+                    && scope != decl.scope
+                {
+                    tracing::warn!(
+                        field = %decl.field,
+                        scope = %scope.as_str(),
+                        other = %format!("{other_key} v{version}"),
+                        other_scope = %decl.scope.as_str(),
+                        "index field declared at two scopes across definitions — two \
+                         indexes over one expression, which may be deliberate; rbpmn \
+                         cannot check the field means the same thing in both"
+                    );
+                }
+            }
         }
         Ok(())
     }

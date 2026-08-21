@@ -1,56 +1,50 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
-  error no-unsupported-element @ bt
 -->
+<!-- A user task interrupted by a message: a payment arriving while a ticket
+     is being contested ends the ticket as Paid. The clerk's pending
+     completion then comes back AlreadyClosed{cancelled}, never succeeds.
+     Bindings: {"correlations": {"paid_during_contest": "ticket.reference"}} -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
-  <bpmn:process id="p" isExecutable="true">
+  <bpmn:message id="m_paid" name="PAID" />
+  <bpmn:process id="ticket" isExecutable="true">
     <bpmn:startEvent id="start">
       <bpmn:outgoing>f1</bpmn:outgoing>
     </bpmn:startEvent>
-    <bpmn:userTask id="ut" name="Approve">
+    <bpmn:userTask id="handle_contest" name="Handle contest">
       <bpmn:incoming>f1</bpmn:incoming>
       <bpmn:outgoing>f2</bpmn:outgoing>
     </bpmn:userTask>
-    <bpmn:boundaryEvent id="bt" cancelActivity="false" attachedToRef="ut">
+    <bpmn:boundaryEvent id="paid_during_contest" attachedToRef="handle_contest">
       <bpmn:outgoing>f3</bpmn:outgoing>
-      <bpmn:timerEventDefinition>
-        <bpmn:timeDuration>PT1H</bpmn:timeDuration>
-      </bpmn:timerEventDefinition>
+      <bpmn:messageEventDefinition messageRef="m_paid" />
     </bpmn:boundaryEvent>
-    <bpmn:userTask id="t_ping" name="Send reminder">
-      <bpmn:incoming>f3</bpmn:incoming>
-      <bpmn:outgoing>f4</bpmn:outgoing>
-    </bpmn:userTask>
-    <bpmn:endEvent id="end">
+    <bpmn:endEvent id="end_decided" name="Contest decided">
       <bpmn:incoming>f2</bpmn:incoming>
     </bpmn:endEvent>
-    <bpmn:endEvent id="e2">
-      <bpmn:incoming>f4</bpmn:incoming>
+    <bpmn:endEvent id="end_paid" name="Paid">
+      <bpmn:incoming>f3</bpmn:incoming>
     </bpmn:endEvent>
-    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ut" />
-    <bpmn:sequenceFlow id="f2" sourceRef="ut" targetRef="end" />
-    <bpmn:sequenceFlow id="f3" sourceRef="bt" targetRef="t_ping" />
-    <bpmn:sequenceFlow id="f4" sourceRef="t_ping" targetRef="e2" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="handle_contest" />
+    <bpmn:sequenceFlow id="f2" sourceRef="handle_contest" targetRef="end_decided" />
+    <bpmn:sequenceFlow id="f3" sourceRef="paid_during_contest" targetRef="end_paid" />
   </bpmn:process>
-  <bpmndi:BPMNDiagram id="BPMNDiagram_p">
-    <bpmndi:BPMNPlane id="BPMNPlane_p" bpmnElement="p">
+  <bpmndi:BPMNDiagram id="BPMNDiagram_ticket">
+    <bpmndi:BPMNPlane id="BPMNPlane_ticket" bpmnElement="ticket">
       <bpmndi:BPMNShape id="start_di" bpmnElement="start">
         <dc:Bounds x="57" y="52" width="36" height="36" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="ut_di" bpmnElement="ut">
+      <bpmndi:BPMNShape id="handle_contest_di" bpmnElement="handle_contest">
         <dc:Bounds x="175" y="30" width="100" height="80" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="bt_di" bpmnElement="bt">
+      <bpmndi:BPMNShape id="paid_during_contest_di" bpmnElement="paid_during_contest">
         <dc:Bounds x="207" y="92" width="36" height="36" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+      <bpmndi:BPMNShape id="end_decided_di" bpmnElement="end_decided">
         <dc:Bounds x="357" y="52" width="36" height="36" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="t_ping_di" bpmnElement="t_ping">
-        <dc:Bounds x="325" y="170" width="100" height="80" />
-      </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="e2_di" bpmnElement="e2">
-        <dc:Bounds x="507" y="192" width="36" height="36" />
+      <bpmndi:BPMNShape id="end_paid_di" bpmnElement="end_paid">
+        <dc:Bounds x="357" y="192" width="36" height="36" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
         <di:waypoint x="93" y="70" />
@@ -63,11 +57,7 @@
       <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
         <di:waypoint x="225" y="128" />
         <di:waypoint x="225" y="210" />
-        <di:waypoint x="325" y="210" />
-      </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4">
-        <di:waypoint x="425" y="210" />
-        <di:waypoint x="507" y="210" />
+        <di:waypoint x="357" y="210" />
       </bpmndi:BPMNEdge>
     </bpmndi:BPMNPlane>
   </bpmndi:BPMNDiagram>

@@ -24,8 +24,16 @@
 //! [`Engine::declare_index`] indexes (`variables->>'field'` with a literal
 //! `definition_key` predicate), so declared indexes actually serve the
 //! query; undeclared fields stay correct via sequential scan, just slower.
+//!
+//! A declaration also carries a *scope*. The definition-scoped index above is
+//! what `TaskFilter` needs; [`Engine::declare_shared_index`] is the same
+//! expression without the key predicate, for the lookup that spans
+//! definitions (`crate::instances`). Both build through one path, because the
+//! interesting part — an interrupted `CONCURRENTLY` build's corpse, and the
+//! try-lock that keeps two builds off one table — is the same for both.
 
 use crate::{Completion, Engine, EngineError, FailOptions, FailOutcome};
+use rbpmn_core::{IndexDeclaration, IndexScope};
 use sqlx::Row;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -121,14 +129,33 @@ pub struct LockedTask {
 }
 
 /// The typed heartbeat result: a client whose lease was lost must be able to
-/// tell its user "this task was reassigned" — never fail silently.
+/// tell its user what happened — never fail silently, and never with the
+/// wrong story.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockExtension {
     Extended {
         until: String,
     },
-    /// Owner mismatch, expired lease, or the task is already closed.
-    Lost,
+    /// The lease is not ours (any more). `state` is the work item's current
+    /// `state` column, and the distinction it exists for is *withdrawn or
+    /// not*:
+    ///
+    /// * `cancelled` — the **process** withdrew the item: an interrupting
+    ///   boundary fired, the instance terminated, an enclosing scope was torn
+    ///   down. There is nothing to go back to. "The ticket was paid", not
+    ///   "your task was reassigned" (docs/design/boundary-messages.md §1.3).
+    /// * `completed` / `failed` — the item was already decided, by a peer or
+    ///   by an earlier call of your own.
+    /// * `locked` / `available` — the claim is simply not yours any more.
+    ///   Deliberately *not* "reassigned": a lease that lapsed with nobody
+    ///   reclaiming it still reads `locked`, with `lock_owner` still naming
+    ///   the caller, so all this says is "claim it again if you still want
+    ///   it". Telling lapsed from reassigned would need the lease columns,
+    ///   and they are not in this answer on purpose — a heartbeat's job is
+    ///   to say whether to keep working, not to narrate the queue.
+    Lost {
+        state: String,
+    },
 }
 
 /// The typed release result. Handing a task back is not the same as never
@@ -143,11 +170,32 @@ pub enum Released {
     /// Nothing was handed back — the lease had been reassigned, the request
     /// named an epoch that is no longer current (a replay, or a claim the
     /// caller has since replaced with a newer one), or the task is not
-    /// locked at all any more (completed, failed, cancelled). Like
-    /// [`LockExtension::Lost`], not an error: the client tells its user the
-    /// task moved on, and a retry that reports this has done no harm —
-    /// which is the whole point of the epoch.
-    Lost,
+    /// locked at all any more. Like [`LockExtension::Lost`], not an error:
+    /// the client tells its user the task moved on, and a retry that reports
+    /// this has done no harm — which is the whole point of the epoch.
+    ///
+    /// `state` carries the same vocabulary as [`LockExtension::Lost`], and
+    /// separates the same thing: `cancelled` is the process having withdrawn
+    /// the item (nothing to hand back, and nothing to re-claim),
+    /// `completed`/`failed` is an item already decided, and
+    /// `locked`/`available` is a claim that is no longer yours — lapsed or
+    /// taken by someone else, which this answer does not distinguish.
+    Lost { state: String },
+}
+
+/// The state column of a work item, read in a statement of its own — what
+/// [`LockExtension::Lost`] and [`Released::Lost`] report. Called only after
+/// an attempt matched no row, and deliberately *after*: a fresh snapshot can
+/// only be more current than the attempt's (see [`Engine::extend_lock`] for
+/// why folding it into the attempt's statement reports a stale state).
+/// `None` — no such row at all — is [`EngineError::UnknownWorkItem`], the
+/// same answer completion and failure give.
+async fn current_item_state(engine: &Engine, task: Uuid) -> Result<String, EngineError> {
+    sqlx::query_scalar("select state from rbpmn_work_item where id = $1")
+        .bind(task)
+        .fetch_optional(engine.pool())
+        .await?
+        .ok_or(EngineError::UnknownWorkItem(task))
 }
 
 /// A lease must be plausible: zero would mint a lock expired at birth (two
@@ -167,7 +215,7 @@ fn validate_ttl(ttl: Duration) -> Result<(), EngineError> {
 /// Field names embed in SQL as literals (the planner needs the literal to
 /// match the index expression), so they are validated hard — same segment
 /// grammar as FEEL qualified names.
-fn validate_field(field: &str) -> Result<(), EngineError> {
+pub(crate) fn validate_field(field: &str) -> Result<(), EngineError> {
     // One grammar source: a field is a single-segment FEEL qualified name.
     let ok = matches!(
         rbpmn_model::condition::parse_qname(field),
@@ -184,9 +232,50 @@ fn validate_field(field: &str) -> Result<(), EngineError> {
 
 /// Up-front validation for a manifest index entry (deploy calls this before
 /// anything persists).
-pub(crate) fn validate_index_declaration(key: &str, field: &str) -> Result<(), EngineError> {
-    validate_definition_key(key)?;
-    validate_field(field)
+///
+/// The definition key is checked only for the scope that *embeds* it: a
+/// shared index's DDL carries no definition key at all, and rejecting a
+/// deploy over a literal that never reaches SQL would be strictness pointed
+/// at the wrong thing. The key is still validated wherever it is embedded —
+/// `declare_index` and `compile_filter` both do it at their own call sites.
+pub(crate) fn validate_index_declaration(
+    key: &str,
+    decl: &IndexDeclaration,
+) -> Result<(), EngineError> {
+    if decl.scope == IndexScope::Definition {
+        validate_definition_key(key)?;
+    }
+    validate_field(&decl.field)
+}
+
+/// Whole-manifest validation: every entry, plus the one contradiction a
+/// single manifest can state — the same field declared at both scopes.
+///
+/// Two indexes over one expression is a legitimate *deployment* (a shared
+/// index serves the cross-definition lookup; a definition-scoped one serves
+/// `TaskFilter` strictly better), which is why the cross-definition case is a
+/// warning. But one manifest saying both about one field says nothing rbpmn
+/// can act on, so it is refused rather than resolved.
+pub(crate) fn validate_index_declarations(
+    key: &str,
+    indexes: &std::collections::BTreeSet<IndexDeclaration>,
+) -> Result<(), EngineError> {
+    for decl in indexes {
+        validate_index_declaration(key, decl)?;
+    }
+    // Entries sort by field first, so a contradiction is always adjacent.
+    for pair in indexes.iter().collect::<Vec<_>>().windows(2) {
+        if pair[0].field == pair[1].field {
+            return Err(EngineError::InvalidVariables(format!(
+                "index field '{}' is declared at scope '{}' and '{}' in one \
+                 manifest — a manifest must say one thing about a field",
+                pair[0].field,
+                pair[0].scope.as_str(),
+                pair[1].scope.as_str(),
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Definition keys embed in SQL as literals too (partial-index predicate).
@@ -326,8 +415,41 @@ impl Engine {
     }
 
     /// Heartbeat: extend the lease while demonstrably still working. A lost
-    /// lease (owner mismatch, expiry, task closed) is a typed result, not an
-    /// error — the client tells its user "this task was reassigned".
+    /// lease (owner mismatch, expiry, the item closed or withdrawn) is a
+    /// typed result, not an error, and it carries the item's `state` so the
+    /// client can tell its user *which* of those happened — see
+    /// [`LockExtension::Lost`].
+    ///
+    /// The `state = 'locked'` predicate is what turns a withdrawn item into
+    /// a loss: cancellation writes the state column and nothing else (a
+    /// lease is a row value and the process does not take it), so the lease
+    /// columns on a cancelled row still name their holder. The state column
+    /// is therefore the only honest thing to report.
+    ///
+    /// **Two statements, deliberately — do not "optimise" this into one.**
+    /// The obvious single statement is a CTE (`with attempt as (update …
+    /// returning …) select …, (select state from rbpmn_work_item where id =
+    /// $1)`), and it reports the *wrong* state exactly when it matters.
+    /// Under READ COMMITTED an `UPDATE` re-evaluates its predicate against
+    /// the latest committed row version when it blocks on a concurrent
+    /// writer (EvalPlanQual), while every plain sub-select in the same
+    /// statement reads that statement's snapshot. So when a boundary's
+    /// cancellation commits between the snapshot and the update, the update
+    /// correctly matches nothing and the sub-select still says `locked` —
+    /// "your task was reassigned" for an item the process withdrew, which is
+    /// the one answer this field exists to get right.
+    ///
+    /// A second, plain statement takes a fresh snapshot, so what it reports
+    /// is at least as current as the attempt: a transition slipping between
+    /// the two can only make the answer *more* current, never stale. No
+    /// transaction and no `FOR SHARE` around the pair — a lease is a row
+    /// value, and locking it to read it would be the thing this API is not.
+    ///
+    /// A task id that matches nothing at all is [`EngineError::UnknownWorkItem`]
+    /// (404), not a loss — the same answer [`Engine::complete_task`] and
+    /// [`Engine::fail_task`] already give for an unknown id, and a
+    /// deliberate alignment: "your lease is gone" is a claim about a task
+    /// that exists.
     pub async fn extend_lock(
         &self,
         task: Uuid,
@@ -347,12 +469,14 @@ impl Engine {
         .bind(ttl.as_secs_f64())
         .fetch_optional(self.pool())
         .await?;
-        Ok(match row {
-            Some(row) => LockExtension::Extended {
+        match row {
+            Some(row) => Ok(LockExtension::Extended {
                 until: row.get("lock_until"),
-            },
-            None => LockExtension::Lost,
-        })
+            }),
+            None => Ok(LockExtension::Lost {
+                state: current_item_state(self, task).await?,
+            }),
+        }
     }
 
     /// Hand a claimed task back to the queue without deciding it — the
@@ -397,18 +521,31 @@ impl Engine {
     /// Both halves of the guard are load-bearing, and `spec/Lease.tla`
     /// checks each with its own counterexample config:
     ///
-    /// * the owner, by `LiveLeaseEndsOnlyByItsHolder` — a live lease ends by
-    ///   the clock or by its own holder's hand, never by anyone else's.
-    ///   Every other route back to the queue already excludes a live holder
-    ///   (a claim needs `CLAIMABLE`, which means the lease lapsed; a
-    ///   completion or failure needs `guard_lease`), so without the owner
-    ///   check this would be the one action able to free an item out from
-    ///   under a worker still working on it (`Lease_UncheckedRelease.cfg`).
+    /// * the owner, by `LiveLeaseEndsOnlyByItsHolderOrTheProcess` — a live
+    ///   lease ends by the clock, by its own holder's hand, or by the
+    ///   process withdrawing the item, and by no *other worker*. (The
+    ///   property was `LiveLeaseEndsOnlyByItsHolder` until the message
+    ///   boundary round: terminate and the interrupting timer boundary have
+    ///   cancelled leased items since phase 3, so the stronger name was
+    ///   never true of the shipped engine — it held vacuously over an actor
+    ///   `Lease.tla` had no action for.) Every other route back to the queue
+    ///   already excludes a live holder (a claim needs `CLAIMABLE`, which
+    ///   means the lease lapsed; a completion or failure needs
+    ///   `guard_lease`), so without the owner check this would be the one
+    ///   action able to free an item out from under a worker still working
+    ///   on it (`Lease_UncheckedRelease.cfg`).
     /// * the epoch, by `ReleaseFreesOnlyTheLeaseItNamed` — a release that
     ///   lands names the lease that is actually current. The model issues
     ///   stale requests to check it (`Lease_EpochlessRelease.cfg`); before
     ///   the epoch existed, neither the model nor a test could see the
     ///   difference between a replay and a fresh release.
+    ///
+    /// A hand-back that lands on nothing reports the item's `state`, read
+    /// the way [`Engine::extend_lock`] reads it and for the same reasons —
+    /// a second plain statement rather than a sub-select sharing the
+    /// update's snapshot (see there; the reasoning is the load-bearing part,
+    /// not the shape). An unknown id is [`EngineError::UnknownWorkItem`]
+    /// rather than a loss.
     pub async fn release_task(
         &self,
         task: Uuid,
@@ -428,10 +565,11 @@ impl Engine {
         .await?
         .rows_affected()
             > 0;
-        Ok(if released {
-            Released::Released
-        } else {
-            Released::Lost
+        if released {
+            return Ok(Released::Released);
+        }
+        Ok(Released::Lost {
+            state: current_item_state(self, task).await?,
         })
     }
 
@@ -503,6 +641,51 @@ pub fn declared_index_name(definition_key: &str, field: &str) -> String {
     format!("{readable}_{}", &digest[..8])
 }
 
+/// Deterministic index name for a **shared** declaration: derived from the
+/// field alone, so every definition declaring it converges on one index and
+/// `IF NOT EXISTS` makes that convergence idempotent by construction — no
+/// reference counting and no registry. Public for the same reason
+/// [`declared_index_name`] is: it is how an operator locates the index, and
+/// (since nothing ever drops one automatically) the only way to remove it.
+pub fn shared_index_name(field: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    // Domain tag. 0xFF is outside `validate_definition_key`'s alphabet, so no
+    // (key, field) pair can hash to a shared digest — the two namespaces
+    // cannot collide even before the differing readable prefix.
+    hasher.update([0xff]);
+    hasher.update(b"shared");
+    hasher.update([0]);
+    hasher.update(field.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    let ascii = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect()
+    };
+    // `rbpmn_vixs_` rather than `rbpmn_vix_`: the definition-scoped form
+    // always has `_` immediately after `vix`, so the two stay readable apart.
+    let mut readable = format!("rbpmn_vixs_{}", ascii(field));
+    readable.truncate(63 - 9);
+    format!("{readable}_{}", &digest[..8])
+}
+
+/// Advisory-lock class for declared-index builds. The **two-int32** form is a
+/// different lock space from the single-bigint form deploy uses
+/// (`pg_advisory_xact_lock(hashtext(key))`), so a definition key can never
+/// hash into a spurious wait on an index build.
+const ADVISORY_CLASS_INDEX_BUILD: i32 = 0x7262_7831; // 'rbx1'
+
+/// One slot for every declared index on `rbpmn_instance`. Not per index name:
+/// concurrent `CREATE INDEX CONCURRENTLY` on one *table* deadlock whether or
+/// not they name the same index, so the slot has to be the table.
+const ADVISORY_KEY_INSTANCE_INDEXES: i32 = 1;
+
+/// How long to keep trying for the build slot. Generous: a concurrent build on
+/// a large table is minutes of honest work, and giving up early would turn a
+/// slow deploy into a failed one.
+const INDEX_BUILD_SLOT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 impl Engine {
     /// Declare that the application filters/counts tasks of `definition_key`
     /// by this variables field: creates the partial expression index the
@@ -517,6 +700,8 @@ impl Engine {
     /// behind that `IF NOT EXISTS` would silently accept forever — so
     /// validity is verified after the build and an invalid leftover is
     /// dropped and reported loudly instead.
+    ///
+    /// The cross-definition counterpart is [`Engine::declare_shared_index`].
     pub async fn declare_index(
         &self,
         definition_key: &str,
@@ -524,36 +709,241 @@ impl Engine {
     ) -> Result<(), EngineError> {
         validate_definition_key(definition_key)?;
         validate_field(field)?;
-        let name = declared_index_name(definition_key, field);
-        sqlx::query(&format!(
-            "create index concurrently if not exists {name} on rbpmn_instance \
-             ((variables->>'{field}')) where definition_key = '{definition_key}'"
-        ))
-        .execute(self.pool())
-        .await?;
-        let valid: Option<bool> = sqlx::query_scalar(
-            "select i.indisvalid from pg_class c \
-             join pg_index i on i.indexrelid = c.oid where c.relname = $1",
+        self.build_declared_index(
+            &declared_index_name(definition_key, field),
+            field,
+            &format!("definition_key = '{definition_key}'"),
         )
-        .bind(&name)
-        .fetch_optional(self.pool())
-        .await?;
-        match valid {
-            Some(true) => Ok(()),
-            Some(false) => {
-                // A previously interrupted concurrent build: drop the
-                // corpse so the next call can rebuild, and say so.
-                sqlx::query(&format!("drop index concurrently if exists {name}"))
-                    .execute(self.pool())
-                    .await?;
-                Err(EngineError::InvalidVariables(format!(
-                    "index '{name}' was left invalid by an interrupted build; \
-                     it has been dropped — call declare_index again"
-                )))
+        .await
+    }
+
+    /// Declare a variables field indexed **across every definition** that
+    /// declares it — the lookup that resolves a business identifier to
+    /// whichever instance carries it, without knowing which workflow or which
+    /// deployment that is.
+    ///
+    /// Partial on `(variables->>'field') is not null`, which costs nothing:
+    /// an equality against the expression is a strict operator clause and so
+    /// implies `IS NOT NULL`, so the planner still uses the index — while
+    /// instances of definitions that never carry the field stay out of it
+    /// entirely. (Measured: 60 154 entries against 100 000, same plan.)
+    ///
+    /// **This asserts a contract rbpmn cannot check** — that the field means
+    /// the same thing in every definition declaring it. See
+    /// [`rbpmn_core::IndexScope::Shared`].
+    pub async fn declare_shared_index(&self, field: &str) -> Result<(), EngineError> {
+        validate_field(field)?;
+        self.build_declared_index(
+            &shared_index_name(field),
+            field,
+            &format!("(variables->>'{field}') is not null"),
+        )
+        .await
+    }
+
+    /// The one build path both scopes take: `CREATE INDEX CONCURRENTLY`, the
+    /// validity probe, and the loud recovery of an interrupted build's corpse.
+    ///
+    /// **Serialized across sessions by a try-lock, and the try is the whole
+    /// point.** Two `CREATE INDEX CONCURRENTLY` on one table deadlock: each
+    /// waits for the other's snapshot to drain while the other waits for the
+    /// table's ShareUpdateExclusive lock. That is not a shared-scope problem —
+    /// rbpmn already had it, because two definitions deploying at once both
+    /// index `rbpmn_instance` — the shared scope only makes it routine.
+    ///
+    /// A *blocking* advisory lock does not fix it; it was tried, and it just
+    /// moves the cycle onto the advisory lock, because the waiter holds a
+    /// snapshot while it waits and the holder's build waits for that snapshot.
+    /// Postgres reported both shapes as real deadlocks. A **try**-lock cannot
+    /// be an edge in a wait-for cycle at all — the same argument that keeps
+    /// the scheduler's `pg_try_advisory_xact_lock` out of `LockOrder` — because
+    /// between attempts this session is idle and holding nothing, so the
+    /// holder's build can drain and finish.
+    ///
+    /// The key is the **table**, not the index: two different indexes on
+    /// `rbpmn_instance` deadlock exactly as two builds of one index do.
+    ///
+    /// Recorded in `spec/README.md`'s lock inventory as "declared index
+    /// build", argued rather than modelled for the same reason the
+    /// scheduler's try-advisory is.
+    async fn build_declared_index(
+        &self,
+        name: &str,
+        field: &str,
+        predicate: &str,
+    ) -> Result<(), EngineError> {
+        let mut conn = self.pool().acquire().await?;
+        let deadline = std::time::Instant::now() + INDEX_BUILD_SLOT_TIMEOUT;
+        let mut backoff = Duration::from_millis(20);
+        loop {
+            let got: bool = sqlx::query_scalar("select pg_try_advisory_lock($1, $2)")
+                .bind(ADVISORY_CLASS_INDEX_BUILD)
+                .bind(ADVISORY_KEY_INSTANCE_INDEXES)
+                .fetch_one(&mut *conn)
+                .await?;
+            if got {
+                break;
             }
-            None => Err(EngineError::InvalidVariables(format!(
-                "index '{name}' disappeared during creation"
-            ))),
+            if std::time::Instant::now() >= deadline {
+                return Err(EngineError::InvalidVariables(format!(
+                    "timed out waiting to build index '{name}': another index \
+                     build on rbpmn_instance has held the slot for longer than \
+                     {INDEX_BUILD_SLOT_TIMEOUT:?}"
+                )));
+            }
+            // Idle between attempts, deliberately: a session holding a
+            // snapshot here is what stalls the holder's build.
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_millis(500));
         }
+        let built = build_index(&mut conn, name, field, predicate).await;
+        // Release on every path — a session lock left on a pooled connection
+        // would outlive the call and stall every later build. The build's own
+        // error wins if both fail; a connection that dies releases it anyway.
+        let released = sqlx::query("select pg_advisory_unlock($1, $2)")
+            .bind(ADVISORY_CLASS_INDEX_BUILD)
+            .bind(ADVISORY_KEY_INSTANCE_INDEXES)
+            .execute(&mut *conn)
+            .await;
+        built.and(released.map(|_| ()).map_err(EngineError::from))
+    }
+}
+
+async fn build_index(
+    conn: &mut sqlx::PgConnection,
+    name: &str,
+    field: &str,
+    predicate: &str,
+) -> Result<(), EngineError> {
+    sqlx::query(&format!(
+        "create index concurrently if not exists {name} on rbpmn_instance \
+         ((variables->>'{field}')) where {predicate}"
+    ))
+    .execute(&mut *conn)
+    .await?;
+    let valid: Option<bool> = sqlx::query_scalar(
+        "select i.indisvalid from pg_class c \
+         join pg_index i on i.indexrelid = c.oid where c.relname = $1",
+    )
+    .bind(name)
+    .fetch_optional(&mut *conn)
+    .await?;
+    match valid {
+        Some(true) => Ok(()),
+        Some(false) => {
+            // A previously interrupted concurrent build: drop the
+            // corpse so the next call can rebuild, and say so.
+            sqlx::query(&format!("drop index concurrently if exists {name}"))
+                .execute(&mut *conn)
+                .await?;
+            Err(EngineError::InvalidVariables(format!(
+                "index '{name}' was left invalid by an interrupted build; \
+                 it has been dropped — declare the index again"
+            )))
+        }
+        None => Err(EngineError::InvalidVariables(format!(
+            "index '{name}' disappeared during creation"
+        ))),
+    }
+}
+
+/// One declared index, as the catalogue and the live manifests jointly
+/// describe it. See [`Engine::declared_indexes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredIndex {
+    /// The catalogue name — [`declared_index_name`] or [`shared_index_name`].
+    pub name: String,
+    /// The field it indexes, when a relevant definition still declares it.
+    /// `None` for an orphan: the name carries a one-way hash and nothing in
+    /// rbpmn records the declaration, so a manifest entry that goes away takes
+    /// the field name with it.
+    pub field: Option<String>,
+    pub scope: Option<IndexScope>,
+    /// `key vN` for every relevant definition whose manifest declares it.
+    /// Empty means orphaned — nothing deployed asks for this index any more.
+    pub declared_by: Vec<String>,
+    /// Present in the catalogue. `false` alongside a non-empty `declared_by`
+    /// is a declaration that never got built — a deploy that failed after its
+    /// commit, fixed by redeploying.
+    pub present: bool,
+    /// Present *and* usable. `false` is an interrupted `CREATE INDEX
+    /// CONCURRENTLY`'s corpse; declaring it again drops and rebuilds it.
+    pub valid: bool,
+}
+
+/// Every `rbpmn_vix*` index on `rbpmn_instance`, matched against what the
+/// relevant definitions' manifests actually declare.
+///
+/// Read-only, and the answer to a question the engine otherwise cannot be
+/// asked: **rbpmn never drops a declared index**, of either scope. Not on
+/// [`Engine::delete_definition`], not under retention, and not when a field
+/// disappears from a manifest — `apply_manifest_indexes` only ever creates.
+/// That is deliberate for the shared scope, where a definition going away
+/// says nothing about whether another still needs the index, and where
+/// reference counting would be racy against a concurrent deploy. It also
+/// means orphans accumulate silently, so this is how an operator sees them:
+/// anything with an empty `declared_by` is safe to drop by hand.
+impl Engine {
+    pub async fn declared_indexes(&self) -> Result<Vec<DeclaredIndex>, EngineError> {
+        use std::collections::BTreeMap;
+
+        let mut expected: BTreeMap<String, DeclaredIndex> = BTreeMap::new();
+        for row in sqlx::query(crate::deploy::RELEVANT_DEFINITIONS)
+            .fetch_all(self.pool())
+            .await?
+        {
+            let key: String = row.get("key");
+            let version: i32 = row.get("version");
+            let Ok(bindings) = serde_json::from_value::<rbpmn_core::Bindings>(row.get("bindings"))
+            else {
+                continue;
+            };
+            for decl in &bindings.indexes {
+                let name = match decl.scope {
+                    IndexScope::Definition => declared_index_name(&key, &decl.field),
+                    IndexScope::Shared => shared_index_name(&decl.field),
+                };
+                expected
+                    .entry(name.clone())
+                    .or_insert_with(|| DeclaredIndex {
+                        name,
+                        field: Some(decl.field.clone()),
+                        scope: Some(decl.scope),
+                        declared_by: Vec::new(),
+                        present: false,
+                        valid: false,
+                    })
+                    .declared_by
+                    .push(format!("{key} v{version}"));
+            }
+        }
+
+        for row in sqlx::query(
+            "select c.relname, i.indisvalid from pg_class c \
+             join pg_index i on i.indexrelid = c.oid \
+             join pg_class t on t.oid = i.indrelid \
+             where t.relname = 'rbpmn_instance' \
+               and (c.relname like 'rbpmn\\_vix\\_%' or c.relname like 'rbpmn\\_vixs\\_%')",
+        )
+        .fetch_all(self.pool())
+        .await?
+        {
+            let name: String = row.get("relname");
+            let valid: bool = row.get("indisvalid");
+            let entry = expected
+                .entry(name.clone())
+                .or_insert_with(|| DeclaredIndex {
+                    name,
+                    field: None,
+                    scope: None,
+                    declared_by: Vec::new(),
+                    present: false,
+                    valid: false,
+                });
+            entry.present = true;
+            entry.valid = valid;
+        }
+
+        Ok(expected.into_values().collect())
     }
 }

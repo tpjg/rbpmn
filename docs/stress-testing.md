@@ -138,7 +138,8 @@ splits are what make the state space explode.
 **Status: (a) and (b) are landed** as `crates/rbpmn-core/tests/modelgen/mod.rs`
 (grammar, XML emitter, oracle, driver) and `tests/generator.rs` (the
 properties). The grammar implemented is `Task | Seq | Xor | Par | Loop` —
-enough to cover everything `balanced-gateways` is actually about. `Loop` is
+enough to cover everything `balanced-gateways` is actually about — plus `Sub`
+and `MsgBoundary`, each added by the phase that made it executable. `Loop` is
 emitted as the fixture-proven shape: exclusive join, body, a control task, an
 exclusive split whose back-edge is conditional and whose exit is the default.
 
@@ -150,15 +151,64 @@ subprocess's start, end, body and flows inside its element, so generated
 models are real scope trees, and mutating one can now produce a cross-scope
 flow — a rule the flat grammar could not reach at all.
 
-Not yet generated, and why: `WithBoundary` and `EventGateway` need care that
-the core grammar does not. In the accepted fixtures a boundary path runs its
-handler and then reaches **its own end event** rather than rejoining the main
-flow — so a boundary inside a parallel branch would put an end event in a
-branch (`end-event-in-branch`, a reject fixture) and would starve the join if
-it fired. They are therefore only legal in positions the generator would have
-to reason about specially, and the oracle has to model "this token stops here"
-rather than "this token continues". Worth doing; deliberately not bundled in
-with the part that needed no special cases.
+`MsgBoundary` was added when the interrupting message boundary became
+executable (`docs/design/boundary-messages.md` §9). It is the first production
+where the driver *chooses* — at every activation of the host it either
+completes the work item or delivers the boundary's message — and the first
+where the oracle predicts which of two mutually exclusive paths ran. That
+makes it the sharpest of the differentials: counting both paths, or neither,
+shows up immediately as a multiset that no longer matches. The delivered path
+additionally asserts what "interrupting" means, at every delivery rather than
+once in a fixture: the host's work item comes back closed and the step said
+`work-item-cancelled`.
+
+Two things the shape had to solve, and they are the reason it was not free.
+In the accepted fixtures a boundary path runs its handler and then reaches
+**its own end event** rather than rejoining the main flow — inside a parallel
+branch that is `end-event-in-branch` and would starve the join. The generated
+shape therefore **merges back** into the host's continuation, which is legal
+for the reason `implicit-merge-after-parallel` exists to check: exactly one of
+the two paths is ever taken, so two tokens can never arrive. And the merge is
+routed through an exclusive gateway rather than straight into whatever comes
+next, because `balanced-gateways` counts *edges* into a parallel join and
+demands exactly one per branch — two would be refused even though only one can
+ever carry a token. Each boundary catches a message of its own, so sibling
+parallel branches can arm concurrently without colliding on `(message, key)`,
+and its correlation binding rides in the manifest the generator hands to
+`compile`, never in the XML.
+
+Non-vacuity is asserted, not assumed:
+`the_message_boundary_production_goes_both_ways` drives a fixed, deterministic
+set of generated models and fails loudly if the production was never reached,
+if the message was never delivered, or if a host was never completed. It is the storm's "never went
+both ways" applied to the generator — and it is the only test here that
+notices any of those, which was verified by making the schedule say "complete"
+every time and watching every other property stay green.
+
+`SideBoundary` — the non-interrupting message boundary — followed in the same
+round, and is the production that earned the tier its keep: the driver
+delivers 0–2 messages per activation (a schedule, like `MsgBoundary`'s), the
+host always counts and the side body counts once per delivery, and the
+instance must stay open until every side item is done. On the day it landed it
+found a lint-clean model that executes wrongly: a parallel block *directly on*
+the side path, where two activations' tokens share the host's scope and the
+block's join double-counts — 59 of 200 interleavings on the minimal shape,
+clean under a subprocess (one scope per activation), clean for `Xor` and
+`Loop`. That became a clause of `boundary-side-path` and the warning
+`side-path-message-arm`, with `reject/side-path-parallel-block` as the
+counterexample in `tests/mutation.rs`; the generator's side-path body emits
+`Par` only under a `Sub` and carries no message arm, which is the rule as
+lint now states it.
+
+Not yet generated, and why: error and timer boundaries (single-shot or
+`timeCycle`), and `EventGateway`.
+The message boundary's merge-back settles the structural question for all of
+them, but each still owes the oracle a stimulus the driver can supply —
+`RaiseError` needs a task that fails on demand, a timer needs `FireTimer`
+scheduled against an activation the oracle can predict — and an event gateway
+has to model "this token stops here" rather than "this token continues".
+Worth doing; deliberately not bundled in with the part that needed no special
+cases.
 
 Four properties fall out:
 
@@ -180,6 +230,14 @@ that exists.
 > blocks inside exclusive branches, nested loops — lints clean and executes as
 > predicted. `balanced-gateways` is not over-strict on anything this grammar
 > can express.
+>
+> **Re-run with `MsgBoundary`: 500 000 generated models, zero false
+> positives** — 250 000 narrow (each also driven four times against the
+> oracle) and 250 000 wide. A message boundary merging back into its host's
+> continuation, inside parallel branches, exclusive branches, loops and
+> subprocess scopes, is accepted by every rule; the deterministic sweep beside
+> it reached the production in 66 of 200 models and took the delivered path
+> 143 times and the completed path 134 times across its 800 runs.
 
 **(b) Structural oracle → differential execution.** The generator holds the
 block tree, so a small recursive interpreter over that tree predicts — for a
@@ -364,7 +422,16 @@ construction — there is no singleton to make this unfair), a mix of push-mode
 workers, pull-mode task consumers, schedulers, `correlate` callers, and
 terminates, all against overlapping instance sets. The mix matters more than
 the volume: the point is to interleave *different code paths on the same
-rows*.
+rows*. Since message boundaries the mix also carries fixture 29 — a user task
+with an interrupting `PAID` boundary — with the driver correlating two of every
+three instances while pull-mode consumers work the task, and the run fails
+unless that race went both ways (completion won some, the message won some),
+the same non-vacuity rule the boundary-timer race already lives under. Fixture
+40's repeating timer is in the mix too, driven through the *schedulers*: the
+armed occurrence is backdated so all three scheduler loops see it due at once,
+and one backdate must be exactly one fire — the claim path's exactly-once for
+a row that re-creates itself in the firing transaction — with one arm per
+instance plus one re-arm per fire, and at least one re-armed occurrence fired.
 
 **Global invariants**, checked from the event table alone:
 

@@ -21,7 +21,7 @@ and 0012, and `spec/`.
 
 ## The motivating case, in one paragraph
 
-Xilium, the first application, runs a *ticket*. A ticket can be contested; the
+The first application, runs a *ticket*. A ticket can be contested; the
 contest parks the instance at a user task `handle_contest`, claimed by a clerk
 under a lease. A `PAID` message — correlated by the ticket reference — must be
 able to arrive *while that task is open* and end the ticket as Paid: withdraw
@@ -72,6 +72,84 @@ Worth stating before the design, because each one shaped a recommendation:
    of them is in the model — so "what interrupting means for a leased work
    item" has been true by code, not by check. The exactly-once property the
    brief asks for belongs there, as a `Cancel` action.
+
+## What shipped, and what building it changed
+
+A running log, newest last. Each line is something the design above did
+not say, or said differently.
+
+- **Slice 1 shipped** (interrupting message boundaries on all four hosts,
+  `Lost { state }` pulled forward). The loader gap was latent rather than
+  live — `enter` arms the host before its boundaries, so the old lookup
+  picked the host by arm order — and the test that makes the fix
+  load-bearing renumbers the two rows the other way round, a state the fsck
+  permits. The correlate loser is `InstanceNotActive` (409) when the winning
+  completion also ended the instance, because the status gate precedes the
+  subscription re-check (§4.2). `Lost { state }` is two statements, not one
+  (§1.3). `spec/Lease.tla`'s "only by its holder" property was never true of
+  the shipped engine; it is "…or the process" now, with `Cancel` modelled.
+- **Slice 2 shipped** (non-interrupting message and single-shot timer
+  boundaries). Two things the design had not anticipated. A non-interrupting
+  *message* boundary re-arms, so the reachable state space of a model with
+  one is infinite; the explorer bounds it with `MAX_SIDE_TOKENS = 2` (a
+  delivery or fire on a non-interrupting boundary is offered only while fewer
+  than two tokens stand on its side path — the same shape as its finite
+  patch alphabet). And the region-analysis change (walk only interrupting
+  pseudo-edges) has a measured counterexample: fixture
+  `37-side-path-inside-a-parallel-block` fails `balanced-gateways` with the
+  old walk. `boundary-side-path` reports one diagnostic per boundary (the
+  first offending node, named), not one per downstream node; the rule also
+  needed a three-line module in `bpmnlint-plugin-rbpmn` for `just parity`,
+  which gates on the plugin covering every L1 rule. `side-path-into-join`
+  run without the lint gate produces the join `Invariant`, as predicted.
+- **The generator found a hole the day its side-path production landed.** A
+  parallel block *directly on* a side path passed every rule and failed on 59
+  of 200 interleavings: the boundary re-arms, two activations' tokens share
+  the host's scope, and the block's join double-counts. §2.3 and §5 had said
+  "joins inside a side path are ordinary blocks" — false. Decided: lint
+  (`boundary-side-path` refuses a parallel gateway on the path; a subprocess
+  on the path is the repair, one scope per activation), plus the warning
+  `side-path-message-arm`⁺ for the same root cause on message arms. The
+  explorer's bound moved from 2 to 4 side tokens, because at 2 one activation
+  of a two-wide block already saturated it and the mutation table would have
+  called the shape clean. `reject/side-path-parallel-block` is the row;
+  `accept/38` is the repaired model with two interleaved activations.
+- **Slice 3 shipped** (`timeCycle` on non-interrupting boundaries). As
+  designed in §2.5/§3.6, with one simplification: no `period` column —
+  `TimerDue::Cycle` keeps the literal text, the core keeps `remaining`, and
+  the projection re-splits the text on every arm (`iso8601::split_cycle`,
+  `fixed_length_seconds`). Migration 0013 adds `'cycle'` to `due_kind` and a
+  nullable `remaining`. The instant arithmetic is in epoch seconds, not
+  `interval`: `timestamptz + interval '1 day'` is a calendar day in the
+  session's time zone, and a fixed-length `P1D` is 86 400 s — so the re-arm
+  steps along the previous due's grid to the first occurrence at or after now
+  (`previous_due + period · max(1, ceil((now − previous_due) / period))`), and
+  the `timer-fired` delete returns the due for the `timer-armed` that
+  `continues` it, in the same persist pass. The `timer-armed` payload
+  carries `continues` and `remaining`; `Display` is the literal
+  (`timer-armed late_fee_due R/P7D`, on every arm). The editor offers
+  `timeCycle` only where lint executes it.
+  Verified against the engine: a scheduler an hour late re-arms at *previous
+  due + 7 d*, a past anchor yields one phase-aligned occurrence and no
+  catch-up burst, `R2` leaves the scheduler idle over live work, and an
+  engine down across three periods re-arms once rather than three times.
+- **The review after slice 3 found two holes, both in the shape this document
+  keeps warning about — a path nobody walked.** The re-arm was a plain
+  `previous_due + period`, which is correct for a scheduler minutes late and
+  wrong for an engine that was *down*: the re-arm landed in the past, and
+  because `drain_due_timers` picks the earliest due row and `Drain::Fired`
+  loops without sleeping, 24 h of downtime on an `R/PT15M` boundary replayed
+  as 96 fires and 96 side tokens. The fix is the `max(1, ceil(…))` above —
+  missed occurrences are skipped, never replayed, and a bounded cycle is
+  untouched because it counts fires. And `ambiguous-message-arm` did not look
+  at a **side path**: it compared the arms live at one wait state and never
+  the ones a non-interrupting boundary's own path can add, so two arms for
+  the same message and binding could still both be live. The period also
+  gained a one-minute floor and `R<n>` a one-million cap at lint, and
+  `remaining` a CHECK constraint plus a loader that rejects a non-positive
+  count instead of clamping it — a projection that silently reads `0` as
+  "nothing left" is exactly the silent reinterpretation the ground rules
+  forbid.
 
 ---
 
@@ -154,15 +232,15 @@ What the holder sees, each a typed result and none of them a 5xx:
 |---|---|---|
 | `complete_task(id, owner, patch)` | `Completion::AlreadyClosed { state: "cancelled" }` — the patch is **not** applied | `200 {"outcome":"alreadyClosed","state":"cancelled"}` |
 | `fail_task` | `FailOutcome::AlreadyClosed { state: "cancelled" }` | same shape |
-| `extend_lock` | `LockExtension::Lost` | `409 {"outcome":"lockLost"}` |
-| `release_task` | `Released::Lost` | `409 {"outcome":"lockLost"}` |
+| `extend_lock` | `LockExtension::Lost { state: "cancelled" }` | `409 {"outcome":"lockLost","state":"cancelled"}` |
+| `release_task` | `Released::Lost { state: "cancelled" }` | `409 {"outcome":"lockLost","state":"cancelled"}` |
 
-Two things to say plainly to application authors, because Xilium will meet
+Two things to say plainly to application authors, because a frontend meets
 both on day one:
 
-- **The clerk's decision is discarded.** A `complete_task` that arrives after
-  the `PAID` boundary fired returns `AlreadyClosed` and records nothing. If
-  the application wants the lost decision kept, that is the application's
+- **The holder's decision is discarded.** A `complete_task` that arrives after
+  the boundary fired returns `AlreadyClosed` and records nothing. If the
+  application wants the lost decision kept, that is the application's own
   write, made when it sees that outcome — the engine will not invent a place
   for it. "Never succeed" means exactly that: the patch never reaches the
   document.
@@ -171,13 +249,24 @@ both on day one:
   tab). The detection bound is the client's renewal interval, which is the
   same bound the lease already puts on everything else.
 
-`LockExtension::Lost` and `Released::Lost` do not say *why*. For a timer
-boundary "reassigned" was an adequate story; for a payment it is the wrong
-one ("your task was reassigned" when the truth is "the ticket was paid"). A
-follow-up, not part of any slice here: `Lost { state }`, carrying the row
-state the way `AlreadyClosed` already does. Additive, no contract change.
+`Lost { state }` **shipped in slice 1**, pulled forward from the deferred list
+because "your task was reassigned" is the wrong message when the truth is
+"the ticket was paid". It carries the row's `state` column the way
+`AlreadyClosed` already does, and the vocabulary is deliberately the column's:
+`cancelled` = withdrawn by the process (a boundary, a terminate, a teardown);
+`completed` / `failed` = already decided; `locked` / `available` = the claim
+is not yours any more — *lapsed or reassigned*, which the field does not
+separate (an expired lease nobody reclaimed still reads `locked` with the
+caller as owner), and need not: claim again if you still want it. Two
+statements, not one: the `UPDATE` unchanged, then a plain `SELECT state` on a
+fresh snapshot when it matched nothing — a single-statement CTE would read the
+fallback state from the statement snapshot while the update re-evaluated
+against the latest row version (EvalPlanQual), and report `locked` for an item
+that had just been cancelled underneath the heartbeat. A task id that names no
+row is `UnknownWorkItem` (404) from both verbs now, as it always was from
+`complete`/`fail`.
 
-### 1.4 The Xilium walk-through
+### 1.4 The walk-through
 
 Model (full fixture in Appendix A): `start → handle_contest (user task) →
 end_decided`, with an interrupting message boundary `paid_during_contest`
@@ -203,7 +292,9 @@ end_decided`, with an interrupting message boundary `paid_during_contest`
 If instead the clerk completes first: step 4 runs first and
 `cancel_attachments` withdraws the `PAID` subscription
 (`subscription-cancelled paid_during_contest PAID`); the payment in step 3
-then finds no subscription → 404, which is the correct, loud answer — the
+then finds no subscription → 404 (or, in the narrow window where it resolved
+the row before that commit, `InstanceNotActive` → 409: the status gate runs
+before the subscription re-check — §4.2), which is the correct, loud answer — the
 application decides what a payment against a decided contest means (usually:
 the next wait state, `await_payment` after a rejected contest, is a catch for
 the *same* `PAID` message, armed in the same transaction the contest closed,
@@ -277,8 +368,20 @@ the side path is **disjoint from everything else in the scope**. It ends at
 its own end event(s) — a plain end is *required*, because that is where the
 side token is consumed; a terminate end is *allowed*, because "on the fifth
 reminder, cancel the whole thing" is a legitimate escape and scope-local
-terminate already exists. It may contain its own split/join blocks,
-subprocesses and boundaries; those are checked as usual inside `P`.
+terminate already exists. It may contain subprocesses, loops, exclusive
+gateways and boundaries of its own — but **not a parallel block directly on
+the path**, and that is the correction building it forced (see the log at
+the top): a side path is a *multi-token* region, because the boundary can
+fire again while an earlier side token is still on it, and a parallel join
+counts one token per incoming flow *per scope* — both activations' tokens run
+in the host's scope, so the second activation's token arrives on a flow the
+first already covered and trips the join's `Invariant`. A subprocess mints a
+scope per entry, so a parallel block *inside a subprocess on the side path*
+is fine, and that is the rewrite hint. The same reasoning makes a message arm
+on a side path suspect — armed once per activation, a duplicate
+`(message, key)` freeze at the second unless each activation changes the key
+(a delivery patch can) — which is not always wrong, so it is the warning
+`side-path-message-arm`⁺ rather than an error.
 
 Message, for the modeller: *a non-interrupting boundary starts a side path
 that must end on its own — it cannot rejoin the flow after `handle_contest`
@@ -342,7 +445,13 @@ R[n]/<datetime with offset>/P…   n fires, phase anchored at the datetime
 ```
 
 - `n` absent = unbounded (bounded by the host's life, which is why it is only
-  allowed on a non-interrupting boundary). `R0/…` is an error: it never fires.
+  allowed on a non-interrupting boundary). `R0/…` is an error: it never fires,
+  and `n` is capped at **1 000 000** — a repeat count is a schedule, not a
+  counter, and `remaining` round-trips through the database as an `int`.
+- The period has a floor of **one minute**. Anything shorter is a poll loop
+  wearing a boundary event's clothes: the scheduler would re-arm faster than
+  it can drain, and the side tokens would outrun the host. Both the floor and
+  the cap are `timer-iso8601` errors, at lint, with fixtures.
 - The period must be **fixed-length**: weeks, days, hours, minutes, seconds.
   `P1M` and `P1Y` are errors under `timer-iso8601` ("a repeating period must
   have a fixed length; months and years do not"). The projection computes
@@ -361,13 +470,18 @@ Semantics of the anchor — decided here, and different from a strict reading
 of ISO 8601, so said out loud: **the anchor fixes the phase, not the set of
 instants.** The first due instant is the first `anchor + k·period ≥ arm
 time`; `n` counts fires from there; occurrences before arm time are never
-replayed (no catch-up burst). A strict reading makes `R3/2026-08-27…/P7D`
-three fixed instants, which would turn every instance started after 2026-09-10
-into one whose boundary silently never arms — a definition outlives its
-anchor, and "every Monday at 00:00 local" is what a modeller means by an
-anchored cycle. Daylight-saving caveat, also said out loud: periods are
-fixed-length, so `P1D` anchored at `00:00+02:00` drifts an hour after the
-clocks change. Calendar-aware schedules are not in this round.
+replayed (no catch-up burst). **A re-arm obeys the same rule**, with the
+previous due in the anchor's place: the next due is the first
+`previous due + k·period ≥ now` with `k ≥ 1` — so the grid never shifts to
+the fire time, and an outage's missed occurrences are skipped rather than replayed. Because `n`
+counts fires, skipping costs a bounded cycle nothing. A strict reading makes
+`R3/2026-08-27…/P7D` three fixed instants, which would turn every instance
+started after 2026-09-10 into one whose boundary silently never arms — a
+definition outlives its anchor, and "every Monday at 00:00 local" is what a
+modeller means by an anchored cycle. Daylight-saving caveat, also said out
+loud: periods are fixed-length, so `P1D` anchored at `00:00+02:00` drifts an
+hour after the clocks change. Calendar-aware schedules are not in this
+round.
 
 ### 2.6 Catalogue additions
 
@@ -533,15 +647,28 @@ The core never interprets time; it must not start now. Division of labour:
   knowing what time it was.
 - **The projection owns every instant.** On the first arm of a cycle it
   computes `due_at` from database time: `clock_timestamp() + period` for
-  `R/P…`; for an anchored cycle `anchor + ceil((clock_timestamp() − anchor) /
-  period) · period` (epoch arithmetic, which is why periods are fixed-length).
-  On a re-arm it computes `previous due_at + period` — from the **previous
-  due**, not from when the fire actually ran, so a scheduler that was late does
-  not drift the schedule. `persist_step` handles events in emission order, so
-  `TimerFired` (a `delete … returning due_at`) precedes the `TimerArmed` that
-  `continues` it; the returned instant is threaded to the insert inside the
-  same loop. No instant is ever stored in the core's state, and none reaches
-  the event payload except in the existing `due_at` column.
+  `R/P…`; for an anchored cycle `anchor + ceil((clock_timestamp() − anchor)
+  / period) · period` (epoch arithmetic, which is why periods are
+  fixed-length). On a re-arm it stays on the **grid of the previous due**
+  and lands on the first occurrence at or after now: `previous due_at +
+  period · max(1, ceil((now − previous due_at) / period))`. Two things in
+  one expression. The grid is the previous due's, not the fire's, so a
+  scheduler an hour late on `R/P7D` re-arms at *previous due + 7 d* and the
+  schedule does not drift. And `k ≥ 1` puts the re-arm strictly in the
+  future, so **occurrences missed while the engine was down are skipped,
+  never replayed**: an engine down 24 h on an `R/PT15M` boundary re-arms at
+  the next quarter hour, not 96 times back to back — a plain `previous +
+  period` re-arms into the past, `drain_due_timers` picks it on the very
+  next pass, and `Drain::Fired` never sleeps, so the outage comes back as a
+  burst of 96 side tokens. A bounded `R<n>` counts **fires**, not
+  occurrences, so what the outage skipped costs it nothing (`R2` down for
+  three periods still has two fires). This is the same rule as the anchored
+  first arm, one line up, with the previous due in the anchor's place.
+  `persist_step` handles events in emission order, so `TimerFired` (a
+  `delete … returning due_at`) precedes the `TimerArmed` that `continues`
+  it; the returned instant is threaded to the insert inside the same loop.
+  No instant is ever stored in the core's state, and none reaches the event
+  payload except in the existing `due_at` column.
 - **`Display` stays the literal.** `timer-armed late_fee R/P7D` on every
   arm; `remaining` and `continues` are payload, like every reason and every
   answer before them. A golden trace for `R3/P7D` therefore shows three
@@ -601,7 +728,7 @@ first** and per-instance rows after, the one order engine-wide
 
 | Path | Shape | Outcome when it wins | Outcome when it loses |
 |---|---|---|---|
-| `correlate` (message boundary) | resolve the subscription **without a lock** → `FOR UPDATE` on the instance → re-check the subscription is still in state → step → persist (item → `cancelled`, subscription row deleted) | `200 {instanceId}` | re-check fails → `NoSubscription` (404) — the same answer as a repeat, deliberately |
+| `correlate` (message boundary) | resolve the subscription **without a lock** → `FOR UPDATE` on the instance → re-check the subscription is still in state → step → persist (item → `cancelled`, subscription row deleted) | `200 {instanceId}` | re-check fails → `NoSubscription` (404), the same answer as a repeat, deliberately — or `InstanceNotActive` (409) when the winning completion also *ended the instance*: `correlate_in_tx` gates on instance status before it re-checks the subscription. Typed and pre-mutation either way; the tests accept both |
 | `complete_task` | find the item row (no lock) → `FOR UPDATE` on the instance → `guard_lease` reads the item `FOR UPDATE` → step → persist (subscription row deleted by `subscription-cancelled`) | `Advanced` | `guard_lease` sees `cancelled` → `AlreadyClosed { state: "cancelled" }`, before the core is invoked |
 | scheduler (a timer boundary on the same host) | try-advisory → `FOR UPDATE NOWAIT` on the instance → re-check the timer row → step | fires | re-check fails → `Attempt::Resolved`, move on |
 
@@ -631,7 +758,7 @@ already asserts zero.
 Most of it is in §3.5–§3.6; this section is the modeller's view and the two
 rules the timer case adds.
 
-**Xilium's late fee, as it should read** (fixture sketch in Appendix A):
+**Example's late fee, as it should read** (fixture sketch in Appendix A):
 `await_payment` is a receive task for `PAID`; on it, a non-interrupting timer
 boundary `late_fee_due` with `<timeCycle>R/P7D</timeCycle>` leading to a
 service task `add_late_fee` and an end event `fee_added`. The arm happens when
@@ -643,8 +770,11 @@ still open keeps the instance alive until it completes. Anchored form for
 `R/2026-08-31T00:00:00+02:00/P7D` — first due the first Monday at or after the
 arm, with the DST caveat of §2.5.
 
-**Join semantics.** There are none to add: a side path never reaches a join
-(`boundary-side-path`), and joins inside a side path are ordinary blocks.
+**Join semantics.** A side path never reaches a join outside itself
+(`boundary-side-path`), and a join *on* the path is refused too: two
+activations share the host's scope, so only a subprocess on the path — one
+scope per entry — can carry a parallel block. Inside that subprocess, joins
+are ordinary blocks.
 
 **Arming table for cycles.**
 
@@ -825,7 +955,7 @@ Accept (`crates/rbpmn-model/tests/fixtures/accept/`):
 
 | Fixture | Slice | What it shows |
 |---|---|---|
-| `29-message-boundary.bpmn` | 1 | the Xilium shape: user task, interrupting `PAID` boundary (Appendix A) |
+| `29-message-boundary.bpmn` | 1 | the Example shape: user task, interrupting `PAID` boundary (Appendix A) |
 | `30-receive-task-message-boundary.bpmn` | 1 | receive task for `PAID` with an interrupting `CANCELLED` boundary — two subscriptions on one token |
 | `31-subprocess-message-boundary.bpmn` | 1 | a subprocess with work inside, interrupted by a message — teardown through the message path |
 | `32-message-and-timer-boundaries.bpmn` | 1 | both kinds on one host; either interrupts, the other is withdrawn |
@@ -855,7 +985,7 @@ corpus): `ambiguous-message-arm` for the three certain shapes, and the
 *negative* — same message, different binding names — accepted.
 
 **Scenarios** (`crates/rbpmn-core/tests/scenarios/`, golden traces; the two
-for the Xilium fixture are written out in Appendix B):
+for the example fixture are written out in Appendix B):
 
 `29-message-boundary-delivered.json`, `29-message-boundary-completed.json`,
 `30-receive-host-delivered.json`, `30-receive-boundary-delivered.json`,
@@ -986,9 +1116,12 @@ model-checked. The service task costs nothing at all beyond its fixture —
 
 ### Deferred, with the reason
 
+`LockExtension::Lost { state }` / `Released::Lost { state }` **shipped in
+slice 1** — the interrupting boundary is what made "your task was reassigned"
+the wrong story, so the honest answer went in with it rather than after it.
+
 | Item | Why not now |
 |---|---|
-| `LockExtension::Lost { state }` / `Released::Lost { state }` | additive; a UX improvement, not a correctness one; ships when a frontend asks |
 | static detection of duplicate arms on parallel branches | needs the region analysis to reason about concurrency; the runtime freeze is loud meanwhile |
 | calendar-aware cycles (`P1M`, DST-stable local time) | a different arithmetic and a timezone database; fixed-length periods cover the motivating case |
 | cycles on intermediate catches / interrupting boundaries | rejected on purpose — "fire once and ignore the rest" is the silent behaviour this engine refuses |
@@ -1001,7 +1134,7 @@ model-checked. The service task costs nothing at all beyond its fixture —
 Ready for `just fixtures-di` (no DI here; it adds it). Each carries its
 `expect-diagnostics` comment in the corpus' form.
 
-### `accept/29-message-boundary.bpmn` — the Xilium shape
+### `accept/29-message-boundary.bpmn` — the example shape
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>

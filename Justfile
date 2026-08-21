@@ -219,25 +219,35 @@ tla:
     check "lock order: rejected AB/BA sketch" LockOrderHistorical.cfg LockOrder.tla fail "Error: Deadlock reached"
     check "lock order: all five per-instance rows"  LockOrderAllRows.cfg           LockOrder.tla hold ""
     check "lock order: five rows, wrong order"      LockOrderAllRowsHistorical.cfg LockOrder.tla fail "Error: Deadlock reached"
-    # -deadlock on the lease configs, and it is new: modelling the voluntary
-    # release made a terminal state reachable that the model could not reach
-    # before. An item released back to the queue of an instance frozen on an
-    # incident is claimable by nobody (CLAIMABLE requires an active instance)
-    # and completable by nobody — and it stays that way until an operator
-    # repairs the incident, which this model does not include. It is the same
-    # legitimate terminal state as a torn-down scope, not a livelock. Before
-    # the release existed, FailFinally simply re-fired forever from that
-    # state, so deadlock freedom held here by accident rather than by design;
-    # it is a property under test only for LockOrder.
+    # -deadlock on the lease configs: a closed item — completed, cancelled by
+    # the process, or failed with its instance frozen for a repair the model
+    # does not include — is a legitimate terminal state once the clock runs
+    # out, the same kind as a torn-down scope, not a livelock. Deadlock
+    # freedom is a property under test only for LockOrder.
     check "lease: safety"                     Lease.cfg               Lease.tla     hold "" -deadlock
     check "lease: double belief is reachable" Lease_DoubleBelief.cfg  Lease.tla     fail "Invariant DoubleBeliefIsReachable is violated" -deadlock
-    check "lease: release without its owner check" Lease_UncheckedRelease.cfg Lease.tla fail "Action property LiveLeaseEndsOnlyByItsHolder is violated" -deadlock
+    check "lease: release without its owner check" Lease_UncheckedRelease.cfg Lease.tla fail "Action property LiveLeaseEndsOnlyByItsHolderOrTheProcess is violated" -deadlock
     check "lease: release without its lease epoch"  Lease_EpochlessRelease.cfg Lease.tla fail "Action property ReleaseFreesOnlyTheLeaseItNamed is violated" -deadlock
+    # A cancelled item (interrupting boundary, terminate, teardown) is the
+    # second terminal state the lease configs reach; same -deadlock reason.
+    check "lease: completing a cancelled item"      Lease_CancelIgnoresGuard.cfg Lease.tla fail "Action property NoCompletionAfterCancel is violated" -deadlock
     # -deadlock: a terminal state is legitimate here (everything torn down,
     # nothing armed). Deadlock freedom is a property under test only for
     # LockOrder, where the flag is deliberately absent.
     check "timer claim vs scope teardown"     TimerTeardown.cfg       TimerTeardown.tla hold "" -deadlock
     check "teardown leaving a timer behind"   TimerTeardown_Buggy.cfg TimerTeardown.tla fail "Invariant NeverFiredADanglingTimer is violated" -deadlock
+    # The same module over subscription rows: correlate claims a boundary
+    # subscription the way try_fire claims a timer (unlocked pick, instance
+    # row, re-check of the ROW), and teardown must withdraw both kinds of arm
+    # with the token. Nothing in the module is timer-specific; this run is
+    # what lets the README say so about subscriptions.
+    check "correlate vs scope teardown"       SubscriptionTeardown.cfg TimerTeardown.tla hold "" -deadlock
+    # -deadlock: the two exits (host completed, boundary taken) are the
+    # model's legitimate terminal states.
+    check "boundary exit: complete vs correlate"    BoundaryExit.cfg               BoundaryExit.tla hold "" -deadlock
+    check "boundary exit: no re-check under the lock" BoundaryExit_NoRecheck.cfg   BoundaryExit.tla fail "Invariant ExactlyOneExit is violated" -deadlock
+    check "boundary exit: completion keeps the arm"   BoundaryExit_NoWithdraw.cfg  BoundaryExit.tla fail "Invariant ArmDiesWithTheWait is violated" -deadlock
+    check "boundary exit: re-check of any row"        BoundaryExit_AnyRowRecheck.cfg BoundaryExit.tla fail "Invariant LateCallsAreTyped is violated" -deadlock
     check "retention: floor and the archive gap" Retention.cfg              Retention.tla hold "" -deadlock
     check "retention: floor from the plan"       Retention_FloorFromPlan.cfg Retention.tla fail "Invariant FloorIsSomethingDeleted is violated" -deadlock
     check "retention: no DUE re-check"           Retention_NoRecheck.cfg     Retention.tla fail "Invariant OnlyDueRecordsDeleted is violated" -deadlock

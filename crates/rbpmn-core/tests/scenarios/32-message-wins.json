@@ -1,0 +1,29 @@
+{
+  "fixture": "accept/32-message-and-timer-boundaries.bpmn",
+  "bindings": { "correlations": { "paid": "ticket.reference" } },
+  "variables": { "ticket": { "reference": "T-32" } },
+  "actions": [{ "deliver": "paid" }],
+  "expect": {
+    "status": "completed",
+    "variables": { "ticket": { "reference": "T-32" } },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started handle_contest",
+      "work-item-created handle_contest user handle_contest",
+      "message-subscribed paid PAID T-32",
+      "timer-armed overdue P2D",
+      "message-received paid PAID",
+      "work-item-cancelled handle_contest",
+      "timer-cancelled overdue",
+      "element-started paid",
+      "element-completed paid",
+      "flow-taken f3",
+      "element-started end_paid",
+      "element-completed end_paid",
+      "instance-completed"
+    ]
+  }
+}

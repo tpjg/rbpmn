@@ -8,10 +8,10 @@ mod explorer;
 mod modelgen;
 
 use explorer::assert_clean;
-use modelgen::{Block, build};
+use modelgen::{Block, Decisions, build, initial_variables};
 use rbpmn_core::*;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -76,7 +76,9 @@ fn corpus_state_spaces_hold_the_invariants() {
 
         let xml = fs::read_to_string(fixtures_dir().join(&sc.fixture)).unwrap();
         let defs = rbpmn_model::parse(&xml).unwrap();
-        let proc = ExecutableProcess::compile(&defs, "p", &sc.bindings)
+        // The fixture names its own process; not every one of them is `p`.
+        let process_id = defs.processes[0].id.clone();
+        let proc = ExecutableProcess::compile(&defs, &process_id, &sc.bindings)
             .unwrap_or_else(|e| panic!("{}: {e}", sc.fixture));
         states += assert_clean(
             &sc.fixture,
@@ -96,12 +98,19 @@ fn corpus_state_spaces_hold_the_invariants() {
 /// docs/stress-testing.md §3 crossed with §7. The fixtures top out at three
 /// parallel branches and never nest a loop inside one, so this is where the
 /// interesting state spaces come from.
+///
+/// Compiled with the generator's own manifest and started from its own
+/// document, not `Bindings::default()` and `{}`. Those two were what kept
+/// `MsgBoundary` out of reach here: a generated message boundary needs its
+/// correlation binding to compile at all, and needs the key present in the
+/// variables to arm without freezing, so a shape containing one was
+/// unreachable by construction rather than by choice.
 fn explore_block(label: &str, block: &Block) -> usize {
     let g = build(block);
     let defs = rbpmn_model::parse(&g.xml).expect("generated model parses");
-    let proc = ExecutableProcess::compile(&defs, "p", &Bindings::default())
+    let proc = ExecutableProcess::compile(&defs, "p", &g.bindings)
         .expect("generated model is block-structured and must compile");
-    assert_clean(label, &proc, json!({}), &[])
+    assert_clean(label, &proc, initial_variables(&Decisions::default()), &[])
 }
 
 /// `Par(branches x depth)` — the concurrency-scaling shape, now expressed in
@@ -165,11 +174,42 @@ fn generated_models_hold_the_invariants() {
             Block::Par(vec![Block::Sub(Box::new(Block::Task)), Block::Task]),
         ),
         (
+            "message boundary".into(),
+            Block::MsgBoundary(Box::new(Block::Task)),
+        ),
+        (
+            "message boundary inside a parallel branch".into(),
+            Block::Par(vec![Block::MsgBoundary(Box::new(Block::Task)), Block::Task]),
+        ),
+        (
+            "loop around a message boundary".into(),
+            Block::Loop(Box::new(Block::MsgBoundary(Box::new(Block::Task)))),
+        ),
+        (
             "nested loops".into(),
             Block::Loop(Box::new(Block::Seq(vec![
                 Block::Loop(Box::new(Block::Task)),
                 Block::Task,
             ]))),
+        ),
+        // Non-interrupting: a re-arming boundary, bounded by MAX_SIDE_TOKENS.
+        (
+            "side boundary".into(),
+            Block::SideBoundary(Box::new(Block::Task)),
+        ),
+        (
+            "side boundary inside a parallel branch".into(),
+            Block::Par(vec![
+                Block::SideBoundary(Box::new(Block::Task)),
+                Block::Task,
+            ]),
+        ),
+        (
+            "side path wrapping a parallel block in a subprocess".into(),
+            Block::SideBoundary(Box::new(Block::Sub(Box::new(Block::Par(vec![
+                Block::Task,
+                Block::Task,
+            ]))))),
         ),
     ];
 

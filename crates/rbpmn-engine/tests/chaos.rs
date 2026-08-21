@@ -150,6 +150,33 @@ async fn the_engine_converges_through_chaos() {
         )
         .await
         .unwrap();
+    // A user task racing a message boundary, through the crashes: the
+    // payment cancels a work item that may be leased by a node about to be
+    // terminated, so the withdrawal and the reclaim contend for real. Its
+    // process id is already `ticket`, so unlike the others it needs no
+    // rename.
+    setup
+        .deploy(
+            &fixture("accept/29-message-boundary.bpmn"),
+            &rbpmn_core::Bindings::new().correlation("paid_during_contest", "ticket.reference"),
+        )
+        .await
+        .unwrap();
+    // The non-interrupting boundary (slice 2). What it adds here is a
+    // delivery whose transaction does *more* than close a token: it consumes
+    // an arm, opens a new one and spawns a sibling, all in the one step a
+    // terminated backend can interrupt. A half-applied version of that would
+    // be a case with two subscriptions, or with none and a live review — both
+    // of which the fsck below names. Its topic is declared, not handled: the
+    // pull consumers claim the side path's task like any other.
+    setup.declare_topic("file_note").await.unwrap();
+    setup
+        .deploy(
+            &fixture("accept/33-non-interrupting-message-boundary.bpmn"),
+            &rbpmn_core::Bindings::new().correlation("note_received", "case.id"),
+        )
+        .await
+        .unwrap();
 
     let deadlocks_before = deadlocks(&db.pool).await;
     let rounds: u32 = std::env::var("RBPMN_CHAOS_ROUNDS")
@@ -237,7 +264,17 @@ async fn the_engine_converges_through_chaos() {
             while !stop.load(Ordering::Relaxed) {
                 let engine = slot.read().await.0.clone();
                 let mut idle = true;
-                for topic in ["ta", "tb", "ut", "t_esc", "pack", "backorder"] {
+                for topic in [
+                    "ta",
+                    "tb",
+                    "ut",
+                    "t_esc",
+                    "pack",
+                    "backorder",
+                    "handle_contest",
+                    "review",
+                    "file_note",
+                ] {
                     if let Ok(Some(task)) = engine.get_task(topic, &options).await {
                         idle = false;
                         // Outlive the lease deliberately.
@@ -300,11 +337,52 @@ async fn the_engine_converges_through_chaos() {
     // The workload, started through the control pool so a terminated node
     // cannot lose a start we are counting on.
     let mut instances: Vec<(Uuid, serde_json::Value)> = Vec::new();
-    for _ in 0..rounds {
+    for round in 0..rounds {
         for key in ["par", "timed", "svc", "scoped"] {
             let vars = serde_json::json!({});
             let id = setup.start(key, None, vars.clone()).await.unwrap().id;
             instances.push((id, vars));
+        }
+        // The message-boundary race, driven per instance and immediately, so
+        // the payment lands while a consumer is claiming the same task under
+        // a 10ms lease and its node may be killed mid-transaction. Every
+        // third ticket is left for the consumers to decide, which is what
+        // keeps both outcomes present rather than assuming they are.
+        let reference = format!("t-{round}");
+        let vars = serde_json::json!({ "ticket": { "reference": reference.clone() } });
+        let id = setup.start("ticket", None, vars.clone()).await.unwrap().id;
+        instances.push((id, vars));
+        if !round.is_multiple_of(3) {
+            match setup
+                .correlate("PAID", &reference, serde_json::json!({}))
+                .await
+            {
+                Ok(_) => {}
+                // The consumer won: the completion withdrew the arm (404) or
+                // closed the instance under the delivery's re-check (409).
+                Err(rbpmn_engine::EngineError::NoSubscription { .. })
+                | Err(rbpmn_engine::EngineError::InstanceNotActive(..)) => {}
+                Err(e) => panic!("correlate PAID {reference}: {e}"),
+            }
+        }
+        // The non-interrupting one, driven the same way: zero, one or two
+        // notes per case, so the re-arm runs while backends are being killed
+        // and every third case is left for the consumers to decide alone.
+        let case = format!("c-{round}");
+        let vars = serde_json::json!({ "case": { "id": case.clone() } });
+        let id = setup
+            .start("casefile", None, vars.clone())
+            .await
+            .unwrap()
+            .id;
+        instances.push((id, vars));
+        for _ in 0..(round % 3) {
+            match setup.correlate("NOTE", &case, serde_json::json!({})).await {
+                Ok(_) => {}
+                Err(rbpmn_engine::EngineError::NoSubscription { .. })
+                | Err(rbpmn_engine::EngineError::InstanceNotActive(..)) => {}
+                Err(e) => panic!("correlate NOTE {case}: {e}"),
+            }
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -410,6 +488,65 @@ async fn the_engine_converges_through_chaos() {
         refused_by_lease.load(Ordering::Relaxed) > 0,
         "no completion was ever refused — the lease was never actually \
          contested, so completion authority is untested here"
+    );
+
+    // ...and the message boundary went both ways through the chaos, too: a
+    // one-sided run would mean the crashes serialized what is supposed to be
+    // a race, and this workload would prove nothing about it.
+    let boundary_fired = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'message-received' \
+         and element_id = 'paid_during_contest'",
+    )
+    .await;
+    let boundary_withdrawn = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'subscription-cancelled' \
+         and element_id = 'paid_during_contest'",
+    )
+    .await;
+    assert!(
+        boundary_fired > 0 && boundary_withdrawn > 0,
+        "the message-boundary race never went both ways ({boundary_fired} delivered, \
+         {boundary_withdrawn} withdrawn by a completion)"
+    );
+
+    // The non-interrupting boundary's own two sides, through the crashes: a
+    // note that landed on an open review, and a review decided without one.
+    // The second identity is the sharper of the two — one side token per
+    // delivered note — because a step that half-committed its spawn would
+    // leave the counts apart, and a killed backend is exactly what could do
+    // that.
+    let notes = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'message-received' \
+         and element_id = 'note_received'",
+    )
+    .await;
+    let quiet_cases = count(
+        &db.pool,
+        "select count(*) from rbpmn_instance i where i.definition_key = 'casefile' \
+           and i.status = 'completed' \
+           and exists (select 1 from rbpmn_event e where e.instance_id = i.id \
+                 and e.kind = 'subscription-cancelled' and e.element_id = 'note_received') \
+           and not exists (select 1 from rbpmn_event e where e.instance_id = i.id \
+                 and e.kind = 'message-received')",
+    )
+    .await;
+    assert!(
+        notes > 0 && quiet_cases > 0,
+        "the non-interrupting boundary never went both ways through chaos \
+         ({notes} notes landed, {quiet_cases} reviews decided without one)"
+    );
+    let side_paths = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'element-started' \
+         and element_id = 'file_note'",
+    )
+    .await;
+    assert_eq!(
+        side_paths, notes,
+        "one side token per delivered note, crashes included"
     );
 
     let statuses: Vec<(String, i64)> = sqlx::query(

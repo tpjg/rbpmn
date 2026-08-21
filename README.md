@@ -76,7 +76,9 @@ and what deviates.
 - [x] **Phase 4 — user tasks & the task API**: pull-mode `get_task` (FIFO
       default / LIFO opt-in, `SKIP LOCKED`, renewable leases — expired locks
       return without a reaper), `extend_lock` with the typed lock-lost
-      result, owner-checked `complete_task`/`fail_task`/`release_task` (the
+      result (carrying the item's state, so a frontend can tell *reassigned*
+      from *withdrawn by the process*), owner-checked
+      `complete_task`/`fail_task`/`release_task` (the
       third exit from a claim: hand it back undecided, claimable again at
       once instead of after the lease runs out — scoped to the claim's lease
       epoch, so a retried release cannot free the claim that replaced it),
@@ -85,7 +87,14 @@ and what deviates.
       `declare_index` (partial expression indexes, also declarable in the
       deploy manifest; index usage verified by test against the real query
       path). Server: `POST /v1/tasks/{get,count}` and
-      `/v1/tasks/{id}/{extend,release,complete,fail}`.
+      `/v1/tasks/{id}/{extend,release,complete,fail}`. A claim is not a
+      promise the process will wait: when the process withdraws a claimed
+      task — an interrupting boundary fired, the instance terminated — the
+      holder's `complete` answers `alreadyClosed` with `state: "cancelled"`
+      and **its patch is not applied**, so an application that wants the
+      holder's decision kept must keep it itself. Nothing is pushed to the
+      holder either: it learns at its next heartbeat, which makes the
+      renewal interval the detection bound.
 - [x] **Phase 5 — rounding out**: the event-stream tailing contract
       (`read_events` / `GET /v1/events`, ordered and cursored by
       `(txid, id)` behind a safe horizon so a cursor cannot miss an event),
@@ -160,6 +169,31 @@ and what deviates.
       validator deploy runs, in the browser, offline.
       [docs/dmn.md](docs/dmn.md) has the decisions, the gates and the
       measured deviations.
+- [x] Phase 10 — **boundary events beyond v1**, in slices. *Interrupting
+      message boundary events* on user, service and receive tasks and on
+      embedded subprocesses: a message correlated to an instance parked at a
+      task withdraws the task and takes the boundary path; a holder who had
+      the task claimed gets `alreadyClosed` with `state: "cancelled"` and its
+      patch is never applied, and `lockLost` now carries the item's state so a
+      frontend can tell *withdrawn by the process* from *reassigned*. Then
+      *non-interrupting* boundary events — message, and single-shot timers —
+      which start a sibling token while the host keeps running, under the new
+      rule `boundary-side-path` (a side path ends at its own end event and
+      never merges back: it would run the continuation twice, or deliver a
+      second token to a join). And repeating timers — `timeCycle` on a
+      non-interrupting boundary, `R[n]/P…` or anchored
+      `R[n]/<datetime>/P…` with a fixed-length period — where every
+      occurrence steps from the *previous due* (a late scheduler never drifts
+      the schedule), an occurrence missed while the engine was down is
+      skipped rather than replayed (an outage is not a backlog), and the
+      anchor fixes the phase rather than replaying the past; "every 7 days
+      while waiting for payment, add a late fee" is one boundary now, not a
+      loop.
+      [docs/design/boundary-messages.md](docs/design/boundary-messages.md)
+      is the record — including the two things building it found that the
+      design had not: a timer boundary on a business-rule task was a dead arm
+      lint accepted, and a re-arming boundary makes the explorer's state space
+      infinite without a bound.
 
 ## Rule catalogue
 
@@ -172,16 +206,19 @@ graphs that pass them).
 |---|---|---|
 | `no-inclusive-gateway` | error | Inclusive gateways rejected entirely; rewrite as parallel split + exclusive skip-bypass per branch. |
 | `no-call-activity` | error | Definitions are islands; interact via message throw → message start/catch with correlation keys. |
-| `no-unsupported-element` | error | Anything outside the supported subset (script/send/manual/abstract tasks, call activities, signals, cycles, multi-instance, …). |
+| `no-unsupported-element` | error | Anything outside the supported subset (script/send/manual/abstract tasks, call activities, signals, multi-instance, a `timeCycle` anywhere but on a non-interrupting boundary, …). |
 | `balanced-gateways` | error | Every parallel split has a matching join; branches stay disjoint; nothing enters/escapes the region; each branch delivers exactly one token; no plain end events inside (terminate allowed). |
 | `single-start-event` | error | Exactly one start event per process and per subprocess. |
 | `conditions-feel-subset` | error | Conditions only on exclusive-split flows, in the strict FEEL subset (`name op literal`, `and`/`or`, parentheses); default flow required. Full-FEEL constructs (functions, arithmetic, ranges) are rejected. |
-| `timer-iso8601` | error | Timer definitions must be valid ISO-8601 — dates require an explicit UTC offset, component magnitudes bounded — **or**, failing that, a FEEL qualified name naming the deadline in the variable document. Text that is neither is the error. Parse order is the only discriminator: `xsi:type="bpmn:tFormalExpression"` is deliberately ignored, because bpmn-moddle stamps it on every expression object and so every bpmn-js modeler writes it on ordinary literals. |
+| `timer-iso8601` | error | Timer definitions must be valid ISO-8601 — dates require an explicit UTC offset, component magnitudes bounded; a `timeCycle` is `R[n]/P…` or `R[n]/<datetime>/P…` with a fixed-length period (weeks, days, hours, minutes, seconds — never months or years; at least one minute, at most a million repeats), `R0` and the `/end` forms refused — **or**, failing that, a FEEL qualified name naming the deadline in the variable document. Text that is neither is the error. Parse order is the only discriminator: `xsi:type="bpmn:tFormalExpression"` is deliberately ignored, because bpmn-moddle stamps it on every expression object and so every bpmn-js modeler writes it on ordinary literals. |
 | `timer-expression`⁺ | warn | A timer whose deadline is read from the variable document cannot be validated ahead of time — if it does not resolve to a valid ISO-8601 value at arm time, that element raises an incident rather than firing. |
-| `message-has-correlation` | error | Message start/catch/throw must reference a *named* message. The correlation binding itself (a FEEL qualified name) is registered via `Bindings::correlation` and checked at deploy. |
+| `message-has-correlation` | error | Message start/catch/throw events, receive tasks and message **boundary** events must reference a *named* message. The correlation binding itself (a FEEL qualified name) is registered via `Bindings::correlation`, keyed by the element's own id — for a boundary, the boundary's id, never its host's — and checked at deploy. |
 | `no-foreign-implementation` | warn | Service task carries vendor attributes (`camunda:`, `zeebe:`, …), which rbpmn ignores — topics are bound at registration. |
 | `unresolved-topic` | error | Every service task's topic (via `Bindings::topic`, default: element id) must have a registered handler or a declared external-worker topic. Checked at deploy against registration state, so `lint(xml)` alone cannot decide it. |
-| `boundary-on-supported-host` | error | Boundary events only on service/user/receive tasks and subprocesses; error boundaries only where errors can originate. |
+| `boundary-on-supported-host` | error | Boundary events only on service/user/receive tasks and subprocesses; error boundaries only where errors can originate. Never on a business rule task: its decision is answered inside the transaction that starts it, so a boundary there is armed and cancelled in one step and can never fire. |
+| `boundary-side-path` ⁺ | error | A non-interrupting boundary spawns a *second* token beside its host's, and no block-structure proof covers it — it entered through no split. So its path must be a **side path**: disjoint from everything else in the scope, ending at its own plain end event (a terminate end is allowed too). It may not rejoin the flow after the host (the rest would run twice) or reach a parallel join (which would collect a second token on one incoming flow), and it may not carry a parallel block of its own: the boundary can fire again while an earlier side token is still inside it, and both activations run in the host's scope — wrap the block in an embedded subprocess, which gives each activation its own scope. For "remind, then wait again", use an interrupting boundary and a loop. |
+| `side-path-message-arm` ⁺ | warn | A message arm (catch, receive task, message boundary) on a side path is armed once per activation of its non-interrupting boundary, and an earlier activation's arm may still be open: unless each activation changes the correlation key (a delivery patch can), the second arm freezes the instance — `duplicate-subscription`, loud, at arm time. Including an arm inside an embedded subprocess on that path, at any depth: a subprocess gives each activation its own *scope*, which is what makes a parallel block there safe, but a subscription is keyed by (message, key) across the whole instance and a scope narrows it by nothing. |
+| `ambiguous-message-arm` ⁺ | error | Two message arms for the same message *and* the same correlation binding that can be live at once — two message boundaries on one host, a receive task and its own boundary, a subprocess boundary and a catch inside it, and a non-interrupting message boundary with an arm for the same pair on its own side path (it re-arms and spawns the side token in one step, so the *first* delivery freezes). Every delivery would be ambiguous, so deploy refuses it. Decided at L2 (`check_deployable`), because with different bindings both arms are legitimate and only the manifest knows. |
 | `no-implicit-split` | error | Activities have at most one outgoing flow; splitting happens at explicit gateways. |
 | `implicit-merge-after-parallel` | warn | Implicit merge receiving concurrent tokens — the "task runs twice" trap (accompanies the balanced-gateways error). |
 | `bpmn-structure` ⁺ | error | Well-formedness: resolvable refs, flow cardinalities, connectivity, unique ids, error definitions. |
@@ -233,9 +270,9 @@ server. Two syntaxes, one manifest, one validation path.
 | Wiring | Registration API | Deploy check |
 |---|---|---|
 | Service-task topic | `Bindings::topic(element_id, topic)`; default topic = element id. `declare_topic(name)` announces pull-mode workers, and is *environment* rather than manifest | `unresolved-topic` |
-| Message correlation | `Bindings::correlation(element_id, "order.id")` — FEEL qualified name into the instance variables | `message-has-correlation` |
+| Message correlation | `Bindings::correlation(element_id, "order.id")` — FEEL qualified name into the instance variables; a message boundary event is bound by its **own** id, not its host's | `message-has-correlation` |
 | Decision | `Bindings::decision(element_id, decision_name, "order.discount")` — which decision a business-rule task invokes, and where its answer lands | `decision-has-binding`, `unresolved-decision` |
-| Filterable fields | `Bindings::index(field)` — optional, performance only | — |
+| Filterable fields | `Bindings::index(field)` (this definition) or `Bindings::shared_index(field)` (across definitions) — optional, performance only | — |
 
 Per-definition wiring deploys **atomically with the definition** as a small
 JSON bindings manifest (`deploy(bpmn_xml, bindings)` in the library, one
@@ -243,6 +280,101 @@ JSON bindings manifest (`deploy(bpmn_xml, bindings)` in the library, one
 information other engines smear into vendor XML annotations, separated cleanly
 and reviewable in git next to the `.bpmn`. Environment capabilities (handler
 targets, `declare_topic`) are engine/server configuration, not manifest content.
+
+### Declared indexes have a scope
+
+`Bindings::index(field)` builds a partial expression index over one
+definition's instances, predicated on its `definition_key`. That is exactly
+what the engine's own `TaskFilter` needs — it always carries a definition key,
+and the literal is what lets the planner prove the predicate — and it keeps
+the index as small as the definition it serves.
+
+`Bindings::shared_index(field)` builds **one** index per field, across every
+definition that declares it, for the other query real applications have:
+resolving a business identifier — an order number, a customer reference, an
+external case id — to whichever instance carries it, without knowing which
+workflow or which deployment that is. Postgres can prove a partial index's
+predicate only from an equality against a constant, so `definition_key =
+any($1)` cannot use the definition-scoped indexes at all; measured, it plans
+as a bitmap scan on the definition-key index with the hoisted field demoted to
+a recheck filter. The recourse without a scope is to unroll one
+`definition_key = $n` branch per key — tolerable at three definitions,
+untenable at a hundred, and a hundred catalogue entries over one identical
+expression.
+
+A shared index is partial on `(variables->>'field') is not null`, which costs
+nothing and saves a lot: an equality against the expression is strict and so
+implies `is not null`, keeping the index usable, while instances of
+definitions that never carry the field stay out of it entirely.
+
+**What rbpmn cannot check.** A shared declaration asserts that the field name
+means the *same thing* in every definition that declares it. `variables` is
+opaque to the engine by design; nothing here verifies that, and nothing can.
+It is the application's contract, and declaring `shared` is the application
+asserting it. Where one definition declares a field `shared` and another
+declares it `definition`-scoped, deploy logs a warning — not an error, because
+two indexes over one expression is a legitimate choice (a `TaskFilter` served
+only by a shared index degrades to a `BitmapAnd`), and not a diagnostic,
+because it is an operator fact about other deployed definitions that no
+offline surface can see.
+
+Both spellings live in the manifest, and the string form is unchanged:
+
+```json
+{ "indexes": ["channel", { "field": "order_no", "scope": "shared" }] }
+```
+
+An unknown scope is refused at deploy, naming the valid ones — never
+defaulted. So is one manifest declaring the same field at both scopes.
+
+**Nothing ever drops a declared index**, of either scope: not
+`delete_definition`, not retention, and not removing the field from a
+manifest. That is deliberate — a shared index belongs to no single definition,
+so one going away says nothing about whether another still needs it, and
+reference counting would race a concurrent deploy. `Engine::declared_indexes()`
+is the read-only audit that makes leftovers visible (an entry with an empty
+`declared_by` is an orphan, safe to drop by hand); `declared_index_name` and
+`shared_index_name` locate them.
+
+**Migration.** Existing deployments are untouched: their per-definition
+indexes keep their names, their DDL and their content hashes, so a redeploy
+does not even allocate a new version. Adopting `shared` is a manifest edit and
+a redeploy. The old index is not removed — if the definition still declares
+the field definition-scoped, it still has it.
+
+### Reading instances: the published view
+
+Applications legitimately need to *join* rbpmn's instances against their own
+rows — a result set of "our tenancy, our ordering, rbpmn's instances" is a SQL
+join, and no API returning data instead of SQL does it as well. So rbpmn
+publishes `rbpmn_v_instance` as **public API**, on the same footing as rule ids
+and the `Display` format of `Event`:
+
+| column | |
+|---|---|
+| `id` | instance id |
+| `definition_key`, `definition_version` | the stable coordinates; instances pin a version |
+| `business_key` | as passed to `start` — nullable, non-unique, unindexed |
+| `status` | `active` / `completed` / `terminated` / `failed` |
+| `variables` | the whole live variable document |
+| `created_at`, `completed_at` | |
+
+Columns may be added; none will be removed or repurposed. The view is
+deliberately a **plain inlinable projection** — one table, no `WHERE`, no
+volatile function, and explicitly not `security_barrier` — so predicates push
+below it and declared variable indexes still apply. (A barrier view would not
+push `variables->>'f' = $1` down, because `jsonb ->>` is not leakproof, and
+every declared index would sit unused beneath a full scan. There is an
+EXPLAIN-based test asserting the plan through the view, not just its shape.)
+
+For the simple case there is `Engine::find_by_shared_index(field, value,
+limit)`, which writes the query for you and is index-backed by construction —
+it refuses outright rather than sequential-scanning when no shared index for
+the field exists. It is **not a search primitive**: the limit is applied by the
+database before the caller sees anything, so an application that then filters
+the result by tenant or permission is filtering an already-truncated page.
+Those queries belong in SQL against the view, where the application's own
+predicate and the limit compose in the right order.
 
 Conditions inside the XML are pure FEEL (a strict subset), so they carry no
 rbpmn-specific syntax either. Null follows FEEL exactly: `x = null` is the

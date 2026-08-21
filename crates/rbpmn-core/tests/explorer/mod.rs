@@ -25,6 +25,23 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 /// Backstop against an un-bounded exploration; no real model comes close.
 pub const MAX_STATES: usize = 200_000;
 
+/// How many tokens one non-interrupting boundary's side path may hold before
+/// the exploration stops offering that boundary's arm.
+///
+/// A non-interrupting message boundary **re-arms** on every delivery, so one
+/// host can spawn side tokens without limit and the reachable state space is
+/// genuinely infinite — the same way an unbounded loop's is. It is bounded
+/// here, at the stimulus, exactly as `patch_alphabet` bounds the variable
+/// document: without a finite alphabet there is nothing to be exhaustive
+/// *over*. Two was what the invariants needed — a second sibling in one
+/// scope, at the same element as the first and at a different one — and two
+/// was also what hid a real hazard: a parallel block directly on a side path
+/// holds two tokens per *activation*, so with the bound at two the second
+/// activation that trips its join was never offered, and the mutation table
+/// would have called the shape clean. Four is two activations of a two-wide
+/// block; `reject/side-path-parallel-block` is the row that needs it.
+pub const MAX_SIDE_TOKENS: usize = 4;
+
 // ---------------------------------------------------------------- invariants
 
 /// The invariant set of docs/stress-testing.md §1, in the subset expressible
@@ -79,9 +96,13 @@ pub fn check(proc: &ExecutableProcess, s: &InstanceState) -> Result<(), String> 
                 Some(_) => return Err(format!("scope {sc:?} disagrees with token {id:?}")),
                 None => return Err(format!("token {id:?} references missing scope {sc:?}")),
             },
+            // The element check is not redundant with the token one: a
+            // receive task with a message boundary carries *two*
+            // subscriptions on one token (the host's and the boundary's),
+            // and only the host's is the one this token waits behind.
             WaitKind::Message(si) => match s.subscriptions().find(|(i, _)| *i == *si) {
-                Some((_, sub)) if sub.token == id => {}
-                Some(_) => return Err(format!("subscription {si:?} points at another token")),
+                Some((_, sub)) if sub.token == id && sub.element == t.node => {}
+                Some(_) => return Err(format!("subscription {si:?} disagrees with token {id:?}")),
                 None => {
                     return Err(format!(
                         "token {id:?} references missing subscription {si:?}"
@@ -101,14 +122,21 @@ pub fn check(proc: &ExecutableProcess, s: &InstanceState) -> Result<(), String> 
     }
 
     // Join arity — the local-counting precondition, stated as a property of
-    // the state rather than as a transition guard.
-    let mut per_join: BTreeMap<NodeIx, Vec<FlowIx>> = BTreeMap::new();
+    // the state rather than as a transition guard. Per *scope instance*, as
+    // the core counts: two activations of a subprocess on a side path each
+    // park a token at the same join in their own scope, and that is the legal
+    // shape (`accept/38`), not the hazard — the hazard is two tokens on one
+    // flow in *one* scope (`reject/side-path-parallel-block`).
+    let mut per_join: BTreeMap<(NodeIx, rbpmn_core::ScopeId), Vec<FlowIx>> = BTreeMap::new();
     for (_, t) in s.tokens() {
         if let WaitKind::Join { arrived_via } = &t.wait {
-            per_join.entry(t.node).or_default().push(*arrived_via);
+            per_join
+                .entry((t.node, t.scope))
+                .or_default()
+                .push(*arrived_via);
         }
     }
-    for (node, mut flows) in per_join {
+    for ((node, _scope), mut flows) in per_join {
         let incoming = proc.node(node).incoming.len();
         if flows.len() > incoming {
             return Err(format!(
@@ -269,7 +297,10 @@ pub fn reachable_conditions(proc: &ExecutableProcess, codes: &[String]) -> Vec<E
             }
             queue.push_back(proc.flow(f).target);
         }
-        for &b in proc.timer_boundaries(n) {
+        // Boundaries carry no incoming flow, so the flow walk alone never
+        // reaches one — and the conditions on a boundary path would drop out
+        // of the alphabet. Timer and message boundaries alike.
+        for &b in proc.boundaries(n) {
             queue.push_back(b);
         }
         for code in codes {
@@ -321,8 +352,42 @@ pub fn patch_alphabet(proc: &ExecutableProcess, codes: &[String]) -> Vec<Value> 
     out
 }
 
+/// The nodes reachable from `boundary` over sequence flows: the side path a
+/// non-interrupting boundary spawns tokens onto.
+fn side_path(proc: &ExecutableProcess, boundary: NodeIx) -> HashSet<NodeIx> {
+    let mut seen = HashSet::from([boundary]);
+    let mut queue = vec![boundary];
+    while let Some(n) = queue.pop() {
+        for &f in &proc.node(n).outgoing {
+            let target = proc.flow(f).target;
+            if seen.insert(target) {
+                queue.push(target);
+            }
+        }
+    }
+    seen
+}
+
+/// Has this arm's side path already collected [`MAX_SIDE_TOKENS`] tokens?
+///
+/// False for everything that is not a non-interrupting boundary — every
+/// catch, every interrupting boundary — so only the models that make the walk
+/// necessary pay for it.
+fn side_path_saturated(proc: &ExecutableProcess, s: &InstanceState, element: NodeIx) -> bool {
+    if proc.node(element).kind.boundary_interrupts() {
+        return false;
+    }
+    let path = side_path(proc, element);
+    s.tokens().filter(|(_, t)| path.contains(&t.node)).count() >= MAX_SIDE_TOKENS
+}
+
 /// Every command the outside world could issue against this state.
-pub fn stimuli(s: &InstanceState, patches: &[Value], codes: &[Option<String>]) -> Vec<Command> {
+pub fn stimuli(
+    proc: &ExecutableProcess,
+    s: &InstanceState,
+    patches: &[Value],
+    codes: &[Option<String>],
+) -> Vec<Command> {
     let mut out = Vec::new();
     for (id, _) in s.open_work_items() {
         for p in patches {
@@ -338,10 +403,16 @@ pub fn stimuli(s: &InstanceState, patches: &[Value], codes: &[Option<String>]) -
             });
         }
     }
-    for (id, _) in s.timers() {
+    for (id, timer) in s.timers() {
+        if side_path_saturated(proc, s, timer.element) {
+            continue;
+        }
         out.push(Command::FireTimer { id });
     }
-    for (id, _) in s.subscriptions() {
+    for (id, sub) in s.subscriptions() {
+        if side_path_saturated(proc, s, sub.element) {
+            continue;
+        }
         for p in patches {
             out.push(Command::DeliverMessage {
                 id,
@@ -412,7 +483,7 @@ pub fn explore(proc: &ExecutableProcess, initial: Value, codes: &[String]) -> Re
             r.terminals += 1;
             continue;
         }
-        for cmd in stimuli(&s, &patches, &codes_opt) {
+        for cmd in stimuli(proc, &s, &patches, &codes_opt) {
             let mut next = s.clone();
             match step(proc, &mut next, cmd.clone()) {
                 Ok(_) => {}

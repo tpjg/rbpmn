@@ -1,0 +1,78 @@
+{
+  "fixture": "accept/33-non-interrupting-message-boundary.bpmn",
+  "bindings": {
+    "correlations": {
+      "note_received": "case.id"
+    }
+  },
+  "variables": {
+    "case": {
+      "id": "c-33"
+    }
+  },
+  "actions": [
+    {
+      "deliver": "note_received"
+    },
+    {
+      "deliver": "note_received"
+    },
+    {
+      "complete": "review"
+    },
+    {
+      "complete": "file_note"
+    },
+    {
+      "complete": "file_note"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {
+      "case": {
+        "id": "c-33"
+      }
+    },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started review",
+      "work-item-created review user review",
+      "message-subscribed note_received NOTE c-33",
+      "message-received note_received NOTE",
+      "message-subscribed note_received NOTE c-33",
+      "element-started note_received",
+      "element-completed note_received",
+      "flow-taken f3",
+      "element-started file_note",
+      "work-item-created file_note service file_note",
+      "message-received note_received NOTE",
+      "message-subscribed note_received NOTE c-33",
+      "element-started note_received",
+      "element-completed note_received",
+      "flow-taken f3",
+      "element-started file_note",
+      "work-item-created file_note service file_note",
+      "work-item-completed review",
+      "subscription-cancelled note_received NOTE",
+      "element-completed review",
+      "flow-taken f2",
+      "element-started reviewed",
+      "element-completed reviewed",
+      "work-item-completed file_note",
+      "element-completed file_note",
+      "flow-taken f4",
+      "element-started note_filed",
+      "element-completed note_filed",
+      "work-item-completed file_note",
+      "element-completed file_note",
+      "flow-taken f4",
+      "element-started note_filed",
+      "element-completed note_filed",
+      "instance-completed"
+    ]
+  }
+}

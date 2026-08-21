@@ -1,0 +1,44 @@
+{
+  "fixture": "accept/36-side-token-reaped.bpmn",
+  "actions": [
+    {
+      "fire": "nudge"
+    },
+    {
+      "fire": "deadline"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started sp",
+      "timer-armed deadline P2D",
+      "element-started s2",
+      "element-completed s2",
+      "flow-taken fi1",
+      "element-started assess",
+      "work-item-created assess user assess",
+      "timer-armed nudge PT1H",
+      "timer-fired nudge",
+      "element-started nudge",
+      "element-completed nudge",
+      "flow-taken fi3",
+      "element-started chase",
+      "work-item-created chase user chase",
+      "timer-fired deadline",
+      "work-item-cancelled assess",
+      "work-item-cancelled chase",
+      "element-started deadline",
+      "element-completed deadline",
+      "flow-taken f3",
+      "element-started expired",
+      "element-completed expired",
+      "instance-completed"
+    ]
+  }
+}

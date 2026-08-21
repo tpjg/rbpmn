@@ -33,14 +33,174 @@ pub struct Bindings {
     /// Variables fields the application filters/counts tasks by — the
     /// engine creates a partial expression index per entry at deploy
     /// (`declare_index`). Entirely optional performance declarations.
+    ///
+    /// Two spellings, one meaning: a bare string is the definition-scoped
+    /// default (`"channel"`), an object names a scope
+    /// (`{"field": "order_no", "scope": "shared"}`). See [`IndexScope`] for
+    /// what a shared declaration asserts — it is a promise the engine cannot
+    /// check.
     #[serde(default)]
-    pub indexes: std::collections::BTreeSet<String>,
+    pub indexes: std::collections::BTreeSet<IndexDeclaration>,
     /// Business-rule task -> the decision it invokes. This is the spot where
     /// every other engine writes `camunda:decisionRef` into the XML; here it
     /// is manifest data, versioned with the definition and reviewable in git
     /// next to it (`docs/dmn.md`, D5).
     #[serde(default)]
     pub decisions: BTreeMap<String, DecisionBinding>,
+}
+
+/// What a declared index covers — the difference between
+/// [`Bindings::index`] and [`Bindings::shared_index`].
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexScope {
+    /// One index per (definition key, field), partial on `definition_key`.
+    /// The default, and the shape a `TaskFilter`'s literal definition key
+    /// lets the planner prove — which keeps the index as small as the one
+    /// definition it serves.
+    #[default]
+    Definition,
+    /// One index per field, shared by every definition that declares it.
+    ///
+    /// For the lookup that spans definitions: a business identifier the
+    /// application hoists into `variables` with the same meaning everywhere
+    /// — an order number, a customer reference, an external case id — that a
+    /// user quotes and the application must resolve to whichever instance
+    /// carries it, without knowing which workflow or which deployment that
+    /// is. Postgres can prove a partial index's predicate only from an
+    /// equality against a constant, so `definition_key = any($1)` cannot use
+    /// the definition-scoped indexes at all: it plans as a bitmap scan on the
+    /// definition-key index with the hoisted field demoted to a recheck
+    /// filter.
+    ///
+    /// **What the engine cannot check.** A shared declaration asserts that
+    /// the field name means the *same thing* in every definition that
+    /// declares it. `variables` is opaque to rbpmn by design — nothing here
+    /// verifies that, and nothing can. It is the application's contract, and
+    /// declaring `shared` is the application asserting it.
+    Shared,
+}
+
+/// One entry of [`Bindings::indexes`]: a variables field, and the scope of
+/// the index that serves it.
+///
+/// Ordered by field first, so a manifest of definition-scoped entries keeps
+/// the plain lexicographic order it has always had.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IndexDeclaration {
+    pub field: String,
+    pub scope: IndexScope,
+}
+
+impl IndexScope {
+    /// The manifest spelling — what diagnostics and log lines name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IndexScope::Definition => "definition",
+            IndexScope::Shared => "shared",
+        }
+    }
+}
+
+impl IndexDeclaration {
+    pub fn definition(field: impl Into<String>) -> Self {
+        IndexDeclaration {
+            field: field.into(),
+            scope: IndexScope::Definition,
+        }
+    }
+
+    pub fn shared(field: impl Into<String>) -> Self {
+        IndexDeclaration {
+            field: field.into(),
+            scope: IndexScope::Shared,
+        }
+    }
+}
+
+/// A definition-scoped entry serializes as the bare string it has always
+/// been — that is not cosmetic. `deploy` hashes the serialized manifest into
+/// `content_hash`, so widening every existing entry to an object would
+/// allocate a new definition version for wiring that did not change. It also
+/// normalizes: `{"field": "f", "scope": "definition"}` and `"f"` are the same
+/// wiring and hash the same.
+impl Serialize for IndexDeclaration {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        match self.scope {
+            IndexScope::Definition => serializer.serialize_str(&self.field),
+            IndexScope::Shared => {
+                let mut entry = serializer.serialize_struct("IndexDeclaration", 2)?;
+                entry.serialize_field("field", &self.field)?;
+                entry.serialize_field("scope", &self.scope)?;
+                entry.end()
+            }
+        }
+    }
+}
+
+/// Both spellings in, strictly: a bare string is definition-scoped, an object
+/// names its scope. An unknown scope or an unknown key is refused here rather
+/// than defaulted — a manifest that says something rbpmn does not understand
+/// must not deploy as something it does.
+impl<'de> Deserialize<'de> for IndexDeclaration {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DeclVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DeclVisitor {
+            type Value = IndexDeclaration;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a field name, or {\"field\": \"...\", \"scope\": \"definition\"|\"shared\"}",
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(self, field: &str) -> Result<Self::Value, E> {
+                Ok(IndexDeclaration::definition(field))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut field: Option<String> = None;
+                let mut scope: Option<IndexScope> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "field" => {
+                            if field.is_some() {
+                                return Err(serde::de::Error::duplicate_field("field"));
+                            }
+                            field = Some(map.next_value()?);
+                        }
+                        "scope" => {
+                            if scope.is_some() {
+                                return Err(serde::de::Error::duplicate_field("scope"));
+                            }
+                            // The derived enum's own error names the valid
+                            // scopes, which is exactly the message wanted.
+                            scope = Some(map.next_value()?);
+                        }
+                        other => {
+                            return Err(serde::de::Error::unknown_field(
+                                other,
+                                &["field", "scope"],
+                            ));
+                        }
+                    }
+                }
+                Ok(IndexDeclaration {
+                    field: field.ok_or_else(|| serde::de::Error::missing_field("field"))?,
+                    scope: scope.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_any(DeclVisitor)
+    }
 }
 
 /// Which decision a business-rule task invokes, and where its answer lands.
@@ -86,9 +246,27 @@ impl Bindings {
         self
     }
 
-    /// Declare a filterable variables field (optional, performance only).
+    /// Declare a filterable variables field, scoped to this definition
+    /// (optional, performance only).
     pub fn index(mut self, field: impl Into<String>) -> Self {
-        self.indexes.insert(field.into());
+        self.indexes.insert(IndexDeclaration {
+            field: field.into(),
+            scope: IndexScope::Definition,
+        });
+        self
+    }
+
+    /// Declare a filterable variables field **shared across definitions** —
+    /// one index serving every definition that declares the same field, for
+    /// the lookup that does not know which workflow carries the value.
+    ///
+    /// This asserts a contract the engine cannot verify; read
+    /// [`IndexScope::Shared`] before using it.
+    pub fn shared_index(mut self, field: impl Into<String>) -> Self {
+        self.indexes.insert(IndexDeclaration {
+            field: field.into(),
+            scope: IndexScope::Shared,
+        });
         self
     }
 
@@ -120,6 +298,12 @@ impl Bindings {
 pub enum TimerDue {
     Duration(String),
     Date(String),
+    /// A repeating cycle (`R[n]/P…`, `R[n]/<datetime>/P…`), only ever on a
+    /// non-interrupting boundary. The core keeps the text and the fire count
+    /// (`TimerState::remaining`); every instant — the first due, and each
+    /// re-arm as *previous due + period* — is the projection's, computed
+    /// from `rbpmn_model::iso8601::split_cycle`.
+    Cycle(String),
 }
 
 /// Which ISO-8601 shape a variable-sourced timer must resolve to.
@@ -128,6 +312,28 @@ pub enum TimerDue {
 pub enum TimerKind {
     Duration,
     Date,
+    Cycle,
+}
+
+impl TimerKind {
+    /// Is `text` a valid literal of this kind? The compiled-side counterpart
+    /// of `rbpmn_model::TimerSpec::literal_check`, over the same validators.
+    pub fn validate(self, text: &str) -> Result<(), String> {
+        match self {
+            TimerKind::Duration => rbpmn_model::iso8601::validate_duration(text),
+            TimerKind::Date => rbpmn_model::iso8601::validate_datetime(text),
+            TimerKind::Cycle => rbpmn_model::iso8601::validate_cycle(text),
+        }
+    }
+
+    /// The resolved form of a validated `text`.
+    pub fn due(self, text: &str) -> TimerDue {
+        match self {
+            TimerKind::Duration => TimerDue::Duration(text.to_string()),
+            TimerKind::Date => TimerDue::Date(text.to_string()),
+            TimerKind::Cycle => TimerDue::Cycle(text.to_string()),
+        }
+    }
 }
 
 /// A compiled timer spec: a literal validated at deploy, or a FEEL qualified
@@ -163,15 +369,8 @@ impl TimerSource {
                 describe(value)
             ));
         };
-        let checked = match kind {
-            TimerKind::Duration => rbpmn_model::iso8601::validate_duration(text),
-            TimerKind::Date => rbpmn_model::iso8601::validate_datetime(text),
-        };
-        match checked {
-            Ok(()) => Ok(match kind {
-                TimerKind::Duration => TimerDue::Duration(text.clone()),
-                TimerKind::Date => TimerDue::Date(text.clone()),
-            }),
+        match kind.validate(text) {
+            Ok(()) => Ok(kind.due(text)),
             Err(why) => Err(format!("'{name}' is \"{text}\", which is not valid: {why}")),
         }
     }
@@ -200,7 +399,7 @@ fn describe(value: &serde_json::Value) -> &'static str {
 impl std::fmt::Display for TimerDue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TimerDue::Duration(s) | TimerDue::Date(s) => write!(f, "{s}"),
+            TimerDue::Duration(s) | TimerDue::Date(s) | TimerDue::Cycle(s) => write!(f, "{s}"),
         }
     }
 }
@@ -266,10 +465,20 @@ pub enum ExecKind {
         message: String,
         key: Vec<String>,
     },
-    /// Interrupting timer boundary: armed on the host's token, entered only
-    /// by its timer firing — never via a sequence flow.
+    /// Timer boundary: armed on the host's token, entered only by its timer
+    /// firing — never via a sequence flow.
     TimerBoundary {
         due: TimerSource,
+        interrupting: bool,
+    },
+    /// Message boundary: a subscription armed on the *host's* token, entered
+    /// only by its own delivery — never via a sequence flow. `key` is the
+    /// parsed correlation qualified name bound to the **boundary's** element
+    /// id, never the host's.
+    MessageBoundary {
+        message: String,
+        key: Vec<String>,
+        interrupting: bool,
     },
     /// Parks its token and arms every target catch event; the first to fire
     /// wins and the rest are cancelled.
@@ -280,6 +489,41 @@ pub enum ExecKind {
     SubProcess {
         scope: ScopeIx,
     },
+}
+
+impl ExecKind {
+    /// What this node subscribes with, if anything: `(message, correlation
+    /// key)` for a message catch, a receive task **or** a message boundary.
+    ///
+    /// The one definition of "this is a message arm". `subscribe` is the
+    /// single arming chokepoint for all three and `ambiguous-message-arm`
+    /// reasons about exactly the same set, so a second `match` is a second
+    /// place for the two to disagree about what an arm is.
+    pub fn message_arm(&self) -> Option<(&str, &[String])> {
+        match self {
+            ExecKind::MessageCatch { message, key }
+            | ExecKind::MessageBoundary { message, key, .. } => {
+                Some((message.as_str(), key.as_slice()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Does triggering this boundary cancel its host?
+    ///
+    /// `cancelActivity` for a timer or a message boundary, straight from the
+    /// model. An error boundary is always interrupting — the activity that
+    /// raised the error has already ended — and lint refuses the XML that
+    /// says otherwise. Anything else answers `true` because nothing else is
+    /// ever asked: the callers are the two arm paths in `step`, which reach
+    /// this only for a boundary that just fired.
+    pub fn boundary_interrupts(&self) -> bool {
+        match self {
+            ExecKind::TimerBoundary { interrupting, .. }
+            | ExecKind::MessageBoundary { interrupting, .. } => *interrupting,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -306,14 +550,58 @@ pub struct ExecutableProcess {
     ids: BTreeMap<String, NodeIx>,
     /// host node -> (error code, boundary node)
     error_boundaries: BTreeMap<NodeIx, Vec<(String, NodeIx)>>,
-    /// host node -> its interrupting timer boundary nodes, armed on the
-    /// host's token whenever the host starts waiting.
-    timer_boundaries: BTreeMap<NodeIx, Vec<NodeIx>>,
+    /// host node -> the boundary nodes armed on the host's token whenever it
+    /// starts waiting — timer *and* message, in **XML declaration order**.
+    /// One list rather than one per kind because arming allocates timer and
+    /// subscription ids and the golden traces pin them: two lists would make
+    /// the trace depend on which kind the code happened to walk first.
+    /// `error_boundaries` stays separate — it is matched by code, never armed.
+    boundaries: BTreeMap<NodeIx, Vec<NodeIx>>,
     /// Each static scope's start event; index 0 is the process root. The
     /// rest of the scope tree (parents, owners) is only needed while
     /// compiling, so it does not survive into the runtime model.
     scope_starts: Vec<NodeIx>,
     start: NodeIx,
+}
+
+/// One `ambiguous-message-arm` group: the arms that catch `message` under
+/// `binding` and are live over the same span, in declaration order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousArms {
+    pub elements: Vec<String>,
+    pub message: String,
+    pub binding: String,
+}
+
+impl AmbiguousArms {
+    /// One group as a phrase, for the log line a deploy failure leaves
+    /// behind; [`crate::check`] renders the same group as a diagnostic per
+    /// element for an editor to highlight.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} catch '{}' correlated by '{}'",
+            and_list(&self.elements),
+            self.message,
+            self.binding
+        )
+    }
+}
+
+/// `'a' and 'b'`, `'a', 'b' and 'c'` — quoted, and readable at any length.
+/// Shared with [`crate::check`] so a group reads the same in the error and
+/// in the diagnostic.
+pub(crate) fn and_list(elements: &[String]) -> String {
+    match elements {
+        [] => String::new(),
+        [only] => format!("'{only}'"),
+        [rest @ .., last] => format!(
+            "{} and '{last}'",
+            rest.iter()
+                .map(|e| format!("'{e}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -339,6 +627,22 @@ pub enum CompileError {
     MissingCorrelation(Vec<String>),
     #[error("correlation binding on '{element}': {reason}")]
     InvalidCorrelation { element: String, reason: String },
+    /// `ambiguous-message-arm`: arms for the same message *and* the same
+    /// correlation binding that are live at the same time. The runtime rule
+    /// (a second open `(message, key)` freezes the instance) stays the
+    /// backstop; these shapes are certain the moment the manifest is known,
+    /// and a certain freeze belongs at deploy rather than in an incident.
+    ///
+    /// **Every** group, not the first: a model with two ambiguous hosts is
+    /// two things to fix, and a modeller who only hears about one fixes it
+    /// and gets refused again — the same reason `MissingCorrelation` carries
+    /// every element.
+    #[error(
+        "message arms that are live at the same time, so every delivery would be \
+         ambiguous: {}",
+        .0.iter().map(AmbiguousArms::describe).collect::<Vec<_>>().join("; ")
+    )]
+    AmbiguousMessageArm(Vec<AmbiguousArms>),
     /// `decision-has-binding`: a business-rule task says *that* a decision
     /// happens, never which — that is manifest data, exactly like a topic.
     /// Unlike a topic there is no sensible default: guessing a decision by
@@ -461,25 +765,40 @@ impl ExecutableProcess {
                         ))
                     })
             };
-            match spec {
-                TimerSpec::Duration(s) => {
-                    if rbpmn_model::iso8601::validate_duration(s).is_ok() {
-                        Ok(TimerSource::Literal(TimerDue::Duration(s.clone())))
-                    } else {
-                        from_variable(TimerKind::Duration, s)
-                    }
+            let kind = match spec {
+                TimerSpec::Duration(_) => TimerKind::Duration,
+                TimerSpec::Date(_) => TimerKind::Date,
+                // The one place a cycle is admitted, asking the same
+                // predicate lint accepted the element with: everywhere else
+                // the first occurrence ends the wait, so a cycle that got
+                // this far is a linter that stopped agreeing with the model.
+                // Guarding here rather than at each call site is the point —
+                // every armed timer resolves through `timer_due`, so there is
+                // exactly one place to keep in step.
+                TimerSpec::Cycle(_) if !node.kind.executes_cycle() => {
+                    return Err(CompileError::Internal(format!(
+                        "timer '{}' with a cycle where it cannot repeat survived lint",
+                        node.id
+                    )));
                 }
-                TimerSpec::Date(s) => {
-                    if rbpmn_model::iso8601::validate_datetime(s).is_ok() {
-                        Ok(TimerSource::Literal(TimerDue::Date(s.clone())))
-                    } else {
-                        from_variable(TimerKind::Date, s)
-                    }
+                TimerSpec::Cycle(_) => TimerKind::Cycle,
+                TimerSpec::Missing => {
+                    return Err(CompileError::Internal(format!(
+                        "timer '{}' with a missing definition survived lint",
+                        node.id
+                    )));
                 }
-                TimerSpec::Cycle(_) | TimerSpec::Missing => Err(CompileError::Internal(format!(
-                    "timer '{}' with a cycle/missing definition survived lint",
-                    node.id
-                ))),
+            };
+            // Literal first, by the same table lint consulted to accept this
+            // element — so the two cannot disagree about what is a literal
+            // and what is a variable name.
+            let (_, text, literal) = spec
+                .literal_check()
+                .expect("a missing definition returned above");
+            if literal.is_ok() {
+                Ok(TimerSource::Literal(kind.due(text)))
+            } else {
+                from_variable(kind, text)
             }
         };
 
@@ -590,34 +909,50 @@ impl ExecutableProcess {
                         node.id
                     )));
                 }
-                NodeKind::Boundary(b) => match &b.trigger {
-                    BoundaryTrigger::Error { error_ref } => {
-                        let code = error_ref
-                            .as_deref()
-                            .and_then(|r| defs.errors.iter().find(|e| e.id == r))
-                            .and_then(|e| e.code.clone())
-                            .ok_or_else(|| {
-                                CompileError::Internal(format!(
-                                    "error boundary '{}' without a coded error survived lint",
-                                    node.id
-                                ))
-                            })?;
-                        boundary_hosts.push((ix, b.attached_to.clone().unwrap_or_default()));
-                        ExecKind::ErrorBoundary { code }
-                    }
-                    BoundaryTrigger::Timer(spec) => {
-                        boundary_hosts.push((ix, b.attached_to.clone().unwrap_or_default()));
-                        ExecKind::TimerBoundary {
+                NodeKind::Boundary(b) => {
+                    // Recorded once, before the trigger says which kind of
+                    // arm this is: every boundary has a host, and the host
+                    // pass below is the one place that validates it.
+                    boundary_hosts.push((ix, b.attached_to.clone().unwrap_or_default()));
+                    match &b.trigger {
+                        BoundaryTrigger::Error { error_ref } => {
+                            let code = error_ref
+                                .as_deref()
+                                .and_then(|r| defs.errors.iter().find(|e| e.id == r))
+                                .and_then(|e| e.code.clone())
+                                .ok_or_else(|| {
+                                    CompileError::Internal(format!(
+                                        "error boundary '{}' without a coded error survived lint",
+                                        node.id
+                                    ))
+                                })?;
+                            ExecKind::ErrorBoundary { code }
+                        }
+                        // `cancelActivity` for both kinds, and lint is what
+                        // makes reading it safe: only a timer or a message
+                        // boundary may be non-interrupting, an error boundary
+                        // never is. Whether *this* timer may repeat is
+                        // `timer_due`'s single guard, not a second one here.
+                        BoundaryTrigger::Timer(spec) => ExecKind::TimerBoundary {
                             due: timer_due(node, spec)?,
+                            interrupting: b.cancel_activity,
+                        },
+                        // The correlation binding is the *boundary's* own element
+                        // id, exactly as a catch's is its own: the XML says which
+                        // message is caught here, the manifest says by which key.
+                        BoundaryTrigger::Message(message_ref) => ExecKind::MessageBoundary {
+                            message: message_name(node, message_ref)?,
+                            key: correlation(node)?,
+                            interrupting: b.cancel_activity,
+                        },
+                        _ => {
+                            return Err(CompileError::Internal(format!(
+                                "unsupported boundary trigger on '{}' survived lint",
+                                node.id
+                            )));
                         }
                     }
-                    _ => {
-                        return Err(CompileError::Internal(format!(
-                            "unsupported boundary trigger on '{}' survived lint",
-                            node.id
-                        )));
-                    }
-                },
+                }
                 NodeKind::SubProcess(_) => ExecKind::SubProcess {
                     scope: child_scope[&ix],
                 },
@@ -688,7 +1023,7 @@ impl ExecutableProcess {
         }
 
         let mut error_boundaries: BTreeMap<NodeIx, Vec<(String, NodeIx)>> = BTreeMap::new();
-        let mut timer_boundaries: BTreeMap<NodeIx, Vec<NodeIx>> = BTreeMap::new();
+        let mut boundaries: BTreeMap<NodeIx, Vec<NodeIx>> = BTreeMap::new();
         for (boundary_ix, host_id) in boundary_hosts {
             let host = *node_ix.get(host_id.as_str()).ok_or_else(|| {
                 CompileError::Internal(format!("boundary host '{host_id}' missing"))
@@ -716,25 +1051,42 @@ impl ExecutableProcess {
                         .or_default()
                         .push((code.clone(), boundary_ix));
                 }
-                ExecKind::TimerBoundary { .. } => {
-                    // Timer boundaries arm on any waiting host token: tasks
-                    // (work items), receive tasks (subscriptions), and
-                    // subprocesses (the whole scope).
-                    if !matches!(
-                        nodes[host].kind,
-                        ExecKind::Task { .. }
-                            | ExecKind::MessageCatch { .. }
-                            | ExecKind::SubProcess { .. }
-                    ) {
+                // Timer and message boundaries arm on any waiting host token:
+                // tasks (work items), receive tasks (subscriptions), and
+                // subprocesses (the whole scope). Never a business-rule task
+                // — its token is answered inside the transaction that parked
+                // it, so the arm could only ever be created and withdrawn in
+                // one step (lint refuses it; this is the "survived lint"
+                // guard behind that).
+                //
+                // Asked of the **model** kind, which is the kind lint judged:
+                // a second allowlist over `ExecKind` is a second answer to
+                // one question, and this one had already drifted (an
+                // intermediate message catch and a receive task are both
+                // `MessageCatch`, so it accepted a host lint refuses).
+                // `nodes` and `flat` share indices here — the only `continue`
+                // in the node pass returned above with `MissingDecision`.
+                ExecKind::TimerBoundary { .. } | ExecKind::MessageBoundary { .. } => {
+                    if !flat[host].1.kind.is_supported_boundary_host() {
                         return Err(CompileError::Internal(format!(
-                            "timer boundary '{}' on unsupported host survived lint",
+                            "boundary '{}' on unsupported host survived lint",
                             nodes[boundary_ix].id
                         )));
                     }
-                    timer_boundaries.entry(host).or_default().push(boundary_ix);
+                    boundaries.entry(host).or_default().push(boundary_ix);
                 }
                 _ => unreachable!("boundary_hosts only collects boundary nodes"),
             }
+        }
+
+        // Node indices line up with `flat` here: the one `continue` in the
+        // node pass (a business-rule task without a binding) already returned
+        // above with `MissingDecision`.
+        let owning_scope: Vec<ScopeIx> = flat.iter().map(|(s, _)| *s).collect();
+        if let Some(e) =
+            ambiguous_message_arm(&nodes, &flows, &boundaries, &owning_scope, &child_scope)
+        {
+            return Err(e);
         }
 
         // Each scope has exactly one start event (`single-start-event`),
@@ -759,7 +1111,7 @@ impl ExecutableProcess {
             flows,
             ids,
             error_boundaries,
-            timer_boundaries,
+            boundaries,
             scope_starts,
             start,
         })
@@ -805,13 +1157,17 @@ impl ExecutableProcess {
         self.scope_starts.get(scope).copied()
     }
 
-    /// The interrupting timer boundaries armed whenever `host` starts
-    /// waiting (declaration order).
-    pub fn timer_boundaries(&self, host: NodeIx) -> &[NodeIx] {
-        self.timer_boundaries
-            .get(&host)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+    /// The boundaries armed whenever `host` starts waiting — timer and
+    /// message alike, in XML declaration order. Error boundaries are not
+    /// here: they are matched by code when the host fails, never armed.
+    pub fn boundaries(&self, host: NodeIx) -> &[NodeIx] {
+        self.boundaries.get(&host).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// What `node` subscribes with, if anything — see
+    /// [`ExecKind::message_arm`], which is where the answer lives.
+    pub fn message_arm(&self, node: NodeIx) -> Option<(&str, &[String])> {
+        self.nodes[node].kind.message_arm()
     }
 
     pub fn flow_by_id(&self, id: &str) -> Option<FlowIx> {
@@ -828,5 +1184,271 @@ impl ExecutableProcess {
             } => Some((n.id.as_str(), topic.as_str())),
             _ => None,
         })
+    }
+}
+
+/// `ambiguous-message-arm` (docs/design/boundary-messages.md §2.4).
+///
+/// Four shapes are certain the moment the manifest is known: two message
+/// boundaries on one host, a message boundary on a receive task catching the
+/// host's own message, a message boundary on a subprocess with a catch of
+/// the same message anywhere inside its body, and a **non-interrupting**
+/// message boundary whose own side path carries an arm for the same pair.
+/// Certain because those arms are live over exactly the same span — the
+/// host's wait — so *every* delivery would be ambiguous, not merely some
+/// interleaving of them. The runtime duplicate rule (a second open
+/// `(message, key)` freezes the instance) stays the backstop for everything
+/// else.
+///
+/// The side path is certain for a reason of its own, and it is the *first*
+/// delivery that freezes: a non-interrupting boundary re-arms itself and
+/// then spawns the side token **in the same step**, so the new arm is
+/// already open when the side token reaches the catch. The host is untouched
+/// and still parked, so its own arm and its other boundaries' arms are open
+/// too — which is why the side path joins the host's group rather than
+/// forming one of its own. `side-path-message-arm` warns about the *other*
+/// half of the same shape (an arm colliding with an earlier activation's,
+/// which only the manifest's key can rule out); this refuses the half that
+/// cannot come out any other way.
+///
+/// The same message with a **different** binding is accepted: the two resolve
+/// to different keys and both may legitimately be live. That is the whole
+/// reason this is an L2 rule and not a linter one — only the manifest knows,
+/// and the manifest is never in the XML.
+fn ambiguous_message_arm(
+    nodes: &[ExecNode],
+    flows: &[ExecFlow],
+    boundaries: &BTreeMap<NodeIx, Vec<NodeIx>>,
+    owning_scope: &[ScopeIx],
+    child_scope: &BTreeMap<NodeIx, ScopeIx>,
+) -> Option<CompileError> {
+    // scope -> the scope its owning subprocess sits in; the root has none.
+    let scope_count = child_scope.values().copied().max().map_or(1, |m| m + 1);
+    let mut parent_scope: Vec<Option<ScopeIx>> = vec![None; scope_count];
+    for (&owner, &child) in child_scope {
+        parent_scope[child] = Some(owning_scope[owner]);
+    }
+    let inside = |scope: ScopeIx, root: ScopeIx| -> bool {
+        let mut at = scope;
+        loop {
+            if at == root {
+                return true;
+            }
+            match parent_scope[at] {
+                Some(p) => at = p,
+                None => return false,
+            }
+        }
+    };
+    // Everything inside a subprocess's body, at any depth — the scope-parent
+    // chain, so one subprocess covers its whole subtree.
+    let body_of = |activity: NodeIx| -> Vec<NodeIx> {
+        child_scope.get(&activity).map_or_else(Vec::new, |&body| {
+            (0..nodes.len())
+                .filter(|&n| inside(owning_scope[n], body))
+                .collect()
+        })
+    };
+    // The forward closure from a non-interrupting boundary: its side path
+    // over sequence flows, the boundaries attached to activities on it, and
+    // the bodies of the subprocesses on it. The same set `boundary-side-path`
+    // reasons about in the linter, computed here over the compiled graph —
+    // and it must include the subprocess bodies, because "put it in a
+    // subprocess" is a repair that rule itself recommends.
+    let side_path = |seed: NodeIx| -> Vec<NodeIx> {
+        let mut seen = vec![false; nodes.len()];
+        let mut queue = vec![seed];
+        seen[seed] = true;
+        let mut reached = Vec::new();
+        while let Some(v) = queue.pop() {
+            reached.push(v);
+            let onward = nodes[v]
+                .outgoing
+                .iter()
+                .map(|&fi| flows[fi].target)
+                .chain(boundaries.get(&v).into_iter().flatten().copied())
+                .chain(body_of(v));
+            for w in onward {
+                if !seen[w] {
+                    seen[w] = true;
+                    queue.push(w);
+                }
+            }
+        }
+        reached
+    };
+    let mut found: Vec<AmbiguousArms> = Vec::new();
+    for (&host, attached) in boundaries {
+        let mut live: Vec<NodeIx> = attached
+            .iter()
+            .copied()
+            .filter(|&b| matches!(nodes[b].kind, ExecKind::MessageBoundary { .. }))
+            .collect();
+        if live.is_empty() {
+            continue;
+        }
+        // A receive task's own arm is live for exactly as long as its
+        // boundaries are — that is what makes host-vs-boundary certain.
+        if matches!(nodes[host].kind, ExecKind::MessageCatch { .. }) {
+            live.push(host);
+        }
+        // A subprocess boundary is armed before the body starts and withdrawn
+        // when it ends, so it overlaps every arm inside, at any depth.
+        live.extend(body_of(host));
+        // A non-interrupting message boundary re-arms and *then* spawns the
+        // side token, so its next arm is open while the side path runs beside
+        // the still-parked host: every arm on that path is live with the
+        // host's own.
+        let side_arms: Vec<NodeIx> = attached
+            .iter()
+            .copied()
+            .filter(|&b| {
+                matches!(
+                    nodes[b].kind,
+                    ExecKind::MessageBoundary {
+                        interrupting: false,
+                        ..
+                    }
+                )
+            })
+            .flat_map(&side_path)
+            .collect();
+        live.extend(side_arms);
+        live.sort_unstable();
+        live.dedup();
+
+        let mut groups: BTreeMap<(String, String), Vec<NodeIx>> = BTreeMap::new();
+        for n in live {
+            if let Some((message, key)) = nodes[n].kind.message_arm() {
+                groups
+                    .entry((message.to_string(), key.join(".")))
+                    .or_default()
+                    .push(n);
+            }
+        }
+        for ((message, binding), elements) in groups {
+            if elements.len() < 2 {
+                continue;
+            }
+            let group = AmbiguousArms {
+                elements: elements.iter().map(|&n| nodes[n].id.clone()).collect(),
+                message,
+                binding,
+            };
+            // Nested hosts can reach the same set twice (a subprocess
+            // boundary sees an inner receive task's own boundary, and so
+            // does that receive task): one group, reported once.
+            if !found.contains(&group) {
+                found.push(group);
+            }
+        }
+    }
+    (!found.is_empty()).then_some(CompileError::AmbiguousMessageArm(found))
+}
+
+#[cfg(test)]
+mod index_declaration_tests {
+    use super::*;
+
+    fn indexes(json: &str) -> Bindings {
+        serde_json::from_str(json).expect("manifest parses")
+    }
+
+    /// The back-compat contract, and the reason it is not cosmetic: `deploy`
+    /// hashes the serialized manifest into `content_hash`, so a manifest of
+    /// definition-scoped entries must serialize to the *same bytes* it always
+    /// has or every existing deployment allocates a new version on its next
+    /// redeploy.
+    #[test]
+    fn definition_scoped_manifests_serialize_byte_for_byte() {
+        let b = Bindings::new().index("channel").index("region");
+        assert_eq!(
+            serde_json::to_string(&b).unwrap(),
+            r#"{"topics":{},"correlations":{},"indexes":["channel","region"],"decisions":{}}"#
+        );
+    }
+
+    #[test]
+    fn a_bare_string_is_definition_scoped() {
+        let b = indexes(r#"{"indexes":["channel"]}"#);
+        assert_eq!(
+            b.indexes.iter().collect::<Vec<_>>(),
+            vec![&IndexDeclaration::definition("channel")]
+        );
+    }
+
+    /// The long spelling of the default normalizes to the short one, so the
+    /// same wiring hashes the same however it was written.
+    #[test]
+    fn the_explicit_definition_scope_normalizes_to_the_string_form() {
+        let long = indexes(r#"{"indexes":[{"field":"channel","scope":"definition"}]}"#);
+        let short = indexes(r#"{"indexes":["channel"]}"#);
+        assert_eq!(long, short);
+        assert_eq!(
+            serde_json::to_string(&long).unwrap(),
+            serde_json::to_string(&short).unwrap()
+        );
+    }
+
+    #[test]
+    fn shared_round_trips_as_an_object() {
+        let b = Bindings::new().shared_index("order_no");
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(
+            json.contains(r#""indexes":[{"field":"order_no","scope":"shared"}]"#),
+            "{json}"
+        );
+        assert_eq!(indexes(&json), b);
+    }
+
+    /// Both spellings of one field are two distinct declarations — the set
+    /// does not collapse them, and deploy refuses the contradiction (that
+    /// check lives in the engine, which is where the scopes turn into SQL).
+    #[test]
+    fn the_two_scopes_of_one_field_are_distinct_entries() {
+        let b = indexes(r#"{"indexes":["f",{"field":"f","scope":"shared"}]}"#);
+        assert_eq!(b.indexes.len(), 2);
+    }
+
+    #[test]
+    fn an_unknown_scope_is_refused_and_names_the_valid_ones() {
+        let e =
+            serde_json::from_str::<Bindings>(r#"{"indexes":[{"field":"f","scope":"sharded"}]}"#)
+                .unwrap_err()
+                .to_string();
+        assert!(e.contains("definition") && e.contains("shared"), "{e}");
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_object_form_is_refused() {
+        let e = serde_json::from_str::<Bindings>(r#"{"indexes":[{"field":"f","scoop":"shared"}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("scoop"), "{e}");
+    }
+
+    #[test]
+    fn the_object_form_requires_a_field() {
+        let e = serde_json::from_str::<Bindings>(r#"{"indexes":[{"scope":"shared"}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("field"), "{e}");
+    }
+
+    /// Field first, so a definition-only manifest keeps the plain
+    /// lexicographic order it has always had.
+    #[test]
+    fn entries_order_by_field() {
+        let b = Bindings::new()
+            .index("zulu")
+            .shared_index("alpha")
+            .index("mike");
+        assert_eq!(
+            b.indexes
+                .iter()
+                .map(|i| i.field.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "mike", "zulu"]
+        );
     }
 }

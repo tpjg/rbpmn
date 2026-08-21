@@ -1,0 +1,44 @@
+{
+  "fixture": "accept/34-non-interrupting-timer-boundary.bpmn",
+  "actions": [
+    {
+      "fire": "bt"
+    },
+    {
+      "complete": "ut"
+    },
+    {
+      "complete": "t_ping"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started ut",
+      "work-item-created ut user ut",
+      "timer-armed bt PT1H",
+      "timer-fired bt",
+      "element-started bt",
+      "element-completed bt",
+      "flow-taken f3",
+      "element-started t_ping",
+      "work-item-created t_ping user t_ping",
+      "work-item-completed ut",
+      "element-completed ut",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "work-item-completed t_ping",
+      "element-completed t_ping",
+      "flow-taken f4",
+      "element-started e2",
+      "element-completed e2",
+      "instance-completed"
+    ]
+  }
+}

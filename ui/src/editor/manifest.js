@@ -9,6 +9,35 @@
 // way out so a manifest with nothing in it is `{}` rather than three empty
 // containers.
 
+/// The scopes a declared index can carry. `definition` (the default) indexes
+/// one definition's instances; `shared` indexes the field across every
+/// definition that declares it — which asserts the field means the same thing
+/// in all of them, a contract nothing can check for you.
+export const INDEX_SCOPES = ['definition', 'shared'];
+
+/// Both manifest spellings in, one shape internally.
+export function normalizeIndex(entry) {
+  return typeof entry === 'string'
+    ? { field: entry, scope: 'definition' }
+    : { field: entry.field, scope: entry.scope ?? 'definition' };
+}
+
+/// The field box's compact syntax: `order_no:shared`, plain `channel` for the
+/// default. One line of text has to carry the scope somehow, and a suffix
+/// round-trips without a second widget.
+export function parseIndexField(text) {
+  const [field, scope] = text.split(':');
+  if (scope !== undefined && !INDEX_SCOPES.includes(scope)) {
+    throw new Error(`unknown index scope "${scope}" — expected ${INDEX_SCOPES.join(' or ')}`);
+  }
+  return { field: field.trim(), scope: scope ?? 'definition' };
+}
+
+export function formatIndexField(entry) {
+  const { field, scope } = normalizeIndex(entry);
+  return scope === 'definition' ? field : `${field}:${scope}`;
+}
+
 export function emptyManifest() {
   return { topics: {}, correlations: {}, indexes: [], decisions: {} };
 }
@@ -63,8 +92,30 @@ export function parseManifest(text) {
     }
   }
   if (raw.indexes !== undefined) {
-    if (!Array.isArray(raw.indexes) || raw.indexes.some((i) => typeof i !== 'string')) {
-      throw new Error('"indexes" must be an array of strings');
+    if (!Array.isArray(raw.indexes)) {
+      throw new Error('"indexes" must be an array');
+    }
+    for (const entry of raw.indexes) {
+      // Two spellings, one meaning: a bare string is the definition-scoped
+      // default, an object names its scope. Refused rather than repaired,
+      // exactly as the engine refuses it — an editor that silently accepted a
+      // manifest deploy rejects would be lying about what it validated.
+      if (typeof entry === 'string') continue;
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new Error('"indexes" entries must be a field name or {field, scope}');
+      }
+      if (typeof entry.field !== 'string' || !entry.field) {
+        throw new Error('"indexes" entries must carry a non-empty "field"');
+      }
+      if (entry.scope !== undefined && !INDEX_SCOPES.includes(entry.scope)) {
+        throw new Error(
+          `unknown index scope "${entry.scope}" — expected ${INDEX_SCOPES.join(' or ')}`
+        );
+      }
+      const extra = Object.keys(entry).filter((k) => !['field', 'scope'].includes(k));
+      if (extra.length) {
+        throw new Error(`unknown key(s) in an "indexes" entry: ${extra.join(', ')}`);
+      }
     }
   }
   const unknown = Object.keys(raw).filter(
@@ -76,7 +127,7 @@ export function parseManifest(text) {
   return {
     topics: { ...(raw.topics ?? {}) },
     correlations: { ...(raw.correlations ?? {}) },
-    indexes: [...(raw.indexes ?? [])],
+    indexes: (raw.indexes ?? []).map(normalizeIndex),
     decisions: Object.fromEntries(
       Object.entries(raw.decisions ?? {}).map(([k, v]) => [
         k,
@@ -91,7 +142,14 @@ export function serializeManifest(manifest) {
   const out = {};
   const topics = sortedEntries(manifest.topics);
   const correlations = sortedEntries(manifest.correlations);
-  const indexes = [...(manifest.indexes ?? [])].sort();
+  // Sorted by field and written back in the narrowest spelling that carries
+  // the meaning: a definition-scoped entry is the bare string it has always
+  // been, so an existing manifest round-trips byte for byte. rbpmn's own
+  // `Ord` sorts by field first for the same reason.
+  const indexes = [...(manifest.indexes ?? [])]
+    .map(normalizeIndex)
+    .sort((a, b) => (a.field < b.field ? -1 : a.field > b.field ? 1 : 0))
+    .map((i) => (i.scope === 'shared' ? { field: i.field, scope: 'shared' } : i.field));
   const decisions = Object.entries(manifest.decisions ?? {})
     .filter(([, v]) => v && v.decision && v.result)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));

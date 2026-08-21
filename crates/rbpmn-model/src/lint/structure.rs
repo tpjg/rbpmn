@@ -20,9 +20,18 @@ pub struct Graph<'a> {
     pub flow_out: Vec<Vec<usize>>,
     /// Boundary event -> host activity, and host -> its boundary events.
     /// Modeled as pseudo-edges (host -> boundary) for reachability and the
-    /// region analysis: a boundary path is part of its host's branch.
+    /// region analysis: an *interrupting* boundary path is part of its host's
+    /// branch.
     pub host_of: Vec<Option<usize>>,
     pub boundaries: Vec<Vec<usize>>,
+    /// host -> the subset of `boundaries` that cancels the host when it
+    /// triggers. A **non**-interrupting boundary spawns a sibling token
+    /// instead, so its path is a side path: not part of any branch, and it
+    /// delivers nothing to any join. Connectivity walks every pseudo-edge
+    /// ([`Graph::succs`] / [`Graph::preds`], so a side path is not
+    /// "unreachable"); the region analysis walks only these
+    /// ([`Graph::region_succs`]).
+    pub interrupting_boundaries: Vec<Vec<usize>>,
 }
 
 impl<'a> Graph<'a> {
@@ -53,12 +62,16 @@ impl<'a> Graph<'a> {
 
         let mut host_of = vec![None; n];
         let mut boundaries = vec![Vec::new(); n];
+        let mut interrupting_boundaries = vec![Vec::new(); n];
         for (i, node) in scope.nodes.iter().enumerate() {
             if let NodeKind::Boundary(b) = &node.kind
                 && let Some(host) = b.attached_to.as_deref().and_then(|h| idx.get(h))
             {
                 host_of[i] = Some(*host);
                 boundaries[*host].push(i);
+                if b.cancel_activity {
+                    interrupting_boundaries[*host].push(i);
+                }
             }
         }
 
@@ -71,6 +84,7 @@ impl<'a> Graph<'a> {
             flow_out,
             host_of,
             boundaries,
+            interrupting_boundaries,
         }
     }
 
@@ -111,6 +125,21 @@ impl<'a> Graph<'a> {
         if let Some(h) = self.host_of[v] {
             out.push(h);
         }
+        out
+    }
+
+    /// Successors over sequence flows plus **interrupting** host->boundary
+    /// pseudo-edges only — what the region analysis walks.
+    ///
+    /// The difference from [`Self::succs`] is the whole of the
+    /// non-interrupting case: an interrupting boundary continues its host's
+    /// token, so its path belongs to the host's branch and must reach the
+    /// join like any other; a non-interrupting one spawns a *sibling*, whose
+    /// path `boundary-side-path` keeps disjoint and ends on its own. Walking
+    /// it as part of a branch would count a token the branch never carries.
+    pub fn region_succs(&self, v: usize) -> Vec<usize> {
+        let mut out: Vec<usize> = self.flow_out[v].iter().map(|&fi| self.tgt(fi)).collect();
+        out.extend(&self.interrupting_boundaries[v]);
         out
     }
 }
@@ -299,7 +328,11 @@ pub fn check(g: &Graph, owner: &str, out: &mut Vec<Diagnostic>) {
 /// Set of nodes reachable from `seeds` under `neighbors` (mark-before-push,
 /// seeds pre-marked). Shared by forward and backward connectivity so the two
 /// checks can never disagree about traversal semantics.
-fn reach(n: usize, seeds: &[usize], neighbors: impl Fn(usize) -> Vec<usize>) -> Vec<bool> {
+pub(super) fn reach(
+    n: usize,
+    seeds: &[usize],
+    neighbors: impl Fn(usize) -> Vec<usize>,
+) -> Vec<bool> {
     let mut visited = vec![false; n];
     let mut queue: Vec<usize> = seeds.to_vec();
     for &s in seeds {

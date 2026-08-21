@@ -171,7 +171,15 @@ pub struct ExtendBody {
 }
 
 /// Heartbeat. A lost lease is 409 with a distinct outcome — the client's UI
-/// must be able to say "this task was reassigned", never fail silently.
+/// must be able to say what happened, never fail silently. `state` is the
+/// work item's own state column, and what it separates is *withdrawn or
+/// not*: `cancelled` means the process took the item (an interrupting
+/// boundary fired, the instance terminated) and there is nothing to go back
+/// to — "the ticket was paid"; `completed`/`failed` means it was already
+/// decided; `locked`/`available` means only that the claim is not yours any
+/// more — lapsed or reassigned, this does not say which — so claim again if
+/// you still want it. An id that names no task at all is a 404, as it is on
+/// complete and fail.
 pub async fn extend_lock(
     State(engine): State<Engine>,
     Path(id): Path<Uuid>,
@@ -188,9 +196,11 @@ pub async fn extend_lock(
         Ok(rbpmn_engine::LockExtension::Extended { until }) => {
             Json(json!({ "outcome": "extended", "lockUntil": until })).into_response()
         }
-        Ok(rbpmn_engine::LockExtension::Lost) => {
-            (StatusCode::CONFLICT, Json(json!({ "outcome": "lockLost" }))).into_response()
-        }
+        Ok(rbpmn_engine::LockExtension::Lost { state }) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "outcome": "lockLost", "state": state })),
+        )
+            .into_response(),
         Err(e) => engine_error(e),
     }
 }
@@ -207,9 +217,13 @@ pub struct ReleaseTaskBody {
 }
 
 /// Hand a claimed task back without deciding it. Deliberately the same
-/// vocabulary as the heartbeat — 200 `released` / 409 `lockLost` — so a
-/// client that already handles a lost lease on extend handles it here
-/// unchanged. Safe to retry: a replay names a spent epoch and gets the 409.
+/// vocabulary as the heartbeat — 200 `released` / 409 `lockLost` with the
+/// item's `state`, read the same way — so a client that already handles a
+/// lost lease on extend handles it here unchanged. Safe to retry: a replay
+/// names a spent epoch and gets the 409, with the `state` the item is in
+/// now — `locked` when a later claim has taken it, `available` when the
+/// first release already landed, `cancelled` when the process withdrew it
+/// while the holder had it open.
 pub async fn release_task(
     State(engine): State<Engine>,
     Path(id): Path<Uuid>,
@@ -219,9 +233,11 @@ pub async fn release_task(
         Ok(rbpmn_engine::Released::Released) => {
             Json(json!({ "outcome": "released" })).into_response()
         }
-        Ok(rbpmn_engine::Released::Lost) => {
-            (StatusCode::CONFLICT, Json(json!({ "outcome": "lockLost" }))).into_response()
-        }
+        Ok(rbpmn_engine::Released::Lost { state }) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "outcome": "lockLost", "state": state })),
+        )
+            .into_response(),
         Err(e) => engine_error(e),
     }
 }
@@ -481,6 +497,10 @@ fn engine_error(e: EngineError) -> Response {
         EngineError::NoSubscription { .. } => (StatusCode::NOT_FOUND, e.to_string()),
         EngineError::AmbiguousCorrelation { .. } => (StatusCode::CONFLICT, e.to_string()),
         EngineError::InvalidVariables(_) => (StatusCode::BAD_REQUEST, e.to_string()),
+        // A lookup naming a field nobody declared shared: the request is
+        // well-formed but asks for an index-backed query the deployment does
+        // not have. The message names the fix, so it is worth returning.
+        EngineError::UndeclaredSharedIndex { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
         EngineError::Compile(_) | EngineError::Step(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
         }

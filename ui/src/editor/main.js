@@ -22,6 +22,8 @@ import {
   emptyManifest,
   orphanedBindings,
   parseManifest,
+  formatIndexField,
+  parseIndexField,
   serializeManifest,
   setBinding,
   setDecisionBinding,
@@ -601,18 +603,33 @@ function renderIndexes() {
   const row = el('div', 'prop');
   row.append(el('span', 'prop-label', 'indexes'));
   const input = el('input', 'prop-input');
-  input.value = (state.manifest.indexes ?? []).join(', ');
+  input.value = (state.manifest.indexes ?? []).map(formatIndexField).join(', ');
   // Top-level names only, and the placeholder used to show two dotted paths
   // that deploy refuses: an index is a single segment (`parse_qname` with
   // `path.len() == 1`), because it becomes a real database index on one JSONB
   // field. A placeholder is an example, and an example deploy rejects is a
   // bug report waiting to happen.
-  input.placeholder = 'status, tier';
+  //
+  // `field:shared` is the compact spelling of the cross-definition scope, so a
+  // scope set in the JSON survives a round trip through this box rather than
+  // being silently flattened back to the default.
+  input.placeholder = 'status, tier, order_no:shared';
   const commit = () => {
-    const fields = input.value
-      .split(',')
-      .map((f) => f.trim())
-      .filter(Boolean);
+    let fields;
+    try {
+      fields = input.value
+        .split(',')
+        .map((f) => f.trim())
+        .filter(Boolean)
+        .map(parseIndexField);
+    } catch (e) {
+      // An unknown scope is refused, never defaulted — the same answer deploy
+      // gives. The text stays in the box so the typo is visible and editable.
+      ui.manifestError.hidden = false;
+      ui.manifestError.textContent = e.message;
+      return;
+    }
+    ui.manifestError.hidden = true;
     state.manifest = { ...state.manifest, indexes: fields };
     syncManifestBox();
     scheduleCheck();

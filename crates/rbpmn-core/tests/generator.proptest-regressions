@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3133b495d9c2b956ad2ca61cdd60f8f86472d009283fec460119936648f5d086 # shrinks to block = Sub(MsgBoundary(Task)), seed = 1643871932437

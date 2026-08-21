@@ -1,0 +1,28 @@
+{
+  "fixture": "accept/34-non-interrupting-timer-boundary.bpmn",
+  "actions": [
+    {
+      "complete": "ut"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started ut",
+      "work-item-created ut user ut",
+      "timer-armed bt PT1H",
+      "work-item-completed ut",
+      "timer-cancelled bt",
+      "element-completed ut",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

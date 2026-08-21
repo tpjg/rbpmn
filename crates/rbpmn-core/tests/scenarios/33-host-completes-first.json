@@ -1,0 +1,42 @@
+{
+  "fixture": "accept/33-non-interrupting-message-boundary.bpmn",
+  "bindings": {
+    "correlations": {
+      "note_received": "case.id"
+    }
+  },
+  "variables": {
+    "case": {
+      "id": "c-33"
+    }
+  },
+  "actions": [
+    {
+      "complete": "review"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {
+      "case": {
+        "id": "c-33"
+      }
+    },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started review",
+      "work-item-created review user review",
+      "message-subscribed note_received NOTE c-33",
+      "work-item-completed review",
+      "subscription-cancelled note_received NOTE",
+      "element-completed review",
+      "flow-taken f2",
+      "element-started reviewed",
+      "element-completed reviewed",
+      "instance-completed"
+    ]
+  }
+}

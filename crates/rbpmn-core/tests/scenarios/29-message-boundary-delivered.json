@@ -1,0 +1,28 @@
+{
+  "fixture": "accept/29-message-boundary.bpmn",
+  "bindings": { "correlations": { "paid_during_contest": "ticket.reference" } },
+  "variables": { "ticket": { "reference": "T-2026-0042" } },
+  "actions": [{ "deliver": "paid_during_contest", "patch": { "payment": { "amount": 60 } } }],
+  "expect": {
+    "status": "completed",
+    "variables": { "ticket": { "reference": "T-2026-0042" }, "payment": { "amount": 60 } },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started handle_contest",
+      "work-item-created handle_contest user handle_contest",
+      "message-subscribed paid_during_contest PAID T-2026-0042",
+      "message-received paid_during_contest PAID",
+      "variables-patched",
+      "work-item-cancelled handle_contest",
+      "element-started paid_during_contest",
+      "element-completed paid_during_contest",
+      "flow-taken f3",
+      "element-started end_paid",
+      "element-completed end_paid",
+      "instance-completed"
+    ]
+  }
+}

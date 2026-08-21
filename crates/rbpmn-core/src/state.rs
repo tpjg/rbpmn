@@ -117,6 +117,16 @@ pub struct TimerState {
     pub element: NodeIx,
     pub token: TokenId,
     pub due: TimerDue,
+    /// For a cycle: fires left, the armed one included, so `Some(1)` is the
+    /// last. `None` is an unbounded cycle — or no cycle at all; the `due`
+    /// says which, and only the cycle path reads this.
+    ///
+    /// `default` for the same reason the sibling fields of
+    /// [`crate::Event::TimerArmed`] carry it: this is a public,
+    /// `Deserialize` shape that a caller may have persisted before the field
+    /// existed, and "absent" and "unbounded" are the same answer here.
+    #[serde(default)]
+    pub remaining: Option<u32>,
 }
 
 /// An open message subscription. `key` is the correlation key **value**,

@@ -251,6 +251,7 @@ def check_editor(browser):
     SHOTS.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(SHOTS / "ui_editor.png"), full_page=False)
     check_condition_repair(page)
+    check_boundary_interrupting(page)
     check_decisions(page)
     check_decision_working_set(page)
     # Asserted last: check_condition_repair drives the whole condition-editing
@@ -716,6 +717,98 @@ def check_condition_repair(page):
     )
     check(True, "fixing a branch from the gateway clears its diagnostic")
     page.screenshot(path=str(SHOTS / "ui_editor_conditions.png"), full_page=False)
+
+
+SHOWS_INTERRUPTING = (
+    "() => document.querySelector('.properties').textContent.includes('interrupting')"
+)
+"""The Element pane has rendered a boundary event's interrupting row."""
+
+
+def prop_select(page, label):
+    """The <select> in the Element pane row whose label is exactly `label`."""
+    return page.locator(
+        ".properties label.prop",
+        has=page.locator(f"span.prop-label:text-is('{label}')"),
+    ).locator("select")
+
+
+def check_boundary_interrupting(page):
+    """Interrupting or not — the standard `cancelActivity` attribute.
+
+    Three things only a browser can answer, and all three are places this
+    could go wrong silently. `cancelActivity` is a double negative whose
+    schema default is *true*, so "interrupting" is spelled by the attribute
+    being **absent**: a pane that wrote `cancelActivity="true"` would still
+    read back correctly and still be wrong, because every other tool spells
+    it by omission. bpmn-js redraws the dashed double circle from the same
+    attribute, which is the only part of this a modeller actually looks at.
+    And an error boundary has no choice to offer — an error always cancels
+    the activity it escaped from — so the row must state that rather than
+    offer a control whose two answers do not both exist.
+    """
+    print("editor.html — the interrupting toggle")
+    xml = page.locator("textarea.code-xml")
+    xml.fill(
+        (REPO / "crates/rbpmn-model/tests/fixtures/accept/29-message-boundary.bpmn").read_text()
+    )
+    page.wait_for_function(
+        "() => document.querySelectorAll("
+        "'.djs-element[data-element-id=\"paid_during_contest\"]').length > 0",
+        timeout=15000,
+    )
+    page.click('.djs-element[data-element-id="paid_during_contest"]')
+    page.wait_for_function(SHOWS_INTERRUPTING, timeout=15000)
+
+    toggle = prop_select(page, "interrupting")
+    check(toggle.count() == 1, "a boundary event offers the interrupting row")
+    check(
+        toggle.input_value() == "yes",
+        f"an absent cancelActivity reads as interrupting ({toggle.input_value()!r})",
+    )
+    dashed = (
+        "() => document.querySelector('.djs-element"
+        "[data-element-id=\"paid_during_contest\"] .djs-visual')"
+        ".outerHTML.includes('stroke-dasharray')"
+    )
+    check(not page.evaluate(dashed), "and is drawn as the solid double circle")
+
+    toggle.select_option("no")
+    page.wait_for_function(
+        "() => document.querySelector('textarea.code-xml').value"
+        ".includes('cancelActivity=\"false\"')",
+        timeout=15000,
+    )
+    check(True, 'choosing no writes the standard cancelActivity="false"')
+    page.wait_for_function(dashed, timeout=15000)
+    check(True, "bpmn-js redraws the boundary as the dashed double circle")
+    page.screenshot(path=str(SHOTS / "ui_editor_boundary.png"), full_page=False)
+
+    # Back again. The attribute must *go*, not become `cancelActivity="true"`:
+    # bpmn-moddle omits a value equal to the schema default, and this is what
+    # asserts that it still does.
+    toggle.select_option("yes")
+    page.wait_for_function(
+        "() => !document.querySelector('textarea.code-xml').value.includes('cancelActivity')",
+        timeout=15000,
+    )
+    check(True, "choosing yes removes the attribute rather than writing true")
+    check(not page.evaluate(dashed), "and the solid double circle comes back")
+
+    # An error boundary: the answer is BPMN's, so the pane says so instead of
+    # offering a control.
+    xml.fill(
+        (REPO / "crates/rbpmn-model/tests/fixtures/accept/10-error-boundary.bpmn").read_text()
+    )
+    page.wait_for_function(
+        "() => document.querySelectorAll('.djs-element[data-element-id=\"be\"]').length > 0",
+        timeout=15000,
+    )
+    page.click('.djs-element[data-element-id="be"]')
+    page.wait_for_function(SHOWS_INTERRUPTING, timeout=15000)
+    pane = page.inner_text(".properties")
+    check(prop_select(page, "interrupting").count() == 0, "an error boundary offers no toggle")
+    check("always yes" in pane, f"and says why it cannot be anything else ({pane!r})")
 
 
 def check_dark_mode(browser):

@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<!-- "Every 7 days while waiting for payment, add a late fee." The cycle is
+     armed when await_payment is entered; each occurrence spawns a side token
+     through add_late_fee; PAID completes the host and cancels the cycle. A
+     fee task still open keeps the instance alive until it completes. The
+     next occurrence is the previous due plus the period, not the fire time
+     plus the period: a scheduler that ran late does not drift the schedule.
+     Bindings: {"correlations": {"await_payment": "ticket.reference"}} -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:message id="m_paid" name="PAID" />
+  <bpmn:process id="ticket" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:receiveTask id="await_payment" name="Await payment" messageRef="m_paid">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:receiveTask>
+    <bpmn:boundaryEvent id="late_fee_due" name="Late fee due" cancelActivity="false" attachedToRef="await_payment">
+      <bpmn:outgoing>f3</bpmn:outgoing>
+      <bpmn:timerEventDefinition>
+        <bpmn:timeCycle>R/P7D</bpmn:timeCycle>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="add_late_fee" name="Add late fee">
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end_paid" name="Paid">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="fee_added" name="Fee added">
+      <bpmn:incoming>f4</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="await_payment" />
+    <bpmn:sequenceFlow id="f2" sourceRef="await_payment" targetRef="end_paid" />
+    <bpmn:sequenceFlow id="f3" sourceRef="late_fee_due" targetRef="add_late_fee" />
+    <bpmn:sequenceFlow id="f4" sourceRef="add_late_fee" targetRef="fee_added" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_ticket">
+    <bpmndi:BPMNPlane id="BPMNPlane_ticket" bpmnElement="ticket">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="await_payment_di" bpmnElement="await_payment">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="late_fee_due_di" bpmnElement="late_fee_due">
+        <dc:Bounds x="207" y="92" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_paid_di" bpmnElement="end_paid">
+        <dc:Bounds x="357" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="add_late_fee_di" bpmnElement="add_late_fee">
+        <dc:Bounds x="325" y="170" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="fee_added_di" bpmnElement="fee_added">
+        <dc:Bounds x="507" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="357" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
+        <di:waypoint x="225" y="128" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="325" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4">
+        <di:waypoint x="425" y="210" />
+        <di:waypoint x="507" y="210" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

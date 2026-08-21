@@ -22,6 +22,7 @@ mod events;
 #[cfg(feature = "http")]
 mod http_handler;
 mod inspect;
+mod instances;
 mod listen;
 mod retention;
 mod runtime;
@@ -40,7 +41,8 @@ pub use http_handler::HttpPostHandler;
 pub use inspect::{
     EventView, InstanceInspection, ScopeView, SubscriptionView, TimerView, TokenView, WorkItemView,
 };
-pub use rbpmn_core::{Bindings, Event};
+pub use instances::{INSTANCE_VIEW, InstanceMatch, MAX_FIND_LIMIT};
+pub use rbpmn_core::{Bindings, Event, IndexDeclaration, IndexScope};
 pub use retention::{
     ArchiveBatch, ArchiveError, InstanceRecord, PrunableDefinition, RetentionArchive,
     RetentionBatch, RetentionOptions, RetentionPolicy, RetentionReport,
@@ -49,7 +51,8 @@ pub use runtime::FailOptions;
 pub use scheduler::SchedulerOptions;
 pub use sqlx::PgPool;
 pub use tasks::{
-    GetTaskOptions, LockExtension, LockedTask, Released, TaskFilter, TaskOrder, declared_index_name,
+    DeclaredIndex, GetTaskOptions, LockExtension, LockedTask, Released, TaskFilter, TaskOrder,
+    declared_index_name, shared_index_name,
 };
 pub use worker::WorkerOptions;
 
@@ -121,6 +124,16 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         12,
         "lease_epoch",
         include_str!("../migrations/0012_lease_epoch.sql"),
+    ),
+    (
+        13,
+        "timer_cycles",
+        include_str!("../migrations/0013_timer_cycles.sql"),
+    ),
+    (
+        14,
+        "public_view",
+        include_str!("../migrations/0014_public_view.sql"),
     ),
 ];
 

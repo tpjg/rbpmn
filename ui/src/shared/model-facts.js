@@ -35,8 +35,9 @@ export function describeElement(bo) {
 
   if (bo.attachedToRef) {
     push('attached to', bo.attachedToRef.id);
-    // BPMN's double negative: cancelActivity defaults to true, and rbpmn v1
-    // only executes the interrupting form.
+    // BPMN's double negative: cancelActivity defaults to true. The editor's
+    // `boundaryInterrupting` reads it the same way; a non-interrupting
+    // boundary starts a side path beside the host.
     push('interrupting', bo.cancelActivity === false ? 'no' : 'yes');
   }
 

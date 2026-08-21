@@ -2,6 +2,8 @@
 //! strategy #4). Each test creates a throwaway database, migrates it, and
 //! drops it on success (see rbpmn_engine::testing).
 
+mod harness;
+
 use rbpmn_core::Bindings;
 use rbpmn_engine::testing::TestDb;
 use rbpmn_engine::{
@@ -2513,7 +2515,9 @@ async fn releasing_a_task_returns_it_to_the_queue_at_once() {
             .release_task(task.id, "alice", task.lease_no)
             .await
             .unwrap(),
-        Released::Lost
+        Released::Lost {
+            state: "locked".into()
+        }
     );
     let (state, owner): (String, Option<String>) =
         sqlx::query_as("select state, lock_owner from rbpmn_work_item where id = $1")
@@ -2528,13 +2532,16 @@ async fn releasing_a_task_returns_it_to_the_queue_at_once() {
 
     // A stranger cannot hand back what bob is holding, even holding bob's
     // epoch — the owner check, from the other side (spec/Lease.tla,
-    // LiveLeaseEndsOnlyByItsHolder).
+    // LiveLeaseEndsOnlyByItsHolderOrTheProcess: the clock, the holder or the
+    // process end a live lease, and no other worker).
     assert_eq!(
         engine
             .release_task(peer.id, "not-bob", peer.lease_no)
             .await
             .unwrap(),
-        Released::Lost
+        Released::Lost {
+            state: "locked".into()
+        }
     );
     // Bob's own release lands, and a task nobody holds is the quiet no-op.
     assert_eq!(
@@ -2549,8 +2556,11 @@ async fn releasing_a_task_returns_it_to_the_queue_at_once() {
             .release_task(peer.id, "bob", peer.lease_no)
             .await
             .unwrap(),
-        Released::Lost,
-        "a second release has nothing left to hand back"
+        Released::Lost {
+            state: "available".into()
+        },
+        "a second release has nothing left to hand back — and says what the \
+         item is now, which is back on the queue"
     );
     db.drop().await;
 }
@@ -2639,7 +2649,9 @@ async fn a_replayed_release_cannot_free_the_claim_that_replaced_it() {
             .release_task(first.id, "alice", first.lease_no)
             .await
             .unwrap(),
-        Released::Lost
+        Released::Lost {
+            state: "locked".into()
+        }
     );
     let (state, owner): (String, Option<String>) =
         sqlx::query_as("select state, lock_owner from rbpmn_work_item where id = $1")
@@ -2702,7 +2714,12 @@ async fn an_expired_lease_is_still_its_owners_to_release() {
             .extend_lock(task.id, "w1", Duration::from_secs(60))
             .await
             .unwrap(),
-        LockExtension::Lost
+        // Expired, not withdrawn: the row is still `locked` with a stale
+        // owner, which is exactly the "reassigned" story `state` exists to
+        // tell apart from `cancelled`.
+        LockExtension::Lost {
+            state: "locked".into()
+        }
     );
     // The release is not: same owner, still locked, so the row is ours to
     // hand back — and it comes back clean rather than lapsed.
@@ -2738,7 +2755,9 @@ async fn an_expired_lease_is_still_its_owners_to_release() {
             .release_task(task.id, "w1", task.lease_no)
             .await
             .unwrap(),
-        Released::Lost,
+        Released::Lost {
+            state: "locked".into()
+        },
         "ownership is the guard, and it moved"
     );
     db.drop().await;
@@ -2774,21 +2793,38 @@ async fn extend_lock_heartbeats_and_reports_loss() {
             .extend_lock(task.id, "somebody-else", Duration::from_secs(600))
             .await
             .unwrap(),
-        LockExtension::Lost
+        LockExtension::Lost {
+            state: "locked".into()
+        }
     );
 
     engine
         .complete_task(task.id, "w1", serde_json::json!({}))
         .await
         .unwrap();
-    // Closed task: the heartbeat reports loss too.
+    // Closed task: the heartbeat reports loss too, and names the state so
+    // the frontend can say "already done" rather than "reassigned".
     assert_eq!(
         engine
             .extend_lock(task.id, "w1", Duration::from_secs(600))
             .await
             .unwrap(),
-        LockExtension::Lost
+        LockExtension::Lost {
+            state: "completed".into()
+        }
     );
+    // An id that names no task at all is a 404's worth of error, not a
+    // loss — the same answer complete_task and fail_task give.
+    assert!(matches!(
+        engine
+            .extend_lock(uuid::Uuid::new_v4(), "w1", Duration::from_secs(600))
+            .await,
+        Err(rbpmn_engine::EngineError::UnknownWorkItem(_))
+    ));
+    assert!(matches!(
+        engine.release_task(uuid::Uuid::new_v4(), "w1", 1).await,
+        Err(rbpmn_engine::EngineError::UnknownWorkItem(_))
+    ));
     db.drop().await;
 }
 
@@ -4460,5 +4496,2554 @@ async fn a_timer_can_resume_into_a_decision() {
     // ...and the instance is still readable, which is the half that failed:
     // a persisted decision wait made every later load error out.
     engine.inspect_instance(started.id).await.unwrap();
+    db.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Message boundary events, slice 1 (docs/design/boundary-messages.md)
+// ---------------------------------------------------------------------------
+
+/// Bindings for fixture 29: the boundary's *own* element id carries the
+/// correlation, exactly as a catch's does. Nothing in the XML.
+fn contest_bindings() -> Bindings {
+    Bindings::new().correlation("paid_during_contest", "ticket.reference")
+}
+
+/// The golden trace a scenario pins, read from the core's corpus so the
+/// projection is held to the same history the pure core produces — not to a
+/// second copy of it maintained here.
+fn golden_trace(scenario: &str) -> Vec<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../rbpmn-core/tests/scenarios")
+        .join(scenario);
+    let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    json["expect"]["trace"]
+        .as_array()
+        .expect("scenario has expect.trace")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect()
+}
+
+async fn assert_fsck_clean(pool: &PgPool) {
+    let violations = harness::fsck(pool).await;
+    assert!(violations.is_empty(), "fsck: {violations:?}");
+}
+
+async fn item_state(pool: &PgPool, instance: uuid::Uuid, element: &str) -> String {
+    sqlx::query_scalar(
+        "select state from rbpmn_work_item where instance_id = $1 and element_id = $2",
+    )
+    .bind(instance)
+    .bind(element)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn variables_of(pool: &PgPool, instance: uuid::Uuid) -> serde_json::Value {
+    sqlx::query_scalar("select variables from rbpmn_instance where id = $1")
+        .bind(instance)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The motivating case, end to end against the database: a payment arrives
+/// while a clerk is holding the contest task under a live lease. The process
+/// withdraws the item — a lease is a row value that protects a holder from
+/// *other workers*, never from the process (`spec/Lease.tla`, `Cancel`) —
+/// and every verb the clerk has left answers typed, about a `cancelled`
+/// item, with no 5xx and no patch applied.
+#[tokio::test]
+async fn message_boundary_interrupts_a_leased_user_task() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/29-message-boundary.bpmn"),
+            &contest_bindings(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start(
+            "ticket",
+            None,
+            serde_json::json!({ "ticket": { "reference": "T-2026-0042" } }),
+        )
+        .await
+        .unwrap();
+
+    let task = engine
+        .get_task("handle_contest", &GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .expect("the clerk's task");
+    assert_eq!(task.element_id, "handle_contest");
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 1);
+
+    let correlation = engine
+        .correlate(
+            "PAID",
+            "T-2026-0042",
+            serde_json::json!({ "payment": { "amount": 60 } }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(correlation.instance_id, started.id);
+    wait_for_status(&db.pool, started.id, "completed").await;
+
+    // The clerk's completion, arriving a moment late. The idempotent no-op,
+    // naming the state — and the patch it carried is nowhere.
+    let refused = engine
+        .complete_task(
+            task.id,
+            "clerk",
+            serde_json::json!({ "contest": { "upheld": true } }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(&refused, Completion::AlreadyClosed { state } if state == "cancelled"),
+        "{refused:?}"
+    );
+    let variables = variables_of(&db.pool, started.id).await;
+    assert_eq!(variables["payment"]["amount"], 60);
+    assert!(
+        variables.get("contest").is_none(),
+        "the refused completion's patch must not have landed: {variables}"
+    );
+
+    // The other two verbs, same story. Note the lease columns still name the
+    // clerk: cancellation writes the state column and nothing else, so the
+    // state is the only thing that could tell "withdrawn" from "reassigned".
+    assert_eq!(
+        engine
+            .extend_lock(task.id, "clerk", Duration::from_secs(600))
+            .await
+            .unwrap(),
+        LockExtension::Lost {
+            state: "cancelled".into()
+        }
+    );
+    assert_eq!(
+        engine
+            .release_task(task.id, "clerk", task.lease_no)
+            .await
+            .unwrap(),
+        Released::Lost {
+            state: "cancelled".into()
+        }
+    );
+    assert!(matches!(
+        engine
+            .fail_task(task.id, "clerk", Some("NOPE".into()), None)
+            .await
+            .unwrap(),
+        FailOutcome::AlreadyClosed { state } if state == "cancelled"
+    ));
+
+    assert_eq!(
+        item_state(&db.pool, started.id, "handle_contest").await,
+        "cancelled"
+    );
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 0);
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("29-message-boundary-delivered.json")
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// The other order, and the loud answer it owes: the clerk decides first, the
+/// completion withdraws the boundary's arm in its own transaction, and the
+/// payment then has nowhere to go — 404, never a silent drop and never a
+/// delivery to a decided contest.
+#[tokio::test]
+async fn completion_wins_then_the_message_is_404() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/29-message-boundary.bpmn"),
+            &contest_bindings(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start(
+            "ticket",
+            None,
+            serde_json::json!({ "ticket": { "reference": "T-2026-0042" } }),
+        )
+        .await
+        .unwrap();
+    let task = engine
+        .get_task("handle_contest", &GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .expect("the clerk's task");
+
+    let done = engine
+        .complete_task(
+            task.id,
+            "clerk",
+            serde_json::json!({ "contest": { "upheld": true } }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(done, Completion::Advanced(_)));
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 0);
+
+    let late = engine
+        .correlate("PAID", "T-2026-0042", serde_json::json!({}))
+        .await;
+    assert!(
+        matches!(late, Err(rbpmn_engine::EngineError::NoSubscription { .. })),
+        "{late:?}"
+    );
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("29-message-boundary-completed.json")
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// `spec/BoundaryExit.tla` against the database: completion and delivery
+/// launched concurrently on one token, on two separate connections, round
+/// after round. Exactly one wins; the loser is refused typed and *before*
+/// mutating anything, so the instance ends with exactly one of the two end
+/// events in its history.
+///
+/// Non-vacuity is the point of the round count: both orders must actually
+/// occur, or this is a sequential test wearing a race's clothes.
+#[tokio::test]
+async fn correlate_and_complete_race_exactly_one_wins() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    // A genuinely separate pool for the correlator: two connections racing on
+    // the instance row, not two futures sharing one.
+    let correlator = Engine::builder(PgPool::connect(&db.url()).await.unwrap())
+        .retry_backoff(Duration::ZERO)
+        .build();
+    engine
+        .deploy(
+            &fixture("accept/29-message-boundary.bpmn"),
+            &contest_bindings(),
+        )
+        .await
+        .unwrap();
+
+    const ROUNDS: u32 = 24;
+    let (mut paid, mut decided) = (0, 0);
+    for round in 0..ROUNDS {
+        let key = format!("T-{round}");
+        let started = engine
+            .start(
+                "ticket",
+                None,
+                serde_json::json!({ "ticket": { "reference": key } }),
+            )
+            .await
+            .unwrap();
+        let task = engine
+            .get_task("handle_contest", &GetTaskOptions::new("clerk"))
+            .await
+            .unwrap()
+            .expect("the clerk's task");
+
+        // A sub-millisecond bias, alternating sides: both calls are still in
+        // flight together, but the interleaving varies instead of settling
+        // into whichever order this machine happens to schedule.
+        let lead = Duration::from_micros(u64::from(round % 5) * 150);
+        let (early, late) = if round.is_multiple_of(2) {
+            (Duration::ZERO, lead)
+        } else {
+            (lead, Duration::ZERO)
+        };
+        let completing = async {
+            tokio::time::sleep(early).await;
+            engine
+                .complete_task(
+                    task.id,
+                    "clerk",
+                    serde_json::json!({ "contest": { "upheld": true } }),
+                )
+                .await
+        };
+        let correlating = async {
+            tokio::time::sleep(late).await;
+            correlator
+                .correlate(
+                    "PAID",
+                    &key,
+                    serde_json::json!({ "payment": { "amount": 60 } }),
+                )
+                .await
+        };
+        let (completion, delivery) = tokio::join!(completing, correlating);
+
+        let completed = matches!(completion, Ok(Completion::Advanced(_)));
+        let delivered = delivery.is_ok();
+        assert!(
+            completed ^ delivered,
+            "round {round}: exactly one exit, got completion={completion:?} \
+             delivery={delivery:?}"
+        );
+        if completed {
+            decided += 1;
+            // The typed refusal, before any mutation. Two shapes, both loud
+            // and both 4xx: the delivery either resolved nothing at all
+            // (the instance was already inactive when it looked) or its
+            // re-check under the instance lock found the winner had closed
+            // the instance underneath it.
+            assert!(
+                matches!(
+                    delivery,
+                    Err(rbpmn_engine::EngineError::NoSubscription { .. })
+                        | Err(rbpmn_engine::EngineError::InstanceNotActive(..))
+                ),
+                "round {round}: {delivery:?}"
+            );
+        } else {
+            paid += 1;
+            assert!(
+                matches!(
+                    &completion,
+                    Ok(Completion::AlreadyClosed { state }) if state == "cancelled"
+                ),
+                "round {round}: {completion:?}"
+            );
+        }
+
+        wait_for_status(&db.pool, started.id, "completed").await;
+        let trace = event_trace(&db.pool, started.id).await;
+        let ends: Vec<&String> = trace
+            .iter()
+            .filter(|e| e.starts_with("element-completed end_"))
+            .collect();
+        assert_eq!(ends.len(), 1, "round {round}: {trace:?}");
+        assert_eq!(
+            ends[0].as_str(),
+            if completed {
+                "element-completed end_decided"
+            } else {
+                "element-completed end_paid"
+            },
+            "round {round}"
+        );
+    }
+    assert!(
+        paid > 0 && decided > 0,
+        "the correlate-vs-complete race never went both ways ({paid} paid, \
+         {decided} decided) — this round proved nothing about the interleaving \
+         spec/BoundaryExit.tla is about"
+    );
+    assert_fsck_clean(&db.pool).await;
+    println!("boundary race: {paid} paid, {decided} decided over {ROUNDS} rounds");
+    db.drop().await;
+}
+
+/// Two subscriptions on one token, told apart by element — the loader fix
+/// (docs/design/boundary-messages.md, finding 2) against the database.
+/// Whichever message arrives, the other arm is withdrawn with it.
+#[tokio::test]
+async fn message_boundary_on_a_receive_task_rehydrates_the_right_subscription() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bindings = Bindings::new()
+        .correlation("await_payment", "order.id")
+        .correlation("cancelled_meanwhile", "order.id");
+    engine
+        .deploy(
+            &fixture("accept/30-receive-task-message-boundary.bpmn"),
+            &bindings,
+        )
+        .await
+        .unwrap();
+
+    // One instance at a time, both on o-77: two live instances would share
+    // the key and `correlate` would (correctly) refuse the ambiguity.
+    let host = engine
+        .start("p", None, serde_json::json!({ "order": { "id": "o-77" } }))
+        .await
+        .unwrap();
+    assert_eq!(
+        subscription_rows(&db.pool, host.id).await,
+        2,
+        "the host's arm and the boundary's, on one token"
+    );
+    engine
+        .correlate(
+            "PAID",
+            "o-77",
+            serde_json::json!({ "payment": { "amount": 60 } }),
+        )
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, host.id, "completed").await;
+    assert_eq!(
+        event_trace(&db.pool, host.id).await,
+        golden_trace("30-receive-host-delivered.json")
+    );
+
+    let boundary = engine
+        .start("p", None, serde_json::json!({ "order": { "id": "o-77" } }))
+        .await
+        .unwrap();
+    engine
+        .correlate(
+            "CANCELLED",
+            "o-77",
+            serde_json::json!({ "cancellation": { "by": "buyer" } }),
+        )
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, boundary.id, "completed").await;
+    assert_eq!(
+        event_trace(&db.pool, boundary.id).await,
+        golden_trace("30-receive-boundary-delivered.json")
+    );
+
+    // ...and the same again with the two rows renumbered the other way
+    // round. Arming allocates the host's subscription before its boundary's,
+    // so resolving a `message` token by `token_no` alone happens to pick the
+    // host today — right by arm order rather than by intent, which is
+    // exactly the bug. The permuted row set is still fsck-clean (each token
+    // has exactly one subscription at its own element), so it is a state the
+    // invariants permit, and the loader must not lean on anything they do
+    // not promise. Resolve by token alone here and the host's own message
+    // takes the *boundary* arm: the receive task never completes.
+    let permuted = engine
+        .start("p", None, serde_json::json!({ "order": { "id": "o-78" } }))
+        .await
+        .unwrap();
+    let numbers: Vec<(i64, String)> = sqlx::query_as(
+        "select subscription_no, element_id from rbpmn_subscription \
+         where instance_id = $1 order by subscription_no",
+    )
+    .bind(permuted.id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(numbers[0].1, "await_payment", "the host arms first");
+    let (low, high) = (numbers[0].0, numbers[1].0);
+    let spare = high + 1;
+    for (from, to) in [(low, spare), (high, low), (spare, high)] {
+        sqlx::query(
+            "update rbpmn_subscription set subscription_no = $3 \
+             where instance_id = $1 and subscription_no = $2",
+        )
+        .bind(permuted.id)
+        .bind(from)
+        .bind(to)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    assert_fsck_clean(&db.pool).await;
+    engine
+        .correlate(
+            "PAID",
+            "o-78",
+            serde_json::json!({ "payment": { "amount": 60 } }),
+        )
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, permuted.id, "completed").await;
+    // The same golden trace as the un-permuted host delivery, key aside.
+    // Resolve by token alone and this diverges by one event — the host is
+    // *entered* rather than completed, because the delivery took the
+    // boundary arm and `interrupt_to_boundary` walked out of the receive
+    // task as though it were a boundary event.
+    let expected: Vec<String> = golden_trace("30-receive-host-delivered.json")
+        .into_iter()
+        .map(|e| e.replace("o-77", "o-78"))
+        .collect();
+    assert_eq!(event_trace(&db.pool, permuted.id).await, expected);
+    assert_eq!(subscription_rows(&db.pool, permuted.id).await, 0);
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// The message that tears a whole scope down — the mirror of
+/// `boundary_timer_tears_down_a_subprocess_scope`, on the other arm kind.
+#[tokio::test]
+async fn message_boundary_tears_down_a_subprocess_scope() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/31-subprocess-message-boundary.bpmn"),
+            &Bindings::new().correlation("cancelled_during_work", "order.id"),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({ "order": { "id": "o-31" } }))
+        .await
+        .unwrap();
+    assert_eq!(scope_rows(&db.pool, started.id).await.len(), 1);
+    assert_eq!(open_items(&db.pool, started.id).await[0].1, "pick");
+
+    engine
+        .correlate(
+            "CANCELLED",
+            "o-31",
+            serde_json::json!({ "cancellation": { "by": "buyer" } }),
+        )
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+
+    // The scope is gone, the work open inside it was cancelled with it, and
+    // the boundary's own arm went with the token it was armed on.
+    assert!(scope_rows(&db.pool, started.id).await.is_empty());
+    assert_eq!(item_state(&db.pool, started.id, "pick").await, "cancelled");
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 0);
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("31-subprocess-message-boundary.json")
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// Competing consumers of one message: both resolve the same row without a
+/// lock, the first to take the instance row delivers, the second's re-check
+/// answers it typed. Unchanged by boundaries — a boundary's subscription is
+/// a row like any other — and asserted here because slice 1 makes a human
+/// with a payment button one of the competing consumers.
+#[tokio::test]
+async fn competing_correlators_deliver_once() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let rival = Engine::builder(PgPool::connect(&db.url()).await.unwrap())
+        .retry_backoff(Duration::ZERO)
+        .build();
+    engine
+        .deploy(
+            &fixture("accept/29-message-boundary.bpmn"),
+            &contest_bindings(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start(
+            "ticket",
+            None,
+            serde_json::json!({ "ticket": { "reference": "T-both" } }),
+        )
+        .await
+        .unwrap();
+
+    let (first, second) = tokio::join!(
+        engine.correlate(
+            "PAID",
+            "T-both",
+            serde_json::json!({ "payment": { "by": "a" } })
+        ),
+        rival.correlate(
+            "PAID",
+            "T-both",
+            serde_json::json!({ "payment": { "by": "b" } })
+        ),
+    );
+    assert!(
+        first.is_ok() ^ second.is_ok(),
+        "exactly one delivery: {first:?} / {second:?}"
+    );
+    let loser = if first.is_ok() { second } else { first };
+    assert!(
+        matches!(
+            loser,
+            Err(rbpmn_engine::EngineError::NoSubscription { .. })
+                | Err(rbpmn_engine::EngineError::InstanceNotActive(..))
+        ),
+        "{loser:?}"
+    );
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(
+        event_count(&db.pool, started.id, "message-received").await,
+        1
+    );
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 0);
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// Both interrupting kinds on one host: whichever fires withdraws the other
+/// in the same transaction, and the row it left behind is gone with it.
+#[tokio::test]
+async fn message_and_timer_boundaries_either_wins() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bindings = Bindings::new().correlation("paid", "ticket.reference");
+    engine
+        .deploy(
+            &fixture("accept/32-message-and-timer-boundaries.bpmn"),
+            &bindings,
+        )
+        .await
+        .unwrap();
+    // The same model with a timer that is due at once, under its own process
+    // id: a second deploy of key `p` would be a new *version*, not a second
+    // definition.
+    let due_now = harness::with_process_id(
+        &fixture("accept/32-message-and-timer-boundaries.bpmn").replace("P2D", "PT0S"),
+        "p32now",
+    );
+    engine.deploy(&due_now, &bindings).await.unwrap();
+
+    // The message wins: the timer row goes with the token it was armed on.
+    let paid = engine
+        .start(
+            "p",
+            None,
+            serde_json::json!({ "ticket": { "reference": "T-32" } }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(timer_rows(&db.pool, paid.id).await, 1);
+    engine
+        .correlate("PAID", "T-32", serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, paid.id, "completed").await;
+    assert_eq!(timer_rows(&db.pool, paid.id).await, 0);
+    assert_eq!(
+        item_state(&db.pool, paid.id, "handle_contest").await,
+        "cancelled"
+    );
+    assert_eq!(
+        event_trace(&db.pool, paid.id).await,
+        golden_trace("32-message-wins.json")
+    );
+
+    // The timer wins: the subscription goes the same way. Started after the
+    // first instance finished, so the two do not share the key `T-32`.
+    let overdue = engine
+        .start(
+            "p32now",
+            None,
+            serde_json::json!({ "ticket": { "reference": "T-32" } }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(subscription_rows(&db.pool, overdue.id).await, 1);
+    assert!(engine.fire_due_timer().await.unwrap());
+    wait_for_status(&db.pool, overdue.id, "completed").await;
+    assert_eq!(subscription_rows(&db.pool, overdue.id).await, 0);
+    assert_eq!(
+        item_state(&db.pool, overdue.id, "handle_contest").await,
+        "cancelled"
+    );
+    // The golden trace, with the one literal this deployment changed.
+    let expected: Vec<String> = golden_trace("32-timer-wins.json")
+        .into_iter()
+        .map(|e| e.replace("timer-armed overdue P2D", "timer-armed overdue PT0S"))
+        .collect();
+    assert_eq!(event_trace(&db.pool, overdue.id).await, expected);
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// The snapshot hazard, made deterministic — and the reason `extend_lock`
+/// reads the state in a **second** statement.
+///
+/// The payment's transaction has already written `cancelled` on the work
+/// item and is holding the row lock. The clerk's heartbeat arrives on
+/// another connection: its `UPDATE` finds the row in its own snapshot,
+/// blocks on the lock, and only after the payment commits re-evaluates its
+/// predicate against the new version (EvalPlanQual) and matches nothing.
+/// Everything else in that statement — a sub-select in a CTE, say — would
+/// still be reading the pre-payment snapshot and would answer `locked`:
+/// "your task was reassigned" for a ticket that was paid, which is exactly
+/// the answer `state` exists to prevent. A separate statement takes a fresh
+/// snapshot and cannot be stale.
+#[tokio::test]
+async fn a_heartbeat_blocked_by_a_cancellation_reports_the_new_state() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    // The heartbeat runs on its own pool: it must be a different backend
+    // from the one holding the payment's transaction open.
+    let clerk = Engine::builder(PgPool::connect(&db.url()).await.unwrap())
+        .retry_backoff(Duration::ZERO)
+        .build();
+    engine
+        .deploy(
+            &fixture("accept/29-message-boundary.bpmn"),
+            &contest_bindings(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start(
+            "ticket",
+            None,
+            serde_json::json!({ "ticket": { "reference": "T-snap" } }),
+        )
+        .await
+        .unwrap();
+    let task = engine
+        .get_task("handle_contest", &GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .expect("the clerk's task");
+
+    // The payment, uncommitted: the work item row is written and locked.
+    let mut tx = db.pool.begin().await.unwrap();
+    engine
+        .correlate_in_tx(&mut tx, "PAID", "T-snap", serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let heartbeat = tokio::spawn(async move {
+        clerk
+            .extend_lock(task.id, "clerk", Duration::from_secs(600))
+            .await
+    });
+    // Wait for the heartbeat to be *actually* parked on the row lock rather
+    // than trusting a sleep — the hazard only exists while its statement
+    // snapshot predates the commit below.
+    let mut blocked = false;
+    for _ in 0..200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "select count(*) from pg_stat_activity where datname = current_database() \
+             and wait_event_type = 'Lock' and query like '%update rbpmn_work_item%'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        blocked,
+        "the heartbeat never blocked on the payment's row lock"
+    );
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        heartbeat.await.unwrap().unwrap(),
+        LockExtension::Lost {
+            state: "cancelled".into()
+        }
+    );
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Non-interrupting boundary events, slice 2
+// (docs/design/boundary-messages.md §3.5 and §5)
+//
+// The claim these hold the projection to is a negative one: a side token is an
+// *ordinary* token and needed no engine code. So every assertion below is
+// really "the thing that would have needed special-casing did not happen" —
+// the host's lease survived, the re-arm is a new row, the sibling lives in the
+// host token's scope, a teardown reaps it like anything else, and the instance
+// stays alive until the last token is consumed whichever one that is.
+// ---------------------------------------------------------------------------
+
+/// Fixture 33's wiring: the boundary carries the correlation, exactly as a
+/// catch does, and the side path's service task takes the default topic. As
+/// ever, none of it is in the XML.
+fn casefile_bindings() -> Bindings {
+    Bindings::new().correlation("note_received", "case.id")
+}
+
+/// A migrated engine with fixture 33 deployed and its side path's topic
+/// declared — `file_note` is a service task, so the environment must cover it
+/// before `unresolved-topic` will let the deploy through.
+async fn casefile_engine(db: &TestDb) -> Engine {
+    let engine = engine(db).await;
+    engine.declare_topic("file_note").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/33-non-interrupting-message-boundary.bpmn"),
+            &casefile_bindings(),
+        )
+        .await
+        .unwrap();
+    engine
+}
+
+async fn status_of(pool: &PgPool, instance: uuid::Uuid) -> String {
+    sqlx::query_scalar("select status from rbpmn_instance where id = $1")
+        .bind(instance)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The armed subscriptions of an instance, in allocation order:
+/// `(subscription_no, element_id, correlation_key)`.
+async fn subscriptions_of(pool: &PgPool, instance: uuid::Uuid) -> Vec<(i64, String, String)> {
+    sqlx::query(
+        "select subscription_no, element_id, correlation_key from rbpmn_subscription \
+         where instance_id = $1 order by subscription_no",
+    )
+    .bind(instance)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| {
+        (
+            r.get::<i64, _>("subscription_no"),
+            r.get::<String, _>("element_id"),
+            r.get::<String, _>("correlation_key"),
+        )
+    })
+    .collect()
+}
+
+/// Every live token's scope, by element. Enough for the fixtures here, where
+/// no element holds two tokens at once.
+async fn token_scopes(
+    pool: &PgPool,
+    instance: uuid::Uuid,
+) -> std::collections::BTreeMap<String, i64> {
+    sqlx::query("select element_id, scope_no from rbpmn_token where instance_id = $1")
+        .bind(instance)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("element_id"),
+                r.get::<i64, _>("scope_no"),
+            )
+        })
+        .collect()
+}
+
+/// Backdate one armed timer so the scheduler will pick *it* next.
+///
+/// The alternative — rewriting the duration literal to `PT0S` before deploy,
+/// as `boundary_timer_xml` and `racing_timer_xml` do — cannot order two
+/// timers on one instance against each other, and it changes the history
+/// (`timer-armed` prints the spec the model carries), which would put the
+/// golden trace out of reach. This changes neither.
+async fn make_due(pool: &PgPool, instance: uuid::Uuid, element: &str) {
+    let rows = sqlx::query(
+        "update rbpmn_timer set due_at = now() - interval '1 second' \
+         where instance_id = $1 and element_id = $2",
+    )
+    .bind(instance)
+    .bind(element)
+    .execute(pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(rows, 1, "no timer armed at '{element}' to make due");
+}
+
+/// The whole of slice 2 in one instance: a note arrives while the reviewer is
+/// holding the task under a live lease, and *nothing* of the reviewer's is
+/// touched. The lease heartbeats, the item stays `locked`, the boundary is
+/// re-armed in the same transaction that consumed it — a new row, so a second
+/// note has somewhere to land — and each delivery leaves a sibling token
+/// behind that keeps the instance alive after the review is decided.
+///
+/// The contrast with `message_boundary_interrupts_a_leased_user_task` is the
+/// point: same verbs, same lease, opposite answers, and the only difference in
+/// the model is `cancelActivity="false"`.
+#[tokio::test]
+async fn a_non_interrupting_message_leaves_the_lease_alive() {
+    let db = TestDb::create().await;
+    let engine = casefile_engine(&db).await;
+    let started = engine
+        .start(
+            "casefile",
+            None,
+            serde_json::json!({ "case": { "id": "c-33" } }),
+        )
+        .await
+        .unwrap();
+
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("reviewer"))
+        .await
+        .unwrap()
+        .expect("the reviewer's task");
+    let armed = subscriptions_of(&db.pool, started.id).await;
+    assert_eq!(armed.len(), 1, "{armed:?}");
+    assert_eq!(
+        (armed[0].1.as_str(), armed[0].2.as_str()),
+        ("note_received", "c-33")
+    );
+
+    // The note. Empty patches throughout: the golden trace this run is held
+    // to records none, and `step` emits one `variables-patched` per patch.
+    engine
+        .correlate("NOTE", "c-33", serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // The reviewer notices nothing. A heartbeat still extends — the verb that
+    // answered `Lost { state: "cancelled" }` for the interrupting boundary —
+    // and the item is still `locked` in the reviewer's name.
+    assert!(
+        matches!(
+            engine
+                .extend_lock(task.id, "reviewer", Duration::from_secs(600))
+                .await
+                .unwrap(),
+            LockExtension::Extended { .. }
+        ),
+        "the host's lease must survive a non-interrupting delivery"
+    );
+    assert_eq!(item_state(&db.pool, started.id, "review").await, "locked");
+
+    // Exactly one subscription at the boundary between deliveries, and a
+    // *different* one: the delivery consumed the arm and the re-arm opened a
+    // new row in the same transaction, so the host is never observably
+    // without its boundary.
+    let rearmed = subscriptions_of(&db.pool, started.id).await;
+    assert_eq!(rearmed.len(), 1, "{rearmed:?}");
+    assert_eq!(
+        (rearmed[0].1.as_str(), rearmed[0].2.as_str()),
+        ("note_received", "c-33")
+    );
+    assert!(
+        rearmed[0].0 > armed[0].0,
+        "the re-arm must be a new subscription, not the consumed one \
+         ({armed:?} -> {rearmed:?})"
+    );
+
+    // The side token's work item is an ordinary one: claimable on its own
+    // topic, leasable, handed back like any other.
+    let side = engine
+        .get_task("file_note", &GetTaskOptions::new("filer"))
+        .await
+        .unwrap()
+        .expect("the side path's service task");
+    assert_eq!(
+        (side.element_id.as_str(), side.kind.as_str()),
+        ("file_note", "service")
+    );
+    assert_eq!(
+        engine
+            .release_task(side.id, "filer", side.lease_no)
+            .await
+            .unwrap(),
+        Released::Released
+    );
+
+    // A second note, on the re-armed subscription. Without the re-arm this is
+    // a 404 and the rest of this test never happens.
+    engine
+        .correlate("NOTE", "c-33", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 1);
+
+    // The review is decided. Its arm goes with it — but the two notes it let
+    // through are tokens of their own, and the instance is not finished.
+    let done = engine
+        .complete_task(task.id, "reviewer", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(matches!(done, Completion::Advanced(_)), "{done:?}");
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 0);
+    assert_eq!(
+        status_of(&db.pool, started.id).await,
+        "active",
+        "the instance must outlive its host: two side tokens are still open"
+    );
+
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["file_note", "file_note"],
+        "one side token per delivery"
+    );
+    engine
+        .complete_work_item(open[0].0, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        status_of(&db.pool, started.id).await,
+        "active",
+        "one side token still to be consumed"
+    );
+    engine
+        .complete_work_item(open[1].0, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+
+    assert_eq!(
+        variables_of(&db.pool, started.id).await,
+        serde_json::json!({ "case": { "id": "c-33" } })
+    );
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("33-non-interrupting-delivered-twice-then-host-completes.json")
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// The other order. Host completion withdraws the arm exactly as an
+/// interrupting one's would — non-interrupting says what a delivery *does*,
+/// never how long the boundary lives — so a note arriving afterwards is the
+/// same loud 404, and no side path ever ran.
+#[tokio::test]
+async fn host_completion_withdraws_a_non_interrupting_arm() {
+    let db = TestDb::create().await;
+    let engine = casefile_engine(&db).await;
+    let started = engine
+        .start(
+            "casefile",
+            None,
+            serde_json::json!({ "case": { "id": "c-33" } }),
+        )
+        .await
+        .unwrap();
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("reviewer"))
+        .await
+        .unwrap()
+        .expect("the reviewer's task");
+
+    let done = engine
+        .complete_task(task.id, "reviewer", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(matches!(done, Completion::Advanced(_)), "{done:?}");
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(
+        event_count(&db.pool, started.id, "subscription-cancelled").await,
+        1
+    );
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 0);
+
+    let late = engine
+        .correlate("NOTE", "c-33", serde_json::json!({}))
+        .await;
+    assert!(
+        matches!(late, Err(rbpmn_engine::EngineError::NoSubscription { .. })),
+        "{late:?}"
+    );
+    // The side path never existed: no token took it, so no item was created.
+    let items: i64 = sqlx::query_scalar(
+        "select count(*) from rbpmn_work_item where instance_id = $1 and element_id = 'file_note'",
+    )
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(items, 0);
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("33-host-completes-first.json")
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// The reminder shape, through the scheduler: a timer fires beside an open
+/// approval instead of taking it away. Both directions in one test, because
+/// the interesting pair is "fired, host untouched" against "host first, arm
+/// withdrawn" — the same two the golden traces pin.
+#[tokio::test]
+async fn a_non_interrupting_timer_spawns_a_reminder() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    // Due at once so the scheduler can fire it here — the same rewrite
+    // `boundary_timer_xml` and `racing_timer_xml` use, and the one literal the
+    // golden trace has to be mapped through below.
+    let xml = fixture("accept/34-non-interrupting-timer-boundary.bpmn").replace("PT1H", "PT0S");
+    engine.deploy(&xml, &Bindings::default()).await.unwrap();
+    let ping = |trace: Vec<String>| -> Vec<String> {
+        trace
+            .into_iter()
+            .map(|e| e.replace("timer-armed bt PT1H", "timer-armed bt PT0S"))
+            .collect()
+    };
+
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(timer_rows(&db.pool, started.id).await, 1);
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    // The reminder ran *beside* the approval. The clerk's item was never
+    // touched: still available, still claimable, still the same item.
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["ut", "t_ping"],
+        "the host's item and the side token's, together"
+    );
+    assert_eq!(item_state(&db.pool, started.id, "ut").await, "available");
+    let approval = engine
+        .get_task("ut", &GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .expect("the approval is still claimable");
+    assert_eq!(
+        (approval.id, approval.element_id.as_str()),
+        (open[0].0, "ut")
+    );
+
+    // The host completes; the reminder keeps the instance alive on its own.
+    assert!(matches!(
+        engine
+            .complete_task(approval.id, "clerk", serde_json::json!({}))
+            .await
+            .unwrap(),
+        Completion::Advanced(_)
+    ));
+    assert_eq!(status_of(&db.pool, started.id).await, "active");
+    engine
+        .complete_work_item(open[1].0, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        ping(golden_trace("34-reminder-fires-then-approved.json"))
+    );
+
+    // The mirror: the clerk is quicker than the deadline. The arm goes with
+    // the host, and there is nothing left for the scheduler to find — a
+    // reminder for a decision already made would be the bug.
+    let quick = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(timer_rows(&db.pool, quick.id).await, 1);
+    let (item, _) = open_items(&db.pool, quick.id).await[0].clone();
+    engine
+        .complete_work_item(item, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, quick.id, "completed").await;
+    assert_eq!(timer_rows(&db.pool, quick.id).await, 0);
+    assert_eq!(event_count(&db.pool, quick.id, "timer-cancelled").await, 1);
+    assert!(
+        !engine.fire_due_timer().await.unwrap(),
+        "the withdrawn arm must leave the scheduler nothing to fire"
+    );
+    assert_eq!(
+        event_trace(&db.pool, quick.id).await,
+        ping(golden_trace("34-host-completes-before-reminder.json"))
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// Scheduler liveness, and the guard against a re-arm sneaking into the
+/// single-shot path. A `timeDuration` boundary fires once — that is what the
+/// spec it carries says — so after the fire the whole database has nothing
+/// armed and `next_due_in` must be `None`.
+///
+/// A boundary that quietly re-armed itself would not fail any trace assertion
+/// above: it would show up here, as a scheduler that never sleeps again. The
+/// repeating form (`timeCycle`) is the one that re-arms, and it is a separate
+/// path — this is the guard that it stayed separate (the cycle tests at the
+/// end of this file check the other side of the same line).
+#[tokio::test]
+async fn a_single_shot_side_timer_leaves_the_scheduler_idle() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let xml = fixture("accept/34-non-interrupting-timer-boundary.bpmn").replace("PT1H", "PT0S");
+    engine.deploy(&xml, &Bindings::default()).await.unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(
+        engine.next_due_in().await.unwrap().is_some(),
+        "the boundary is armed and overdue"
+    );
+
+    assert!(engine.fire_due_timer().await.unwrap());
+    assert_eq!(
+        engine.next_due_in().await.unwrap(),
+        None,
+        "the single-shot boundary re-armed itself — the scheduler will now spin"
+    );
+    assert!(!engine.fire_due_timer().await.unwrap());
+    assert_eq!(timer_rows(&db.pool, started.id).await, 0);
+    assert_eq!(event_count(&db.pool, started.id, "timer-armed").await, 1);
+    assert_eq!(event_count(&db.pool, started.id, "timer-fired").await, 1);
+
+    // ...and the host is still open with the reminder beside it, so this is
+    // an idle scheduler over live work, not over a finished instance.
+    for (item, _) in open_items(&db.pool, started.id).await {
+        engine
+            .complete_work_item(item, serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(engine.next_due_in().await.unwrap(), None);
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// A non-interrupting boundary on a *subprocess*: the escalation runs beside
+/// the work, in the parent scope, because that is where the boundary's
+/// outgoing flow lives. The projection is what makes this checkable — the
+/// side token's `scope_no` is a column — and it is the one place where
+/// "the host token's scope" and "the host's own scope" are different answers.
+#[tokio::test]
+async fn a_side_token_on_a_subprocess_host_runs_in_the_parent_scope() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("warn_customer").await.unwrap();
+    let xml = fixture("accept/35-non-interrupting-on-subprocess.bpmn").replace("PT4H", "PT0S");
+    engine.deploy(&xml, &Bindings::default()).await.unwrap();
+    let started = engine
+        .start("shipment", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        scope_rows(&db.pool, started.id).await,
+        vec![(1, 0, "sp".to_string())]
+    );
+
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    // The three tokens, and the whole claim of §3.5 in one assertion: the
+    // sibling is in the *parent* scope beside the parked subprocess token,
+    // while the work inside the subprocess keeps its child scope.
+    let scopes = token_scopes(&db.pool, started.id).await;
+    assert_eq!(scopes.get("warn_customer"), Some(&0), "{scopes:?}");
+    assert_eq!(scopes.get("sp"), Some(&0), "the parked host token");
+    assert_eq!(scopes.get("pack"), Some(&1), "{scopes:?}");
+
+    // The subprocess finishes on its own — the boundary took nothing from it
+    // — and the escalation then keeps the instance alive after its host's
+    // scope has closed.
+    let (pack, _) = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .find(|(_, e)| e == "pack")
+        .unwrap();
+    engine
+        .complete_work_item(pack, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(
+        scope_rows(&db.pool, started.id).await.is_empty(),
+        "the subprocess completed with the side token outside it"
+    );
+    assert_eq!(status_of(&db.pool, started.id).await, "active");
+
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["warn_customer"]
+    );
+    engine
+        .complete_work_item(open[0].0, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    let expected: Vec<String> = golden_trace("35-side-token-in-parent-scope.json")
+        .into_iter()
+        .map(|e| {
+            e.replace(
+                "timer-armed taking_long PT4H",
+                "timer-armed taking_long PT0S",
+            )
+        })
+        .collect();
+    assert_eq!(event_trace(&db.pool, started.id).await, expected);
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// Teardown reaps side tokens, and nothing special-cases them. A side path
+/// runs *inside* a subprocess; the deadline on that subprocess then tears the
+/// whole scope down, and the sibling goes with everything else in it — its
+/// work item cancelled, its token gone, no scope row left behind.
+///
+/// Both timers are driven by backdating their rows rather than by rewriting
+/// literals: two arms on one instance have to fire in a defined order, and
+/// this keeps the history identical to the golden one.
+#[tokio::test]
+async fn teardown_reaps_side_tokens() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/36-side-token-reaped.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("claim", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    make_due(&db.pool, started.id, "nudge").await;
+    assert!(engine.fire_due_timer().await.unwrap());
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["assess", "chase"]
+    );
+    // The sibling is inside the subprocess' scope, beside its host: the
+    // boundary is on `assess`, whose token lives there.
+    let scopes = token_scopes(&db.pool, started.id).await;
+    assert_eq!(scopes.get("chase"), Some(&1), "{scopes:?}");
+    assert_eq!(scopes.get("assess"), Some(&1), "{scopes:?}");
+
+    make_due(&db.pool, started.id, "deadline").await;
+    assert!(engine.fire_due_timer().await.unwrap());
+    wait_for_status(&db.pool, started.id, "completed").await;
+
+    // Nothing of the side path survived, and nothing of it was treated
+    // differently from the host's own work.
+    assert!(scope_rows(&db.pool, started.id).await.is_empty());
+    assert!(open_items(&db.pool, started.id).await.is_empty());
+    assert_eq!(item_state(&db.pool, started.id, "chase").await, "cancelled");
+    assert_eq!(
+        item_state(&db.pool, started.id, "assess").await,
+        "cancelled"
+    );
+    assert_eq!(timer_rows(&db.pool, started.id).await, 0);
+    assert!(token_scopes(&db.pool, started.id).await.is_empty());
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("36-teardown-reaps-a-side-token.json")
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// The re-arm is an **arm**, and arms evaluate at arm time: the new
+/// subscription's key is read from the document the delivery just patched,
+/// not from the one the first arm saw. Nothing else in the corpus shows this
+/// — every other slice-2 delivery carries an empty patch — and it is visible
+/// only here, as the `correlation_key` column of a row the core asked for.
+///
+/// The trace slice at the end pins §3.5's emission order: delivery, its
+/// patch, **then** the re-arm, and only then the sibling's first move. A live
+/// host is never observably without its boundary.
+#[tokio::test]
+async fn a_re_arm_reads_its_key_from_the_patched_document() {
+    let db = TestDb::create().await;
+    let engine = casefile_engine(&db).await;
+    let started = engine
+        .start(
+            "casefile",
+            None,
+            serde_json::json!({ "case": { "id": "c-old" } }),
+        )
+        .await
+        .unwrap();
+    engine
+        .correlate(
+            "NOTE",
+            "c-old",
+            serde_json::json!({ "case": { "id": "c-new" } }),
+        )
+        .await
+        .unwrap();
+
+    let rearmed = subscriptions_of(&db.pool, started.id).await;
+    assert_eq!(rearmed.len(), 1, "{rearmed:?}");
+    assert_eq!(
+        rearmed[0].2, "c-new",
+        "the re-arm must evaluate its key at arm time, against the patched document"
+    );
+    let trace = event_trace(&db.pool, started.id).await;
+    let at = trace
+        .iter()
+        .position(|e| e == "message-received note_received NOTE")
+        .expect("the delivery");
+    assert_eq!(
+        &trace[at..at + 4],
+        [
+            "message-received note_received NOTE",
+            "variables-patched",
+            "message-subscribed note_received NOTE c-new",
+            "element-started note_received",
+        ]
+    );
+
+    // So the old key is nobody's any more, and the new one delivers.
+    let stale = engine
+        .correlate("NOTE", "c-old", serde_json::json!({}))
+        .await;
+    assert!(
+        matches!(stale, Err(rbpmn_engine::EngineError::NoSubscription { .. })),
+        "{stale:?}"
+    );
+    engine
+        .correlate("NOTE", "c-new", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        event_count(&db.pool, started.id, "message-received").await,
+        2
+    );
+
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("reviewer"))
+        .await
+        .unwrap()
+        .expect("the reviewer's task");
+    engine
+        .complete_task(task.id, "reviewer", serde_json::json!({}))
+        .await
+        .unwrap();
+    for (item, _) in open_items(&db.pool, started.id).await {
+        engine
+            .complete_work_item(item, serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(
+        variables_of(&db.pool, started.id).await,
+        serde_json::json!({ "case": { "id": "c-new" } })
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+// ----------------------------------------------------------- cycles (slice 3)
+
+const WEEK: f64 = 604_800.0;
+
+/// Every armed timer of an instance: (timer_no, due in epoch seconds,
+/// remaining) — the three things a cycle's row adds up to.
+async fn timer_dues(pool: &PgPool, instance: uuid::Uuid) -> Vec<(i64, f64, Option<i32>)> {
+    sqlx::query(
+        "select timer_no, extract(epoch from due_at)::float8 as due, remaining \
+         from rbpmn_timer where instance_id = $1 order by timer_no",
+    )
+    .bind(instance)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| (r.get("timer_no"), r.get("due"), r.get("remaining")))
+    .collect()
+}
+
+async fn db_epoch(pool: &PgPool, expr: &str) -> f64 {
+    sqlx::query_scalar(&format!("select extract(epoch from {expr})::float8"))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Push every armed occurrence of an instance `ago` into the past. The golden
+/// traces are untouched by this — only the instant moves, and the instant is
+/// the projection's.
+async fn backdate_timers_by(pool: &PgPool, instance: uuid::Uuid, ago: &str) {
+    sqlx::query("update rbpmn_timer set due_at = now() - $2::interval where instance_id = $1")
+        .bind(instance)
+        .bind(ago)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// A scheduler that is an hour late: the armed occurrence is overdue by the
+/// time anyone looks, but by less than one period.
+async fn backdate_timers(pool: &PgPool, instance: uuid::Uuid) {
+    backdate_timers_by(pool, instance, "1 hour").await;
+}
+
+async fn late_fee_engine(db: &TestDb) -> (Engine, uuid::Uuid) {
+    let engine = engine(db).await;
+    engine.declare_topic("add_late_fee").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/40-late-fee-cycle.bpmn"),
+            &Bindings::new().correlation("await_payment", "ticket.reference"),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start(
+            "ticket",
+            None,
+            serde_json::json!({ "ticket": { "reference": "T-40" } }),
+        )
+        .await
+        .unwrap();
+    (engine, started.id)
+}
+
+/// The schedule is *previous due + period*, never *now + period*: a
+/// scheduler that ran an hour late must not push every later occurrence an
+/// hour later too. `continues` in the re-arm's payload is how the projection
+/// knew which due to step from.
+#[tokio::test]
+async fn a_cycle_rearms_from_its_previous_due() {
+    let db = TestDb::create().await;
+    let (engine, instance) = late_fee_engine(&db).await;
+
+    let now = db_epoch(&db.pool, "clock_timestamp()").await;
+    let armed = timer_dues(&db.pool, instance).await;
+    assert_eq!(armed.len(), 1, "one occurrence at a time");
+    let (first_no, first_due, remaining) = armed[0];
+    assert!(remaining.is_none(), "R/… is unbounded");
+    assert!(
+        (first_due - (now + WEEK)).abs() < 5.0,
+        "the first due is a week from the arm, off by {}s",
+        first_due - now - WEEK
+    );
+
+    backdate_timers(&db.pool, instance).await;
+    let (_, overdue, _) = timer_dues(&db.pool, instance).await[0];
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    let next = timer_dues(&db.pool, instance).await;
+    assert_eq!(next.len(), 1, "the fired row is gone and the next is in");
+    assert_eq!(next[0].0, first_no + 1);
+    assert!(
+        (next[0].1 - (overdue + WEEK)).abs() < 0.001,
+        "the next due steps from the overdue one, not from now: got {}, wanted {}",
+        next[0].1,
+        overdue + WEEK
+    );
+    assert!(next[0].2.is_none());
+
+    // The side token is real work beside the untouched host (a receive task:
+    // no item of its own, its subscription still there).
+    let open = open_items(&db.pool, instance).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["add_late_fee"]
+    );
+    assert_eq!(subscription_rows(&db.pool, instance).await, 1);
+    let continues: Option<i64> = sqlx::query_scalar(
+        "select (payload->>'continues')::bigint from rbpmn_event \
+         where instance_id = $1 and kind = 'timer-armed' order by id desc limit 1",
+    )
+    .bind(instance)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        continues,
+        Some(first_no),
+        "the re-arm names the occurrence it continues"
+    );
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// **Downtime is not a backlog.** A re-arm lands on the grid of the previous
+/// due at the first occurrence *at or after* now, so an engine that was down
+/// across three periods re-arms *once*, at the next occurrence. Stepping
+/// blindly to `previous due + period` would leave the re-arm already past,
+/// and nothing would slow the replay down: `drain_due_timers` picks it on the
+/// very next pass and `Drain::Fired` never sleeps, so a day of downtime on an
+/// `R/PT15M` boundary would spawn 96 side tokens back to back.
+///
+/// The occurrences the outage missed are skipped, never replayed — and
+/// because a bounded `R<n>` counts *fires*, skipping them costs it nothing.
+#[tokio::test]
+async fn a_re_arm_skips_occurrences_missed_while_down() {
+    let db = TestDb::create().await;
+    let (engine, instance) = late_fee_engine(&db).await;
+
+    // Down for three periods and a bit, on `R/P7D`.
+    backdate_timers_by(&db.pool, instance, "22 days").await;
+    let (_, overdue, _) = timer_dues(&db.pool, instance).await[0];
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    let next = timer_dues(&db.pool, instance).await;
+    assert_eq!(
+        next.len(),
+        1,
+        "one occurrence armed, not one per missed period"
+    );
+    let (_, due, remaining) = next[0];
+    assert!(remaining.is_none(), "R/… is unbounded");
+    let now = db_epoch(&db.pool, "clock_timestamp()").await;
+    assert!(
+        due > now && due <= now + WEEK,
+        "the re-arm is the next occurrence, not a past one: due {due}, now {now}"
+    );
+    let periods = (due - overdue) / WEEK;
+    assert!(
+        (periods - periods.round()).abs() < 1e-6,
+        "still on the previous due's grid, not on now's: {periods} periods on"
+    );
+    assert_eq!(
+        periods.round(),
+        4.0,
+        "the first whole period at or after now"
+    );
+
+    // The burst, in the one place it would show: a second pass finds nothing
+    // due, and exactly one side token was spawned.
+    assert!(
+        !engine.fire_due_timer().await.unwrap(),
+        "the scheduler has nothing left to fire — no catch-up burst"
+    );
+    let open = open_items(&db.pool, instance).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["add_late_fee"],
+        "one fire, one late fee — not one per missed week"
+    );
+    assert_eq!(event_count(&db.pool, instance, "timer-fired").await, 1);
+
+    // A bounded cycle spends its count on fires. The same outage over `R2`
+    // leaves one fire left, not none.
+    engine.declare_topic("nudge").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/41-anchored-cycle.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let bounded = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(timer_dues(&db.pool, bounded.id).await[0].2, Some(2));
+    backdate_timers_by(&db.pool, bounded.id, "22 days").await;
+    assert!(engine.fire_due_timer().await.unwrap());
+    let after = timer_dues(&db.pool, bounded.id).await;
+    assert_eq!(after.len(), 1, "R2 re-armed once");
+    assert_eq!(
+        after[0].2,
+        Some(1),
+        "the fire spent one; the three occurrences the outage skipped spent nothing"
+    );
+    assert!(
+        !engine.fire_due_timer().await.unwrap(),
+        "and no burst on the bounded cycle either"
+    );
+
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// The host ending is what ends a cycle — and only the cycle: side work
+/// already spawned runs to its end and keeps the instance alive until then.
+#[tokio::test]
+async fn host_completion_cancels_the_cycle_but_not_the_side_work() {
+    let db = TestDb::create().await;
+    let (engine, instance) = late_fee_engine(&db).await;
+    backdate_timers(&db.pool, instance).await;
+    assert!(engine.fire_due_timer().await.unwrap());
+    assert_eq!(timer_rows(&db.pool, instance).await, 1, "re-armed");
+
+    engine
+        .correlate("PAID", "T-40", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        timer_rows(&db.pool, instance).await,
+        0,
+        "the arm went with the host"
+    );
+    assert_eq!(event_count(&db.pool, instance, "timer-cancelled").await, 1);
+    assert_eq!(status_of(&db.pool, instance).await, "active");
+    assert!(!engine.fire_due_timer().await.unwrap());
+
+    let (fee, _) = open_items(&db.pool, instance).await[0].clone();
+    engine
+        .complete_work_item(fee, serde_json::json!({ "fees": 1 }))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, instance, "completed").await;
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// The anchor fixes the *phase*, not a set of instants: the first due is the
+/// first occurrence at or after the arm, aligned to the anchor, and nothing
+/// in the past is replayed. Checked for an anchor long past and one that may
+/// still be ahead, with one assertion that is true either way.
+#[tokio::test]
+async fn an_anchored_cycle_starts_at_its_phase() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("nudge").await.unwrap();
+    let fixture_xml = fixture("accept/41-anchored-cycle.bpmn");
+    let past = fixture_xml
+        .replace(
+            "R2/2026-08-31T00:00:00+02:00/P7D",
+            "R2/2020-01-06T00:00:00Z/P7D",
+        )
+        .replace("<bpmn:process id=\"p\"", "<bpmn:process id=\"past\"");
+    engine
+        .deploy(&fixture_xml, &Bindings::default())
+        .await
+        .unwrap();
+    engine.deploy(&past, &Bindings::default()).await.unwrap();
+
+    for (key, anchor) in [
+        ("p", "'2026-08-31T00:00:00+02:00'::timestamptz"),
+        ("past", "'2020-01-06T00:00:00Z'::timestamptz"),
+    ] {
+        let started = engine
+            .start(key, None, serde_json::json!({}))
+            .await
+            .unwrap();
+        let now = db_epoch(&db.pool, "clock_timestamp()").await;
+        let anchor = db_epoch(&db.pool, anchor).await;
+        let armed = timer_dues(&db.pool, started.id).await;
+        assert_eq!(armed.len(), 1, "{key}: no catch-up burst, one occurrence");
+        let (_, due, remaining) = armed[0];
+        assert_eq!(remaining, Some(2), "{key}: R2 starts with two fires left");
+        let floor = now.max(anchor);
+        assert!(
+            due >= floor - 1.0 && due < floor + WEEK,
+            "{key}: the first occurrence at or after the arm, got {due} (now {now}, anchor {anchor})"
+        );
+        let phase = ((due - anchor) / WEEK).fract().abs();
+        assert!(
+            phase < 1e-6 || (1.0 - phase) < 1e-6,
+            "{key}: aligned to the anchor's phase, off by {phase} weeks"
+        );
+        assert!(harness::fsck(&db.pool).await.is_empty());
+    }
+    db.drop().await;
+}
+
+/// `R2`: two fires and then nothing — no third row, and a scheduler that
+/// knows it (`next_due_in` is None while the host is still open, so it is
+/// idleness over live work, not an empty database).
+#[tokio::test]
+async fn a_bounded_cycle_exhausts() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("nudge").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/41-anchored-cycle.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    backdate_timers(&db.pool, started.id).await;
+    let (_, first, _) = timer_dues(&db.pool, started.id).await[0];
+    assert!(engine.fire_due_timer().await.unwrap());
+    let second = timer_dues(&db.pool, started.id).await;
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].2, Some(1), "the last fire left");
+    assert!((second[0].1 - (first + WEEK)).abs() < 0.001);
+
+    backdate_timers(&db.pool, started.id).await;
+    assert!(engine.fire_due_timer().await.unwrap());
+    assert_eq!(
+        timer_rows(&db.pool, started.id).await,
+        0,
+        "no third occurrence"
+    );
+    assert_eq!(event_count(&db.pool, started.id, "timer-armed").await, 2);
+    assert_eq!(event_count(&db.pool, started.id, "timer-fired").await, 2);
+    assert!(engine.next_due_in().await.unwrap().is_none());
+    assert!(!engine.fire_due_timer().await.unwrap());
+
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["await_signature", "nudge", "nudge"],
+        "the host untouched, one side token per fire"
+    );
+    assert_eq!(status_of(&db.pool, started.id).await, "active");
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Scoped variable indexes: `definition` (per definition, today's behaviour)
+// and `shared` (one index per field, across definitions).
+// ---------------------------------------------------------------------------
+
+/// EXPLAIN of a *parameterised* lookup. PREPARE and EXPLAIN must see the same
+/// session, so both run on one pinned connection. Parameterised deliberately:
+/// the shape an application actually issues is `definition_key = any($n)`, and
+/// a literal array would be a different question.
+async fn explain_prepared(pool: &PgPool, name: &str, prepare: &str, execute: &str) -> String {
+    let mut conn = pool.acquire().await.unwrap();
+    // Pooled connections come back with their prepared statements intact, so
+    // a second call in one test collides on the name. Drop just ours —
+    // `deallocate all` would take sqlx's own statement cache with it and
+    // break every later query on this connection.
+    let _ = sqlx::query(&format!("deallocate {name}"))
+        .execute(&mut *conn)
+        .await;
+    sqlx::query(prepare).execute(&mut *conn).await.unwrap();
+    let rows = sqlx::query(&format!("explain (costs off) {execute}"))
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+    rows.iter()
+        .map(|r| r.get::<String, _>(0))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The plan lines that mention `needle`, so an assertion can distinguish
+/// "appears as an Index Cond" from "appears as a Filter".
+fn plan_lines<'a>(plan: &'a str, needle: &str) -> Vec<&'a str> {
+    plan.lines().filter(|l| l.contains(needle)).collect()
+}
+
+async fn analyze(pool: &PgPool) {
+    sqlx::query("analyze rbpmn_instance")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Bulk instance rows for the planner's benefit.
+///
+/// Deliberately inserted as SQL rather than driven through `start`: a plan
+/// test needs table statistics, not engine history, and the difference
+/// between 600 rows and 40 000 is the difference between a hash join being
+/// genuinely cheaper and the index being the only sane choice. Driving 40 000
+/// instances through the step function would take minutes and prove the same
+/// thing about the planner.
+///
+/// `half` of them carry `order_no`; the rest carry none at all — those are
+/// exactly the rows a shared index's `IS NOT NULL` predicate keeps out.
+async fn bulk_instances(pool: &PgPool, key: &str, prefix: &str, n: i32) {
+    sqlx::query(
+        "insert into rbpmn_instance \
+           (definition_id, definition_key, definition_version, status, variables) \
+         select d.id, d.key, d.version, 'active', \
+                case when g % 2 = 0 \
+                     then jsonb_build_object('order_no', $2 || g) \
+                     else jsonb_build_object('channel', 'web') end \
+           from rbpmn_definition d, generate_series(1, $3) g \
+          where d.key = $1",
+    )
+    .bind(key)
+    .bind(prefix)
+    .bind(n)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Two definitions hoisting the same business identifier, each with ~n
+/// instances carrying it, plus a third definition that never carries it (the
+/// rows a shared index's `IS NOT NULL` predicate keeps out).
+async fn two_definitions_with(engine: &Engine, bindings: &Bindings, n: usize) {
+    engine.declare_topic("warn_customer").await.unwrap();
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), bindings)
+        .await
+        .unwrap();
+    engine
+        .deploy(
+            &fixture("accept/35-non-interrupting-on-subprocess.bpmn"),
+            bindings,
+        )
+        .await
+        .unwrap();
+    for i in 0..n {
+        engine
+            .start(
+                "p",
+                None,
+                serde_json::json!({ "order_no": format!("A-{i}") }),
+            )
+            .await
+            .unwrap();
+        engine
+            .start(
+                "shipment",
+                None,
+                serde_json::json!({ "order_no": format!("B-{i}") }),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// Through the **published view**, which is how an application reaches this.
+/// If the view ever stopped being a plain inlinable projection — a
+/// `security_barrier`, a WHERE, a volatile function — the outside predicate
+/// could no longer be pushed below it (`jsonb ->>` is not leakproof) and this
+/// plan would collapse to a full scan.
+const XDEF_PREPARE: &str = "prepare xdef(text, text[]) as \
+     select id, definition_key from rbpmn_v_instance \
+      where variables->>'order_no' = $1 and definition_key = any($2)";
+const XDEF_EXECUTE: &str = "execute xdef('X-42', array['p','shipment'])";
+
+/// The headline: a lookup across definitions cannot use the per-definition
+/// indexes — Postgres can prove a partial predicate only from an equality
+/// against a constant, and `definition_key = any($1)` is not one — but does
+/// use the shared index, with the key set demoted to a filter.
+#[tokio::test]
+async fn shared_index_serves_the_cross_definition_lookup() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    two_definitions_with(&engine, &Bindings::new().index("order_no"), 5).await;
+    bulk_instances(&db.pool, "p", "X-", 20_000).await;
+    bulk_instances(&db.pool, "shipment", "Y-", 20_000).await;
+    analyze(&db.pool).await;
+
+    // Before: only the two definition-scoped indexes exist.
+    let before = explain_prepared(&db.pool, "xdef", XDEF_PREPARE, XDEF_EXECUTE).await;
+    for key in ["p", "shipment"] {
+        assert!(
+            !before.contains(&rbpmn_engine::declared_index_name(key, "order_no")),
+            "a definition-scoped index cannot serve the cross-definition \
+             lookup, but the plan used one:\n{before}"
+        );
+    }
+
+    engine.declare_shared_index("order_no").await.unwrap();
+    engine.declare_shared_index("order_no").await.unwrap(); // idempotent
+    analyze(&db.pool).await;
+
+    let after = explain_prepared(&db.pool, "xdef", XDEF_PREPARE, XDEF_EXECUTE).await;
+    let shared = rbpmn_engine::shared_index_name("order_no");
+    assert!(
+        after.contains(&shared),
+        "the shared index must serve the cross-definition lookup:\n{after}"
+    );
+    // The roles must invert: the field becomes the index qual, the key set a
+    // filter applied afterwards. A `definition_key` index condition would mean
+    // the planner led with the key set again.
+    assert!(
+        plan_lines(&after, "definition_key")
+            .iter()
+            .all(|l| !l.contains("Index Cond")),
+        "definition_key must be a filter, not an index condition:\n{after}"
+    );
+    assert!(
+        plan_lines(&after, "Index Cond")
+            .iter()
+            .any(|l| l.contains("order_no")),
+        "the hoisted field must be the index condition:\n{after}"
+    );
+    db.drop().await;
+}
+
+/// The definition-scoped path is untouched by the existence of a shared
+/// index: `TaskFilter`'s literal key still plans onto its own partial index,
+/// which serves it strictly better (measured: a single index scan, versus a
+/// BitmapAnd against the definition-key index when only the shared one is
+/// available).
+#[tokio::test]
+async fn the_definition_scoped_path_is_unchanged_by_a_shared_index() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    two_definitions_with(&engine, &Bindings::new().index("order_no"), 5).await;
+    bulk_instances(&db.pool, "p", "X-", 20_000).await;
+    bulk_instances(&db.pool, "shipment", "Y-", 20_000).await;
+    engine.declare_shared_index("order_no").await.unwrap();
+    analyze(&db.pool).await;
+
+    let plan = explain_prepared(
+        &db.pool,
+        "scoped",
+        "prepare scoped(text) as select id from rbpmn_v_instance \
+          where definition_key = 'p' and variables->>'order_no' = $1",
+        "execute scoped('X-42')",
+    )
+    .await;
+    assert!(
+        plan.contains(&rbpmn_engine::declared_index_name("p", "order_no")),
+        "the definition-scoped filter must keep using its own index:\n{plan}"
+    );
+    db.drop().await;
+}
+
+/// N definitions declaring the same shared field converge on ONE index —
+/// by construction, because the name is derived from the field alone and
+/// `IF NOT EXISTS` does the rest. No reference counting anywhere.
+#[tokio::test]
+async fn shared_declarations_converge_on_one_index() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    two_definitions_with(&engine, &Bindings::new().shared_index("order_no"), 2).await;
+
+    let shared: i64 =
+        sqlx::query_scalar("select count(*) from pg_class where relname like 'rbpmn\\_vixs\\_%'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(shared, 1, "two definitions, one shared index");
+    let exists: bool =
+        sqlx::query_scalar("select exists (select 1 from pg_class where relname = $1)")
+            .bind(rbpmn_engine::shared_index_name("order_no"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(exists);
+    // The shared DDL, pinned the same way: no definition key anywhere, and
+    // the `is not null` predicate that keeps out every definition which never
+    // carries the field.
+    let ddl: String = sqlx::query_scalar("select indexdef from pg_indexes where indexname = $1")
+        .bind(rbpmn_engine::shared_index_name("order_no"))
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        ddl,
+        format!(
+            "CREATE INDEX {} ON public.rbpmn_instance \
+             USING btree (((variables ->> 'order_no'::text))) \
+             WHERE ((variables ->> 'order_no'::text) IS NOT NULL)",
+            rbpmn_engine::shared_index_name("order_no")
+        )
+    );
+    // And no definition-scoped index was created alongside it.
+    let scoped: i64 =
+        sqlx::query_scalar("select count(*) from pg_class where relname like 'rbpmn\\_vix\\_%'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(scoped, 0);
+    db.drop().await;
+}
+
+/// The two namespaces cannot collide, including for a definition whose key is
+/// literally `shared`.
+#[test]
+fn index_names_are_domain_separated() {
+    assert_ne!(
+        rbpmn_engine::shared_index_name("f"),
+        rbpmn_engine::declared_index_name("shared", "f")
+    );
+    assert!(rbpmn_engine::shared_index_name("f").starts_with("rbpmn_vixs_"));
+    assert!(rbpmn_engine::declared_index_name("k", "f").starts_with("rbpmn_vix_"));
+    // Postgres identifiers cap at 63 bytes, and the hash always survives.
+    let long = rbpmn_engine::shared_index_name(&"f".repeat(200));
+    assert!(long.len() <= 63, "{}", long.len());
+}
+
+/// Back-compat: the string form is definition-scoped and produces exactly the
+/// index it always has; and spelling the default the long way is the *same
+/// wiring*, so it hashes the same and does not allocate a version.
+#[tokio::test]
+async fn the_string_manifest_form_stays_definition_scoped() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+
+    let from_json: Bindings = serde_json::from_str(r#"{"indexes":["channel"]}"#).unwrap();
+    let first = engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &from_json)
+        .await
+        .unwrap();
+    assert_eq!(first.version, 1);
+    let exists: bool =
+        sqlx::query_scalar("select exists (select 1 from pg_class where relname = $1)")
+            .bind(rbpmn_engine::declared_index_name("p", "channel"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(exists, "the string form must build the index it always has");
+
+    // Byte-for-byte against the DDL that shipped before scopes existed —
+    // taken from a database built by the old code. This is not decoration:
+    // the index name is derived from (key, field) only, so a drifted
+    // predicate or expression would be silently kept by `IF NOT EXISTS` on
+    // every deployment that already has one, and the drift would never
+    // surface.
+    let ddl: String = sqlx::query_scalar("select indexdef from pg_indexes where indexname = $1")
+        .bind(rbpmn_engine::declared_index_name("p", "channel"))
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        ddl,
+        "CREATE INDEX rbpmn_vix_p_channel_d70abfc6 ON public.rbpmn_instance \
+         USING btree (((variables ->> 'channel'::text))) \
+         WHERE (definition_key = 'p'::text)"
+    );
+
+    let spelled_out: Bindings =
+        serde_json::from_str(r#"{"indexes":[{"field":"channel","scope":"definition"}]}"#).unwrap();
+    let again = engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &spelled_out)
+        .await
+        .unwrap();
+    assert!(
+        again.reused && again.version == 1,
+        "the same wiring spelled differently must not allocate a version"
+    );
+    db.drop().await;
+}
+
+/// One manifest saying both things about one field says nothing rbpmn can act
+/// on, so it is refused before anything persists.
+#[tokio::test]
+async fn contradictory_scopes_in_one_manifest_are_refused() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let contradictory: Bindings =
+        serde_json::from_str(r#"{"indexes":["order_no",{"field":"order_no","scope":"shared"}]}"#)
+            .unwrap();
+    let refused = engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &contradictory)
+        .await;
+    match refused {
+        Err(DeployError::InvalidManifest(m)) => {
+            assert!(m.contains("order_no") && m.contains("shared"), "{m}")
+        }
+        other => panic!("expected InvalidManifest, got {other:?}"),
+    }
+    let defs: i64 = sqlx::query_scalar("select count(*) from rbpmn_definition")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(defs, 0, "a rejected manifest must not deploy");
+    db.drop().await;
+}
+
+/// An interrupted `CREATE INDEX CONCURRENTLY` leaves an *invalid* index that
+/// `IF NOT EXISTS` would accept forever. Both scopes take the same recovery
+/// path: drop the corpse, say so, and rebuild on the next call.
+#[tokio::test]
+async fn an_invalid_shared_index_is_dropped_and_reported() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine.declare_shared_index("order_no").await.unwrap();
+    let name = rbpmn_engine::shared_index_name("order_no");
+
+    // Exactly what an interrupted build leaves behind.
+    sqlx::query("update pg_index set indisvalid = false where indexrelid = $1::regclass")
+        .bind(&name)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    match engine.declare_shared_index("order_no").await {
+        Err(rbpmn_engine::EngineError::InvalidVariables(m)) => {
+            assert!(m.contains(&name) && m.contains("invalid"), "{m}")
+        }
+        other => panic!("expected the loud invalid-index error, got {other:?}"),
+    }
+    let gone: bool =
+        sqlx::query_scalar("select not exists (select 1 from pg_class where relname = $1)")
+            .bind(&name)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(gone, "the corpse must be dropped, not kept");
+
+    engine.declare_shared_index("order_no").await.unwrap();
+    let valid: bool = sqlx::query_scalar(
+        "select i.indisvalid from pg_class c join pg_index i on i.indexrelid = c.oid \
+         where c.relname = $1",
+    )
+    .bind(&name)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(valid, "the next call must rebuild it");
+    db.drop().await;
+}
+
+/// Two deploys racing on the same shared field. The advisory lock makes this
+/// deterministic instead of resting on an unstated Postgres property: both
+/// succeed, and exactly one valid index exists afterwards.
+#[tokio::test]
+async fn concurrent_deploys_of_one_shared_field() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("warn_customer").await.unwrap();
+
+    // Genuinely separate nodes: separate pools over one database.
+    let a = Engine::builder(sqlx::PgPool::connect(&db.url()).await.unwrap()).build();
+    let b = Engine::builder(sqlx::PgPool::connect(&db.url()).await.unwrap()).build();
+    let bindings = Bindings::new().shared_index("order_no");
+
+    let minimal = fixture("accept/01-minimal.bpmn");
+    let shipment = fixture("accept/35-non-interrupting-on-subprocess.bpmn");
+    let (ra, rb) = tokio::join!(
+        a.deploy(&minimal, &bindings),
+        b.deploy(&shipment, &bindings),
+    );
+    ra.unwrap();
+    rb.unwrap();
+
+    let indexes: Vec<(String, bool)> = sqlx::query_as(
+        "select c.relname, i.indisvalid from pg_class c \
+         join pg_index i on i.indexrelid = c.oid \
+         where c.relname like 'rbpmn\\_vixs\\_%'",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(indexes.len(), 1, "one shared field, one index: {indexes:?}");
+    assert!(indexes[0].1, "and it must be valid: {indexes:?}");
+    db.drop().await;
+}
+
+/// The lifecycle answer, made visible. Nothing drops a declared index — not
+/// `delete_definition`, not retention, not dropping the field from the
+/// manifest — so the audit is how an operator finds what is left over, and
+/// how a shared index still needed by a *second* definition is shown to be
+/// safe when the first goes away.
+#[tokio::test]
+async fn declared_indexes_reports_orphans_and_shared_survivors() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("warn_customer").await.unwrap();
+    let bindings = Bindings::new().index("channel").shared_index("order_no");
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &bindings)
+        .await
+        .unwrap();
+    engine
+        .deploy(
+            &fixture("accept/35-non-interrupting-on-subprocess.bpmn"),
+            &bindings,
+        )
+        .await
+        .unwrap();
+
+    let shared_name = rbpmn_engine::shared_index_name("order_no");
+    let audit = engine.declared_indexes().await.unwrap();
+    let shared = audit.iter().find(|i| i.name == shared_name).unwrap();
+    assert_eq!(shared.declared_by.len(), 2, "{shared:?}");
+    assert!(shared.present && shared.valid);
+    assert_eq!(shared.scope, Some(rbpmn_engine::IndexScope::Shared));
+
+    // Remove one of the two definitions entirely. Nothing is dropped.
+    engine.delete_definition("p", 1).await.unwrap();
+    let audit = engine.declared_indexes().await.unwrap();
+
+    let shared = audit.iter().find(|i| i.name == shared_name).unwrap();
+    assert_eq!(
+        shared.declared_by,
+        vec!["shipment v1".to_string()],
+        "the surviving definition still declares it — it must not read as an orphan"
+    );
+    assert!(shared.present && shared.valid);
+
+    // The departed definition's own index is still there, and now orphaned:
+    // the field name is gone with the manifest, because the name is one-way.
+    let orphan = audit
+        .iter()
+        .find(|i| i.name == rbpmn_engine::declared_index_name("p", "channel"))
+        .expect("the orphan is still in the catalogue");
+    assert!(orphan.declared_by.is_empty(), "{orphan:?}");
+    assert!(orphan.present, "nothing drops a declared index");
+    assert_eq!(orphan.field, None);
+    db.drop().await;
+}
+
+/// The view is public API, so its shape is asserted the way rule ids and the
+/// `Event` display format are: columns may be added, never removed or
+/// repurposed.
+#[tokio::test]
+async fn the_published_view_has_the_documented_shape() {
+    let db = TestDb::create().await;
+    let _engine = engine(&db).await;
+
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        "select column_name::text, data_type::text from information_schema.columns \
+         where table_name = 'rbpmn_v_instance' order by ordinal_position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        vec![
+            ("id".into(), "uuid".into()),
+            ("definition_key".into(), "text".into()),
+            ("definition_version".into(), "integer".into()),
+            ("business_key".into(), "text".into()),
+            ("status".into(), "text".into()),
+            ("variables".into(), "jsonb".into()),
+            ("created_at".into(), "timestamp with time zone".into()),
+            ("completed_at".into(), "timestamp with time zone".into()),
+        ],
+        "rbpmn_v_instance is public API — adding a column is fine, changing \
+         or removing one is a breaking change"
+    );
+
+    // A barrier view would refuse to push `variables->>'f' = $1` below itself,
+    // because `jsonb ->>` is not leakproof — and every declared variable index
+    // would then sit unused beneath a full scan.
+    let barrier: Option<Vec<String>> =
+        sqlx::query_scalar("select reloptions from pg_class where relname = 'rbpmn_v_instance'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(
+        barrier.is_none(),
+        "the view must carry no reloptions at all, and above all not \
+         security_barrier: {barrier:?}"
+    );
+    db.drop().await;
+}
+
+/// What an application actually does: its own table, its own tenancy filter,
+/// its own ordering, joined against rbpmn's published view on the identifier
+/// it hoisted into `variables`. This is the join no data-returning API can do
+/// as well, and the reason the view exists — so it must plan onto the shared
+/// index, not scan every instance in the system.
+#[tokio::test]
+async fn an_application_joins_its_own_table_against_the_published_view() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    two_definitions_with(&engine, &Bindings::new().shared_index("order_no"), 5).await;
+    bulk_instances(&db.pool, "p", "X-", 20_000).await;
+    bulk_instances(&db.pool, "shipment", "Y-", 20_000).await;
+
+    // The application's own rows, keyed by the same business identifier.
+    // Three of them belong to the tenant asking — the shape that makes a
+    // nested loop into the shared index the right plan.
+    sqlx::query("create table app_order (order_id text primary key, tenant text not null)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "insert into app_order (order_id, tenant) \
+         select 'X-' || g, case when g <= 6 then 'acme' else 'other' end \
+         from generate_series(2, 20000, 2) g",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("analyze app_order")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    analyze(&db.pool).await;
+
+    let plan = explain_prepared(
+        &db.pool,
+        "tenant_inbox",
+        "prepare tenant_inbox(text) as \
+           select i.id, i.definition_key, i.status, o.order_id \
+             from app_order o \
+             join rbpmn_v_instance i on i.variables->>'order_no' = o.order_id \
+            where o.tenant = $1 \
+            order by i.created_at",
+        "execute tenant_inbox('acme')",
+    )
+    .await;
+
+    let shared = rbpmn_engine::shared_index_name("order_no");
+    assert!(
+        plan.contains(&shared),
+        "an application's join must reach the shared index:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Subquery Scan"),
+        "the view must be inlined, not materialised as a subquery:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Seq Scan on rbpmn_instance"),
+        "the join must not fall back to scanning every instance:\n{plan}"
+    );
+
+    // And it returns what the application asked for: its three acme orders,
+    // resolved across two different definitions without naming either.
+    let rows: Vec<(uuid::Uuid, String, String, String)> = sqlx::query_as(
+        "select i.id, i.definition_key, i.status, o.order_id \
+           from app_order o \
+           join rbpmn_v_instance i on i.variables->>'order_no' = o.order_id \
+          where o.tenant = $1 order by o.order_id",
+    )
+    .bind("acme")
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(rows.iter().all(|r| r.1 == "p"));
+    assert_eq!(
+        rows.iter().map(|r| r.3.as_str()).collect::<Vec<_>>(),
+        vec!["X-2", "X-4", "X-6"]
+    );
+    db.drop().await;
+}
+
+/// The no-SQL entry point: index-backed by construction, bounded, and loud
+/// when the index it promises is not there.
+#[tokio::test]
+async fn find_by_shared_index_resolves_across_definitions() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    two_definitions_with(&engine, &Bindings::new().shared_index("order_no"), 50).await;
+
+    let found = engine
+        .find_by_shared_index("order_no", "A-7", 10)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].definition_key, "p");
+
+    // The same identifier carried by two definitions resolves to both — the
+    // whole point of not knowing which workflow holds it.
+    engine
+        .start(
+            "shipment",
+            Some("bk-7"),
+            serde_json::json!({ "order_no": "A-7" }),
+        )
+        .await
+        .unwrap();
+    let found = engine
+        .find_by_shared_index("order_no", "A-7", 10)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(
+        found
+            .iter()
+            .map(|m| m.definition_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["p", "shipment"],
+        "oldest first, deterministically"
+    );
+    assert_eq!(found[1].business_key.as_deref(), Some("bk-7"));
+
+    // Bounded, and the bound is enforced at both ends.
+    assert_eq!(
+        engine
+            .find_by_shared_index("order_no", "A-7", 1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    for bad in [0, rbpmn_engine::MAX_FIND_LIMIT + 1] {
+        assert!(matches!(
+            engine.find_by_shared_index("order_no", "A-7", bad).await,
+            Err(rbpmn_engine::EngineError::InvalidVariables(_))
+        ));
+    }
+    db.drop().await;
+}
+
+/// Refused, not silently sequential-scanned: the call's whole contract is
+/// that it is index-backed, and "correct but catastrophically slow" is the
+/// "seems to run" failure this project rejects everywhere else.
+#[tokio::test]
+async fn find_by_shared_index_refuses_an_undeclared_field() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    // Declared, but definition-scoped — which is not the index this needs.
+    two_definitions_with(&engine, &Bindings::new().index("order_no"), 2).await;
+
+    match engine.find_by_shared_index("order_no", "A-1", 10).await {
+        Err(rbpmn_engine::EngineError::UndeclaredSharedIndex { field, index }) => {
+            assert_eq!(field, "order_no");
+            assert_eq!(index, rbpmn_engine::shared_index_name("order_no"));
+        }
+        other => panic!("expected UndeclaredSharedIndex, got {other:?}"),
+    }
+
+    // Injection-shaped field names never reach SQL, index or no index.
+    assert!(matches!(
+        engine.find_by_shared_index("x') or ('1'='1", "v", 10).await,
+        Err(rbpmn_engine::EngineError::InvalidVariables(_))
+    ));
+    db.drop().await;
+}
+
+/// A hazard that **predates** the shared scope: two definitions deploying at
+/// once each build a `CREATE INDEX CONCURRENTLY` on `rbpmn_instance`, and two
+/// concurrent builds on one table deadlock — whether or not they name the same
+/// index. Two different fields, therefore, and no shared scope in sight.
+#[tokio::test]
+async fn concurrent_deploys_of_different_indexes_do_not_deadlock() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("warn_customer").await.unwrap();
+
+    let a = Engine::builder(sqlx::PgPool::connect(&db.url()).await.unwrap()).build();
+    let b = Engine::builder(sqlx::PgPool::connect(&db.url()).await.unwrap()).build();
+    let minimal = fixture("accept/01-minimal.bpmn");
+    let shipment = fixture("accept/35-non-interrupting-on-subprocess.bpmn");
+
+    let channel = Bindings::new().index("channel");
+    let region = Bindings::new().index("region");
+    let (ra, rb) = tokio::join!(a.deploy(&minimal, &channel), b.deploy(&shipment, &region),);
+    ra.unwrap();
+    rb.unwrap();
+
+    for (key, field) in [("p", "channel"), ("shipment", "region")] {
+        let exists: bool =
+            sqlx::query_scalar("select exists (select 1 from pg_class where relname = $1)")
+                .bind(rbpmn_engine::declared_index_name(key, field))
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(exists, "{key}/{field} was not built");
+    }
+    db.drop().await;
+}
+
+/// The recovery stampede the shared scope makes routine: one corpse, several
+/// declarers finding it at once. Whatever order they arrive in, nobody
+/// deadlocks and the next declaration leaves exactly one valid index.
+#[tokio::test]
+async fn a_recovery_stampede_leaves_one_valid_index() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine.declare_shared_index("order_no").await.unwrap();
+    let name = rbpmn_engine::shared_index_name("order_no");
+    sqlx::query("update pg_index set indisvalid = false where indexrelid = $1::regclass")
+        .bind(&name)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let a = Engine::builder(sqlx::PgPool::connect(&db.url()).await.unwrap()).build();
+    let b = Engine::builder(sqlx::PgPool::connect(&db.url()).await.unwrap()).build();
+    let (ra, rb) = tokio::join!(
+        a.declare_shared_index("order_no"),
+        b.declare_shared_index("order_no"),
+    );
+    // Each declarer either recovered the corpse (loudly) or arrived after the
+    // recovery and rebuilt. Neither is allowed to be a deadlock or a panic.
+    for r in [&ra, &rb] {
+        if let Err(e) = r {
+            assert!(
+                matches!(e, rbpmn_engine::EngineError::InvalidVariables(m) if m.contains(&name)),
+                "unexpected error: {e:?}"
+            );
+        }
+    }
+    engine.declare_shared_index("order_no").await.unwrap();
+    let valid: Vec<bool> = sqlx::query_scalar(
+        "select i.indisvalid from pg_class c join pg_index i on i.indexrelid = c.oid \
+         where c.relname = $1",
+    )
+    .bind(&name)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(valid, vec![true], "exactly one valid index at the end");
     db.drop().await;
 }

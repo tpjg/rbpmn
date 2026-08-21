@@ -81,6 +81,26 @@ pub mod rule {
     /// pure `lint(xml)`; the id is reserved here and the engine enforces it.
     pub const UNRESOLVED_TOPIC: &str = "unresolved-topic";
     pub const BOUNDARY_ON_SUPPORTED_HOST: &str = "boundary-on-supported-host";
+    /// A non-interrupting boundary spawns a *second* token beside its host's,
+    /// which no block-structure proof covers: it entered through no split.
+    /// So its path must be a **side path** — disjoint from everything else in
+    /// the scope, ending at its own end event. Structural (L1), like every
+    /// other token-conservation rule.
+    pub const BOUNDARY_SIDE_PATH: &str = "boundary-side-path";
+    /// A message arm (catch, receive task, message boundary) on a side path
+    /// is armed once per activation of the non-interrupting boundary, and an
+    /// earlier activation's arm may still be open: the second arm is a
+    /// duplicate-(message, key) freeze unless each activation changes the
+    /// key (a delivery patch can). Not always wrong, so a warning — with the
+    /// consequence named.
+    pub const SIDE_PATH_MESSAGE_ARM: &str = "side-path-message-arm";
+    /// Two message arms for the same message *and* the same correlation
+    /// binding that can be live at once. Deploy-time (L2) like
+    /// `unresolved-decision`: with *different* bindings both arms resolve to
+    /// different keys and both may legitimately be live, so only the manifest
+    /// decides — and the manifest is never in the XML. Enforced in
+    /// `rbpmn_core::compile`, reported through `check_deployable`.
+    pub const AMBIGUOUS_MESSAGE_ARM: &str = "ambiguous-message-arm";
     pub const NO_IMPLICIT_SPLIT: &str = "no-implicit-split";
     pub const IMPLICIT_MERGE_AFTER_PARALLEL: &str = "implicit-merge-after-parallel";
     // Structural prerequisites added beyond the brief's initial list (documented
@@ -154,7 +174,7 @@ pub const CATALOGUE: &[RuleInfo] = &[
     RuleInfo {
         id: rule::MESSAGE_HAS_CORRELATION,
         severity: Severity::Error,
-        summary: "Every message start/catch/throw references a named message; correlation bindings (FEEL qualified names) are registered in code and checked at deploy.",
+        summary: "Every message start/catch/throw/boundary references a named message; correlation bindings (FEEL qualified names) are registered in code and checked at deploy — a message boundary needs its own, keyed by the boundary's element id, never the host's.",
     },
     RuleInfo {
         id: rule::NO_FOREIGN_IMPLEMENTATION,
@@ -170,6 +190,21 @@ pub const CATALOGUE: &[RuleInfo] = &[
         id: rule::BOUNDARY_ON_SUPPORTED_HOST,
         severity: Severity::Error,
         summary: "Boundary events only on tasks/subprocesses we support; error boundaries on service tasks/subprocesses.",
+    },
+    RuleInfo {
+        id: rule::BOUNDARY_SIDE_PATH,
+        severity: Severity::Error,
+        summary: "A non-interrupting boundary starts a side path: it ends at its own end event, never merges into another flow or reaches a parallel join, and carries no parallel block of its own (the boundary can fire again while an earlier side token is still inside it — wrap the block in a subprocess).",
+    },
+    RuleInfo {
+        id: rule::SIDE_PATH_MESSAGE_ARM,
+        severity: Severity::Warn,
+        summary: "A message arm on a side path is armed once per activation of its non-interrupting boundary; unless each activation changes the correlation key, the second arm freezes the instance (duplicate-subscription).",
+    },
+    RuleInfo {
+        id: rule::AMBIGUOUS_MESSAGE_ARM,
+        severity: Severity::Error,
+        summary: "Two message arms for the same message and the same correlation binding can be live at once (two boundaries on one host, a host and its own boundary, a subprocess boundary and a catch inside it): every delivery would be ambiguous, so deploy refuses it.",
     },
     RuleInfo {
         id: rule::NO_IMPLICIT_SPLIT,

@@ -70,9 +70,23 @@ deliberately not the default posture.
 
 - **SQL injection via definitions**: per-definition partial indexes embed the
   definition key as a **literal** in generated DDL/queries (a planner
-  requirement, see the design brief). Therefore definition keys must match
-  `[a-z][a-z0-9-]{0,63}` at deploy time — validated before any SQL is
-  generated. Everything else is bound parameters (sqlx).
+  requirement, see the design brief). Therefore definition keys are validated
+  against `[A-Za-z0-9_.-]+` (`validate_definition_key`) before any SQL is
+  generated. Field names are literals for the same reason and are validated
+  harder — a single-segment FEEL qualified name, `[A-Za-z_][A-Za-z0-9_]*`
+  (`validate_field`). Everything else is bound parameters (sqlx).
+- **Shared indexes and the instance lookup** embed the *field* as a literal
+  and no definition key at all: a shared index's DDL carries the field twice
+  (the indexed expression and the `is not null` predicate), and
+  `find_by_shared_index` embeds it once. Same validator, same guarantee; the
+  looked-up value is a bound parameter.
+- **The published view** (`rbpmn_v_instance`) is a read-only projection and
+  grants nothing on its own — it is visible to whatever role the application's
+  connection already uses, and rbpmn does not manage grants. It deliberately
+  carries no row filtering: it is **not** a tenancy boundary, and an
+  application that needs one must express it in its own query. Note in
+  particular that it exposes the whole variable document, exactly as the
+  inspector does, and who may see that is the application's call.
 - **SSRF**: `HttpPostHandler` targets come from operator configuration at
   engine build time, never from request data or model content.
 - **Scoped tokens**: deploy (code-adjacent) vs runtime (start/correlate/

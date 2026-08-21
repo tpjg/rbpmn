@@ -15,7 +15,7 @@
 //! which signals a bug in the engine (lint-clean models cannot trigger it)
 //! and poisons the state.
 
-use crate::compile::{ExecKind, ExecutableProcess, FlowIx, NodeIx};
+use crate::compile::{ExecKind, ExecutableProcess, FlowIx, NodeIx, TimerDue};
 use crate::event::Event;
 use crate::merge_patch::merge_patch;
 use crate::state::{
@@ -45,7 +45,11 @@ pub enum Command {
     /// timer interrupts its host; an event-gateway timer wins the race.
     FireTimer { id: TimerId },
     /// A correlated message arrived for an open subscription, carrying an
-    /// RFC 7386 merge patch (like work-item completion).
+    /// RFC 7386 merge patch (like work-item completion). Delivering to a
+    /// catch resumes its token; to a message boundary interrupts its host
+    /// (work item withdrawn, subscription withdrawn, or the whole scope torn
+    /// down) and takes the boundary path; to an event-gateway alternative
+    /// wins the race — the same three shapes `FireTimer` has.
     DeliverMessage { id: SubscriptionId, patch: Value },
     /// A decision was evaluated for the token parked at `token`.
     ///
@@ -372,43 +376,34 @@ pub fn step(
                     adv.leave_single(state, timer.token, timer.element)?;
                     adv.run(state)
                 }
-                // Interrupting boundary on a subprocess: the timer kills the
-                // whole scope, recursively, and the boundary path is taken.
-                WaitKind::Scope(_) => {
-                    adv.interrupt_to_boundary(state, timer.token, timer.element)?;
-                    adv.run(state)
-                }
-                // Interrupting boundary on a task: cancel the work item and
-                // continue on the boundary path — the host never completes.
-                WaitKind::WorkItem(wid) => {
-                    let item = state.work_items.get_mut(&wid).ok_or_else(|| {
-                        StepError::Invariant(format!(
-                            "boundary timer {id:?} host work item {wid:?} does not exist"
-                        ))
-                    })?;
-                    item.open = false;
-                    let host_element = item.element;
-                    adv.events.push(Event::WorkItemCancelled {
-                        id: wid,
-                        element: proc.node_id(host_element).to_string(),
-                    });
-                    adv.interrupt_to_boundary(state, timer.token, timer.element)?;
-                    adv.run(state)
-                }
-                // Interrupting boundary on a receive task: the open
-                // subscription is withdrawn instead of a work item.
-                WaitKind::Message(sid) => {
-                    let sub = state.subscriptions.remove(&sid).ok_or_else(|| {
-                        StepError::Invariant(format!(
-                            "boundary timer {id:?} host subscription {sid:?} does not exist"
-                        ))
-                    })?;
-                    adv.events.push(Event::SubscriptionCancelled {
-                        id: sid,
-                        element: proc.node_id(sub.element).to_string(),
-                        message: sub.message,
-                    });
-                    adv.interrupt_to_boundary(state, timer.token, timer.element)?;
+                // A timer boundary fired on a waiting host. Interrupting:
+                // the host is cancelled per its wait kind — work item, own
+                // subscription, or the whole child scope — and the boundary
+                // path is taken. One helper with `DeliverMessage`, because
+                // "an arm on a parked token fired" is one thing whichever
+                // kind of arm it was.
+                //
+                // Non-interrupting: `side_path_triggered`, the other half of
+                // that pairing — the host is left exactly as it was and a
+                // sibling token takes the path instead. A single-shot timer
+                // does **not** re-arm — it fired once, which is what a
+                // `timeDuration`/`timeDate` says, and `rearm_cycle` returns
+                // having done nothing; a cycle re-arms its next occurrence
+                // first, while fires remain.
+                WaitKind::WorkItem(_) | WaitKind::Message(_) | WaitKind::Scope(_) => {
+                    if proc.node(timer.element).kind.boundary_interrupts() {
+                        adv.interrupt_host(state, timer.token, timer.element)?;
+                    } else {
+                        adv.side_path_triggered(
+                            state,
+                            timer.token,
+                            timer.element,
+                            |adv, state| {
+                                adv.rearm_cycle(state, id, &timer);
+                                true
+                            },
+                        )?;
+                    }
                     adv.run(state)
                 }
                 // The race at an event-based gateway: this timer won, every
@@ -472,7 +467,50 @@ pub fn step(
                     adv.take_gateway_path(state, sub.token, token.node, sub.element)?;
                     adv.run(state)
                 }
-                _ => Err(StepError::Invariant(format!(
+                // The interrupting message boundary, through the very helper
+                // an interrupting timer boundary uses: cancel the host per
+                // its wait kind (work item, its own subscription — this is
+                // the two-subscriptions-on-one-token case — or the whole
+                // child scope) and take the boundary path. The host never
+                // completes, so the holder of a live lease learns at its next
+                // verb (`AlreadyClosed { state: "cancelled" }`) — a lease
+                // protects a worker from other workers, never from the
+                // process.
+                //
+                // The non-interrupting one leaves the host alone and spawns a
+                // sibling — and **re-arms first**, through the same
+                // `side_path_triggered` a non-interrupting timer boundary
+                // uses. Delivery consumed the subscription, and the boundary
+                // must stay active for as long as its host is, so a new one
+                // is opened immediately: a new id, and the key re-evaluated
+                // against the now-patched document, because this is an arm and
+                // arms evaluate at arm time. The old row is already gone, so
+                // the duplicate check cannot trip on itself; a key that has
+                // become unusable freezes exactly as it would have at the
+                // first arm, and the helper stops before the side token.
+                //
+                // The emission order is the one the golden traces pin:
+                // `message-received`, `variables-patched`, **then** the
+                // re-arm, then the side token's first move. A live host is
+                // never observably without its boundary.
+                WaitKind::WorkItem(_) | WaitKind::Message(_) | WaitKind::Scope(_) => {
+                    if proc.node(sub.element).kind.boundary_interrupts() {
+                        adv.interrupt_host(state, sub.token, sub.element)?;
+                    } else {
+                        adv.side_path_triggered(state, sub.token, sub.element, |adv, state| {
+                            adv.subscribe(state, sub.token, sub.element).is_some()
+                        })?;
+                    }
+                    adv.run(state)
+                }
+                // A timer catch hosts nothing, a join holds no arm, an
+                // incident advances nothing, and a decision never survives the
+                // transaction that parked it — so none of these can own a
+                // subscription.
+                WaitKind::Timer(_)
+                | WaitKind::Join { .. }
+                | WaitKind::Incident
+                | WaitKind::Decision => Err(StepError::Invariant(format!(
                     "message {id:?} delivered to a token in an unrelated wait state"
                 ))),
             }
@@ -562,9 +600,11 @@ impl<'a> Advancer<'a> {
                     element: node.id.clone(),
                     decision: decision.clone(),
                 });
-                // Boundaries arm as they do on any other activity: an error
-                // boundary here is what catches a decision that fails.
-                let _ = self.arm_boundaries(state, token, node_ix);
+                // No `arm_boundaries` here, and there never is one: a
+                // business-rule task is not a boundary host (lint refuses
+                // one, `compile` re-checks it), because this wait does not
+                // survive the transaction that created it — an arm made here
+                // would be withdrawn in the same step and could never fire.
                 Ok(())
             }
             ExecKind::Task { kind, topic } => {
@@ -705,6 +745,10 @@ impl<'a> Advancer<'a> {
                 "timer boundary '{}' entered via a sequence flow",
                 node.id
             ))),
+            ExecKind::MessageBoundary { .. } => Err(StepError::Invariant(format!(
+                "message boundary '{}' entered via a sequence flow",
+                node.id
+            ))),
             ExecKind::ExclusiveGateway { default_flow } => {
                 self.element_started(node_ix);
                 let chosen = if node.outgoing.len() == 1 {
@@ -779,12 +823,7 @@ impl<'a> Advancer<'a> {
                     .map(|(id, _)| *id)
                     .collect();
                 for id in open {
-                    let item = state.work_items.get_mut(&id).unwrap();
-                    item.open = false;
-                    self.events.push(Event::WorkItemCancelled {
-                        id,
-                        element: self.proc.node_id(item.element).to_string(),
-                    });
+                    self.cancel_work_item(state, id);
                 }
                 // Everything of the instance goes in one transaction:
                 // tokens, work items, timers, subscriptions, scopes.
@@ -913,17 +952,27 @@ impl<'a> Advancer<'a> {
         });
     }
 
-    /// Arm the host's interrupting timer boundaries on its parked token.
-    /// `false` means one of them had an unresolvable deadline and the
-    /// instance is frozen at an incident — the caller must not continue, and
-    /// `freeze` has already withdrawn whatever this loop armed first.
+    /// Arm the host's interrupting boundaries on its parked token, in
+    /// declaration order: a timer becomes an armed timer, a message an open
+    /// subscription. `false` means one of them could not be armed — an
+    /// unresolvable deadline, an unusable correlation key, a duplicate
+    /// `(message, key)` — and the instance is frozen at an incident, so the
+    /// caller must not continue; `freeze` has already withdrawn whatever this
+    /// loop armed first.
     #[must_use]
     fn arm_boundaries(&mut self, state: &mut InstanceState, token: TokenId, host: NodeIx) -> bool {
-        for b in self.proc.timer_boundaries(host).to_vec() {
-            let ExecKind::TimerBoundary { due } = &self.proc.node(b).kind else {
-                unreachable!("timer_boundaries only holds timer boundary nodes");
+        // `self.proc` outlives the advancer, so the host's list is borrowed
+        // rather than copied — the loop mutates `self`, not the process.
+        let proc = self.proc;
+        for &b in proc.boundaries(host) {
+            let armed = match &proc.node(b).kind {
+                ExecKind::TimerBoundary { due, .. } => {
+                    self.arm_timer(state, token, b, due).is_some()
+                }
+                ExecKind::MessageBoundary { .. } => self.subscribe(state, token, b).is_some(),
+                other => unreachable!("boundaries holds only armable boundaries, found {other:?}"),
             };
-            if self.arm_timer(state, token, b, due).is_none() {
+            if !armed {
                 return false;
             }
         }
@@ -959,18 +1008,223 @@ impl<'a> Advancer<'a> {
                 return None;
             }
         };
+        // A cycle's repeat count is pure data the core owns; the instants
+        // are the projection's. `split_cycle` cannot fail here: `resolve`
+        // just validated the text with the same function.
+        let remaining = match &due {
+            TimerDue::Cycle(text) => rbpmn_model::iso8601::split_cycle(text)
+                .ok()
+                .and_then(|parts| parts.repeats),
+            _ => None,
+        };
+        Some(self.record_timer(state, token, element, due, remaining, None))
+    }
+
+    /// Allocate a timer and say so: the tail both arming paths share, so a
+    /// field added to [`TimerState`] or to `timer-armed` lands in one place
+    /// rather than in one place and a half. `continues` is the only thing
+    /// that differs between a first arm (`None`) and a cycle's next
+    /// occurrence.
+    fn record_timer(
+        &mut self,
+        state: &mut InstanceState,
+        token: TokenId,
+        element: NodeIx,
+        due: TimerDue,
+        remaining: Option<u32>,
+        continues: Option<TimerId>,
+    ) -> TimerId {
         let id = state.alloc_timer(TimerState {
             element,
             token,
             due: due.clone(),
+            remaining,
         });
         self.events.push(Event::TimerArmed {
             id,
             element: self.proc.node_id(element).to_string(),
             due,
             token,
+            continues,
+            remaining,
         });
-        Some(id)
+        id
+    }
+
+    /// A cycle fired: arm the next occurrence, unless that was the last.
+    ///
+    /// Emitted right after `timer-fired` and before the side token moves —
+    /// the same place a message boundary re-arms, for the same reason: a
+    /// live host is never observably without its boundary. `continues`
+    /// carries the fired timer's id so the projection steps from *its* due,
+    /// not from now; `remaining` counts down, and `Some(0)` is the end.
+    fn rearm_cycle(&mut self, state: &mut InstanceState, fired: TimerId, timer: &TimerState) {
+        let TimerDue::Cycle(_) = &timer.due else {
+            return;
+        };
+        let left = timer.remaining.map(|r| r.saturating_sub(1));
+        if left == Some(0) {
+            return;
+        }
+        self.record_timer(
+            state,
+            timer.token,
+            timer.element,
+            timer.due.clone(),
+            left,
+            Some(fired),
+        );
+    }
+
+    /// An interrupting boundary fired on a waiting host: end the host's own
+    /// wait, then take the boundary path.
+    ///
+    /// One helper for both arms — a timer firing and a message being
+    /// delivered — because what an interrupting boundary does is decided by
+    /// the *host's* wait kind, never by the kind of arm that woke it. The two
+    /// used to be a line-for-line copy of each other, which is one place too
+    /// many for the event order below to be got right.
+    ///
+    /// The `subscription-cancelled` for a receive-task host is emitted
+    /// **here**, before `interrupt_to_boundary` runs `cancel_attachments`:
+    /// the host's own subscription goes first, then whatever else was armed
+    /// on the token. That is the order the golden traces pin
+    /// (`19-receive-timeout-fired.json`, `30-receive-boundary-delivered.json`).
+    fn interrupt_host(
+        &mut self,
+        state: &mut InstanceState,
+        token: TokenId,
+        boundary: NodeIx,
+    ) -> Result<(), StepError> {
+        let wait = state
+            .tokens
+            .get(&token)
+            .map(|t| t.wait.clone())
+            .ok_or_else(|| {
+                StepError::Invariant(format!(
+                    "boundary '{}' host token {token:?} does not exist",
+                    self.proc.node_id(boundary)
+                ))
+            })?;
+        match wait {
+            WaitKind::WorkItem(wid) => {
+                if !self.cancel_work_item(state, wid) {
+                    return Err(StepError::Invariant(format!(
+                        "boundary '{}' host work item {wid:?} does not exist",
+                        self.proc.node_id(boundary)
+                    )));
+                }
+            }
+            WaitKind::Message(sid) => {
+                let host = state.subscriptions.remove(&sid).ok_or_else(|| {
+                    StepError::Invariant(format!(
+                        "boundary '{}' host subscription {sid:?} does not exist",
+                        self.proc.node_id(boundary)
+                    ))
+                })?;
+                self.events.push(Event::SubscriptionCancelled {
+                    id: sid,
+                    element: self.proc.node_id(host.element).to_string(),
+                    message: host.message,
+                });
+            }
+            // A subprocess host needs nothing here: `interrupt_to_boundary`
+            // tears the child scope down recursively — work items, arms and
+            // tokens at every depth — and continues in the parent scope,
+            // where the boundary's flow lives.
+            WaitKind::Scope(_) => {}
+            other => {
+                return Err(StepError::Invariant(format!(
+                    "boundary '{}' fired on a host in wait state {other:?}",
+                    self.proc.node_id(boundary)
+                )));
+            }
+        }
+        self.interrupt_to_boundary(state, token, boundary)
+    }
+
+    /// Close an open work item because the *process* took it away — an
+    /// interrupting boundary, a terminate, a scope teardown, a freeze — and
+    /// say so. The one place `work-item-cancelled` is emitted, so no
+    /// withdrawal can silently forget it. `false` means there is no such
+    /// item, which only a boundary interrupt can observe (the sweeping
+    /// callers collected the ids they pass from the state itself).
+    fn cancel_work_item(&mut self, state: &mut InstanceState, id: WorkItemId) -> bool {
+        let Some(item) = state.work_items.get_mut(&id) else {
+            return false;
+        };
+        item.open = false;
+        let element = item.element;
+        self.events.push(Event::WorkItemCancelled {
+            id,
+            element: self.proc.node_id(element).to_string(),
+        });
+        true
+    }
+
+    /// A non-interrupting boundary triggered on a parked host: keep its arm
+    /// alive, then run the side path. The mirror of [`Self::interrupt_host`],
+    /// and one helper for both arms for the same reason — what a
+    /// non-interrupting boundary does is one thing whichever kind of arm woke
+    /// it, and the two copies had already drifted on the scope.
+    ///
+    /// The order is the whole content of this function, and the golden traces
+    /// pin it:
+    ///
+    /// 1. the **host's scope**, before anything can freeze in it: a re-arm
+    ///    that cannot resolve its key parks the host as an incident, and an
+    ///    advancer still pointing at the root would file it in the wrong
+    ///    scope;
+    /// 2. the **re-arm** — a fresh subscription for a message boundary, the
+    ///    next occurrence for a cycle, nothing at all for a single-shot timer
+    ///    (it fired once, which is what a `timeDuration` says). `false` means
+    ///    the re-arm failed and already froze the instance, so there is no
+    ///    side path to run: the caller flushes the events it produced;
+    /// 3. the **side token**. A live host is never observably without its
+    ///    boundary, which is what puts the re-arm ahead of this.
+    fn side_path_triggered(
+        &mut self,
+        state: &mut InstanceState,
+        host: TokenId,
+        boundary: NodeIx,
+        rearm: impl FnOnce(&mut Self, &mut InstanceState) -> bool,
+    ) -> Result<(), StepError> {
+        self.scope = state.tokens.get(&host).map(|t| t.scope).ok_or_else(|| {
+            StepError::Invariant(format!(
+                "boundary '{}' host token {host:?} does not exist",
+                self.proc.node_id(boundary)
+            ))
+        })?;
+        if !rearm(self, state) {
+            return Ok(()); // frozen on the re-arm
+        }
+        self.spawn_side_token(state, boundary)
+    }
+
+    /// The side path itself: the host's token is **untouched** — still
+    /// parked, its work item / own subscription / child scope intact, its
+    /// other arms still armed — and a fresh sibling token leaves along the
+    /// boundary's single outgoing flow.
+    ///
+    /// The sibling starts in the **host token's scope**, which for a
+    /// subprocess host is the *parent* scope: the boundary's flow lives
+    /// beside the parked subprocess token, not inside the body.
+    /// [`Self::side_path_triggered`] has already set it — the one lookup, so
+    /// a re-arm and its side token cannot end up in different scopes.
+    /// Nothing else is special about the sibling. It is a token: the scope
+    /// completes when its last one is consumed (a host that finished first
+    /// keeps the instance alive until the side work does), a teardown reaps
+    /// it with everything else in its scope, and a terminate takes it. That
+    /// is why scope and instance completion need no code here.
+    fn spawn_side_token(
+        &mut self,
+        state: &mut InstanceState,
+        boundary: NodeIx,
+    ) -> Result<(), StepError> {
+        let sibling = state.next_token_id();
+        self.element_started(boundary);
+        self.element_completed(boundary);
+        self.leave_single(state, sibling, boundary)
     }
 
     /// Interrupting boundary taken: the host's token leaves on the boundary
@@ -999,22 +1253,25 @@ impl<'a> Advancer<'a> {
         self.leave_single(state, token, boundary)
     }
 
-    /// Open a subscription for the message catch at `element`, evaluating
-    /// its correlation key from the variables **now** (arm time). Keys must
-    /// be strings or exact integers (floats have no canonical spelling
-    /// across a jsonb round-trip — the same logical value would arm two
-    /// different keys); anything else can never match. Both cases, and a
+    /// Open a subscription for the message arm at `element` — a catch, a
+    /// receive task or a message boundary, all three through here —
+    /// evaluating its correlation key from the variables **now** (arm time).
+    /// Keys must be strings or exact integers (floats have no canonical
+    /// spelling across a jsonb round-trip — the same logical value would arm
+    /// two different keys); anything else can never match. Both cases, and a
     /// duplicate open (message, key) in this instance (which would make
     /// every delivery permanently ambiguous), freeze the instance as an
-    /// incident instead of waiting forever.
+    /// incident instead of waiting forever. A boundary's freeze parks its
+    /// host's token **at the boundary element**, exactly as `arm_timer`'s
+    /// does, so inspection names the arm that could not be made.
     fn subscribe(
         &mut self,
         state: &mut InstanceState,
         token: TokenId,
         element: NodeIx,
     ) -> Option<SubscriptionId> {
-        let ExecKind::MessageCatch { message, key } = &self.proc.node(element).kind else {
-            unreachable!("subscribe is only called on message catch nodes");
+        let Some((message, key)) = self.proc.message_arm(element) else {
+            unreachable!("subscribe is only called on message arms");
         };
         let value = rbpmn_model::condition::resolve_path(&state.variables, key);
         let key_value = match value {
@@ -1036,11 +1293,11 @@ impl<'a> Advancer<'a> {
         if state
             .subscriptions
             .values()
-            .any(|s| s.message == *message && s.key == key_value)
+            .any(|s| s.message == message && s.key == key_value)
         {
             self.events.push(Event::DuplicateSubscription {
                 element: self.proc.node_id(element).to_string(),
-                message: message.clone(),
+                message: message.to_string(),
                 key: key_value,
             });
             self.freeze(state, token, element, None, None);
@@ -1049,13 +1306,13 @@ impl<'a> Advancer<'a> {
         let id = state.alloc_subscription(SubscriptionState {
             element,
             token,
-            message: message.clone(),
+            message: message.to_string(),
             key: key_value.clone(),
         });
         self.events.push(Event::MessageSubscribed {
             id,
             element: self.proc.node_id(element).to_string(),
-            message: message.clone(),
+            message: message.to_string(),
             key: key_value,
             token,
         });
@@ -1097,12 +1354,7 @@ impl<'a> Advancer<'a> {
             .map(|(id, _)| *id)
             .collect();
         for id in open {
-            let item = state.work_items.get_mut(&id).unwrap();
-            item.open = false;
-            self.events.push(Event::WorkItemCancelled {
-                id,
-                element: self.proc.node_id(item.element).to_string(),
-            });
+            self.cancel_work_item(state, id);
         }
         // A scope this token owns has no members and no owner left once the
         // freeze parks it as an incident; leaving it behind would project a
@@ -1253,12 +1505,7 @@ impl<'a> Advancer<'a> {
                 .map(|(id, _)| *id)
                 .collect();
             for id in open {
-                let item = state.work_items.get_mut(&id).unwrap();
-                item.open = false;
-                self.events.push(Event::WorkItemCancelled {
-                    id,
-                    element: self.proc.node_id(item.element).to_string(),
-                });
+                self.cancel_work_item(state, id);
             }
             self.withdraw_arms(state, Some(*token));
             state.tokens.remove(token);
