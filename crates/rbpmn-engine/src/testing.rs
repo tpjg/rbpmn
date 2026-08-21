@@ -3,6 +3,19 @@
 
 use sqlx::PgPool;
 
+/// The claim path's own SQL, exposed so a test can differential the published
+/// `rbpmn_v_work_item.claimable` column against the very string `get_task`
+/// claims by, rather than against a re-typed copy of it. Aliases `w` (work
+/// item) and `i` (instance), as everywhere else.
+///
+/// Behind `test-util` deliberately: applications must read claimability from
+/// the view, not paste the predicate into their own queries — a pasted copy
+/// is exactly the drift the view exists to prevent.
+pub const CLAIMABLE_SQL: &str = crate::CLAIMABLE;
+
+/// The live-lease half, for the same reason. See [`CLAIMABLE_SQL`].
+pub const IN_PROGRESS_SQL: &str = crate::IN_PROGRESS;
+
 pub struct TestDb {
     pub pool: PgPool,
     admin_url: String,

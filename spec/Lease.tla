@@ -110,8 +110,17 @@ Deadline == 0..(MaxTime + TTL + Backoff)
 \* statement in tasks.rs carries.
 HoldsLive(w) == state = "locked" /\ owner = w /\ until > now
 
-\* Exactly `CLAIMABLE` (crates/rbpmn-engine/src/lib.rs): free or lapsed, past
-\* any retry backoff, and the instance still active.
+\* `CLAIMABLE` (crates/rbpmn-engine/src/lib.rs): free or lapsed, past any
+\* retry backoff, and the instance still active.
+\*
+\* The SQL carries one conjunct this does not — `lock_until is not null`. It
+\* is not modelled because it is not modellable: `until` here always has a
+\* value, so the model has no state in which the conjunct could be false, and
+\* no transition changes. It exists in the SQL because `rbpmn_v_work_item`
+\* *projects* this predicate as a boolean column, where NULL would be a third
+\* answer an application must not be handed; in a WHERE clause, which is all
+\* this model describes, NULL and false are the same. Re-read at the time the
+\* work-item view landed, and left alone deliberately.
 \*
 \* `until < now`, not `<= now`: the SQL is `lock_until < now()` for claiming
 \* and `lock_until > now()` for holding, so at the single instant

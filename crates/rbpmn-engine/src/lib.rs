@@ -30,6 +30,7 @@ mod scheduler;
 mod tasks;
 #[cfg(feature = "test-util")]
 pub mod testing;
+mod work_items;
 mod worker;
 
 pub use error::{
@@ -54,6 +55,7 @@ pub use tasks::{
     DeclaredIndex, GetTaskOptions, LockExtension, LockedTask, Released, TaskFilter, TaskOrder,
     declared_index_name, shared_index_name,
 };
+pub use work_items::{QueueDepth, WORK_ITEM_VIEW};
 pub use worker::WorkerOptions;
 
 /// Convenience: connect a pool for the engine (the URL comes from operator
@@ -134,6 +136,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         14,
         "public_view",
         include_str!("../migrations/0014_public_view.sql"),
+    ),
+    (
+        15,
+        "work_item_view",
+        include_str!("../migrations/0015_work_item_view.sql"),
     ),
 ];
 
@@ -258,12 +265,48 @@ struct Inner {
 }
 
 /// The one claimability predicate, shared verbatim by the push worker's
-/// claim, the pull API's claim, and the dashboard count — aliases `w` (work
-/// item) and `i` (instance) are part of the contract. Three queries, one
-/// truth: a claimability change edited here cannot desynchronize them.
+/// claim, the pull API's claim, the dashboard count, and the `claimable`
+/// column of `rbpmn_v_work_item` — aliases `w` (work item) and `i`
+/// (instance) are part of the contract. Four readers, one truth: a
+/// claimability change edited here cannot desynchronize them.
+///
+/// **Total, not merely correct in a WHERE clause.** `lock_until is not null`
+/// looks redundant — every path that writes `state = 'locked'` writes a
+/// `lock_until` with it — and in a WHERE clause it is: a NULL there is not
+/// true, so the row is skipped either way. It earns its place because the
+/// published view *projects* this expression as a boolean column, and a
+/// three-valued column is a trap a read model must not ship: `where not
+/// claimable` would silently drop the NULL rows, putting an item in neither
+/// bucket of a dashboard that thinks it split the world in two.
+///
+/// The obvious alternative — projecting `coalesce(<this>, false)` — was
+/// measured and rejected. COALESCE is opaque to the planner's predicate
+/// prover, so it cannot see `state in ('available','locked')` inside it, and
+/// the grouped depth query falls back to a parallel sequential scan of every
+/// work item in the system. Written total instead, the same query plans onto
+/// `rbpmn_work_item_depth`. Adding the conjunct costs the claim path nothing:
+/// its plan is unchanged, byte for byte.
+///
+/// `migrations/0015_work_item_view.sql` carries this same text, because a
+/// migration is static SQL and cannot read a Rust const. They are held
+/// together by `the_view_and_the_claim_predicate_cannot_drift`, which
+/// differentials the view's column against this string over a corpus with
+/// every state, lease and backoff in it — a behavioural check, so it survives
+/// either side being rewritten rather than merely re-typed.
 pub(crate) const CLAIMABLE: &str = "(w.state = 'available' \
-     or (w.state = 'locked' and w.lock_until < now())) \
+     or (w.state = 'locked' and w.lock_until is not null and w.lock_until < now())) \
      and (w.retry_at is null or w.retry_at <= now()) and i.status = 'active'";
+
+/// The live-lease half, projected as `rbpmn_v_work_item.in_progress`. Total
+/// for the same reason [`CLAIMABLE`] is.
+///
+/// Deliberately about the **lease alone**: an item whose instance has frozen
+/// on an incident still reads as in progress, because a worker really is
+/// holding it. So `waiting + in_progress` is not "every open item", and the
+/// two are mutually exclusive by construction — a live lease is not
+/// claimable, a lapsed one is not in progress.
+pub(crate) const IN_PROGRESS: &str =
+    "(w.state = 'locked' and w.lock_until is not null and w.lock_until >= now())";
 
 /// Why (and until when) the scheduler is skipping an instance. Two very
 /// different situations share one map because both must be excluded from

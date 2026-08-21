@@ -342,7 +342,9 @@ does not even allocate a new version. Adopting `shared` is a manifest edit and
 a redeploy. The old index is not removed — if the definition still declares
 the field definition-scoped, it still has it.
 
-### Reading instances: the published view
+### The published read surface: two views
+
+#### `rbpmn_v_instance` — the instance side
 
 Applications legitimately need to *join* rbpmn's instances against their own
 rows — a result set of "our tenancy, our ordering, rbpmn's instances" is a SQL
@@ -366,6 +368,67 @@ below it and declared variable indexes still apply. (A barrier view would not
 push `variables->>'f' = $1` down, because `jsonb ->>` is not leakproof, and
 every declared index would sit unused beneath a full scan. There is an
 EXPLAIN-based test asserting the plan through the view, not just its shape.)
+
+#### `rbpmn_v_work_item` — the queue side
+
+The same reasoning, sharpened by a query every user issues on the first screen
+they load: *for every queue this user can work, how many items are waiting
+right now?*, busiest first. `count_tasks(topic, filter)` answers it one queue
+at a time — one topic, one definition-scoped filter — so a dashboard covering
+T topics across D deployed definitions costs T×D round trips. Through the view
+it is one statement, and it joins `rbpmn_v_instance` on `instance_id`, so
+depths can be grouped by an application's own dimensions (a tenant in the
+definition key, a hoisted variable) in that same statement.
+
+| column | |
+|---|---|
+| `id`, `instance_id`, `item_no` | identity; `(instance_id, item_no)` is the stable pair |
+| `definition_key`, `definition_version`, `element_id` | where in which model |
+| `topic`, `kind` | the queue, and `user` / `service` |
+| `state` | `available` / `locked` / `completed` / `cancelled` / `failed` |
+| **`claimable`** | **would `get_task` hand this out right now** |
+| **`in_progress`** | held under a lease that has not expired |
+| `lock_owner`, `lock_until` | who holds it, until when |
+| `retry_at`, `retries`, `failures`, `last_failure` | why it is stuck |
+| `created_at` | |
+
+**`claimable` is computed by the engine, and that is the point of the whole
+surface.** It is not `state = 'available'`. It has to account for a lapsed
+lease (claimable again), a live lease (not), retry backoff not yet due (not),
+closed states (never), and an instance frozen on an incident (never — which is
+why the view joins instances at all). If the view exposed only raw columns,
+every application would re-derive that rule, and a dashboard whose depths
+disagree with what `get_task` actually hands out is worse than no dashboard.
+The expression is the same text the claim path uses, and a test differentials
+the two row for row over a corpus containing every one of those edges.
+
+`in_progress` is deliberately about the **lease alone**, so `waiting +
+in_progress` is not "every open item" — work belonging to a frozen instance is
+in neither bucket. That gap is information: 0 waiting with 5 in progress is a
+different situation from 0 and 0, and both differ from 0, 0 and a pile of
+frozen work.
+
+**What the view does not promise.** It is a read model, not a claim. A depth
+is true when it was measured and can be stale by the time it is rendered; two
+dashboards both seeing 5 waiting does not mean ten items exist. The only way
+to hold an item is `get_task`, which arbitrates with `FOR UPDATE SKIP LOCKED`.
+Reading a depth reserves nothing.
+
+#### SQL or a typed call?
+
+Use **SQL against the views** whenever the answer involves your own data:
+joining your rows, filtering by your tenancy, grouping by your dimensions,
+ordering by your rules. That is a join, and it is the reason the surface is
+SQL rather than an API.
+
+Use the **typed calls** when you want ids or counts and no join:
+
+- `Engine::queue_depths(definition_keys) -> Vec<QueueDepth { definition_key,
+  topic, waiting, in_progress }>` — the dashboard query, busiest first. The key
+  set is an argument bound into the statement, and there is deliberately no
+  limit at all, so nothing is truncated before your filter can compose with it.
+  An empty slice matches no keys and returns no rows — plain SQL set semantics.
+- `Engine::find_by_shared_index(field, value, limit)` — below.
 
 For the simple case there is `Engine::find_by_shared_index(field, value,
 limit)`, which writes the query for you and is index-backed by construction —

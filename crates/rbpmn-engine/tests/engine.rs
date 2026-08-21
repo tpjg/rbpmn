@@ -7047,3 +7047,752 @@ async fn a_recovery_stampede_leaves_one_valid_index() {
     assert_eq!(valid, vec![true], "exactly one valid index at the end");
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// The published work-item view: rbpmn_v_work_item, and the claimability it
+// computes so applications do not have to.
+// ---------------------------------------------------------------------------
+
+/// `(waiting, in_progress)` straight from the view, the way a dashboard asks.
+async fn view_depth(pool: &PgPool, key: &str, topic: &str) -> (i64, i64) {
+    let row = sqlx::query(&format!(
+        "select count(*) filter (where claimable) as waiting, \
+                count(*) filter (where in_progress) as in_progress \
+           from {} where definition_key = $1 and topic = $2",
+        rbpmn_engine::WORK_ITEM_VIEW
+    ))
+    .bind(key)
+    .bind(topic)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (row.get("waiting"), row.get("in_progress"))
+}
+
+/// **The property that matters.** For a topic with N claimable items and no
+/// competing worker, exactly N consecutive `get_task` calls succeed and the
+/// N+1st returns None — and the view's count agrees at every single step.
+///
+/// A dashboard whose depths disagree with what the engine actually hands out
+/// is worse than no dashboard, so this is the test the whole surface exists
+/// to pass. It walks the count down one claim at a time rather than checking
+/// only the endpoints: an off-by-one, or a claimable rule that disagreed
+/// about lapsed leases, would sit in the middle of the walk.
+#[tokio::test]
+async fn the_views_depth_agrees_with_what_get_task_hands_out() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+
+    const N: i64 = 12;
+    for _ in 0..N {
+        engine
+            .start("p", None, serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    assert_eq!(view_depth(&db.pool, "p", "review").await, (N, 0));
+
+    for taken in 0..N {
+        assert_eq!(
+            view_depth(&db.pool, "p", "review").await,
+            (N - taken, taken),
+            "the view disagreed after {taken} claim(s)"
+        );
+        let claimed = engine
+            .get_task("review", &GetTaskOptions::new("w1"))
+            .await
+            .unwrap();
+        assert!(
+            claimed.is_some(),
+            "claim {} of {N} should have succeeded while the view said {} waiting",
+            taken + 1,
+            N - taken
+        );
+    }
+
+    assert_eq!(view_depth(&db.pool, "p", "review").await, (0, N));
+    assert!(
+        engine
+            .get_task("review", &GetTaskOptions::new("w1"))
+            .await
+            .unwrap()
+            .is_none(),
+        "the N+1st claim must find nothing"
+    );
+    // And the typed call reports the same thing it does.
+    let depths = engine.queue_depths(&["p".to_string()]).await.unwrap();
+    assert_eq!(
+        depths,
+        vec![rbpmn_engine::QueueDepth {
+            definition_key: "p".into(),
+            topic: "review".into(),
+            waiting: 0,
+            in_progress: N as u64,
+        }]
+    );
+    db.drop().await;
+}
+
+/// The view's `claimable` column against the very string the claim path
+/// claims by — a *behavioural* differential, so it survives either side being
+/// rewritten rather than merely re-typed. The corpus below deliberately
+/// contains every edge the rule has: available, a live lease, a lapsed lease,
+/// backoff not yet due, backoff come due, completed, cancelled, failed, and a
+/// frozen instance holding an otherwise-perfect item.
+#[tokio::test]
+async fn the_view_and_the_claim_predicate_cannot_drift() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    for _ in 0..9 {
+        engine
+            .start("p", None, serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    // Paint every state directly: this is a predicate test, and driving each
+    // edge through the engine would prove less about more.
+    let ids: Vec<uuid::Uuid> =
+        sqlx::query_scalar("select id from rbpmn_work_item order by created_at, item_no")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    let paint = |sql: &'static str, id: uuid::Uuid| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query(sql).bind(id).execute(&pool).await.unwrap();
+        }
+    };
+    paint(
+        "update rbpmn_work_item set state='locked', lock_until=now()+interval '10 min' where id=$1",
+        ids[1],
+    )
+    .await;
+    paint(
+        "update rbpmn_work_item set state='locked', lock_until=now()-interval '10 min' where id=$1",
+        ids[2],
+    )
+    .await;
+    paint(
+        "update rbpmn_work_item set retry_at=now()+interval '1 hour' where id=$1",
+        ids[3],
+    )
+    .await;
+    paint(
+        "update rbpmn_work_item set retry_at=now()-interval '1 hour' where id=$1",
+        ids[4],
+    )
+    .await;
+    for (i, state) in [(5, "completed"), (6, "cancelled"), (7, "failed")] {
+        sqlx::query(&format!(
+            "update rbpmn_work_item set state='{state}' where id=$1"
+        ))
+        .bind(ids[i])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    // A perfectly claimable item whose instance has frozen on an incident.
+    sqlx::query(
+        "update rbpmn_instance set status='failed' where id = \
+         (select instance_id from rbpmn_work_item where id=$1)",
+    )
+    .bind(ids[8])
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // And the pathological row the totality argument is about: locked with no
+    // lock_until at all, which no code path writes but nothing forbids.
+    sqlx::query("update rbpmn_work_item set state='locked', lock_until=null where id=$1")
+        .bind(ids[0])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let disagreements: i64 = sqlx::query_scalar(&format!(
+        "select count(*) from {view} v \
+           join rbpmn_work_item w on w.id = v.id \
+           join rbpmn_instance i on i.id = w.instance_id \
+          where v.claimable is distinct from ({claimable}) \
+             or v.in_progress is distinct from ({in_progress})",
+        view = rbpmn_engine::WORK_ITEM_VIEW,
+        claimable = rbpmn_engine::testing::CLAIMABLE_SQL,
+        in_progress = rbpmn_engine::testing::IN_PROGRESS_SQL,
+    ))
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        disagreements, 0,
+        "the view's claimability disagreed with the predicate get_task uses"
+    );
+
+    // `is distinct from` above would pass if BOTH sides were NULL, so the
+    // totality the read model promises is asserted separately: a boolean
+    // column an application can trust to split the world in two.
+    let nulls: i64 = sqlx::query_scalar(&format!(
+        "select count(*) from {} where claimable is null or in_progress is null",
+        rbpmn_engine::WORK_ITEM_VIEW
+    ))
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(nulls, 0, "claimable/in_progress must never be null");
+
+    // Disjoint by construction: a live lease is not claimable, a lapsed one
+    // is not in progress.
+    let both: i64 = sqlx::query_scalar(&format!(
+        "select count(*) from {} where claimable and in_progress",
+        rbpmn_engine::WORK_ITEM_VIEW
+    ))
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(both, 0);
+    db.drop().await;
+}
+
+/// Public API, asserted the way `rbpmn_v_instance`'s shape is: columns may be
+/// added, never removed or repurposed.
+#[tokio::test]
+async fn the_published_work_item_view_has_the_documented_shape() {
+    let db = TestDb::create().await;
+    let _engine = engine(&db).await;
+
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        "select column_name::text, data_type::text from information_schema.columns \
+         where table_name = 'rbpmn_v_work_item' order by ordinal_position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        vec![
+            ("id".into(), "uuid".into()),
+            ("instance_id".into(), "uuid".into()),
+            ("item_no".into(), "bigint".into()),
+            ("definition_key".into(), "text".into()),
+            ("definition_version".into(), "integer".into()),
+            ("element_id".into(), "text".into()),
+            ("topic".into(), "text".into()),
+            ("kind".into(), "text".into()),
+            ("state".into(), "text".into()),
+            ("claimable".into(), "boolean".into()),
+            ("in_progress".into(), "boolean".into()),
+            ("lock_owner".into(), "text".into()),
+            ("lock_until".into(), "timestamp with time zone".into()),
+            ("retry_at".into(), "timestamp with time zone".into()),
+            ("retries".into(), "integer".into()),
+            ("failures".into(), "integer".into()),
+            ("last_failure".into(), "text".into()),
+            ("created_at".into(), "timestamp with time zone".into()),
+        ],
+        "rbpmn_v_work_item is public API"
+    );
+
+    // Not security_barrier — a barrier view stops an outside predicate being
+    // pushed below it, and the depth index would go unused beneath a scan.
+    let barrier: Option<Vec<String>> =
+        sqlx::query_scalar("select reloptions from pg_class where relname = 'rbpmn_v_work_item'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(barrier.is_none(), "must carry no reloptions: {barrier:?}");
+    db.drop().await;
+}
+
+/// A lease is a loan, and the view has to say so: while it is live the item
+/// is in progress and not waiting; the moment it lapses it is waiting again,
+/// because that is exactly when `get_task` will hand it to someone else.
+#[tokio::test]
+async fn a_lapsed_lease_returns_to_the_queue_and_a_live_one_does_not() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(view_depth(&db.pool, "p", "review").await, (1, 0));
+
+    // A live lease: held, not waiting.
+    let mut options = GetTaskOptions::new("w1");
+    options.ttl = Duration::from_millis(20);
+    let task = engine.get_task("review", &options).await.unwrap().unwrap();
+    assert_eq!(view_depth(&db.pool, "p", "review").await, (0, 1));
+
+    // Let it lapse. Waiting again, and no longer in progress — and the engine
+    // agrees, because it hands the very same item to the next caller.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(view_depth(&db.pool, "p", "review").await, (1, 0));
+    let again = engine
+        .get_task("review", &GetTaskOptions::new("w2"))
+        .await
+        .unwrap()
+        .expect("a lapsed lease must be claimable again");
+    assert_eq!(again.id, task.id);
+    db.drop().await;
+}
+
+/// Retry backoff is a promise not to try again yet. A dashboard that counted
+/// a backed-off item as waiting would send someone to a queue the engine will
+/// refuse to serve from.
+#[tokio::test]
+async fn an_item_in_retry_backoff_is_not_waiting_until_it_is_due() {
+    let db = TestDb::create().await;
+    // A real backoff, not the tests' usual zero.
+    let engine = Engine::builder(db.pool.clone())
+        .retry_backoff(Duration::from_secs(3600))
+        .build();
+    engine.migrate().await.unwrap();
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        engine
+            .fail_task(task.id, "w1", None, Some("nope".into()))
+            .await
+            .unwrap(),
+        FailOutcome::Retrying { .. }
+    ));
+
+    // Available again, but not due: neither waiting nor in progress.
+    assert_eq!(view_depth(&db.pool, "p", "review").await, (0, 0));
+    assert!(
+        engine
+            .get_task("review", &GetTaskOptions::new("w2"))
+            .await
+            .unwrap()
+            .is_none(),
+        "the engine must refuse it too, or the view is lying"
+    );
+
+    // Travel to when it comes due; both agree again.
+    sqlx::query("update rbpmn_work_item set retry_at = now() - interval '1 second'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(view_depth(&db.pool, "p", "review").await, (1, 0));
+    assert!(
+        engine
+            .get_task("review", &GetTaskOptions::new("w2"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    db.drop().await;
+}
+
+/// Closed is closed: a completed item and one the process withdrew both leave
+/// every bucket for good. The cancellation here is real — a message boundary
+/// takes the task out from under its holder — rather than a state painted on
+/// by the test.
+#[tokio::test]
+async fn closed_items_leave_the_queue_for_good() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+    engine
+        .complete_task(task.id, "w1", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(view_depth(&db.pool, "p", "review").await, (0, 0));
+
+    // The withdrawn one, through the boundary that withdraws it.
+    engine
+        .deploy(
+            &fixture("accept/29-message-boundary.bpmn"),
+            &contest_bindings(),
+        )
+        .await
+        .unwrap();
+    engine
+        .start(
+            "ticket",
+            None,
+            serde_json::json!({ "ticket": { "reference": "T-1" } }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        view_depth(&db.pool, "ticket", "handle_contest").await,
+        (1, 0)
+    );
+    let clerk = engine
+        .get_task("handle_contest", &GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        view_depth(&db.pool, "ticket", "handle_contest").await,
+        (0, 1)
+    );
+
+    engine
+        .correlate(
+            "PAID",
+            "T-1",
+            serde_json::json!({ "payment": { "amount": 1 } }),
+        )
+        .await
+        .unwrap();
+    let state: String = sqlx::query_scalar("select state from rbpmn_work_item where id = $1")
+        .bind(clerk.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "cancelled");
+    assert_eq!(
+        view_depth(&db.pool, "ticket", "handle_contest").await,
+        (0, 0),
+        "a withdrawn item is neither waiting nor in progress"
+    );
+    db.drop().await;
+}
+
+/// An instance frozen on an incident keeps its work items exactly where they
+/// were — and none of them may be handed out. This is why `claimable` needs
+/// the instance at all, and it is asserted on a *sibling*: two parallel user
+/// tasks, one driven to an incident, the other still `available` and still
+/// gone from the queue.
+#[tokio::test]
+async fn a_frozen_instance_holds_its_sibling_work_out_of_the_queue() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/03-parallel-gateway.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(view_depth(&db.pool, "p", "ta").await, (1, 0));
+    assert_eq!(view_depth(&db.pool, "p", "tb").await, (1, 0));
+
+    // Drive `ta` to an incident: three failures with the tests' zero backoff.
+    let ta = engine
+        .get_task("ta", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            engine
+                .fail_task(ta.id, "w1", None, Some("boom".into()))
+                .await
+                .unwrap(),
+            FailOutcome::Retrying { .. }
+        ));
+        engine
+            .get_task("ta", &GetTaskOptions::new("w1"))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(
+        engine
+            .fail_task(ta.id, "w1", None, Some("boom".into()))
+            .await
+            .unwrap(),
+        FailOutcome::IncidentRaised
+    );
+    wait_for_status(&db.pool, started.id, "failed").await;
+
+    // `tb` never failed and is still `available` — but the instance is frozen,
+    // so it is not work anyone can take, and the view must not offer it.
+    let tb_state: String = sqlx::query_scalar(
+        "select state from rbpmn_work_item where instance_id = $1 and element_id = 'tb'",
+    )
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        tb_state, "available",
+        "the sibling is untouched by the incident"
+    );
+    assert_eq!(
+        view_depth(&db.pool, "p", "tb").await,
+        (0, 0),
+        "a frozen instance's untouched sibling must still leave the queue"
+    );
+    assert!(
+        engine
+            .get_task("tb", &GetTaskOptions::new("w2"))
+            .await
+            .unwrap()
+            .is_none(),
+        "and the engine must refuse it, or the view is lying"
+    );
+    db.drop().await;
+}
+
+/// Bulk work items, for the planner's benefit — same reasoning as
+/// `bulk_instances`: a plan test needs table statistics, not engine history.
+/// `open_n` of every instance's items are left open and the rest completed,
+/// which is the shape a real deployment has: closed work dominates the table
+/// forever, and that is exactly what the partial index exists to skip.
+async fn bulk_work_items(pool: &PgPool, key: &str, topics: &[&str], open_n: i32, closed_n: i32) {
+    for (t, topic) in topics.iter().enumerate() {
+        sqlx::query(
+            "insert into rbpmn_work_item \
+               (instance_id, item_no, definition_id, definition_key, definition_version, \
+                token_no, kind, topic, element_id, state) \
+             select i.id, $4 * 1000 + g, i.definition_id, i.definition_key, \
+                    i.definition_version, 0, 'user', $2, $2, \
+                    case when g <= $3 then 'available' else 'completed' end \
+               from rbpmn_instance i, generate_series(1, $3 + $5) g \
+              where i.definition_key = $1",
+        )
+        .bind(key)
+        .bind(topic)
+        .bind(open_n)
+        .bind(t as i32 + 1)
+        .bind(closed_n)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+/// The motivating query, planned THROUGH the view: "for every queue, how many
+/// are waiting?" must be index-driven, not a scan of every work item ever
+/// created. Issued through the view on purpose — a `security_barrier` or a
+/// non-inlinable definition would silently defeat the index, and the shape
+/// test alone would not notice.
+#[tokio::test]
+async fn the_grouped_depth_query_is_index_driven() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    bulk_instances(&db.pool, "p", "Z-", 2_000).await;
+    // 2 open per topic against 18 closed: ~12k open in a ~120k-row table.
+    bulk_work_items(&db.pool, "p", &["alpha", "beta", "gamma"], 2, 18).await;
+    analyze(&db.pool).await;
+
+    let plan = explain_prepared(
+        &db.pool,
+        "depths",
+        &format!(
+            "prepare depths as select definition_key, topic, count(*) \
+               from {} where claimable group by 1, 2",
+            rbpmn_engine::WORK_ITEM_VIEW
+        ),
+        "execute depths",
+    )
+    .await;
+
+    // Unfiltered, the whole-installation question: index-driven over the open
+    // set only. Note it is the *pre-existing* `rbpmn_work_item_fifo` that
+    // serves this — same partial predicate, and with one key to group by the
+    // new index offers nothing over it. Asserted as the property that matters
+    // rather than by index name, because which partial index wins here is the
+    // planner's business; that none of them is a full scan is ours.
+    assert!(
+        !plan.contains("Seq Scan on rbpmn_work_item"),
+        "the depth query must not scan every work item in the system:\n{plan}"
+    );
+    assert!(
+        plan.contains("state = ANY ('{available,locked}'::text[])"),
+        "and must be driven by a partial index over the open states:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Subquery Scan"),
+        "the view must be inlined, not materialised:\n{plan}"
+    );
+
+    // Filtered by a key set — the shape `queue_depths` issues, and the shape
+    // a real dashboard issues, because a user works *some* queues. This is
+    // where `rbpmn_work_item_depth` earns its keep: `definition_key` becomes
+    // an index condition instead of a filter, and the instance join collapses
+    // from hashing every instance to a nested loop on the primary key.
+    let filtered = explain_prepared(
+        &db.pool,
+        "depths_f",
+        &format!(
+            "prepare depths_f(text[]) as select definition_key, topic, count(*) \
+               from {} where claimable and definition_key = any($1) group by 1, 2",
+            rbpmn_engine::WORK_ITEM_VIEW
+        ),
+        "execute depths_f(array['p'])",
+    )
+    .await;
+    assert!(
+        filtered.contains("rbpmn_work_item_depth"),
+        "the filtered depth query must reach the depth index:\n{filtered}"
+    );
+    assert!(
+        filtered
+            .lines()
+            .any(|l| l.contains("Index Cond") && l.contains("definition_key")),
+        "and definition_key must be an index condition, not a filter:\n{filtered}"
+    );
+    assert!(
+        !filtered.contains("Seq Scan on rbpmn_instance"),
+        "the instance join should be a nested loop on the pkey:\n{filtered}"
+    );
+    db.drop().await;
+}
+
+/// The typed call: the caller's key set is an argument bound into the query,
+/// so it composes with everything else instead of filtering a result that was
+/// already cut down. Busiest queue first, because that is the question.
+#[tokio::test]
+async fn queue_depths_composes_the_callers_key_set() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("warn_customer").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/03-parallel-gateway.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    engine
+        .deploy(
+            &fixture("accept/35-non-interrupting-on-subprocess.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        engine
+            .start("p", None, serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        engine
+            .start("shipment", None, serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    // One of p's `ta` items goes to a worker, so the two buckets differ.
+    engine
+        .get_task("ta", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mine = engine.queue_depths(&["p".to_string()]).await.unwrap();
+    assert_eq!(
+        mine,
+        vec![
+            rbpmn_engine::QueueDepth {
+                definition_key: "p".into(),
+                topic: "tb".into(),
+                waiting: 5,
+                in_progress: 0
+            },
+            rbpmn_engine::QueueDepth {
+                definition_key: "p".into(),
+                topic: "ta".into(),
+                waiting: 4,
+                in_progress: 1
+            },
+        ],
+        "busiest first, and the leased one counted as in progress"
+    );
+
+    // The other definition's queues are not mine to see unless I ask.
+    assert!(mine.iter().all(|d| d.definition_key == "p"));
+    let both = engine
+        .queue_depths(&["p".to_string(), "shipment".to_string()])
+        .await
+        .unwrap();
+    assert!(both.iter().any(|d| d.definition_key == "shipment"));
+
+    // An empty key set matches no keys: plain SQL set semantics, not a
+    // special case that quietly means "everything".
+    assert_eq!(engine.queue_depths(&[]).await.unwrap(), vec![]);
+    db.drop().await;
+}
+
+/// The two published views compose on `instance_id`, which is the point of
+/// publishing them: an application groups queue depth by its *own* dimension
+/// — here a tenant hoisted into the variable document — in one statement.
+#[tokio::test]
+async fn the_two_views_compose_on_instance_id() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    for i in 0..7 {
+        engine
+            .start(
+                "p",
+                None,
+                serde_json::json!({ "tenant": if i % 3 == 0 { "acme" } else { "globex" } }),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(&format!(
+        "select i.variables->>'tenant' as tenant, w.topic, count(*) as waiting \
+           from {work} w join {inst} i on i.id = w.instance_id \
+          where w.claimable \
+          group by 1, 2 order by waiting desc",
+        work = rbpmn_engine::WORK_ITEM_VIEW,
+        inst = rbpmn_engine::INSTANCE_VIEW,
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("globex".to_string(), "review".to_string(), 4),
+            ("acme".to_string(), "review".to_string(), 3),
+        ]
+    );
+    db.drop().await;
+}

@@ -80,13 +80,17 @@ deliberately not the default posture.
   (the indexed expression and the `is not null` predicate), and
   `find_by_shared_index` embeds it once. Same validator, same guarantee; the
   looked-up value is a bound parameter.
-- **The published view** (`rbpmn_v_instance`) is a read-only projection and
-  grants nothing on its own — it is visible to whatever role the application's
-  connection already uses, and rbpmn does not manage grants. It deliberately
-  carries no row filtering: it is **not** a tenancy boundary, and an
-  application that needs one must express it in its own query. Note in
-  particular that it exposes the whole variable document, exactly as the
-  inspector does, and who may see that is the application's call.
+- **The published views** (`rbpmn_v_instance`, `rbpmn_v_work_item`) are
+  read-only projections and
+  grant nothing on their own — they are visible to whatever role the
+  application's connection already uses, and rbpmn does not manage grants.
+  They deliberately carry no row filtering: they are **not** a tenancy
+  boundary, and an application that needs one must express it in its own
+  query. Note in particular that `rbpmn_v_instance` exposes the whole variable
+  document, exactly as the inspector does, and `rbpmn_v_work_item` exposes
+  `lock_owner` and `last_failure` — a handler's error text, which can carry
+  whatever a failing integration put in it. Who may see any of that is the
+  application's call.
 - **SSRF**: `HttpPostHandler` targets come from operator configuration at
   engine build time, never from request data or model content.
 - **Scoped tokens**: deploy (code-adjacent) vs runtime (start/correlate/

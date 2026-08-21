@@ -154,16 +154,33 @@ inclusive gateway, block structure, messages-only interaction, build order).
   a bug that predates scopes (two definitions deploying at once both index
   `rbpmn_instance`). The session must be **idle** between attempts; that is
   what lets the holder's build drain.
-- **`rbpmn_v_instance` is public API and must stay a plain inlinable
-  projection.** One table, no WHERE, no volatile function, and above all not
-  `security_barrier` — a barrier view refuses to push `variables->>'f' = $1`
+- **The published views (`rbpmn_v_instance`, `rbpmn_v_work_item`) are public
+  API and must stay plain inlinable projections.** No WHERE, no volatile
+  function, and above all not `security_barrier` — a barrier view refuses to push `variables->>'f' = $1`
   below itself (`jsonb ->>` is not leakproof), which would strand every
   declared index beneath a full scan. Columns may be added, never removed or
   repurposed. It is not a tenancy boundary and does no row filtering: an
   application's own predicate belongs in the application's own query, which is
   the whole reason the surface is SQL rather than an API. `find_by_shared_index`
   is the no-SQL convenience beside it and is explicitly not a search
-  primitive — its limit lands before any caller-side filter.
+  primitive — its limit lands before any caller-side filter. `queue_depths`
+  deliberately does not repeat that shape: its key set is a bound argument and
+  it has no limit at all.
+- **`rbpmn_v_work_item.claimable` is the claim predicate, not a guess at it.**
+  `CLAIMABLE` in `lib.rs` is the one source, and it is written **total**
+  (`lock_until is not null`) rather than merely correct-in-a-WHERE, because
+  the view *projects* it: a three-valued boolean would put an item in neither
+  bucket of a dashboard that thinks it split the world in two. Do **not**
+  "fix" that by projecting `coalesce(…, false)` — measured, COALESCE is opaque
+  to the planner's predicate prover, `state in ('available','locked')` can no
+  longer be proved, and the depth query becomes a parallel sequential scan of
+  every work item in the system. Migration 0015 carries the same text because
+  a migration cannot read a Rust const; they are held together by
+  `the_view_and_the_claim_predicate_cannot_drift`, a behavioural differential
+  over a corpus with every state, lease and backoff in it — not a textual
+  comparison. `claimable` needs `i.status = 'active'`, which is why the view
+  joins instances: an instance frozen on an incident keeps its work items and
+  none of them may be handed out.
 - The UI documents inline business data into HTML, which makes **escaping our
   problem** — one mistake ships to every embedder at once. The rule:
   `escape_json_for_html` for the data block, `textContent` (never
