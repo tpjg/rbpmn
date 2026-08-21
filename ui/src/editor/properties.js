@@ -65,6 +65,25 @@ function selectRow(label, value, options, commit, { hint } = {}) {
 /// Pure — no DOM, no modeler — so it is unit-tested under node.
 /// @returns {{interrupting: boolean, fixed: boolean}|null} null if `bo` is
 /// not a boundary event, in which case there is no row at all.
+/// Which timer definitions the linter will execute for this element. A
+/// repeating `timeCycle` only on a *non-interrupting* boundary: anywhere else
+/// the first occurrence ends the wait and the repetitions could only be
+/// dropped silently, which `no-unsupported-element` refuses — so the control
+/// is not offered there rather than offered and then rejected. A file that
+/// already carries one elsewhere still shows it, labelled as not executed.
+export function timerKinds(bo, current) {
+  const kinds = [
+    ['timeDuration', 'duration (ISO-8601, e.g. P3D)'],
+    ['timeDate', 'date (ISO-8601 with UTC offset)'],
+  ];
+  if (bo?.$type === 'bpmn:BoundaryEvent' && bo.cancelActivity === false) {
+    kinds.push(['timeCycle', 'cycle (R/P7D, R3/P1D, or anchored R/2026-08-31T00:00:00+02:00/P7D)']);
+  } else if (current === 'timeCycle') {
+    kinds.push(['timeCycle', 'cycle (only executed on a non-interrupting boundary)']);
+  }
+  return kinds;
+}
+
 export function boundaryInterrupting(bo) {
   if (bo?.$type !== 'bpmn:BoundaryEvent') return null;
   const definitions = bo.eventDefinitions ?? [];
@@ -281,34 +300,38 @@ function renderEventDefinition(container, modeler, element, definition) {
 
   switch (definition.$type) {
     case 'bpmn:TimerEventDefinition': {
-      // One of duration or date; rbpmn rejects cycles, and offering a control
-      // for something the linter refuses would be teaching the wrong thing.
-      const kind = definition.timeDate ? 'timeDate' : 'timeDuration';
+      // Duration, date — and a cycle only where the linter executes one
+      // (`timerKinds`): offering a control for something the linter refuses
+      // would be teaching the wrong thing.
+      const kind = definition.timeDate
+        ? 'timeDate'
+        : definition.timeCycle
+          ? 'timeCycle'
+          : 'timeDuration';
       const current = definition[kind]?.body ?? '';
       container.append(
-        selectRow(
-          'timer kind',
-          kind,
-          [
-            ['timeDuration', 'duration (ISO-8601, e.g. P3D)'],
-            ['timeDate', 'date (ISO-8601 with UTC offset)'],
-          ],
-          (next) => {
-            const body = current;
-            updateDefinition({
-              timeDuration: next === 'timeDuration' && body
-                ? moddle.create('bpmn:FormalExpression', { body })
-                : undefined,
-              timeDate: next === 'timeDate' && body
-                ? moddle.create('bpmn:FormalExpression', { body })
-                : undefined,
-            });
-          }
-        )
+        selectRow('timer kind', kind, timerKinds(element.businessObject, kind), (next) => {
+          const body = current;
+          const expression = (selected) =>
+            next === selected && body ? moddle.create('bpmn:FormalExpression', { body }) : undefined;
+          updateDefinition({
+            timeDuration: expression('timeDuration'),
+            timeDate: expression('timeDate'),
+            timeCycle: expression('timeCycle'),
+          });
+        })
       );
+      const labels = { timeDate: 'due date', timeDuration: 'duration', timeCycle: 'cycle' };
+      const placeholders = { timeDate: '2026-12-24T09:00:00Z', timeDuration: 'P3D', timeCycle: 'R/P7D' };
+      const hints = {
+        timeDate: 'timer-iso8601: dates need an explicit UTC offset',
+        timeDuration: 'timer-iso8601: an ISO-8601 duration, or a variable name read when the timer is armed',
+        timeCycle:
+          'timer-iso8601: R[n]/P… or R[n]/<datetime>/P…, fixed-length period (weeks, days, hours, minutes, seconds); the anchor fixes the phase, each occurrence steps from the previous due',
+      };
       container.append(
         textRow(
-          kind === 'timeDate' ? 'due date' : 'duration',
+          labels[kind],
           current,
           (body) => {
             const expression = body.trim()
@@ -316,10 +339,7 @@ function renderEventDefinition(container, modeler, element, definition) {
               : undefined;
             updateDefinition({ [kind]: expression });
           },
-          {
-            placeholder: kind === 'timeDate' ? '2026-12-24T09:00:00Z' : 'P3D',
-            hint: 'timer-iso8601: dates need an explicit UTC offset',
-          }
+          { placeholder: placeholders[kind], hint: hints[kind] }
         )
       );
       break;

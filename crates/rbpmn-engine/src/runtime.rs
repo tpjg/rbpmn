@@ -727,7 +727,7 @@ pub(crate) async fn load_instance_nowait(
 
     let mut timers = Vec::new();
     for row in sqlx::query(
-        "select timer_no, token_no, element_id, due_kind, due_spec \
+        "select timer_no, token_no, element_id, due_kind, due_spec, remaining \
          from rbpmn_timer where instance_id = $1 order by timer_no",
     )
     .bind(instance_id)
@@ -739,8 +739,12 @@ pub(crate) async fn load_instance_nowait(
         let due = match row.get::<String, _>("due_kind").as_str() {
             "duration" => TimerDue::Duration(spec),
             "date" => TimerDue::Date(spec),
+            "cycle" => TimerDue::Cycle(spec),
             other => return Err(internal(format!("unknown timer due kind '{other}'"))),
         };
+        let remaining = row
+            .get::<Option<i32>, _>("remaining")
+            .map(|r| r.max(0) as u32);
         timers.push((
             TimerId(row.get::<i64, _>("timer_no") as u64),
             TimerState {
@@ -749,6 +753,7 @@ pub(crate) async fn load_instance_nowait(
                 })?,
                 token: TokenId(row.get::<i64, _>("token_no") as u64),
                 due,
+                remaining,
             },
         ));
     }
@@ -1076,6 +1081,12 @@ pub(crate) async fn persist_step(
     let mut event_elements: Vec<Option<String>> = Vec::new();
     let mut event_payloads: Vec<serde_json::Value> = Vec::new();
     let mut armed_timer = false;
+    // The due instant of every timer row this step deleted, in epoch seconds:
+    // a cycle's re-arm steps from the due of the occurrence it continues, and
+    // the core emits `timer-fired` before the `timer-armed` that continues it,
+    // so the value is always here by the time it is needed.
+    let mut deleted_due: std::collections::BTreeMap<TimerId, f64> =
+        std::collections::BTreeMap::new();
     for event in events {
         match event {
             Event::WorkItemCreated {
@@ -1125,37 +1136,73 @@ pub(crate) async fn persist_step(
                 element,
                 due,
                 token,
+                continues,
+                remaining,
             } => {
                 let token_no = token.0 as i64;
-                let (due_kind, spec) = match due {
-                    TimerDue::Duration(s) => ("duration", s),
-                    TimerDue::Date(s) => ("date", s),
-                };
-                // due_at from database time — the design's clock authority.
-                // Both ISO-8601 forms cast natively in PostgreSQL.
-                sqlx::query(
-                    "insert into rbpmn_timer \
-                     (instance_id, timer_no, token_no, element_id, due_kind, due_spec, due_at) \
-                     values ($1, $2, $3, $4, $5, $6, case when $5 = 'duration' \
-                     then clock_timestamp() + $6::interval else $6::timestamptz end)",
-                )
-                .bind(instance_id)
-                .bind(id.0 as i64)
-                .bind(token_no)
-                .bind(element)
-                .bind(due_kind)
-                .bind(spec)
-                .execute(&mut *tx)
-                .await?;
+                match due {
+                    TimerDue::Duration(_) | TimerDue::Date(_) => {
+                        let (due_kind, spec) = match due {
+                            TimerDue::Duration(s) => ("duration", s),
+                            TimerDue::Date(s) => ("date", s),
+                            TimerDue::Cycle(_) => unreachable!("matched above"),
+                        };
+                        // due_at from database time — the design's clock
+                        // authority. Both ISO-8601 forms cast natively.
+                        sqlx::query(
+                            "insert into rbpmn_timer \
+                             (instance_id, timer_no, token_no, element_id, due_kind, \
+                              due_spec, due_at) \
+                             values ($1, $2, $3, $4, $5, $6, case when $5 = 'duration' \
+                             then clock_timestamp() + $6::interval else $6::timestamptz end)",
+                        )
+                        .bind(instance_id)
+                        .bind(id.0 as i64)
+                        .bind(token_no)
+                        .bind(element)
+                        .bind(due_kind)
+                        .bind(spec)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    TimerDue::Cycle(text) => {
+                        arm_cycle(
+                            tx,
+                            instance_id,
+                            *id,
+                            token_no,
+                            element,
+                            text,
+                            *remaining,
+                            continues.map(|prev| {
+                                deleted_due.get(&prev).copied().ok_or_else(|| {
+                                    internal(format!(
+                                        "cycle '{element}' continues timer {} which this \
+                                         step did not fire",
+                                        prev.0
+                                    ))
+                                })
+                            }),
+                        )
+                        .await?;
+                    }
+                }
                 armed_timer = true;
             }
             Event::TimerFired { id, .. } | Event::TimerCancelled { id, .. } => {
-                // Fired: the delete commits with the step — exactly-once.
-                sqlx::query("delete from rbpmn_timer where instance_id = $1 and timer_no = $2")
-                    .bind(instance_id)
-                    .bind(id.0 as i64)
-                    .execute(&mut *tx)
-                    .await?;
+                // Fired: the delete commits with the step — exactly-once. The
+                // due comes back for a cycle's re-arm to step from.
+                let due: Option<f64> = sqlx::query_scalar(
+                    "delete from rbpmn_timer where instance_id = $1 and timer_no = $2 \
+                     returning extract(epoch from due_at)::float8",
+                )
+                .bind(instance_id)
+                .bind(id.0 as i64)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(due) = due {
+                    deleted_due.insert(*id, due);
+                }
             }
             Event::MessageSubscribed {
                 id,
@@ -1257,6 +1304,72 @@ pub(crate) async fn persist_step(
         .execute(&mut *tx)
         .await?;
     }
+    Ok(())
+}
+
+/// Insert the row for one occurrence of a cycle.
+///
+/// The instant is the projection's to compute, and it is computed in **epoch
+/// seconds** because lint made the period fixed-length: `timestamptz +
+/// interval '1 day'` is a calendar day in the session's time zone and would
+/// slide an hour across a daylight-saving change, which is not what `P1D`
+/// means in a cycle. Three cases, one per kind of arm:
+///
+/// * a re-arm (`previous` is the fired occurrence's due): *that* due plus the
+///   period — never the time the fire happened to run, so a scheduler that
+///   was late does not drift the schedule;
+/// * a first arm with an anchor: the anchor fixes the *phase* — the first
+///   occurrence at or after now (`anchor + ceil((now − anchor)/period) ·
+///   period`, clamped so a future anchor is itself the first due). Occurrences
+///   already in the past are never replayed: a definition outlives its anchor;
+/// * a first arm without one: now plus the period.
+#[allow(clippy::too_many_arguments)]
+async fn arm_cycle(
+    tx: &mut PgConnection,
+    instance_id: Uuid,
+    id: TimerId,
+    token_no: i64,
+    element: &str,
+    text: &str,
+    remaining: Option<u32>,
+    previous: Option<Result<f64, EngineError>>,
+) -> Result<(), EngineError> {
+    // Validated at lint (a literal) or at arm time (a variable), with this
+    // same function; failing here means a row the core never produced.
+    let parts = rbpmn_model::iso8601::split_cycle(text)
+        .map_err(|e| internal(format!("cycle '{text}' on '{element}' is not valid: {e}")))?;
+    let period = rbpmn_model::iso8601::fixed_length_seconds(&parts.period)
+        .map_err(|e| internal(format!("cycle '{text}' on '{element}': {e}")))?;
+    let previous_due = match previous {
+        Some(p) => Some(p?),
+        None => None,
+    };
+    // One statement for the three cases, so every parameter is always bound:
+    // $7 the fired occurrence's due (a re-arm), $9 the anchor (a first arm
+    // with a phase), neither (a first arm from now). All in epoch seconds.
+    sqlx::query(
+        "insert into rbpmn_timer \
+         (instance_id, timer_no, token_no, element_id, due_kind, due_spec, remaining, due_at) \
+         values ($1, $2, $3, $4, 'cycle', $5, $6, case \
+           when $7::float8 is not null then to_timestamp($7::float8 + $8::float8) \
+           when $9::timestamptz is not null then to_timestamp( \
+             extract(epoch from $9::timestamptz) \
+             + $8::float8 * ceil(greatest(0, extract(epoch from clock_timestamp()) \
+                                          - extract(epoch from $9::timestamptz)) / $8::float8)) \
+           else to_timestamp(extract(epoch from clock_timestamp()) + $8::float8) \
+         end)",
+    )
+    .bind(instance_id)
+    .bind(id.0 as i64)
+    .bind(token_no)
+    .bind(element)
+    .bind(text)
+    .bind(remaining.map(|r| r as i32))
+    .bind(previous_due)
+    .bind(period)
+    .bind(parts.anchor.as_deref())
+    .execute(&mut *tx)
+    .await?;
     Ok(())
 }
 

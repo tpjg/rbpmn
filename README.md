@@ -180,7 +180,13 @@ and what deviates.
       which start a sibling token while the host keeps running, under the new
       rule `boundary-side-path` (a side path ends at its own end event and
       never merges back: it would run the continuation twice, or deliver a
-      second token to a join). Repeating timers (`timeCycle`) follow.
+      second token to a join). And repeating timers — `timeCycle` on a
+      non-interrupting boundary, `R[n]/P…` or anchored
+      `R[n]/<datetime>/P…` with a fixed-length period — where every
+      occurrence steps from the *previous due* (a late scheduler never drifts
+      the schedule) and the anchor fixes the phase rather than replaying the
+      past; "every 7 days while waiting for payment, add a late fee" is one
+      boundary now, not a loop.
       [docs/design/boundary-messages.md](docs/design/boundary-messages.md)
       is the record — including the two things building it found that the
       design had not: a timer boundary on a business-rule task was a dead arm
@@ -198,11 +204,11 @@ graphs that pass them).
 |---|---|---|
 | `no-inclusive-gateway` | error | Inclusive gateways rejected entirely; rewrite as parallel split + exclusive skip-bypass per branch. |
 | `no-call-activity` | error | Definitions are islands; interact via message throw → message start/catch with correlation keys. |
-| `no-unsupported-element` | error | Anything outside the supported subset (script/send/manual/abstract tasks, call activities, signals, cycles, multi-instance, …). |
+| `no-unsupported-element` | error | Anything outside the supported subset (script/send/manual/abstract tasks, call activities, signals, multi-instance, a `timeCycle` anywhere but on a non-interrupting boundary, …). |
 | `balanced-gateways` | error | Every parallel split has a matching join; branches stay disjoint; nothing enters/escapes the region; each branch delivers exactly one token; no plain end events inside (terminate allowed). |
 | `single-start-event` | error | Exactly one start event per process and per subprocess. |
 | `conditions-feel-subset` | error | Conditions only on exclusive-split flows, in the strict FEEL subset (`name op literal`, `and`/`or`, parentheses); default flow required. Full-FEEL constructs (functions, arithmetic, ranges) are rejected. |
-| `timer-iso8601` | error | Timer definitions must be valid ISO-8601 — dates require an explicit UTC offset, component magnitudes bounded — **or**, failing that, a FEEL qualified name naming the deadline in the variable document. Text that is neither is the error. Parse order is the only discriminator: `xsi:type="bpmn:tFormalExpression"` is deliberately ignored, because bpmn-moddle stamps it on every expression object and so every bpmn-js modeler writes it on ordinary literals. |
+| `timer-iso8601` | error | Timer definitions must be valid ISO-8601 — dates require an explicit UTC offset, component magnitudes bounded; a `timeCycle` is `R[n]/P…` or `R[n]/<datetime>/P…` with a fixed-length period (weeks, days, hours, minutes, seconds — never months or years), `R0` and the `/end` forms refused — **or**, failing that, a FEEL qualified name naming the deadline in the variable document. Text that is neither is the error. Parse order is the only discriminator: `xsi:type="bpmn:tFormalExpression"` is deliberately ignored, because bpmn-moddle stamps it on every expression object and so every bpmn-js modeler writes it on ordinary literals. |
 | `timer-expression`⁺ | warn | A timer whose deadline is read from the variable document cannot be validated ahead of time — if it does not resolve to a valid ISO-8601 value at arm time, that element raises an incident rather than firing. |
 | `message-has-correlation` | error | Message start/catch/throw events, receive tasks and message **boundary** events must reference a *named* message. The correlation binding itself (a FEEL qualified name) is registered via `Bindings::correlation`, keyed by the element's own id — for a boundary, the boundary's id, never its host's — and checked at deploy. |
 | `no-foreign-implementation` | warn | Service task carries vendor attributes (`camunda:`, `zeebe:`, …), which rbpmn ignores — topics are bound at registration. |

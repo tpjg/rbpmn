@@ -6,7 +6,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { boundaryInterrupting } from '../src/editor/properties.js';
+import { boundaryInterrupting, timerKinds } from '../src/editor/properties.js';
 
 test('only a boundary event gets the row at all', () => {
   assert.equal(boundaryInterrupting(null), null);
@@ -65,4 +65,24 @@ test('an error boundary is interrupting by definition', () => {
     }),
     { interrupting: false, fixed: true }
   );
+});
+
+// A repeating timer is executed on a non-interrupting boundary and nowhere
+// else, so the control follows the linter: offered there, absent elsewhere —
+// unless the file already carries one, which is shown rather than hidden.
+test('timeCycle is offered only on a non-interrupting boundary', () => {
+  const ids = (bo, current) => timerKinds(bo, current).map(([id]) => id);
+  assert.deepEqual(ids({ $type: 'bpmn:IntermediateCatchEvent' }), ['timeDuration', 'timeDate']);
+  assert.deepEqual(ids({ $type: 'bpmn:BoundaryEvent' }), ['timeDuration', 'timeDate']);
+  assert.deepEqual(ids({ $type: 'bpmn:BoundaryEvent', cancelActivity: true }), ['timeDuration', 'timeDate']);
+  assert.deepEqual(ids({ $type: 'bpmn:BoundaryEvent', cancelActivity: false }), [
+    'timeDuration',
+    'timeDate',
+    'timeCycle',
+  ]);
+  // Already in the file, on an element where it is not executed: shown, and
+  // labelled as such, rather than silently re-read as a duration.
+  const shown = timerKinds({ $type: 'bpmn:IntermediateCatchEvent' }, 'timeCycle');
+  assert.equal(shown.at(-1)[0], 'timeCycle');
+  assert.match(shown.at(-1)[1], /only executed on a non-interrupting boundary/);
 });

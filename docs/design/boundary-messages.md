@@ -114,6 +114,22 @@ not say, or said differently.
   of a two-wide block already saturated it and the mutation table would have
   called the shape clean. `reject/side-path-parallel-block` is the row;
   `accept/38` is the repaired model with two interleaved activations.
+- **Slice 3 shipped** (`timeCycle` on non-interrupting boundaries). As
+  designed in §2.5/§3.6, with one simplification: no `period` column —
+  `TimerDue::Cycle` keeps the literal text, the core keeps `remaining`, and
+  the projection re-splits the text on every arm (`iso8601::split_cycle`,
+  `fixed_length_seconds`). Migration 0013 adds `'cycle'` to `due_kind` and a
+  nullable `remaining`. The instant arithmetic is in epoch seconds, not
+  `interval`: `timestamptz + interval '1 day'` is a calendar day in the
+  session's time zone, and a fixed-length `P1D` is 86 400 s — so the re-arm
+  is `to_timestamp(previous_due + period)`, and the `timer-fired` delete
+  returns the due for the `timer-armed` that `continues` it, in the same
+  persist pass. The `timer-armed` payload carries `continues` and
+  `remaining`; `Display` is the literal (`timer-armed late_fee_due R/P7D`,
+  on every arm). The editor offers `timeCycle` only where lint executes it.
+  Verified against the engine: a scheduler an hour late re-arms at *previous
+  due + 7 d*, a past anchor yields one phase-aligned occurrence and no
+  catch-up burst, `R2` leaves the scheduler idle over live work.
 
 ---
 

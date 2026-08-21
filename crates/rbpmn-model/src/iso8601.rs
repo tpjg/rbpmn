@@ -2,8 +2,10 @@
 //!
 //! Deliberately strict: datetimes require an explicit UTC offset ('Z' or
 //! ±hh:mm) so a timer never depends on server-local time. Cycles (repeating
-//! timers) are rejected at the lint layer until v2, so no cycle validator
-//! exists yet.
+//! timers, `timeCycle`) are a deliberate subset of ISO 8601's recurring
+//! intervals — `R[n]/P…` and `R[n]/<datetime>/P…` with a **fixed-length**
+//! period — and only a non-interrupting boundary may carry one
+//! (docs/design/boundary-messages.md §2.5).
 
 /// `YYYY-MM-DDThh:mm:ss[.fff](Z|±hh:mm)`
 pub fn validate_datetime(s: &str) -> Result<(), String> {
@@ -223,6 +225,146 @@ pub fn validate_duration(s: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The pieces of a validated cycle, for the two places that need them: the
+/// core reads `repeats` when it arms, the projection reads `anchor` and the
+/// period when it computes an instant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CycleParts {
+    /// `None` for `R/…`: unbounded, ended by the host.
+    pub repeats: Option<u32>,
+    /// The phase-fixing datetime of `R[n]/<datetime>/P…`, if any.
+    pub anchor: Option<String>,
+    /// The ISO-8601 period, already known to be fixed-length.
+    pub period: String,
+}
+
+/// `R[n]/P…` or `R[n]/<datetime>/P…`: `n` fires (absent = unbounded, zero
+/// refused), an optional anchor that fixes the *phase*, and a period that is
+/// fixed-length — weeks, days, hours, minutes, seconds. Months and years are
+/// refused: the projection steps a cycle with epoch arithmetic, the previous
+/// due plus the period, and a month is not a number of seconds. The
+/// `R/<start>/<end>` and `R/P…/<end>` forms are refused too; the subset is
+/// stated rather than silently narrowed.
+pub fn validate_cycle(s: &str) -> Result<(), String> {
+    split_cycle(s).map(|_| ())
+}
+
+/// [`validate_cycle`], handing back the parts. Errors are the same text lint
+/// shows, so an arm-time failure on a variable-sourced cycle reads the same.
+pub fn split_cycle(s: &str) -> Result<CycleParts, String> {
+    let Some(rest) = s.strip_prefix('R') else {
+        return Err(format!("a repeating timer starts with 'R': '{s}'"));
+    };
+    let digits_end = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let repeats = if digits_end == 0 {
+        None
+    } else {
+        let n = rest[..digits_end]
+            .parse::<u32>()
+            .map_err(|_| format!("repeat count too large in '{s}'"))?;
+        if n == 0 {
+            return Err(format!(
+                "'R0' repeats zero times and would never fire: '{s}'"
+            ));
+        }
+        Some(n)
+    };
+    let Some(rest) = rest[digits_end..].strip_prefix('/') else {
+        return Err(format!("expected '/' after the repeat count in '{s}'"));
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    let (anchor, period) = match parts.as_slice() {
+        [period] => (None, *period),
+        [anchor, period] => {
+            if validate_datetime(anchor).is_err() {
+                if validate_duration(anchor).is_ok() {
+                    return Err(format!(
+                        "the 'R/duration/end' form is not supported — rbpmn accepts \
+                         'Rn/P…' and 'Rn/<datetime>/P…': '{s}'"
+                    ));
+                }
+                return Err(format!(
+                    "the anchor of a repeating timer must be a datetime with an \
+                     explicit UTC offset: '{s}'"
+                ));
+            }
+            (Some(anchor.to_string()), *period)
+        }
+        _ => {
+            return Err(format!(
+                "a repeating timer has at most an anchor and a period — rbpmn accepts \
+                 'Rn/P…' and 'Rn/<datetime>/P…': '{s}'"
+            ));
+        }
+    };
+    if validate_datetime(period).is_ok() {
+        return Err(format!(
+            "the 'R/start/end' form is not supported — rbpmn accepts 'Rn/P…' and \
+             'Rn/<datetime>/P…': '{s}'"
+        ));
+    }
+    validate_duration(period)?;
+    fixed_length_seconds(period)?;
+    Ok(CycleParts {
+        repeats,
+        anchor,
+        period: period.to_string(),
+    })
+}
+
+/// A duration as a number of seconds, for durations that *have* one: weeks,
+/// days, hours, minutes, seconds. `P1M` and `P1Y` are refused — their length
+/// depends on where in the calendar they land, which is exactly what a cycle
+/// stepped by epoch arithmetic cannot honour. Assumes [`validate_duration`]
+/// has passed; the magnitude caps there keep this finite.
+pub fn fixed_length_seconds(period: &str) -> Result<f64, String> {
+    let body = period.strip_prefix('P').unwrap_or(period);
+    if let Some(weeks) = body.strip_suffix('W') {
+        return Ok(component_value(weeks) * 604_800.0);
+    }
+    let (date, time) = match body.split_once('T') {
+        Some((d, t)) => (d, t),
+        None => (body, ""),
+    };
+    let mut secs = 0f64;
+    let mut num = String::new();
+    for c in date.chars() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+            continue;
+        }
+        match c {
+            'D' => secs += component_value(&num) * 86_400.0,
+            'Y' | 'M' => {
+                return Err(format!(
+                    "a repeating period must have a fixed length — months and years \
+                     do not (use weeks or days): '{period}'"
+                ));
+            }
+            _ => return Err(format!("unexpected '{c}' in period '{period}'")),
+        }
+        num.clear();
+    }
+    for c in time.chars() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+            continue;
+        }
+        let per = match c {
+            'H' => 3_600.0,
+            'M' => 60.0,
+            'S' => 1.0,
+            _ => return Err(format!("unexpected '{c}' in period '{period}'")),
+        };
+        secs += component_value(&num) * per;
+        num.clear();
+    }
+    if secs <= 0.0 {
+        return Err(format!("a repeating period must be positive: '{period}'"));
+    }
+    Ok(secs)
+}
+
 /// Per-component value bound. This must reject at lint time everything the
 /// runtime's `now() + spec::interval` would reject: PostgreSQL intervals
 /// hold months and days as int32, so e.g. P999999999W (7e9 days) errors at
@@ -339,6 +481,44 @@ mod tests {
             "P", "PT", "15M", "P1.5D", "P3W2D", "PT5X", "P1D2H", "PT1H!", "soon",
         ] {
             assert!(validate_duration(s).is_err(), "{s} should be rejected");
+        }
+    }
+
+    #[test]
+    fn valid_cycles() {
+        for (s, repeats, anchored, secs) in [
+            ("R/P7D", None, false, 604_800.0),
+            ("R3/P7D", Some(3), false, 604_800.0),
+            ("R/2026-08-31T00:00:00+02:00/P7D", None, true, 604_800.0),
+            ("R2/2026-08-31T00:00:00Z/P1W", Some(2), true, 604_800.0),
+            ("R/PT90M", None, false, 5_400.0),
+            ("R/P1DT12H", None, false, 129_600.0),
+            ("R/PT0.5S", None, false, 0.5),
+        ] {
+            let parts = split_cycle(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+            assert_eq!(parts.repeats, repeats, "{s}");
+            assert_eq!(parts.anchor.is_some(), anchored, "{s}");
+            assert_eq!(fixed_length_seconds(&parts.period).unwrap(), secs, "{s}");
+        }
+    }
+
+    #[test]
+    fn invalid_cycles() {
+        for s in [
+            "P7D",                                         // no R
+            "R0/P7D",                                      // never fires
+            "R/P1M",                                       // not fixed-length
+            "R/P1Y",                                       // not fixed-length
+            "R/P7D/2026-12-31T00:00:00Z",                  // duration/end form
+            "R/2026-08-31T00:00:00Z/2026-12-31T00:00:00Z", // start/end form
+            "R/2026-08-31T00:00:00/P7D",                   // anchor without offset
+            "R/",                                          // nothing to repeat
+            "R3P7D",                                       // missing slash
+            "R/P7D/P1D/P1D",                               // too many parts
+            "R/PT0S",                                      // zero period
+            "R99999999999/P7D",                            // repeat count overflow
+        ] {
+            assert!(validate_cycle(s).is_err(), "{s} should be rejected");
         }
     }
 

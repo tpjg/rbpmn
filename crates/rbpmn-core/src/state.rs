@@ -117,6 +117,10 @@ pub struct TimerState {
     pub element: NodeIx,
     pub token: TokenId,
     pub due: TimerDue,
+    /// For a cycle: fires left, the armed one included, so `Some(1)` is the
+    /// last. `None` is an unbounded cycle — or no cycle at all; the `due`
+    /// says which, and only the cycle path reads this.
+    pub remaining: Option<u32>,
 }
 
 /// An open message subscription. `key` is the correlation key **value**,

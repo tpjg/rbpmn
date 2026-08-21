@@ -155,6 +155,16 @@ committed state with a live host and no arm), and teardown withdraws it with
 the token like any other row — `SubscriptionTeardown.cfg` already covers
 that shape.
 
+### Slice 3 (`timeCycle`): re-read, nothing to model
+
+A cycle's re-arm is a new `rbpmn_timer` row inserted in the firing
+transaction, after the fired row's delete — both under the instance row
+lock the claim already holds, so the claim path's shape (`try_fire`: pick,
+NOWAIT, re-check, step, persist) and `LockOrder` are unchanged. For
+`TimerTeardown` the re-armed row is an arm row on the same token, withdrawn
+with it like any other; the scheduler's re-check still sees the row and
+never the token, and the invariant that protects it is the same one.
+
 ## What the failures show
 
 `LockOrderHistorical` restores the originally sketched timer claim — timer row

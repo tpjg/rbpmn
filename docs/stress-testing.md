@@ -200,7 +200,8 @@ counterexample in `tests/mutation.rs`; the generator's side-path body emits
 `Par` only under a `Sub` and carries no message arm, which is the rule as
 lint now states it.
 
-Not yet generated, and why: error and timer boundaries, and `EventGateway`.
+Not yet generated, and why: error and timer boundaries (single-shot or
+`timeCycle`), and `EventGateway`.
 The message boundary's merge-back settles the structural question for all of
 them, but each still owes the oracle a stimulus the driver can supply —
 `RaiseError` needs a task that fails on demand, a timer needs `FireTimer`

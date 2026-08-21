@@ -5919,3 +5919,257 @@ async fn a_re_arm_reads_its_key_from_the_patched_document() {
     assert_fsck_clean(&db.pool).await;
     db.drop().await;
 }
+
+// ----------------------------------------------------------- cycles (slice 3)
+
+const WEEK: f64 = 604_800.0;
+
+/// Every armed timer of an instance: (timer_no, due in epoch seconds,
+/// remaining) — the three things a cycle's row adds up to.
+async fn timer_dues(pool: &PgPool, instance: uuid::Uuid) -> Vec<(i64, f64, Option<i32>)> {
+    sqlx::query(
+        "select timer_no, extract(epoch from due_at)::float8 as due, remaining \
+         from rbpmn_timer where instance_id = $1 order by timer_no",
+    )
+    .bind(instance)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| (r.get("timer_no"), r.get("due"), r.get("remaining")))
+    .collect()
+}
+
+async fn db_epoch(pool: &PgPool, expr: &str) -> f64 {
+    sqlx::query_scalar(&format!("select extract(epoch from {expr})::float8"))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A scheduler that is an hour late: the armed occurrence is overdue by the
+/// time anyone looks. The golden traces are untouched by this — only the
+/// instant moves, and the instant is the projection's.
+async fn backdate_timers(pool: &PgPool, instance: uuid::Uuid) {
+    sqlx::query("update rbpmn_timer set due_at = now() - interval '1 hour' where instance_id = $1")
+        .bind(instance)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn late_fee_engine(db: &TestDb) -> (Engine, uuid::Uuid) {
+    let engine = engine(db).await;
+    engine.declare_topic("add_late_fee").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/40-late-fee-cycle.bpmn"),
+            &Bindings::new().correlation("await_payment", "ticket.reference"),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start(
+            "ticket",
+            None,
+            serde_json::json!({ "ticket": { "reference": "T-40" } }),
+        )
+        .await
+        .unwrap();
+    (engine, started.id)
+}
+
+/// The schedule is *previous due + period*, never *now + period*: a
+/// scheduler that ran an hour late must not push every later occurrence an
+/// hour later too. `continues` in the re-arm's payload is how the projection
+/// knew which due to step from.
+#[tokio::test]
+async fn a_cycle_rearms_from_its_previous_due() {
+    let db = TestDb::create().await;
+    let (engine, instance) = late_fee_engine(&db).await;
+
+    let now = db_epoch(&db.pool, "clock_timestamp()").await;
+    let armed = timer_dues(&db.pool, instance).await;
+    assert_eq!(armed.len(), 1, "one occurrence at a time");
+    let (first_no, first_due, remaining) = armed[0];
+    assert!(remaining.is_none(), "R/… is unbounded");
+    assert!(
+        (first_due - (now + WEEK)).abs() < 5.0,
+        "the first due is a week from the arm, off by {}s",
+        first_due - now - WEEK
+    );
+
+    backdate_timers(&db.pool, instance).await;
+    let (_, overdue, _) = timer_dues(&db.pool, instance).await[0];
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    let next = timer_dues(&db.pool, instance).await;
+    assert_eq!(next.len(), 1, "the fired row is gone and the next is in");
+    assert_eq!(next[0].0, first_no + 1);
+    assert!(
+        (next[0].1 - (overdue + WEEK)).abs() < 0.001,
+        "the next due steps from the overdue one, not from now: got {}, wanted {}",
+        next[0].1,
+        overdue + WEEK
+    );
+    assert!(next[0].2.is_none());
+
+    // The side token is real work beside the untouched host (a receive task:
+    // no item of its own, its subscription still there).
+    let open = open_items(&db.pool, instance).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["add_late_fee"]
+    );
+    assert_eq!(subscription_rows(&db.pool, instance).await, 1);
+    let continues: Option<i64> = sqlx::query_scalar(
+        "select (payload->>'continues')::bigint from rbpmn_event \
+         where instance_id = $1 and kind = 'timer-armed' order by id desc limit 1",
+    )
+    .bind(instance)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        continues,
+        Some(first_no),
+        "the re-arm names the occurrence it continues"
+    );
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// The host ending is what ends a cycle — and only the cycle: side work
+/// already spawned runs to its end and keeps the instance alive until then.
+#[tokio::test]
+async fn host_completion_cancels_the_cycle_but_not_the_side_work() {
+    let db = TestDb::create().await;
+    let (engine, instance) = late_fee_engine(&db).await;
+    backdate_timers(&db.pool, instance).await;
+    assert!(engine.fire_due_timer().await.unwrap());
+    assert_eq!(timer_rows(&db.pool, instance).await, 1, "re-armed");
+
+    engine
+        .correlate("PAID", "T-40", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        timer_rows(&db.pool, instance).await,
+        0,
+        "the arm went with the host"
+    );
+    assert_eq!(event_count(&db.pool, instance, "timer-cancelled").await, 1);
+    assert_eq!(status_of(&db.pool, instance).await, "active");
+    assert!(!engine.fire_due_timer().await.unwrap());
+
+    let (fee, _) = open_items(&db.pool, instance).await[0].clone();
+    engine
+        .complete_work_item(fee, serde_json::json!({ "fees": 1 }))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, instance, "completed").await;
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// The anchor fixes the *phase*, not a set of instants: the first due is the
+/// first occurrence at or after the arm, aligned to the anchor, and nothing
+/// in the past is replayed. Checked for an anchor long past and one that may
+/// still be ahead, with one assertion that is true either way.
+#[tokio::test]
+async fn an_anchored_cycle_starts_at_its_phase() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("nudge").await.unwrap();
+    let fixture_xml = fixture("accept/41-anchored-cycle.bpmn");
+    let past = fixture_xml
+        .replace(
+            "R2/2026-08-31T00:00:00+02:00/P7D",
+            "R2/2020-01-06T00:00:00Z/P7D",
+        )
+        .replace("<bpmn:process id=\"p\"", "<bpmn:process id=\"past\"");
+    engine
+        .deploy(&fixture_xml, &Bindings::default())
+        .await
+        .unwrap();
+    engine.deploy(&past, &Bindings::default()).await.unwrap();
+
+    for (key, anchor) in [
+        ("p", "'2026-08-31T00:00:00+02:00'::timestamptz"),
+        ("past", "'2020-01-06T00:00:00Z'::timestamptz"),
+    ] {
+        let started = engine
+            .start(key, None, serde_json::json!({}))
+            .await
+            .unwrap();
+        let now = db_epoch(&db.pool, "clock_timestamp()").await;
+        let anchor = db_epoch(&db.pool, anchor).await;
+        let armed = timer_dues(&db.pool, started.id).await;
+        assert_eq!(armed.len(), 1, "{key}: no catch-up burst, one occurrence");
+        let (_, due, remaining) = armed[0];
+        assert_eq!(remaining, Some(2), "{key}: R2 starts with two fires left");
+        let floor = now.max(anchor);
+        assert!(
+            due >= floor - 1.0 && due < floor + WEEK,
+            "{key}: the first occurrence at or after the arm, got {due} (now {now}, anchor {anchor})"
+        );
+        let phase = ((due - anchor) / WEEK).fract().abs();
+        assert!(
+            phase < 1e-6 || (1.0 - phase) < 1e-6,
+            "{key}: aligned to the anchor's phase, off by {phase} weeks"
+        );
+        assert!(harness::fsck(&db.pool).await.is_empty());
+    }
+    db.drop().await;
+}
+
+/// `R2`: two fires and then nothing — no third row, and a scheduler that
+/// knows it (`next_due_in` is None while the host is still open, so it is
+/// idleness over live work, not an empty database).
+#[tokio::test]
+async fn a_bounded_cycle_exhausts() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("nudge").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/41-anchored-cycle.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    backdate_timers(&db.pool, started.id).await;
+    let (_, first, _) = timer_dues(&db.pool, started.id).await[0];
+    assert!(engine.fire_due_timer().await.unwrap());
+    let second = timer_dues(&db.pool, started.id).await;
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].2, Some(1), "the last fire left");
+    assert!((second[0].1 - (first + WEEK)).abs() < 0.001);
+
+    backdate_timers(&db.pool, started.id).await;
+    assert!(engine.fire_due_timer().await.unwrap());
+    assert_eq!(
+        timer_rows(&db.pool, started.id).await,
+        0,
+        "no third occurrence"
+    );
+    assert_eq!(event_count(&db.pool, started.id, "timer-armed").await, 2);
+    assert_eq!(event_count(&db.pool, started.id, "timer-fired").await, 2);
+    assert!(engine.next_due_in().await.unwrap().is_none());
+    assert!(!engine.fire_due_timer().await.unwrap());
+
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["await_signature", "nudge", "nudge"],
+        "the host untouched, one side token per fire"
+    );
+    assert_eq!(status_of(&db.pool, started.id).await, "active");
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}

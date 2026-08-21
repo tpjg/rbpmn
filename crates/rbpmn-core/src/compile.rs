@@ -120,6 +120,12 @@ impl Bindings {
 pub enum TimerDue {
     Duration(String),
     Date(String),
+    /// A repeating cycle (`R[n]/P…`, `R[n]/<datetime>/P…`), only ever on a
+    /// non-interrupting boundary. The core keeps the text and the fire count
+    /// (`TimerState::remaining`); every instant — the first due, and each
+    /// re-arm as *previous due + period* — is the projection's, computed
+    /// from `rbpmn_model::iso8601::split_cycle`.
+    Cycle(String),
 }
 
 /// Which ISO-8601 shape a variable-sourced timer must resolve to.
@@ -128,6 +134,7 @@ pub enum TimerDue {
 pub enum TimerKind {
     Duration,
     Date,
+    Cycle,
 }
 
 /// A compiled timer spec: a literal validated at deploy, or a FEEL qualified
@@ -166,11 +173,13 @@ impl TimerSource {
         let checked = match kind {
             TimerKind::Duration => rbpmn_model::iso8601::validate_duration(text),
             TimerKind::Date => rbpmn_model::iso8601::validate_datetime(text),
+            TimerKind::Cycle => rbpmn_model::iso8601::validate_cycle(text),
         };
         match checked {
             Ok(()) => Ok(match kind {
                 TimerKind::Duration => TimerDue::Duration(text.clone()),
                 TimerKind::Date => TimerDue::Date(text.clone()),
+                TimerKind::Cycle => TimerDue::Cycle(text.clone()),
             }),
             Err(why) => Err(format!("'{name}' is \"{text}\", which is not valid: {why}")),
         }
@@ -200,7 +209,7 @@ fn describe(value: &serde_json::Value) -> &'static str {
 impl std::fmt::Display for TimerDue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TimerDue::Duration(s) | TimerDue::Date(s) => write!(f, "{s}"),
+            TimerDue::Duration(s) | TimerDue::Date(s) | TimerDue::Cycle(s) => write!(f, "{s}"),
         }
     }
 }
@@ -581,8 +590,18 @@ impl ExecutableProcess {
                         from_variable(TimerKind::Date, s)
                     }
                 }
-                TimerSpec::Cycle(_) | TimerSpec::Missing => Err(CompileError::Internal(format!(
-                    "timer '{}' with a cycle/missing definition survived lint",
+                // Same literal-first rule as the other two. Lint admits a
+                // cycle on a non-interrupting boundary only; the callers
+                // below refuse it anywhere else as "survived lint".
+                TimerSpec::Cycle(s) => {
+                    if rbpmn_model::iso8601::validate_cycle(s).is_ok() {
+                        Ok(TimerSource::Literal(TimerDue::Cycle(s.clone())))
+                    } else {
+                        from_variable(TimerKind::Cycle, s)
+                    }
+                }
+                TimerSpec::Missing => Err(CompileError::Internal(format!(
+                    "timer '{}' with a missing definition survived lint",
                     node.id
                 ))),
             }
@@ -665,9 +684,17 @@ impl ExecutableProcess {
                 }
                 NodeKind::ParallelGateway => ExecKind::ParallelGateway,
                 NodeKind::EventBasedGateway => ExecKind::EventBasedGateway,
-                NodeKind::Catch(CatchTrigger::Timer(spec)) => ExecKind::TimerCatch {
-                    due: timer_due(node, spec)?,
-                },
+                NodeKind::Catch(CatchTrigger::Timer(spec)) => {
+                    if matches!(spec, TimerSpec::Cycle(_)) {
+                        return Err(CompileError::Internal(format!(
+                            "timer catch '{}' with a cycle survived lint",
+                            node.id
+                        )));
+                    }
+                    ExecKind::TimerCatch {
+                        due: timer_due(node, spec)?,
+                    }
+                }
                 NodeKind::Catch(CatchTrigger::Message(message_ref)) => ExecKind::MessageCatch {
                     message: message_name(node, message_ref)?,
                     key: correlation(node)?,
@@ -718,10 +745,18 @@ impl ExecutableProcess {
                         // makes reading it safe: only a timer (non-cycle) or
                         // a message boundary may be non-interrupting, an
                         // error boundary never is.
-                        BoundaryTrigger::Timer(spec) => ExecKind::TimerBoundary {
-                            due: timer_due(node, spec)?,
-                            interrupting: b.cancel_activity,
-                        },
+                        BoundaryTrigger::Timer(spec) => {
+                            if b.cancel_activity && matches!(spec, TimerSpec::Cycle(_)) {
+                                return Err(CompileError::Internal(format!(
+                                    "interrupting boundary '{}' with a cycle survived lint",
+                                    node.id
+                                )));
+                            }
+                            ExecKind::TimerBoundary {
+                                due: timer_due(node, spec)?,
+                                interrupting: b.cancel_activity,
+                            }
+                        }
                         // The correlation binding is the *boundary's* own element
                         // id, exactly as a catch's is its own: the XML says which
                         // message is caught here, the manifest says by which key.

@@ -218,7 +218,7 @@ fn element_rules(
                 CatchTrigger::Message(message_ref) => {
                     check_message(defs, id, message_ref.as_deref(), out)
                 }
-                CatchTrigger::Timer(spec) => check_timer(id, spec, out),
+                CatchTrigger::Timer(spec) => check_timer(id, spec, false, out),
                 CatchTrigger::Unsupported { tag } => out.push(Diagnostic::error(
                     rule::NO_UNSUPPORTED_ELEMENT,
                     id,
@@ -251,7 +251,9 @@ fn element_rules(
                     // `timeCycle` is still refused wherever it appears —
                     // `check_timer` says so — so a non-interrupting timer is
                     // single-shot until slice 3.
-                    BoundaryTrigger::Timer(spec) => check_timer(id, spec, out),
+                    // A repeating timer only makes sense where the first
+                    // occurrence does not end the wait.
+                    BoundaryTrigger::Timer(spec) => check_timer(id, spec, !b.cancel_activity, out),
                     // An error boundary is interrupting by definition: the
                     // activity that raised the error has already ended, so
                     // there is nothing left to run beside the handler.
@@ -350,16 +352,23 @@ fn unsupported_message(tag: &str) -> String {
 /// (`P30X` is a mistyped duration *and* a syntactically valid qualified
 /// name). That is what keeps a typo legible: the author reads why it is not a
 /// duration and what it will be treated as instead, in one line.
-fn check_timer(id: &str, spec: &TimerSpec, out: &mut Vec<Diagnostic>) {
+fn check_timer(id: &str, spec: &TimerSpec, cycle_allowed: bool, out: &mut Vec<Diagnostic>) {
     let (what, text, literal) = match spec {
         TimerSpec::Date(s) => ("timeDate", s, iso8601::validate_datetime(s)),
         TimerSpec::Duration(s) => ("timeDuration", s, iso8601::validate_duration(s)),
+        // A cycle is executed on a non-interrupting boundary and nowhere
+        // else: on an intermediate catch or an interrupting boundary the
+        // first occurrence ends the wait, and "fire once, drop the rest" is
+        // the silent reinterpretation other engines ship and this one
+        // refuses. The cycle's own grammar is checked like any other literal.
+        TimerSpec::Cycle(s) if cycle_allowed => ("timeCycle", s, iso8601::validate_cycle(s)),
         TimerSpec::Cycle(_) => {
             out.push(Diagnostic::error(
                 rule::NO_UNSUPPORTED_ELEMENT,
                 id,
-                "repeating timer cycles (timeCycle) are not supported in v1 — planned \
-                 for v2 with non-interrupting boundary timers",
+                "a repeating timer (timeCycle) is only executed on a non-interrupting \
+                 boundary event — here the first occurrence ends the wait, so write a \
+                 timeDuration or timeDate instead",
             ));
             return;
         }

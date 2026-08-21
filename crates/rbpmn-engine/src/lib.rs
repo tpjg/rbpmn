@@ -122,6 +122,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "lease_epoch",
         include_str!("../migrations/0012_lease_epoch.sql"),
     ),
+    (
+        13,
+        "timer_cycles",
+        include_str!("../migrations/0013_timer_cycles.sql"),
+    ),
 ];
 
 /// A claimed unit of service work, as handed to a push-mode handler.

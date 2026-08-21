@@ -15,7 +15,7 @@
 //! which signals a bug in the engine (lint-clean models cannot trigger it)
 //! and poisons the state.
 
-use crate::compile::{ExecKind, ExecutableProcess, FlowIx, NodeIx};
+use crate::compile::{ExecKind, ExecutableProcess, FlowIx, NodeIx, TimerDue};
 use crate::event::Event;
 use crate::merge_patch::merge_patch;
 use crate::state::{
@@ -386,12 +386,13 @@ pub fn step(
                 // Non-interrupting: the host is left exactly as it was and a
                 // sibling token takes the path instead. A single-shot timer
                 // does **not** re-arm — it fired once, which is what a
-                // `timeDuration`/`timeDate` says; the repeating form
-                // (`timeCycle`) is still refused by lint.
+                // `timeDuration`/`timeDate` says; a cycle re-arms its next
+                // occurrence first, while fires remain.
                 WaitKind::WorkItem(_) | WaitKind::Message(_) | WaitKind::Scope(_) => {
                     if proc.node(timer.element).kind.boundary_interrupts() {
                         adv.interrupt_host(state, timer.token, timer.element)?;
                     } else {
+                        adv.rearm_cycle(state, id, &timer);
                         adv.spawn_side_token(state, timer.token, timer.element)?;
                     }
                     adv.run(state)
@@ -1002,18 +1003,61 @@ impl<'a> Advancer<'a> {
                 return None;
             }
         };
+        // A cycle's repeat count is pure data the core owns; the instants
+        // are the projection's. `split_cycle` cannot fail here: `resolve`
+        // just validated the text with the same function.
+        let remaining = match &due {
+            TimerDue::Cycle(text) => rbpmn_model::iso8601::split_cycle(text)
+                .ok()
+                .and_then(|parts| parts.repeats),
+            _ => None,
+        };
         let id = state.alloc_timer(TimerState {
             element,
             token,
             due: due.clone(),
+            remaining,
         });
         self.events.push(Event::TimerArmed {
             id,
             element: self.proc.node_id(element).to_string(),
             due,
             token,
+            continues: None,
+            remaining,
         });
         Some(id)
+    }
+
+    /// A cycle fired: arm the next occurrence, unless that was the last.
+    ///
+    /// Emitted right after `timer-fired` and before the side token moves —
+    /// the same place a message boundary re-arms, for the same reason: a
+    /// live host is never observably without its boundary. `continues`
+    /// carries the fired timer's id so the projection steps from *its* due,
+    /// not from now; `remaining` counts down, and `Some(0)` is the end.
+    fn rearm_cycle(&mut self, state: &mut InstanceState, fired: TimerId, timer: &TimerState) {
+        let TimerDue::Cycle(_) = &timer.due else {
+            return;
+        };
+        let left = timer.remaining.map(|r| r.saturating_sub(1));
+        if left == Some(0) {
+            return;
+        }
+        let next = state.alloc_timer(TimerState {
+            element: timer.element,
+            token: timer.token,
+            due: timer.due.clone(),
+            remaining: left,
+        });
+        self.events.push(Event::TimerArmed {
+            id: next,
+            element: self.proc.node_id(timer.element).to_string(),
+            due: timer.due.clone(),
+            token: timer.token,
+            continues: Some(fired),
+            remaining: left,
+        });
     }
 
     /// An interrupting boundary fired on a waiting host: end the host's own
