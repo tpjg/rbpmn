@@ -497,6 +497,10 @@ fn engine_error(e: EngineError) -> Response {
         EngineError::NoSubscription { .. } => (StatusCode::NOT_FOUND, e.to_string()),
         EngineError::AmbiguousCorrelation { .. } => (StatusCode::CONFLICT, e.to_string()),
         EngineError::InvalidVariables(_) => (StatusCode::BAD_REQUEST, e.to_string()),
+        // A lookup naming a field nobody declared shared: the request is
+        // well-formed but asks for an index-backed query the deployment does
+        // not have. The message names the fix, so it is worth returning.
+        EngineError::UndeclaredSharedIndex { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
         EngineError::Compile(_) | EngineError::Step(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
         }

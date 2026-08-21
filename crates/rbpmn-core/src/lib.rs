@@ -32,8 +32,8 @@ mod step;
 
 pub use check::{Checked, DeployCheck, check_deployable};
 pub use compile::{
-    Bindings, CompileError, ExecKind, ExecutableProcess, FlowIx, NodeIx, ScopeIx, TimerDue,
-    WorkKind,
+    Bindings, CompileError, ExecKind, ExecutableProcess, FlowIx, IndexDeclaration, IndexScope,
+    NodeIx, ScopeIx, TimerDue, WorkKind,
 };
 pub use decisions::{DecisionCheck, DecisionValidator, Invocable, NoDecisions};
 pub use event::Event;

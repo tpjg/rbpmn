@@ -33,14 +33,174 @@ pub struct Bindings {
     /// Variables fields the application filters/counts tasks by — the
     /// engine creates a partial expression index per entry at deploy
     /// (`declare_index`). Entirely optional performance declarations.
+    ///
+    /// Two spellings, one meaning: a bare string is the definition-scoped
+    /// default (`"channel"`), an object names a scope
+    /// (`{"field": "order_no", "scope": "shared"}`). See [`IndexScope`] for
+    /// what a shared declaration asserts — it is a promise the engine cannot
+    /// check.
     #[serde(default)]
-    pub indexes: std::collections::BTreeSet<String>,
+    pub indexes: std::collections::BTreeSet<IndexDeclaration>,
     /// Business-rule task -> the decision it invokes. This is the spot where
     /// every other engine writes `camunda:decisionRef` into the XML; here it
     /// is manifest data, versioned with the definition and reviewable in git
     /// next to it (`docs/dmn.md`, D5).
     #[serde(default)]
     pub decisions: BTreeMap<String, DecisionBinding>,
+}
+
+/// What a declared index covers — the difference between
+/// [`Bindings::index`] and [`Bindings::shared_index`].
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexScope {
+    /// One index per (definition key, field), partial on `definition_key`.
+    /// The default, and the shape a `TaskFilter`'s literal definition key
+    /// lets the planner prove — which keeps the index as small as the one
+    /// definition it serves.
+    #[default]
+    Definition,
+    /// One index per field, shared by every definition that declares it.
+    ///
+    /// For the lookup that spans definitions: a business identifier the
+    /// application hoists into `variables` with the same meaning everywhere
+    /// — an order number, a customer reference, an external case id — that a
+    /// user quotes and the application must resolve to whichever instance
+    /// carries it, without knowing which workflow or which deployment that
+    /// is. Postgres can prove a partial index's predicate only from an
+    /// equality against a constant, so `definition_key = any($1)` cannot use
+    /// the definition-scoped indexes at all: it plans as a bitmap scan on the
+    /// definition-key index with the hoisted field demoted to a recheck
+    /// filter.
+    ///
+    /// **What the engine cannot check.** A shared declaration asserts that
+    /// the field name means the *same thing* in every definition that
+    /// declares it. `variables` is opaque to rbpmn by design — nothing here
+    /// verifies that, and nothing can. It is the application's contract, and
+    /// declaring `shared` is the application asserting it.
+    Shared,
+}
+
+/// One entry of [`Bindings::indexes`]: a variables field, and the scope of
+/// the index that serves it.
+///
+/// Ordered by field first, so a manifest of definition-scoped entries keeps
+/// the plain lexicographic order it has always had.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IndexDeclaration {
+    pub field: String,
+    pub scope: IndexScope,
+}
+
+impl IndexScope {
+    /// The manifest spelling — what diagnostics and log lines name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IndexScope::Definition => "definition",
+            IndexScope::Shared => "shared",
+        }
+    }
+}
+
+impl IndexDeclaration {
+    pub fn definition(field: impl Into<String>) -> Self {
+        IndexDeclaration {
+            field: field.into(),
+            scope: IndexScope::Definition,
+        }
+    }
+
+    pub fn shared(field: impl Into<String>) -> Self {
+        IndexDeclaration {
+            field: field.into(),
+            scope: IndexScope::Shared,
+        }
+    }
+}
+
+/// A definition-scoped entry serializes as the bare string it has always
+/// been — that is not cosmetic. `deploy` hashes the serialized manifest into
+/// `content_hash`, so widening every existing entry to an object would
+/// allocate a new definition version for wiring that did not change. It also
+/// normalizes: `{"field": "f", "scope": "definition"}` and `"f"` are the same
+/// wiring and hash the same.
+impl Serialize for IndexDeclaration {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        match self.scope {
+            IndexScope::Definition => serializer.serialize_str(&self.field),
+            IndexScope::Shared => {
+                let mut entry = serializer.serialize_struct("IndexDeclaration", 2)?;
+                entry.serialize_field("field", &self.field)?;
+                entry.serialize_field("scope", &self.scope)?;
+                entry.end()
+            }
+        }
+    }
+}
+
+/// Both spellings in, strictly: a bare string is definition-scoped, an object
+/// names its scope. An unknown scope or an unknown key is refused here rather
+/// than defaulted — a manifest that says something rbpmn does not understand
+/// must not deploy as something it does.
+impl<'de> Deserialize<'de> for IndexDeclaration {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DeclVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DeclVisitor {
+            type Value = IndexDeclaration;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a field name, or {\"field\": \"...\", \"scope\": \"definition\"|\"shared\"}",
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(self, field: &str) -> Result<Self::Value, E> {
+                Ok(IndexDeclaration::definition(field))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut field: Option<String> = None;
+                let mut scope: Option<IndexScope> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "field" => {
+                            if field.is_some() {
+                                return Err(serde::de::Error::duplicate_field("field"));
+                            }
+                            field = Some(map.next_value()?);
+                        }
+                        "scope" => {
+                            if scope.is_some() {
+                                return Err(serde::de::Error::duplicate_field("scope"));
+                            }
+                            // The derived enum's own error names the valid
+                            // scopes, which is exactly the message wanted.
+                            scope = Some(map.next_value()?);
+                        }
+                        other => {
+                            return Err(serde::de::Error::unknown_field(
+                                other,
+                                &["field", "scope"],
+                            ));
+                        }
+                    }
+                }
+                Ok(IndexDeclaration {
+                    field: field.ok_or_else(|| serde::de::Error::missing_field("field"))?,
+                    scope: scope.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_any(DeclVisitor)
+    }
 }
 
 /// Which decision a business-rule task invokes, and where its answer lands.
@@ -86,9 +246,27 @@ impl Bindings {
         self
     }
 
-    /// Declare a filterable variables field (optional, performance only).
+    /// Declare a filterable variables field, scoped to this definition
+    /// (optional, performance only).
     pub fn index(mut self, field: impl Into<String>) -> Self {
-        self.indexes.insert(field.into());
+        self.indexes.insert(IndexDeclaration {
+            field: field.into(),
+            scope: IndexScope::Definition,
+        });
+        self
+    }
+
+    /// Declare a filterable variables field **shared across definitions** —
+    /// one index serving every definition that declares the same field, for
+    /// the lookup that does not know which workflow carries the value.
+    ///
+    /// This asserts a contract the engine cannot verify; read
+    /// [`IndexScope::Shared`] before using it.
+    pub fn shared_index(mut self, field: impl Into<String>) -> Self {
+        self.indexes.insert(IndexDeclaration {
+            field: field.into(),
+            scope: IndexScope::Shared,
+        });
         self
     }
 
@@ -1166,4 +1344,111 @@ fn ambiguous_message_arm(
         }
     }
     (!found.is_empty()).then_some(CompileError::AmbiguousMessageArm(found))
+}
+
+#[cfg(test)]
+mod index_declaration_tests {
+    use super::*;
+
+    fn indexes(json: &str) -> Bindings {
+        serde_json::from_str(json).expect("manifest parses")
+    }
+
+    /// The back-compat contract, and the reason it is not cosmetic: `deploy`
+    /// hashes the serialized manifest into `content_hash`, so a manifest of
+    /// definition-scoped entries must serialize to the *same bytes* it always
+    /// has or every existing deployment allocates a new version on its next
+    /// redeploy.
+    #[test]
+    fn definition_scoped_manifests_serialize_byte_for_byte() {
+        let b = Bindings::new().index("channel").index("region");
+        assert_eq!(
+            serde_json::to_string(&b).unwrap(),
+            r#"{"topics":{},"correlations":{},"indexes":["channel","region"],"decisions":{}}"#
+        );
+    }
+
+    #[test]
+    fn a_bare_string_is_definition_scoped() {
+        let b = indexes(r#"{"indexes":["channel"]}"#);
+        assert_eq!(
+            b.indexes.iter().collect::<Vec<_>>(),
+            vec![&IndexDeclaration::definition("channel")]
+        );
+    }
+
+    /// The long spelling of the default normalizes to the short one, so the
+    /// same wiring hashes the same however it was written.
+    #[test]
+    fn the_explicit_definition_scope_normalizes_to_the_string_form() {
+        let long = indexes(r#"{"indexes":[{"field":"channel","scope":"definition"}]}"#);
+        let short = indexes(r#"{"indexes":["channel"]}"#);
+        assert_eq!(long, short);
+        assert_eq!(
+            serde_json::to_string(&long).unwrap(),
+            serde_json::to_string(&short).unwrap()
+        );
+    }
+
+    #[test]
+    fn shared_round_trips_as_an_object() {
+        let b = Bindings::new().shared_index("order_no");
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(
+            json.contains(r#""indexes":[{"field":"order_no","scope":"shared"}]"#),
+            "{json}"
+        );
+        assert_eq!(indexes(&json), b);
+    }
+
+    /// Both spellings of one field are two distinct declarations — the set
+    /// does not collapse them, and deploy refuses the contradiction (that
+    /// check lives in the engine, which is where the scopes turn into SQL).
+    #[test]
+    fn the_two_scopes_of_one_field_are_distinct_entries() {
+        let b = indexes(r#"{"indexes":["f",{"field":"f","scope":"shared"}]}"#);
+        assert_eq!(b.indexes.len(), 2);
+    }
+
+    #[test]
+    fn an_unknown_scope_is_refused_and_names_the_valid_ones() {
+        let e =
+            serde_json::from_str::<Bindings>(r#"{"indexes":[{"field":"f","scope":"sharded"}]}"#)
+                .unwrap_err()
+                .to_string();
+        assert!(e.contains("definition") && e.contains("shared"), "{e}");
+    }
+
+    #[test]
+    fn an_unknown_key_in_the_object_form_is_refused() {
+        let e = serde_json::from_str::<Bindings>(r#"{"indexes":[{"field":"f","scoop":"shared"}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("scoop"), "{e}");
+    }
+
+    #[test]
+    fn the_object_form_requires_a_field() {
+        let e = serde_json::from_str::<Bindings>(r#"{"indexes":[{"scope":"shared"}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("field"), "{e}");
+    }
+
+    /// Field first, so a definition-only manifest keeps the plain
+    /// lexicographic order it has always had.
+    #[test]
+    fn entries_order_by_field() {
+        let b = Bindings::new()
+            .index("zulu")
+            .shared_index("alpha")
+            .index("mike");
+        assert_eq!(
+            b.indexes
+                .iter()
+                .map(|i| i.field.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "mike", "zulu"]
+        );
+    }
 }

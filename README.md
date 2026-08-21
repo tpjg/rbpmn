@@ -272,7 +272,7 @@ server. Two syntaxes, one manifest, one validation path.
 | Service-task topic | `Bindings::topic(element_id, topic)`; default topic = element id. `declare_topic(name)` announces pull-mode workers, and is *environment* rather than manifest | `unresolved-topic` |
 | Message correlation | `Bindings::correlation(element_id, "order.id")` — FEEL qualified name into the instance variables; a message boundary event is bound by its **own** id, not its host's | `message-has-correlation` |
 | Decision | `Bindings::decision(element_id, decision_name, "order.discount")` — which decision a business-rule task invokes, and where its answer lands | `decision-has-binding`, `unresolved-decision` |
-| Filterable fields | `Bindings::index(field)` — optional, performance only | — |
+| Filterable fields | `Bindings::index(field)` (this definition) or `Bindings::shared_index(field)` (across definitions) — optional, performance only | — |
 
 Per-definition wiring deploys **atomically with the definition** as a small
 JSON bindings manifest (`deploy(bpmn_xml, bindings)` in the library, one
@@ -280,6 +280,101 @@ JSON bindings manifest (`deploy(bpmn_xml, bindings)` in the library, one
 information other engines smear into vendor XML annotations, separated cleanly
 and reviewable in git next to the `.bpmn`. Environment capabilities (handler
 targets, `declare_topic`) are engine/server configuration, not manifest content.
+
+### Declared indexes have a scope
+
+`Bindings::index(field)` builds a partial expression index over one
+definition's instances, predicated on its `definition_key`. That is exactly
+what the engine's own `TaskFilter` needs — it always carries a definition key,
+and the literal is what lets the planner prove the predicate — and it keeps
+the index as small as the definition it serves.
+
+`Bindings::shared_index(field)` builds **one** index per field, across every
+definition that declares it, for the other query real applications have:
+resolving a business identifier — an order number, a customer reference, an
+external case id — to whichever instance carries it, without knowing which
+workflow or which deployment that is. Postgres can prove a partial index's
+predicate only from an equality against a constant, so `definition_key =
+any($1)` cannot use the definition-scoped indexes at all; measured, it plans
+as a bitmap scan on the definition-key index with the hoisted field demoted to
+a recheck filter. The recourse without a scope is to unroll one
+`definition_key = $n` branch per key — tolerable at three definitions,
+untenable at a hundred, and a hundred catalogue entries over one identical
+expression.
+
+A shared index is partial on `(variables->>'field') is not null`, which costs
+nothing and saves a lot: an equality against the expression is strict and so
+implies `is not null`, keeping the index usable, while instances of
+definitions that never carry the field stay out of it entirely.
+
+**What rbpmn cannot check.** A shared declaration asserts that the field name
+means the *same thing* in every definition that declares it. `variables` is
+opaque to the engine by design; nothing here verifies that, and nothing can.
+It is the application's contract, and declaring `shared` is the application
+asserting it. Where one definition declares a field `shared` and another
+declares it `definition`-scoped, deploy logs a warning — not an error, because
+two indexes over one expression is a legitimate choice (a `TaskFilter` served
+only by a shared index degrades to a `BitmapAnd`), and not a diagnostic,
+because it is an operator fact about other deployed definitions that no
+offline surface can see.
+
+Both spellings live in the manifest, and the string form is unchanged:
+
+```json
+{ "indexes": ["channel", { "field": "order_no", "scope": "shared" }] }
+```
+
+An unknown scope is refused at deploy, naming the valid ones — never
+defaulted. So is one manifest declaring the same field at both scopes.
+
+**Nothing ever drops a declared index**, of either scope: not
+`delete_definition`, not retention, and not removing the field from a
+manifest. That is deliberate — a shared index belongs to no single definition,
+so one going away says nothing about whether another still needs it, and
+reference counting would race a concurrent deploy. `Engine::declared_indexes()`
+is the read-only audit that makes leftovers visible (an entry with an empty
+`declared_by` is an orphan, safe to drop by hand); `declared_index_name` and
+`shared_index_name` locate them.
+
+**Migration.** Existing deployments are untouched: their per-definition
+indexes keep their names, their DDL and their content hashes, so a redeploy
+does not even allocate a new version. Adopting `shared` is a manifest edit and
+a redeploy. The old index is not removed — if the definition still declares
+the field definition-scoped, it still has it.
+
+### Reading instances: the published view
+
+Applications legitimately need to *join* rbpmn's instances against their own
+rows — a result set of "our tenancy, our ordering, rbpmn's instances" is a SQL
+join, and no API returning data instead of SQL does it as well. So rbpmn
+publishes `rbpmn_v_instance` as **public API**, on the same footing as rule ids
+and the `Display` format of `Event`:
+
+| column | |
+|---|---|
+| `id` | instance id |
+| `definition_key`, `definition_version` | the stable coordinates; instances pin a version |
+| `business_key` | as passed to `start` — nullable, non-unique, unindexed |
+| `status` | `active` / `completed` / `terminated` / `failed` |
+| `variables` | the whole live variable document |
+| `created_at`, `completed_at` | |
+
+Columns may be added; none will be removed or repurposed. The view is
+deliberately a **plain inlinable projection** — one table, no `WHERE`, no
+volatile function, and explicitly not `security_barrier` — so predicates push
+below it and declared variable indexes still apply. (A barrier view would not
+push `variables->>'f' = $1` down, because `jsonb ->>` is not leakproof, and
+every declared index would sit unused beneath a full scan. There is an
+EXPLAIN-based test asserting the plan through the view, not just its shape.)
+
+For the simple case there is `Engine::find_by_shared_index(field, value,
+limit)`, which writes the query for you and is index-backed by construction —
+it refuses outright rather than sequential-scanning when no shared index for
+the field exists. It is **not a search primitive**: the limit is applied by the
+database before the caller sees anything, so an application that then filters
+the result by tenant or permission is filtering an already-truncated page.
+Those queries belong in SQL against the view, where the application's own
+predicate and the limit compose in the right order.
 
 Conditions inside the XML are pure FEEL (a strict subset), so they carry no
 rbpmn-specific syntax either. Null follows FEEL exactly: `x = null` is the

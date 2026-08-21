@@ -8,7 +8,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   emptyManifest,
+  formatIndexField,
   orphanedBindings,
+  parseIndexField,
   parseManifest,
   serializeManifest,
   setBinding,
@@ -51,13 +53,18 @@ test('serialization is stable and drops empty groups', () => {
 });
 
 test('serialize/parse round-trips', () => {
+  // Index entries are normalized to {field, scope} in memory and written back
+  // in the narrowest spelling that carries the meaning, so the on-disk form of
+  // a definition-scoped entry is still the bare string it has always been.
   const manifest = {
     topics: { st: 'payments' },
     correlations: { rt: 'order.id' },
-    indexes: ['order.status'],
+    indexes: [{ field: 'order_no', scope: 'shared' }, { field: 'status', scope: 'definition' }],
     decisions: { brt: { decision: 'Discount', result: 'order.discount' } },
   };
   assert.deepEqual(parseManifest(serializeManifest(manifest)), manifest);
+  // Sorted by field, and the definition-scoped entry stays a bare string.
+  assert.match(serializeManifest(manifest), /"scope": "shared"\n\s+\},\n\s+"status"/);
 });
 
 // An unmapped service task runs on a topic named after its element id, so
@@ -145,4 +152,49 @@ test('a decision binding on a vanished element is reported as orphaned', () => {
   assert.deepEqual(orphanedBindings(manifest, ['still-here']), [
     { group: 'decisions', elementId: 'gone' },
   ]);
+});
+
+test('index declarations carry a scope, in either spelling', () => {
+  const parsed = parseManifest(
+    '{"indexes":["channel",{"field":"order_no","scope":"shared"}]}'
+  );
+  assert.deepEqual(parsed.indexes, [
+    { field: 'channel', scope: 'definition' },
+    { field: 'order_no', scope: 'shared' },
+  ]);
+  // The default is written back as the bare string it has always been, so an
+  // existing manifest round-trips byte for byte; only `shared` widens.
+  assert.equal(
+    serializeManifest(parsed),
+    '{\n  "indexes": [\n    "channel",\n    {\n      "field": "order_no",\n      "scope": "shared"\n    }\n  ]\n}\n'
+  );
+  assert.deepEqual(parseManifest(serializeManifest(parsed)), parsed);
+  // Spelling the default the long way is the same wiring.
+  assert.deepEqual(
+    parseManifest('{"indexes":[{"field":"channel","scope":"definition"}]}').indexes,
+    [{ field: 'channel', scope: 'definition' }]
+  );
+});
+
+test('index shapes rbpmn would reject are refused rather than repaired', () => {
+  assert.throws(() => parseManifest('{"indexes":"a"}'), /indexes/);
+  assert.throws(() => parseManifest('{"indexes":[1]}'), /indexes/);
+  assert.throws(() => parseManifest('{"indexes":[{}]}'), /field/);
+  assert.throws(() => parseManifest('{"indexes":[{"field":"f","scoop":"x"}]}'), /scoop/);
+  assert.throws(
+    () => parseManifest('{"indexes":[{"field":"f","scope":"sharded"}]}'),
+    /definition or shared/
+  );
+});
+
+test('the field box round-trips a scope through one line of text', () => {
+  assert.deepEqual(parseIndexField('order_no:shared'), {
+    field: 'order_no',
+    scope: 'shared',
+  });
+  assert.deepEqual(parseIndexField('channel'), { field: 'channel', scope: 'definition' });
+  assert.equal(formatIndexField({ field: 'channel', scope: 'definition' }), 'channel');
+  assert.equal(formatIndexField({ field: 'order_no', scope: 'shared' }), 'order_no:shared');
+  assert.equal(formatIndexField('channel'), 'channel');
+  assert.throws(() => parseIndexField('f:sharded'), /definition or shared/);
 });

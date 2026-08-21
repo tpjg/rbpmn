@@ -216,12 +216,41 @@ paths. Every shape that takes a lock:
 | retention (`retention.rs`) | instance rows → definition row → floor row | SKIP LOCKED |
 | `delete_definition` | definition row → policy row | blocking |
 | deploy (`deploy.rs`) | advisory(key) → definition rows | blocking |
+| declared index build (`tasks.rs`) | [try-advisory(instance indexes)] → **no row locks at all** | try only |
 
-`retire` and `deploy` were outside the model until the third audit. Two
+`retire` and `deploy` were outside the model until the third audit. Three
 things are deliberately *not* modelled and are argued instead: the
-scheduler's `pg_try_advisory_xact_lock` and the migration advisory. Both are
-excluded for the same reason — a try-lock never waits, so it cannot be an
-edge in a wait-for cycle; the migration one also runs only at startup.
+scheduler's `pg_try_advisory_xact_lock`, the migration advisory, and the
+declared index build's slot. All are excluded for the same reason — a
+try-lock never waits, so it cannot be an edge in a wait-for cycle; the
+migration one also runs only at startup.
+
+The index-build slot earns a paragraph, because it is the one place where
+"use a blocking lock, it is simpler" is not merely worse but **wrong**, and
+the wrongness was measured rather than reasoned:
+
+- `CREATE INDEX CONCURRENTLY` waits for every concurrent snapshot to drain
+  before it finishes. A session blocked on a lock is a session holding a
+  snapshot. So a blocking lock around the build closes a cycle: the holder
+  waits for the waiter's snapshot, the waiter waits for the holder's lock.
+  Postgres reported this as a genuine deadlock, on the first run of
+  `concurrent_deploys_of_one_shared_field`.
+- Removing the lock does not help either: two `CREATE INDEX CONCURRENTLY` on
+  one *table* deadlock the same way, one waiting for
+  ShareUpdateExclusive while the other waits for its snapshot. That hazard
+  **predates** scoped indexes — two definitions deploying at once already
+  both index `rbpmn_instance` — and is reproduced by
+  `concurrent_deploys_of_different_indexes_do_not_deadlock`, which fails
+  against the old code.
+- Hence: a try-lock, polled, with the session **idle between attempts**. The
+  idleness is load-bearing, not tidiness — it is what lets the holder's build
+  drain. And the key is the *table*, not the index name, because two
+  different indexes on one table deadlock exactly as two builds of one index
+  do.
+
+It takes no row lock and no transaction, and it cannot overlap deploy's
+advisory: `apply_manifest_indexes` runs strictly after the deploy transaction
+commits, because a CONCURRENTLY build cannot run inside one.
 
 Inverting retention's order in the model (floor → definition → instance)
 violates the invariant, so these kinds are not decoration.

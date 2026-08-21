@@ -45,6 +45,16 @@ pub enum EngineError {
     AmbiguousCorrelation { message: String, key: String },
     #[error("variables rejected: {0}")]
     InvalidVariables(String),
+    /// `find_by_shared_index` on a field with no shared index. Refused rather
+    /// than served by a sequential scan of every instance in the system: the
+    /// call's whole contract is that it is index-backed, and "correct but
+    /// catastrophically slow" is the "seems to run" failure this project
+    /// rejects everywhere else.
+    #[error(
+        "no shared index for field '{field}' (expected '{index}') — declare it with \
+         Bindings::shared_index or Engine::declare_shared_index, then call again"
+    )]
+    UndeclaredSharedIndex { field: String, index: String },
     /// The cursor points below the retention floor: history it has not read
     /// has been deleted. Never silent — a consumer either resumes above the
     /// floor with a provably complete stream, or is told exactly this.
