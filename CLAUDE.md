@@ -188,6 +188,20 @@ inclusive gateway, block structure, messages-only interaction, build order).
   does none: the inspector shows the whole variable document by design, and
   who may see it is the application's call. The hostile-payload corpus is in
   `crates/rbpmn-ui/tests/documents.rs`.
+- **Diagram export is always the light palette, and never restyles the live
+  canvas.** bpmn-js bakes stroke/fill as SVG *attributes* at construction
+  (`ui/src/shared/theme.js` says why CSS cannot reach them), so exporting the
+  visible canvas exports its theme — and a dark export is near-invisible on
+  paper, which is the one job the button has. `svg-export.js` renders through
+  a second, detached viewer with `LIGHT_DIAGRAM`. Do **not** "simplify" it to
+  flipping the live canvas: that means re-constructing the modeler, which
+  `remountForTheme`'s own comment records as costing the undo history — fair
+  once when the OS flips at sunset, not on every export. The detached host
+  must be off-screen but **laid out**, never `display: none`: `saveSVG`
+  measures with `getBBox()`, which reports zeros on an unrendered SVG and
+  yields an empty-looking file. The print stylesheets are the other half and
+  fix a different problem (chrome eating the page); they cannot fix the dark
+  palette, and say so.
 - The inspector is **read-only, forever**. No retry, no cancel, no variable
   edit, no migration, no lists, no search. Every one of those is a designed
   API first; a UI is never the reason one ships early. The pressure to add a

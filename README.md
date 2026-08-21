@@ -567,6 +567,46 @@ live — the try-it pane evaluates it with the engine's own evaluator, offline,
 because a deployment's DMN travels inside it. **New** clears that down to a
 deployable skeleton when you want to model your own.
 
+### Getting a diagram out, for a document or a printer
+
+Two ways, and they are not the same thing.
+
+**Export SVG** (editor toolbar) writes the diagram as a standalone `.svg` next
+to where you would save the `.bpmn` — vector, so it scales into a report, a
+slide or a printed page at any size. Three decisions worth knowing about:
+
+- **Always light**, whatever theme the editor is wearing. bpmn-js paints
+  strokes and fills as SVG *attributes* chosen when the canvas is built, so a
+  dark-mode canvas would export a dark-mode diagram — `#c9cfda` strokes are
+  near-invisible on white paper, which is precisely what the button is for. A
+  document is not a screen.
+- **Rendered by a second, detached viewer**, not by restyling the canvas in
+  front of you. Restyling works, and the editor already owns the machinery for
+  it (the OS flipping to dark at sunset rebuilds the canvas), but that rebuild
+  costs the undo history. That is a fair price once at sunset; it is not a
+  price to pay silently on every export. The visible canvas is untouched.
+- **The whole model, not the viewport**, tightly cropped, with its own white
+  background — so zoom and scroll position do not change what you get.
+
+Diagnostics do not come along, which is the point: the badges are HTML
+overlays that live outside the SVG, and the element highlighting is a CSS
+class the file carries without the stylesheet that colours it. What lands in
+the document is the model, not the review of it.
+
+**Printing** (both documents) has a stylesheet that hides the chrome — the
+toolbar, and the whole side column of diagnostics, wiring and raw documents
+that was otherwise taking more of the page than the diagram. The inspector
+keeps its heading, instance id and diagnosis, because those are what a
+printout is *for*, and keeps the canvas annotations, because there the badges
+are the content.
+
+Its limits, stated rather than discovered: the canvas is sized to its
+container, so what prints is the current zoom and scroll rather than
+necessarily the whole model; and printing in dark mode prints a dark diagram,
+for the same reason the export exists — no stylesheet can reach an SVG
+attribute, and half-overriding it loses every arrowhead. For a document, use
+Export SVG.
+
 **The inspector** shows one instance, read-only, addressed by UUID. Its data
 is baked into the document rather than fetched, so it has no API to secure,
 works with the database unreachable, and can be attached to a support ticket.

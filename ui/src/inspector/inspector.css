@@ -434,3 +434,48 @@ body {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* ------------------------------------------------------------------ print
+ *
+ * An inspector printout answers one question — where is this instance, and
+ * why is it stuck — so it keeps more than the editor's does: the heading and
+ * instance id identify *which* instance, and the diagnosis is the sentence
+ * someone will read first. What goes is the side column (trace, element
+ * detail, the raw documents) and the navigation chrome.
+ *
+ * The canvas annotations stay, deliberately: unlike the editor's diagnostics,
+ * the badges here *are* the content — they are where the tokens are. The same
+ * two caveats as the editor's print rules apply (viewport, not whole model;
+ * dark mode prints dark), see ui/src/editor/editor.css.
+ */
+@media print {
+  @page {
+    size: landscape;
+    margin: 10mm;
+  }
+
+  .side,
+  .canvas-note,
+  .djs-palette,
+  .djs-context-pad,
+  .djs-popup,
+  .bjs-powered-by {
+    display: none !important;
+  }
+
+  .layout {
+    display: block;
+    height: auto;
+  }
+
+  .canvas-wrap {
+    position: static;
+  }
+
+  .canvas {
+    position: static;
+    width: 100%;
+    height: 80vh;
+    background: #fff;
+  }
+}

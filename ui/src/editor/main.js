@@ -34,6 +34,8 @@ import { download, manifestNameFor, openFile } from './files.js';
 import { buildBundle, bundleNameFor, decisionFileName, parseBundle } from './bundle.js';
 import { DecisionEditor, addDecision, starterDecision } from './decisions.js';
 import { onThemeChange, rendererColors } from '../shared/theme.js';
+import { diagramToSvg } from '../shared/svg-export.js';
+import { svgNameFor } from '../shared/svg-document.js';
 
 // The example deployment, imported from the files that *are* it rather than
 // copied into string literals here. All three are the same artifacts
@@ -170,6 +172,7 @@ function buildLayout(root) {
     button('Save .bpmn', saveBpmn, 'btn btn-primary'),
     button('Save manifest', saveManifest, 'btn btn-primary'),
     button('Export bundle', saveBundle, 'btn btn-primary'),
+    button('Export SVG', saveSvg, 'btn btn-primary'),
     button('Open bundle', openBundle)
   );
   ui.verdict = el('span', 'verdict', 'checking…');
@@ -799,6 +802,23 @@ async function saveBpmn() {
 
 function saveManifest() {
   download(manifestNameFor(state.fileName), serializeManifest(state.manifest), 'application/json');
+}
+
+/// The diagram as a picture, for a document or a printer — the one export
+/// here that is not an artifact rbpmn consumes.
+///
+/// Always light, whatever theme the editor is wearing: a document is not a
+/// screen, and the dark palette's `#c9cfda` strokes are near-invisible on
+/// white paper. Rendered by a detached viewer rather than by restyling this
+/// canvas, which would cost the undo history — see `svg-export.js`.
+///
+/// Diagnostics do not come along, which is the point: the badges are HTML
+/// overlays outside the SVG, and the element highlighting is a CSS class the
+/// exported file carries without the stylesheet that colours it. What lands
+/// in the document is the model, not the review of it.
+async function saveSvg() {
+  const { xml } = await modeler.saveXML({ format: true });
+  download(svgNameFor(state.fileName), await diagramToSvg(xml), 'image/svg+xml');
 }
 
 /// The whole deployment in one file: exactly the body `POST /v1/definitions`

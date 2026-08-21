@@ -17,21 +17,28 @@ export function prefersDark() {
   return window.matchMedia(DARK).matches;
 }
 
+/// The two palettes, named rather than inlined because one surface must
+/// deliberately *not* follow the viewer's theme: an exported diagram. A
+/// document is not a screen — `#c9cfda` strokes are near-invisible on white
+/// paper — so `svg-export.js` asks for [`LIGHT_DIAGRAM`] by name.
+
 /// The `bpmnRenderer` options for the viewer's current theme. Kept in step
 /// with the `--ink` / `--panel` tokens in the stylesheets by hand; there is
 /// no way to read a CSS variable into an SVG attribute at construction time.
+export const DARK_DIAGRAM = {
+  defaultFillColor: '#1d2026',
+  defaultStrokeColor: '#c9cfda',
+  defaultLabelColor: '#e7e9ee',
+};
+
+export const LIGHT_DIAGRAM = {
+  defaultFillColor: '#ffffff',
+  defaultStrokeColor: '#16181d',
+  defaultLabelColor: '#16181d',
+};
+
 export function rendererColors() {
-  return prefersDark()
-    ? {
-        defaultFillColor: '#1d2026',
-        defaultStrokeColor: '#c9cfda',
-        defaultLabelColor: '#e7e9ee',
-      }
-    : {
-        defaultFillColor: '#ffffff',
-        defaultStrokeColor: '#16181d',
-        defaultLabelColor: '#16181d',
-      };
+  return prefersDark() ? DARK_DIAGRAM : LIGHT_DIAGRAM;
 }
 
 /// Runs `handler` when the viewer's theme flips — a laptop switching to dark

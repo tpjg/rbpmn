@@ -18,6 +18,7 @@ calls in here).
 
 import http.server
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -882,6 +883,154 @@ def check_dark_mode(browser):
         page.close()
 
 
+def check_svg_export(browser):
+    """The Export SVG button, driven in DARK mode on purpose.
+
+    bpmn-js bakes stroke and fill as SVG *attributes* at construction, so the
+    canvas in front of you exports the theme it was built with — and a
+    dark-mode export is near-invisible on white paper, which is the one thing
+    the button exists for. `svg-export.js` renders through a second, detached
+    viewer with the light palette rather than restyling the live canvas, and
+    this is the test that the choice actually holds end to end: right colours
+    out, and the canvas you were working on untouched.
+    """
+    print("svg export")
+    page = browser.new_page(color_scheme="dark")
+    problems = collect_problems(page)
+    page.goto((DIST / "editor.html").as_uri())
+    page.wait_for_selector(".djs-container", timeout=20000)
+    page.wait_for_timeout(1500)
+
+    # The canvas under test really is dark, or nothing below proves anything.
+    # Read the *computed* stroke: bpmn-js writes its palette into an inline
+    # `style`, not into `stroke`/`fill` attributes, so getAttribute is null.
+    live = page.evaluate(
+        "() => { const v = document.querySelector('.djs-visual > :not(text)');"
+        " return v && getComputedStyle(v).stroke; }"
+    )
+    check(
+        live is not None and live.replace(" ", "") == "rgb(201,207,218)",
+        f"the canvas being exported from is dark ({live})",
+    )
+    # A marker on the live container: if the export had restyled the canvas by
+    # re-constructing the modeler, this node would be replaced and the marker
+    # would be gone — which is `remountForTheme`'s documented cost, the undo
+    # history, and the reason the export does not take that route.
+    page.evaluate(
+        "() => { document.querySelector('.canvas .djs-container').dataset.probe = 'kept'; }"
+    )
+
+    with page.expect_download() as pending:
+        page.click("text=Export SVG")
+    downloaded = pending.value
+    check(
+        downloaded.suggested_filename.endswith(".svg"),
+        f"downloaded as an svg ({downloaded.suggested_filename})",
+    )
+    svg = Path(downloaded.path()).read_text(encoding="utf-8")
+
+    check(svg.startswith("<?xml"), "a standalone svg document, not a fragment")
+    check("<svg" in svg and "</svg>" in svg, "with a closed root element")
+    check("data-element-id" in svg, "carrying the model's elements")
+    check('fill="#ffffff"' in svg, "and its own white paper")
+    # The whole point: the viewer's dark palette must not have travelled.
+    #
+    # Compared with the spaces stripped, and in `rgb()` rather than hex,
+    # because that is how bpmn-js actually writes a palette — into an inline
+    # `style` attribute. Asserting on the hex strings looked fine and proved
+    # nothing: they never appear in the file at all, so the check passed
+    # whatever the export contained.
+    compact = re.sub(r"\s+", "", svg)
+    for label, rgb in (
+        ("fill", "rgb(29,32,38)"),
+        ("stroke", "rgb(201,207,218)"),
+        ("label", "rgb(231,233,238)"),
+    ):
+        check(rgb not in compact, f"no dark-palette {label} reached the export ({rgb})")
+    check("rgb(22,24,29)" in compact, "painted with the light palette instead")
+    check("rgb(255,255,255)" in compact, "on light fills")
+    # Overlays live outside the SVG layer, so diagnostics stay out for free.
+    check("rbpmn-badge" not in svg, "diagnostic badges stayed out of the export")
+
+    kept = page.evaluate(
+        "() => document.querySelector('.canvas .djs-container')?.dataset.probe"
+    )
+    check(kept == "kept", "the live canvas was not re-constructed to do it")
+    after = page.evaluate(
+        "() => { const v = document.querySelector('.djs-visual > :not(text)');"
+        " return v && getComputedStyle(v).stroke; }"
+    )
+    check(after == live, f"and it is still the theme the user chose ({after})")
+    check(not problems, f"no console errors while exporting: {problems}")
+    page.close()
+
+
+def check_print_layout(browser):
+    """The print stylesheets, under emulated print media.
+
+    The complaint they answer is concrete: browser print takes the whole page,
+    and the editor's side column — diagnostics, wiring, the XML pane — was
+    getting more of the paper than the model it describes. Asserted rather
+    than eyeballed because a print rule is invisible in normal use: it can rot
+    for months and nobody notices until they print.
+    """
+    print("print layout")
+    for name in ("editor", "inspector"):
+        page = browser.new_page()
+        problems = collect_problems(page)
+        page.goto((DIST / f"{name}.html").as_uri())
+        page.wait_for_selector(".djs-container", timeout=20000)
+        page.wait_for_timeout(1000)
+
+        on_screen = page.evaluate(
+            "() => getComputedStyle(document.querySelector('.side')).display"
+        )
+        check(on_screen != "none", f"{name}: the side column is there on screen")
+
+        page.emulate_media(media="print")
+        hidden = page.evaluate(
+            "() => getComputedStyle(document.querySelector('.side')).display"
+        )
+        check(hidden == "none", f"{name}: the side column gives up the paper ({hidden})")
+
+        # The canvas has to become a real block: it is `position: absolute;
+        # inset: 0` inside a relative wrapper on screen, which prints as
+        # nothing once the grid it depended on is gone.
+        canvas = page.evaluate(
+            """() => {
+              const c = document.querySelector('.canvas');
+              const cs = getComputedStyle(c);
+              return { position: cs.position, height: c.getBoundingClientRect().height };
+            }"""
+        )
+        check(
+            canvas["position"] == "static" and canvas["height"] > 200,
+            f"{name}: the diagram gets the page ({canvas})",
+        )
+
+        if name == "editor":
+            toolbar = page.evaluate(
+                "() => getComputedStyle(document.querySelector('.toolbar')).display"
+            )
+            check(toolbar == "none", f"editor: the toolbar is not printed ({toolbar})")
+        else:
+            # The inspector keeps what identifies the printout and the sentence
+            # someone reads first; only the panes go.
+            kept = page.evaluate(
+                """() => ['.topbar', '.diagnosis'].map(
+                     s => { const e = document.querySelector(s);
+                            return e ? getComputedStyle(e).display : 'missing'; })"""
+            )
+            check(
+                all(d not in ("none", "missing") for d in kept),
+                f"inspector: heading and diagnosis survive the print rules ({kept})",
+            )
+
+        page.emulate_media(media="screen")
+        check(not problems, f"{name}: no console errors: {problems}")
+        page.close()
+
+
 def check_served(browser):
     """The half `file://` cannot reach: a real server behind a real proxy.
 
@@ -993,6 +1142,8 @@ def main():
         check_inspector(browser)
         check_editor(browser)
         check_dark_mode(browser)
+        check_svg_export(browser)
+        check_print_layout(browser)
         check_served(browser)
         browser.close()
 
