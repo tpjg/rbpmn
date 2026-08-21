@@ -426,7 +426,12 @@ rows*. Since message boundaries the mix also carries fixture 29 — a user task
 with an interrupting `PAID` boundary — with the driver correlating two of every
 three instances while pull-mode consumers work the task, and the run fails
 unless that race went both ways (completion won some, the message won some),
-the same non-vacuity rule the boundary-timer race already lives under.
+the same non-vacuity rule the boundary-timer race already lives under. Fixture
+40's repeating timer is in the mix too, driven through the *schedulers*: the
+armed occurrence is backdated so all three scheduler loops see it due at once,
+and one backdate must be exactly one fire — the claim path's exactly-once for
+a row that re-creates itself in the firing transaction — with one arm per
+instance plus one re-arm per fire, and at least one re-armed occurrence fired.
 
 **Global invariants**, checked from the event table alone:
 

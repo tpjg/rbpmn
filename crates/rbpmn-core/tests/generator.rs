@@ -153,8 +153,20 @@ fn report(context: &str, block: &Block, xml: &str, detail: &str) -> String {
     format!("{context}\n  block: {block:?}\n  detail: {detail}\n--- model ---\n{xml}")
 }
 
+/// proptest reads `PROPTEST_CASES` only into `ProptestConfig::default()`; a
+/// struct literal with `cases:` silently overrides it, which is how the
+/// documented `PROPTEST_CASES=20000 cargo test -- --ignored` ran 128 cases
+/// for a long time. The environment wins when set; the literal is what a
+/// plain `cargo test` runs.
+fn cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: cases(256), ..ProptestConfig::default() })]
 
     /// (a) Every generated model lints clean — no errors, and no warnings
     /// either: a warning on a machine-generated, textbook-block-structured
@@ -848,7 +860,7 @@ fn the_side_boundary_production_delivers_none_once_and_twice() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: cases(128), ..ProptestConfig::default() })]
 
     /// The wide sweep — deeper nesting and parallel widths up to 6. Run it
     /// with volume when hunting: `PROPTEST_CASES=20000 cargo test -- --ignored`.

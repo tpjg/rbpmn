@@ -187,6 +187,24 @@ async fn a_storm_holds_every_global_invariant() {
         )
         .await
         .unwrap();
+    // The repeating timer (slice 3): the late-fee cycle at the one-minute
+    // floor, renamed so it does not collide with fixture 29's `ticket`. It is
+    // the one construct the storm drives through the *schedulers* rather than
+    // through a verb: an armed occurrence is backdated and three scheduler
+    // loops race to claim it. Its side task is the consumers' to complete.
+    setup.declare_topic("add_late_fee").await.unwrap();
+    setup
+        .deploy(
+            // Its process id is `ticket`, like fixture 29's, so the rename is
+            // spelled out rather than going through `with_process_id`.
+            &fixture("accept/40-late-fee-cycle.bpmn")
+                .replace("R/P7D", "R/PT1M")
+                .replace("id=\"ticket\"", "id=\"billing\"")
+                .replace("bpmnElement=\"ticket\"", "bpmnElement=\"billing\""),
+            &rbpmn_core::Bindings::new().correlation("await_payment", "ticket.reference"),
+        )
+        .await
+        .unwrap();
 
     // Crank with RBPMN_STORM_ROUNDS when hunting; 20 keeps the suite quick.
     let rounds: u32 = std::env::var("RBPMN_STORM_ROUNDS")
@@ -241,6 +259,7 @@ async fn a_storm_holds_every_global_invariant() {
                     "handle_contest",
                     "review",
                     "file_note",
+                    "add_late_fee",
                 ] {
                     if let Ok(Some(task)) = node.get_task(topic, &options).await {
                         idle = false;
@@ -295,6 +314,7 @@ async fn a_storm_holds_every_global_invariant() {
     // The workload: instances of all three definitions, started concurrently
     // from every node, with correlations chasing the message ones.
     let mut instances: Vec<(Uuid, serde_json::Value)> = Vec::new();
+    let mut cycle_backdates: u32 = 0;
     let (mut notes_delivered, mut notes_refused) = (0u32, 0u32);
     for round in 0..rounds {
         let node = &nodes[round as usize % nodes.len()];
@@ -356,6 +376,49 @@ async fn a_storm_holds_every_global_invariant() {
                 Err(e) => panic!("correlate NOTE {case}: {e}"),
             }
         }
+
+        // The repeating timer, driven through the schedulers. Backdating the
+        // armed occurrence makes all three loops see it due at once and race
+        // for it — advisory try-lock, NOWAIT on the instance row, re-check of
+        // the timer row — and the winner's re-arm lands on the grid of the
+        // previous due at or after now, a minute out. So one backdate is
+        // exactly one fire, and the count settling at one (not two, not zero)
+        // is the claim path's exactly-once under competing schedulers, for a
+        // row that re-creates itself in the firing transaction. Every other
+        // instance is backdated twice, so the re-armed occurrence fires too.
+        // PAID then ends the host, which cancels the cycle and leaves the fee
+        // items to the consumers.
+        let reference = format!("b-{round}");
+        let vars = serde_json::json!({ "ticket": { "reference": reference.clone() } });
+        let id = node.start("billing", None, vars.clone()).await.unwrap().id;
+        instances.push((id, vars));
+        for fire in 1..=(1 + round % 2) {
+            sqlx::query(
+                "update rbpmn_timer set due_at = now() - interval '90 minutes' \
+                 where instance_id = $1",
+            )
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            cycle_backdates += 1;
+            let mut fired = 0;
+            for _ in 0..600 {
+                fired = fires_of(&db.pool, id).await;
+                if fired >= fire {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                fired, fire,
+                "billing {reference}: a backdated occurrence fires exactly once across \
+                 the competing schedulers (saw {fired} after backdate {fire})"
+            );
+        }
+        node.correlate("PAID", &reference, serde_json::json!({}))
+            .await
+            .unwrap_or_else(|e| panic!("correlate PAID {reference}: {e}"));
     }
     // Deliver every message; each must land on exactly one subscription.
     let mut delivered = 0;
@@ -547,6 +610,69 @@ async fn a_storm_holds_every_global_invariant() {
         cases + notes,
         "one arm per review entered ({cases}) plus one re-arm per note ({notes})"
     );
+    // The repeating timer: each backdate fired exactly once under three
+    // competing schedulers (asserted per fire in the loop); this is the shape
+    // of the whole run. One side token per fire; one arm per instance plus one
+    // re-arm per fire — a cycle that failed to re-arm, or re-armed twice, is
+    // off by the fire count; one cancel per instance, because PAID ended
+    // every host with an occurrence still armed; and at least one instance
+    // whose *re-armed* occurrence fired, or the re-arm was never stormed.
+    // `>=` on the fires, not `==`: the re-arm lands a minute out, and a run
+    // cranked past a minute may see one fire on its own.
+    let cycle_fires = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'timer-fired' \
+         and element_id = 'late_fee_due'",
+    )
+    .await;
+    assert!(
+        cycle_fires >= cycle_backdates as i64,
+        "{cycle_backdates} backdated occurrences, {cycle_fires} fires"
+    );
+    let fees = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'element-started' \
+         and element_id = 'add_late_fee'",
+    )
+    .await;
+    assert_eq!(fees, cycle_fires, "one side token per cycle fire");
+    let billings = count(
+        &db.pool,
+        "select count(*) from rbpmn_instance where definition_key = 'billing'",
+    )
+    .await;
+    let cycle_arms = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'timer-armed' \
+         and element_id = 'late_fee_due'",
+    )
+    .await;
+    assert_eq!(
+        cycle_arms,
+        billings + cycle_fires,
+        "one arm per instance ({billings}) plus one re-arm per fire ({cycle_fires})"
+    );
+    let cycle_cancels = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'timer-cancelled' \
+         and element_id = 'late_fee_due'",
+    )
+    .await;
+    assert_eq!(
+        cycle_cancels, billings,
+        "PAID cancelled exactly one armed occurrence per instance"
+    );
+    let rearmed_and_fired = count(
+        &db.pool,
+        "select count(*) from (select instance_id from rbpmn_event \
+         where kind = 'timer-fired' and element_id = 'late_fee_due' \
+         group by 1 having count(*) >= 2) x",
+    )
+    .await;
+    assert!(
+        rearmed_and_fired > 0,
+        "no instance fired a re-armed occurrence — the re-arm was never stormed"
+    );
     let stuck = count(
         &db.pool,
         "select count(*) from rbpmn_instance where status = 'active'",
@@ -626,6 +752,11 @@ async fn a_storm_holds_every_global_invariant() {
          {arms} arms over {cases} cases"
     );
     println!(
+        "  cycles:   {cycle_backdates} backdated, {cycle_fires} fired, {fees} fees, \
+         {cycle_arms} arms and {cycle_cancels} cancels over {billings} instances, \
+         {rearmed_and_fired} fired a re-armed occurrence"
+    );
+    println!(
         "  statuses: {:?}",
         statuses
             .iter()
@@ -640,4 +771,17 @@ async fn a_storm_holds_every_global_invariant() {
             .collect::<Vec<_>>()
     );
     db.drop().await;
+}
+
+/// `timer-fired` events of one instance — how the cycle driver waits for the
+/// schedulers to claim the occurrence it just backdated.
+async fn fires_of(pool: &PgPool, instance: Uuid) -> u32 {
+    let n: i64 = sqlx::query_scalar(
+        "select count(*) from rbpmn_event where instance_id = $1 and kind = 'timer-fired'",
+    )
+    .bind(instance)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    n as u32
 }
