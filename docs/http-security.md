@@ -80,7 +80,8 @@ deliberately not the default posture.
   (the indexed expression and the `is not null` predicate), and
   `find_by_shared_index` embeds it once. Same validator, same guarantee; the
   looked-up value is a bound parameter.
-- **The published views** (`rbpmn_v_instance`, `rbpmn_v_work_item`,
+- **The published views** (`rbpmn_v_definition`,
+  `rbpmn_v_definition_decision`, `rbpmn_v_instance`, `rbpmn_v_work_item`,
   `rbpmn_v_timer`, `rbpmn_v_subscription`) are read-only projections and
   grant nothing on their own — they are visible to whatever role the
   application's connection already uses, and rbpmn does not manage grants.
@@ -94,8 +95,10 @@ deliberately not the default posture.
   but names a field of the variable document all the same. `rbpmn_v_subscription`
   exposes `correlation_key`, which **is** a business identifier by
   construction — an order number, a customer reference — and is the most
-  directly identifying column on the whole surface. Who may see any of that is
-  the application's call.
+  directly identifying column on the whole surface. And `rbpmn_v_definition`
+  exposes `bpmn_xml` and `bindings` — the process models themselves, which for
+  many organisations are the confidential part. Who may see any of that is the
+  application's call.
 - **SSRF**: `HttpPostHandler` targets come from operator configuration at
   engine build time, never from request data or model content.
 - **Scoped tokens**: deploy (code-adjacent) vs runtime (start/correlate/

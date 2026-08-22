@@ -9,6 +9,9 @@ The full rationale — why tokens-per-row, why no inclusive gateway, why no call
 activities, why block structure — lives in [bpmn-engine-design.md](bpmn-engine-design.md).
 Read it before touching the semantics.
 
+**PostgreSQL 18 or newer is recommended.** Older versions are correct but
+slower on some read paths; 13 is the floor the schema needs.
+
 ## Workspace
 
 | Crate / package | Purpose |
@@ -342,7 +345,7 @@ does not even allocate a new version. Adopting `shared` is a manifest edit and
 a redeploy. The old index is not removed — if the definition still declares
 the field definition-scoped, it still has it.
 
-### The published read surface: four views
+### The published read surface
 
 Applications legitimately need to *join* rbpmn's state against their own rows.
 A result set of "our tenancy, our ordering, rbpmn's instances" is a SQL join,
@@ -353,6 +356,8 @@ and the `Display` format of `Event`, one per thing an instance can be doing:
 
 | view | the question it answers |
 |---|---|
+| `rbpmn_v_definition` | what is deployed, at which version, and from which artifacts |
+| `rbpmn_v_definition_decision` | the DMN artifacts a version was deployed with |
 | `rbpmn_v_instance` | what is running, and what does it hold |
 | `rbpmn_v_work_item` | what is waiting to be worked, and how deep is each queue |
 | `rbpmn_v_timer` | when does this next happen |
@@ -360,11 +365,14 @@ and the `Display` format of `Event`, one per thing an instance can be doing:
 
 The last three are the three things an instance can be *waiting* on — a
 worker, a clock, a message — so between them there is no wait state an
-application has to read an undocumented table to see.
+application has to read an undocumented table to see. The first two are what
+is deployed rather than what is happening: the question behind them is
+reconciliation, "is the model running here the one in git?", which is
+`content_hash` against a hash of the bundle.
 
 They compose on `instance_id`, so a statement can group deadlines and queue
-depths by an application's own dimensions at once. The constants `rbpmn_engine::{INSTANCE_VIEW, WORK_ITEM_VIEW,
-TIMER_VIEW, SUBSCRIPTION_VIEW}` name them, so a rename is a compile error for
+depths by an application's own dimensions at once. The constants `rbpmn_engine::{DEFINITION_VIEW, DEFINITION_DECISION_VIEW,
+INSTANCE_VIEW, WORK_ITEM_VIEW, TIMER_VIEW, SUBSCRIPTION_VIEW}` name them, so a rename is a compile error for
 callers rather than a runtime surprise.
 
 **One contract, for all three.** Columns may be added; none will be removed or
@@ -386,6 +394,40 @@ surface is SQL.
 was measured. A depth of five does not reserve five items, an armed timer is
 not a promise about when it fires, and the only way to *hold* work is
 `get_task`.
+
+#### `rbpmn_v_definition` and `rbpmn_v_definition_decision`
+
+| column | |
+|---|---|
+| `id` | the definition id `deploy` returns |
+| `key`, `version` | the stable pair everything else joins on |
+| `content_hash` | sha256 of the bundle — deploy's own idempotency key |
+| `deployed_at` | when this version landed |
+| `bpmn_xml`, `bindings` | the artifacts that are 1:1 with a definition |
+| `retired_instances` | why `delete_definition` may refuse a version that looks unreferenced |
+
+The DMN artifacts are 0..N, so folding them in would need an `array_agg` and
+that would stop the view being an inlinable projection — the same reason
+`rbpmn_v_subscription` leaves ambiguity to a query. They get
+`rbpmn_v_definition_decision` (`definition_id`, `definition_key`,
+`definition_version`, `ordinal`, `dmn_xml`), joinable either way. **Read them
+ordered by `ordinal`:** artifacts may import one another, so deployment order
+is part of the deployment.
+
+⚠️ `bpmn_xml` and `dmn_xml` are whole documents. `select *` here pulls every
+model in the installation across the wire — name your columns, and reach for
+the XML only when the answer *is* the model. The deployment inventory asked
+for most often is `Engine::DEPLOYED_NOW_SQL`, which selects no XML at all:
+
+```sql
+select distinct on (key) key, version, content_hash, deployed_at
+  from rbpmn_v_definition order by key, version desc
+```
+
+No index was added for these. Definitions are bounded by deploys rather than
+by throughput — a few versions per process — so there is no scan worth
+preventing, and the primary key plus the `(key, version)` unique index already
+serve both "this exact version" and "the latest of this key".
 
 #### `rbpmn_v_instance`
 

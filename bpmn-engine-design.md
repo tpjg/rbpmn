@@ -505,6 +505,12 @@ current registration state** and fails loudly with the same rule id
   shapes were reproduced as real Postgres deadlocks. The hazard predates
   scoped indexes: two definitions deploying at once already both index
   `rbpmn_instance`. See `spec/README.md`'s lock inventory.
+- **`rbpmn_v_definition`** is the other half of the surface: not what is
+  happening but what is deployed, for the reconciliation question ("is the
+  model running here the one in git?") that `content_hash` answers. Its 0..N
+  DMN artifacts go in a projection of their own rather than an `array_agg`,
+  for the same reason subscription ambiguity stays a query. No index: the
+  table is bounded by deploys, not throughput.
 - **`rbpmn_v_subscription`** closes the set: one view per wait state, so no
   wait state is reachable only through an undocumented table. Searched by
   `correlation_key` alone, because that is the shape a support question

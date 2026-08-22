@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+mod definitions;
 mod deploy;
 pub use deploy::Bundle;
 mod error;
@@ -35,6 +36,7 @@ mod timers;
 mod work_items;
 mod worker;
 
+pub use definitions::{DEFINITION_DECISION_VIEW, DEFINITION_VIEW};
 pub use error::{
     Completion, Correlation, DeployError, Deployment, EngineError, FailOutcome, StartedInstance,
 };
@@ -155,6 +157,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         17,
         "subscription_view",
         include_str!("../migrations/0017_subscription_view.sql"),
+    ),
+    (
+        18,
+        "definition_view",
+        include_str!("../migrations/0018_definition_view.sql"),
     ),
 ];
 

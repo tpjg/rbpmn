@@ -154,9 +154,14 @@ inclusive gateway, block structure, messages-only interaction, build order).
   a bug that predates scopes (two definitions deploying at once both index
   `rbpmn_instance`). The session must be **idle** between attempts; that is
   what lets the holder's build drain.
-- **The published views (`rbpmn_v_instance`, `rbpmn_v_work_item`,
+- **The published views (`rbpmn_v_definition`,
+  `rbpmn_v_definition_decision`, `rbpmn_v_instance`, `rbpmn_v_work_item`,
   `rbpmn_v_timer`, `rbpmn_v_subscription` — one per wait state, plus the
-  instance) are public API and must stay plain inlinable projections.** No WHERE, no volatile
+  instance and what it was deployed from) are public API and must stay plain
+  inlinable projections.** A 0..N artifact set does not get folded in with an
+  aggregate; it gets a projection of its own (`rbpmn_v_definition_decision`)
+  or stays a documented query (subscription ambiguity), because an aggregate
+  stops the view being inlinable. No WHERE, no volatile
   function, and above all not `security_barrier` — a barrier view refuses to push `variables->>'f' = $1`
   below itself (`jsonb ->>` is not leakproof), which would strand every
   declared index beneath a full scan. Columns may be added, never removed or

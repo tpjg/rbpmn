@@ -8567,3 +8567,251 @@ async fn the_business_identifier_lookup_is_index_driven() {
     );
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// The published definition views: what is deployed, and the artifacts it was
+// deployed with.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_published_definition_views_have_the_documented_shape() {
+    let db = TestDb::create().await;
+    let _engine = engine(&db).await;
+
+    let columns = |view: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, String)>(
+                "select column_name::text, data_type::text from information_schema.columns \
+                 where table_name = $1 order by ordinal_position",
+            )
+            .bind(view)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(
+        columns("rbpmn_v_definition").await,
+        vec![
+            ("id".into(), "uuid".into()),
+            ("key".into(), "text".into()),
+            ("version".into(), "integer".into()),
+            ("content_hash".into(), "text".into()),
+            ("deployed_at".into(), "timestamp with time zone".into()),
+            ("bpmn_xml".into(), "text".into()),
+            ("bindings".into(), "jsonb".into()),
+            ("retired_instances".into(), "bigint".into()),
+        ],
+        "rbpmn_v_definition is public API"
+    );
+    assert_eq!(
+        columns("rbpmn_v_definition_decision").await,
+        vec![
+            ("definition_id".into(), "uuid".into()),
+            ("definition_key".into(), "text".into()),
+            ("definition_version".into(), "integer".into()),
+            ("ordinal".into(), "integer".into()),
+            ("dmn_xml".into(), "text".into()),
+        ],
+        "rbpmn_v_definition_decision is public API"
+    );
+
+    for view in ["rbpmn_v_definition", "rbpmn_v_definition_decision"] {
+        let barrier: Option<Vec<String>> =
+            sqlx::query_scalar("select reloptions from pg_class where relname = $1")
+                .bind(view)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(barrier.is_none(), "{view} must carry no reloptions");
+    }
+    db.drop().await;
+}
+
+/// The view hands back exactly what was deployed — same XML, same manifest,
+/// same hash — so an application can reconcile "the model in git" against
+/// "the model that is running" without trusting a copy.
+#[tokio::test]
+async fn the_definition_view_returns_what_was_deployed() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let xml = fixture("accept/01-minimal.bpmn");
+    let bindings = Bindings::new().index("channel");
+    let deployed = engine.deploy(&xml, &bindings).await.unwrap();
+
+    let row: (
+        uuid::Uuid,
+        String,
+        i32,
+        String,
+        String,
+        serde_json::Value,
+        i64,
+    ) = sqlx::query_as(&format!(
+        "select id, key, version, content_hash, bpmn_xml, bindings, retired_instances \
+               from {} where key = $1 and version = $2",
+        rbpmn_engine::DEFINITION_VIEW
+    ))
+    .bind("p")
+    .bind(1)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, deployed.definition_id);
+    assert_eq!((row.1.as_str(), row.2), ("p", 1));
+    assert_eq!(row.4, xml, "the model itself, byte for byte");
+    assert_eq!(row.5, serde_json::to_value(&bindings).unwrap());
+    assert_eq!(row.6, 0);
+
+    // The hash is the idempotency key deploy actually uses: redeploying the
+    // same bundle must not add a row, and the view must not show two.
+    let again = engine.deploy(&xml, &bindings).await.unwrap();
+    assert!(again.reused);
+    let versions: i64 = sqlx::query_scalar(&format!(
+        "select count(*) from {} where key = 'p'",
+        rbpmn_engine::DEFINITION_VIEW
+    ))
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(versions, 1);
+    assert_eq!(row.3.len(), 64, "a sha256 hex digest: {}", row.3);
+    db.drop().await;
+}
+
+/// The DMN half: the artifacts come back in deployment order, and each
+/// version keeps the ones it was validated with.
+#[cfg(feature = "dmn")]
+#[tokio::test]
+async fn the_decision_view_returns_the_artifacts_in_order() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bundle =
+        rbpmn_engine::Bundle::new(fixture("accept/01-minimal.bpmn")).decision(DECISION_DMN);
+    let first = engine.deploy_bundle(&bundle).await.unwrap();
+
+    let artifacts: Vec<(String, i32, i32, String)> = sqlx::query_as(&format!(
+        "select definition_key, definition_version, ordinal, dmn_xml from {} \
+           where definition_id = $1 order by ordinal",
+        rbpmn_engine::DEFINITION_DECISION_VIEW
+    ))
+    .bind(first.definition_id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(
+        (artifacts[0].0.as_str(), artifacts[0].1, artifacts[0].2),
+        ("p", 1, 0)
+    );
+    assert_eq!(artifacts[0].3, DECISION_DMN);
+
+    // A changed rule is changed content: a new version, and the old one keeps
+    // the artifact it was validated against.
+    let edited = rbpmn_engine::Bundle::new(fixture("accept/01-minimal.bpmn"))
+        .decision(DECISION_DMN.replace("Amount * 0.1", "Amount * 0.2"));
+    let second = engine.deploy_bundle(&edited).await.unwrap();
+    assert_eq!(second.version, first.version + 1);
+
+    let by_version: Vec<(i32, String)> = sqlx::query_as(&format!(
+        "select definition_version, dmn_xml from {} where definition_key = 'p' \
+          order by definition_version",
+        rbpmn_engine::DEFINITION_DECISION_VIEW
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(by_version.len(), 2);
+    assert!(by_version[0].1.contains("0.1"));
+    assert!(by_version[1].1.contains("0.2"));
+
+    // And they go with the definition when it goes.
+    engine.delete_definition("p", 1).await.unwrap();
+    let left: i64 = sqlx::query_scalar(&format!(
+        "select count(*) from {} where definition_version = 1",
+        rbpmn_engine::DEFINITION_DECISION_VIEW
+    ))
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+    db.drop().await;
+}
+
+/// The deployment inventory — the question asked most often, and the shape
+/// that answers it without dragging every model across the wire.
+#[tokio::test]
+async fn the_deployed_now_query_reports_the_latest_of_every_key() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("warn_customer").await.unwrap();
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().index("channel"),
+        )
+        .await
+        .unwrap();
+    engine
+        .deploy(
+            &fixture("accept/35-non-interrupting-on-subprocess.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+
+    let now: Vec<(String, i32)> = sqlx::query_as(&format!(
+        "select key, version from ({}) q order by key",
+        rbpmn_engine::Engine::DEPLOYED_NOW_SQL
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        now,
+        vec![("p".to_string(), 2), ("shipment".to_string(), 1)],
+        "the latest of every key, and only the latest"
+    );
+    db.drop().await;
+}
+
+/// The whole surface joins up: an instance's definition is reachable through
+/// the stable pair, which is what lets one statement answer "what is running,
+/// on which version of which model".
+#[tokio::test]
+async fn an_instance_reaches_its_definition_through_the_stable_pair() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().index("channel"),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let row: (uuid::Uuid, String, i32, String) = sqlx::query_as(&format!(
+        "select i.id, d.key, d.version, d.content_hash \
+           from {inst} i join {def} d \
+             on d.key = i.definition_key and d.version = i.definition_version \
+          where i.id = $1",
+        inst = rbpmn_engine::INSTANCE_VIEW,
+        def = rbpmn_engine::DEFINITION_VIEW,
+    ))
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!((row.0, row.1.as_str(), row.2), (started.id, "p", 1));
+    assert_eq!(row.3.len(), 64);
+    db.drop().await;
+}
