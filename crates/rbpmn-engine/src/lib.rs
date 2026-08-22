@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+mod definitions;
 mod deploy;
 pub use deploy::Bundle;
 mod error;
@@ -27,12 +28,15 @@ mod listen;
 mod retention;
 mod runtime;
 mod scheduler;
+mod subscriptions;
 mod tasks;
 #[cfg(feature = "test-util")]
 pub mod testing;
+mod timers;
 mod work_items;
 mod worker;
 
+pub use definitions::{DEFINITION_DECISION_VIEW, DEFINITION_VIEW};
 pub use error::{
     Completion, Correlation, DeployError, Deployment, EngineError, FailOutcome, StartedInstance,
 };
@@ -51,10 +55,12 @@ pub use retention::{
 pub use runtime::FailOptions;
 pub use scheduler::SchedulerOptions;
 pub use sqlx::PgPool;
+pub use subscriptions::SUBSCRIPTION_VIEW;
 pub use tasks::{
     DeclaredIndex, GetTaskOptions, LockExtension, LockedTask, Released, TaskFilter, TaskOrder,
     declared_index_name, shared_index_name,
 };
+pub use timers::TIMER_VIEW;
 pub use work_items::{QueueDepth, WORK_ITEM_VIEW};
 pub use worker::WorkerOptions;
 
@@ -141,6 +147,21 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         15,
         "work_item_view",
         include_str!("../migrations/0015_work_item_view.sql"),
+    ),
+    (
+        16,
+        "timer_view",
+        include_str!("../migrations/0016_timer_view.sql"),
+    ),
+    (
+        17,
+        "subscription_view",
+        include_str!("../migrations/0017_subscription_view.sql"),
+    ),
+    (
+        18,
+        "definition_view",
+        include_str!("../migrations/0018_definition_view.sql"),
     ),
 ];
 

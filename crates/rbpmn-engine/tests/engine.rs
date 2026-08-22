@@ -7796,3 +7796,1022 @@ async fn the_two_views_compose_on_instance_id() {
     );
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// The published timer view: rbpmn_v_timer, the third wait state.
+// ---------------------------------------------------------------------------
+
+/// The soonest armed timer the view reports, restricted to live instances the
+/// way the scheduler's own candidate query is. `order by due_at limit 1`,
+/// never `min(due_at)` — see the migration comment.
+async fn view_next_due(pool: &PgPool) -> Option<(uuid::Uuid, i64)> {
+    sqlx::query(&format!(
+        "select instance_id, timer_no from {} \
+          where instance_status = 'active' order by due_at limit 1",
+        rbpmn_engine::TIMER_VIEW
+    ))
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+    .map(|r| (r.get("instance_id"), r.get("timer_no")))
+}
+
+async fn timer_still_armed(pool: &PgPool, instance: uuid::Uuid, timer_no: i64) -> bool {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "select count(*) from {} where instance_id = $1 and timer_no = $2",
+        rbpmn_engine::TIMER_VIEW
+    ))
+    .bind(instance)
+    .bind(timer_no)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+        > 0
+}
+
+/// Public API, asserted the way the other two views' shapes are.
+#[tokio::test]
+async fn the_published_timer_view_has_the_documented_shape() {
+    let db = TestDb::create().await;
+    let _engine = engine(&db).await;
+
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        "select column_name::text, data_type::text from information_schema.columns \
+         where table_name = 'rbpmn_v_timer' order by ordinal_position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        vec![
+            ("instance_id".into(), "uuid".into()),
+            ("timer_no".into(), "bigint".into()),
+            ("definition_key".into(), "text".into()),
+            ("definition_version".into(), "integer".into()),
+            ("element_id".into(), "text".into()),
+            ("due_kind".into(), "text".into()),
+            ("due_spec".into(), "text".into()),
+            ("due_at".into(), "timestamp with time zone".into()),
+            ("remaining".into(), "integer".into()),
+            ("instance_status".into(), "text".into()),
+            ("created_at".into(), "timestamp with time zone".into()),
+        ],
+        "rbpmn_v_timer is public API"
+    );
+
+    let barrier: Option<Vec<String>> =
+        sqlx::query_scalar("select reloptions from pg_class where relname = 'rbpmn_v_timer'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(barrier.is_none(), "must carry no reloptions: {barrier:?}");
+    db.drop().await;
+}
+
+/// **The property that matters**, and the timer analogue of the work-item
+/// view's claimability differential: what the view calls the next due timer
+/// must be the timer the scheduler actually fires next.
+///
+/// Walked one firing at a time rather than checked at the endpoints — a read
+/// model that agreed only about the first and last pick would be no use — and
+/// with **distinct** due instants on purpose: the scheduler orders by `due_at`
+/// with no tie-break, so among equal instants "next" is genuinely
+/// unspecified and asserting a particular row would be asserting an accident.
+#[tokio::test]
+async fn the_views_next_due_is_the_timer_the_scheduler_fires() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT0S</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+
+    const N: i64 = 8;
+    let mut started = Vec::new();
+    for _ in 0..N {
+        started.push(
+            engine
+                .start("pt", None, serde_json::json!({}))
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    // Distinct, all in the past, and deliberately not in creation order — so
+    // agreeing means agreeing about `due_at`, not about insertion order.
+    for (i, instance) in started.iter().enumerate() {
+        let offset = ((i * 7) % 8) as i64 + 1;
+        sqlx::query(&format!(
+            "update rbpmn_timer set due_at = now() - interval '{offset} hours' \
+             where instance_id = $1"
+        ))
+        .bind(instance)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    for fired in 0..N {
+        let (instance, timer_no) = view_next_due(&db.pool)
+            .await
+            .unwrap_or_else(|| panic!("the view ran out of timers after {fired} firing(s)"));
+        assert!(
+            engine.fire_due_timer().await.unwrap(),
+            "the scheduler found nothing while the view named one"
+        );
+        assert!(
+            !timer_still_armed(&db.pool, instance, timer_no).await,
+            "firing {} of {N}: the scheduler fired something other than the timer \
+             the view named ({instance} #{timer_no} is still armed)",
+            fired + 1
+        );
+    }
+
+    assert_eq!(view_next_due(&db.pool).await, None, "the view is empty too");
+    assert!(
+        !engine.fire_due_timer().await.unwrap(),
+        "and so is the scheduler"
+    );
+    db.drop().await;
+}
+
+/// A frozen instance's timer is armed and overdue and will never fire — the
+/// distinction the health question turns on, and the reason `instance_status`
+/// is a column rather than a second join.
+#[tokio::test]
+async fn a_frozen_instances_timer_is_armed_but_not_the_scheduler_being_behind() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT0S</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    sqlx::query("update rbpmn_timer set due_at = now() - interval '1 day'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("update rbpmn_instance set status = 'failed' where id = $1")
+        .bind(started.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Still armed, still overdue, and still visible — support needs to see it.
+    let row: (String, bool) = sqlx::query_as(&format!(
+        "select instance_status, due_at < now() from {} where instance_id = $1",
+        rbpmn_engine::TIMER_VIEW
+    ))
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row, ("failed".to_string(), true));
+
+    // But it is not the scheduler being behind, and the view says which.
+    assert_eq!(view_next_due(&db.pool).await, None);
+    assert!(!engine.fire_due_timer().await.unwrap());
+    db.drop().await;
+}
+
+/// A cycle is one row at a time, and the view must never show two "next"
+/// occurrences for one arm — an application rendering a date would have to
+/// guess which one it had. Firing replaces the row rather than adding to it.
+#[tokio::test]
+async fn a_cycle_shows_one_next_occurrence_not_a_series() {
+    let db = TestDb::create().await;
+    let (engine, instance) = late_fee_engine(&db).await;
+
+    let armed: Vec<(i64, f64, Option<i32>, String, String)> = sqlx::query_as(&format!(
+        "select timer_no, extract(epoch from due_at)::float8, remaining, due_kind, due_spec \
+           from {} where instance_id = $1 and element_id = 'late_fee_due'",
+        rbpmn_engine::TIMER_VIEW
+    ))
+    .bind(instance)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(armed.len(), 1, "one occurrence at a time: {armed:?}");
+    let (first_no, _pre_backdate_due, remaining, kind, spec) = armed[0].clone();
+    assert_eq!(kind, "cycle");
+    // The period lives inside the spec: there is no period column, and this
+    // is the reason `due_spec` is the load-bearing one.
+    assert_eq!(spec, "R/P7D");
+    assert_eq!(remaining, None, "R/… is unbounded");
+
+    backdate_timers(&db.pool, instance).await;
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    let after: Vec<(i64, f64)> = sqlx::query_as(&format!(
+        "select timer_no, extract(epoch from due_at)::float8 from {} \
+           where instance_id = $1 and element_id = 'late_fee_due'",
+        rbpmn_engine::TIMER_VIEW
+    ))
+    .bind(instance)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(after.len(), 1, "still one occurrence, not two: {after:?}");
+    assert_ne!(after[0].0, first_no, "a new row, not the old one re-dated");
+    // Still renderable as "next": in the future. The grid arithmetic itself —
+    // that it steps from the *previous due* and not from now — is
+    // `a_cycle_rearms_from_its_previous_due`'s job, not this one's; here the
+    // property is only that an application never has two rows to choose
+    // between. (`_pre_backdate_due` is deliberately not compared against:
+    // `backdate_timers` rewrites due_at absolutely, so the occurrence that
+    // actually fired was an hour ago, not a week hence.)
+    let now = db_epoch(&db.pool, "clock_timestamp()").await;
+    assert!(
+        after[0].1 > now,
+        "the next occurrence must still be ahead ({} vs {now})",
+        after[0].1
+    );
+    db.drop().await;
+}
+
+/// A timer disappears with its token when the wait ends another way — here a
+/// boundary timer on a task that completed first. The view is a projection of
+/// what is armed, so "nothing armed" has to mean nothing armed.
+#[tokio::test]
+async fn a_timer_leaves_the_view_when_its_wait_ends() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &boundary_timer_xml("<bpmn:timeDuration>PT1H</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pb", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let rows = |id: uuid::Uuid| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(&format!(
+                "select count(*) from {} where instance_id = $1",
+                rbpmn_engine::TIMER_VIEW
+            ))
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(rows(started.id).await, 1, "armed while the task is open");
+
+    let (item, _) = open_items(&db.pool, started.id).await[0].clone();
+    engine
+        .complete_work_item(item, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(rows(started.id).await, 0, "and gone with its token");
+    db.drop().await;
+}
+
+/// Both questions the view exists for, planned THROUGH it. No new index was
+/// added for either: the scheduler's own already serve them, and this is what
+/// says so out loud rather than leaving it to be re-derived.
+#[tokio::test]
+async fn the_timer_queries_are_index_driven() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT1H</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pt", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    // Enough rows that an index is the cheaper answer; inserted as SQL for the
+    // same reason `bulk_work_items` is — a plan test needs statistics, not
+    // engine history.
+    bulk_instances(&db.pool, "pt", "T-", 20_000).await;
+    sqlx::query(
+        "insert into rbpmn_timer \
+           (instance_id, timer_no, token_no, element_id, due_kind, due_spec, due_at) \
+         select i.id, 1, 1, 'c', 'duration', 'PT1H', \
+                now() + make_interval(secs => (i.definition_version * 37 + g) * 60) \
+           from rbpmn_instance i, generate_series(1, 1) g \
+          where i.definition_key = 'pt' and i.id <> $1",
+    )
+    .bind(started.id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    analyze(&db.pool).await;
+    sqlx::query("analyze rbpmn_timer")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // "What is armed for this instance" -> the primary key's leading column.
+    let per_instance = explain_prepared(
+        &db.pool,
+        "armed",
+        &format!(
+            "prepare armed(uuid) as select due_at, element_id, due_spec from {} \
+               where instance_id = $1 order by due_at limit 1",
+            rbpmn_engine::TIMER_VIEW
+        ),
+        &format!("execute armed('{}')", started.id),
+    )
+    .await;
+    assert!(
+        per_instance.contains("rbpmn_timer_pkey"),
+        "the per-instance lookup must use the timer primary key:\n{per_instance}"
+    );
+    assert!(
+        !per_instance.contains("Seq Scan on rbpmn_timer"),
+        "and must not scan every armed timer:\n{per_instance}"
+    );
+    assert!(
+        !per_instance.contains("Subquery Scan"),
+        "the view must be inlined:\n{per_instance}"
+    );
+
+    // "Everything overdue right now" -> the scheduler's due index.
+    let overdue = explain_prepared(
+        &db.pool,
+        "overdue",
+        &format!(
+            "prepare overdue as select count(*) from {} where due_at < now()",
+            rbpmn_engine::TIMER_VIEW
+        ),
+        "execute overdue",
+    )
+    .await;
+    assert!(
+        overdue.contains("rbpmn_timer_due"),
+        "the overdue sweep must use the scheduler's due index:\n{overdue}"
+    );
+    assert!(
+        !overdue.contains("Seq Scan on rbpmn_timer"),
+        "and must not scan every armed timer:\n{overdue}"
+    );
+    db.drop().await;
+}
+
+/// The three published views compose on `instance_id`: an application groups
+/// deadlines by its own dimension — a tenant hoisted into the variable
+/// document — in one statement, and can ask about queues in the same breath.
+#[tokio::test]
+async fn the_timer_view_composes_with_the_instance_view() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &timer_catch_xml("<bpmn:timeDuration>PT1H</bpmn:timeDuration>"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    for i in 0..6 {
+        engine
+            .start(
+                "pt",
+                None,
+                serde_json::json!({ "tenant": if i % 2 == 0 { "acme" } else { "globex" } }),
+            )
+            .await
+            .unwrap();
+    }
+
+    let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+        "select i.variables->>'tenant' as tenant, count(*) as deadlines \
+           from {timer} t join {inst} i on i.id = t.instance_id \
+          where t.due_at > now() group by 1 order by 1",
+        timer = rbpmn_engine::TIMER_VIEW,
+        inst = rbpmn_engine::INSTANCE_VIEW,
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![("acme".to_string(), 3), ("globex".to_string(), 3)]
+    );
+    db.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// The published subscription view: rbpmn_v_subscription, the fourth wait state.
+// ---------------------------------------------------------------------------
+
+/// How many live subscriptions the view shows for one (message, key) — the
+/// number `correlate`'s three-way answer turns on.
+async fn view_live_matches(pool: &PgPool, message: &str, key: &str) -> i64 {
+    sqlx::query_scalar(&format!(
+        "select count(*) from {} where message_name = $1 and correlation_key = $2 \
+           and instance_status = 'active'",
+        rbpmn_engine::SUBSCRIPTION_VIEW
+    ))
+    .bind(message)
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_published_subscription_view_has_the_documented_shape() {
+    let db = TestDb::create().await;
+    let _engine = engine(&db).await;
+
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        "select column_name::text, data_type::text from information_schema.columns \
+         where table_name = 'rbpmn_v_subscription' order by ordinal_position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        vec![
+            ("instance_id".into(), "uuid".into()),
+            ("subscription_no".into(), "bigint".into()),
+            ("definition_key".into(), "text".into()),
+            ("definition_version".into(), "integer".into()),
+            ("element_id".into(), "text".into()),
+            ("message_name".into(), "text".into()),
+            ("correlation_key".into(), "text".into()),
+            ("instance_status".into(), "text".into()),
+            ("created_at".into(), "timestamp with time zone".into()),
+        ],
+        "rbpmn_v_subscription is public API"
+    );
+
+    let barrier: Option<Vec<String>> = sqlx::query_scalar(
+        "select reloptions from pg_class where relname = 'rbpmn_v_subscription'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(barrier.is_none(), "must carry no reloptions: {barrier:?}");
+    db.drop().await;
+}
+
+/// **The differential**: what the view shows live for a (message, key) must
+/// predict which of `correlate`'s three answers you get — deliver on exactly
+/// one, `NoSubscription` on none, `AmbiguousCorrelation` on two or more. A
+/// support surface that disagreed with the verb it exists to explain would be
+/// worse than reading the table directly.
+#[tokio::test]
+async fn the_view_predicts_correlates_three_way_answer() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/17-message-catch.bpmn"),
+            &Bindings::new().correlation("c", "order.id"),
+        )
+        .await
+        .unwrap();
+    let start = |key: &str| {
+        let engine = engine.clone();
+        let key = key.to_string();
+        async move {
+            engine
+                .start("p", None, serde_json::json!({ "order": { "id": key } }))
+                .await
+                .unwrap()
+                .id
+        }
+    };
+
+    // none armed
+    assert_eq!(
+        view_live_matches(&db.pool, "WarehouseAck", "absent").await,
+        0
+    );
+    assert!(matches!(
+        engine
+            .correlate("WarehouseAck", "absent", serde_json::json!({}))
+            .await,
+        Err(rbpmn_engine::EngineError::NoSubscription { .. })
+    ));
+
+    // exactly one armed
+    start("solo").await;
+    assert_eq!(view_live_matches(&db.pool, "WarehouseAck", "solo").await, 1);
+    assert!(
+        engine
+            .correlate("WarehouseAck", "solo", serde_json::json!({}))
+            .await
+            .is_ok()
+    );
+    // ...and consumed, so the view and the verb agree on the way back down too
+    assert_eq!(view_live_matches(&db.pool, "WarehouseAck", "solo").await, 0);
+    assert!(matches!(
+        engine
+            .correlate("WarehouseAck", "solo", serde_json::json!({}))
+            .await,
+        Err(rbpmn_engine::EngineError::NoSubscription { .. })
+    ));
+
+    // two armed
+    start("dup").await;
+    start("dup").await;
+    assert_eq!(view_live_matches(&db.pool, "WarehouseAck", "dup").await, 2);
+    assert!(matches!(
+        engine
+            .correlate("WarehouseAck", "dup", serde_json::json!({}))
+            .await,
+        Err(rbpmn_engine::EngineError::AmbiguousCorrelation { .. })
+    ));
+    db.drop().await;
+}
+
+/// A frozen instance keeps its subscriptions, and `correlate` ignores them —
+/// so the view must show the row *and* say why it is not answering. This is
+/// what `instance_status` is for: one column between "nothing is waiting" and
+/// "the thing waiting is frozen", which are opposite support answers.
+#[tokio::test]
+async fn a_frozen_instances_subscription_is_visible_but_not_answering() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/17-message-catch.bpmn"),
+            &Bindings::new().correlation("c", "order.id"),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({ "order": { "id": "o-9" } }))
+        .await
+        .unwrap();
+    sqlx::query("update rbpmn_instance set status = 'failed' where id = $1")
+        .bind(started.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // Visible, with the reason attached.
+    let row: (uuid::Uuid, String, String) = sqlx::query_as(&format!(
+        "select instance_id, message_name, instance_status from {} \
+           where correlation_key = $1",
+        rbpmn_engine::SUBSCRIPTION_VIEW
+    ))
+    .bind("o-9")
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (started.id, "WarehouseAck".to_string(), "failed".to_string())
+    );
+
+    // And correlate does not see it, exactly as the view's live count says.
+    assert_eq!(view_live_matches(&db.pool, "WarehouseAck", "o-9").await, 0);
+    assert!(matches!(
+        engine
+            .correlate("WarehouseAck", "o-9", serde_json::json!({}))
+            .await,
+        Err(rbpmn_engine::EngineError::NoSubscription { .. })
+    ));
+    db.drop().await;
+}
+
+/// The 409 diagnostic: the documented ambiguity query must name exactly the
+/// pairs `correlate` refuses — no more (a frozen duplicate is not a conflict)
+/// and no fewer.
+#[tokio::test]
+async fn the_ambiguity_query_names_exactly_what_correlate_refuses() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/17-message-catch.bpmn"),
+            &Bindings::new().correlation("c", "order.id"),
+        )
+        .await
+        .unwrap();
+    for key in ["clash", "clash", "lonely", "frozen-dup", "frozen-dup"] {
+        engine
+            .start("p", None, serde_json::json!({ "order": { "id": key } }))
+            .await
+            .unwrap();
+    }
+    // One of the frozen-dup pair freezes, which makes it no longer a conflict.
+    sqlx::query(
+        "update rbpmn_instance set status = 'failed' where id = \
+         (select instance_id from rbpmn_subscription where correlation_key = 'frozen-dup' \
+           order by created_at limit 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let conflicts: Vec<(String, String, i64)> = sqlx::query_as(&format!(
+        "select message_name, correlation_key, waiting from ({}) q order by correlation_key",
+        rbpmn_engine::Engine::AMBIGUOUS_CORRELATIONS_SQL
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        conflicts,
+        vec![("WarehouseAck".to_string(), "clash".to_string(), 2)],
+        "only the live duplicate is a conflict"
+    );
+
+    // Which is exactly what the verb does.
+    assert!(matches!(
+        engine
+            .correlate("WarehouseAck", "clash", serde_json::json!({}))
+            .await,
+        Err(rbpmn_engine::EngineError::AmbiguousCorrelation { .. })
+    ));
+    assert!(
+        engine
+            .correlate("WarehouseAck", "frozen-dup", serde_json::json!({}))
+            .await
+            .is_ok(),
+        "one live half of a frozen pair still delivers"
+    );
+    assert!(
+        engine
+            .correlate("WarehouseAck", "lonely", serde_json::json!({}))
+            .await
+            .is_ok()
+    );
+    db.drop().await;
+}
+
+/// A subscription leaves the view with its token when the wait ends — here
+/// because the message arrived.
+#[tokio::test]
+async fn a_subscription_leaves_the_view_when_its_wait_ends() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/17-message-catch.bpmn"),
+            &Bindings::new().correlation("c", "order.id"),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({ "order": { "id": "o-1" } }))
+        .await
+        .unwrap();
+    let rows = |id: uuid::Uuid| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(&format!(
+                "select count(*) from {} where instance_id = $1",
+                rbpmn_engine::SUBSCRIPTION_VIEW
+            ))
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(rows(started.id).await, 1);
+    engine
+        .correlate("WarehouseAck", "o-1", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(rows(started.id).await, 0, "gone with its token");
+    db.drop().await;
+}
+
+/// The support question — "what is waiting on this order number?" — planned
+/// THROUGH the view, and the reason `rbpmn_subscription_by_key` exists.
+///
+/// The correlate index is `(message_name, correlation_key)`, so a predicate on
+/// the second column with nothing on the first has no leading equality to seek
+/// on. Skip scan gives it one from PostgreSQL 18, by seeking once per distinct
+/// message name — which is why this names `rbpmn_subscription_by_key`
+/// specifically rather than settling for "an index was used". The looser
+/// assertion would pass on a development 18 while the same query has no index
+/// path at all on the 15 CI runs, and would still pass on 18 while costing one
+/// seek per name in the deployment's model portfolio. Measured on 60 000
+/// subscriptions: 24 buffers at 4 message names, 394 at 400, against 3 here.
+#[tokio::test]
+async fn the_business_identifier_lookup_is_index_driven() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/17-message-catch.bpmn"),
+            &Bindings::new().correlation("c", "order.id"),
+        )
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({ "order": { "id": "ORD-1" } }))
+        .await
+        .unwrap();
+    // Statistics, not history — same reasoning as `bulk_work_items`.
+    bulk_instances(&db.pool, "p", "S-", 20_000).await;
+    sqlx::query(
+        "insert into rbpmn_subscription \
+           (instance_id, subscription_no, token_no, element_id, message_name, correlation_key) \
+         select i.id, 1, 1, 'c', 'MSG-' || (i.definition_version * 7 % 400), \
+                'ORD-' || i.id \
+           from rbpmn_instance i where i.definition_key = 'p' \
+             and not exists (select 1 from rbpmn_subscription s where s.instance_id = i.id)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("analyze rbpmn_subscription")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    analyze(&db.pool).await;
+
+    let plan = explain_prepared(
+        &db.pool,
+        "waiting",
+        &format!(
+            "prepare waiting(text) as {}",
+            rbpmn_engine::Engine::WAITING_ON_KEY_SQL
+        ),
+        "execute waiting('ORD-1')",
+    )
+    .await;
+    assert!(
+        plan.contains("rbpmn_subscription_by_key"),
+        "the business-identifier lookup must use its own index rather than \
+         skip-scanning the correlate index once per message name:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Seq Scan on rbpmn_subscription"),
+        "and must not scan every armed subscription:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Subquery Scan"),
+        "the view must be inlined:\n{plan}"
+    );
+    db.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// The published definition views: what is deployed, and the artifacts it was
+// deployed with.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_published_definition_views_have_the_documented_shape() {
+    let db = TestDb::create().await;
+    let _engine = engine(&db).await;
+
+    let columns = |view: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, String)>(
+                "select column_name::text, data_type::text from information_schema.columns \
+                 where table_name = $1 order by ordinal_position",
+            )
+            .bind(view)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(
+        columns("rbpmn_v_definition").await,
+        vec![
+            ("id".into(), "uuid".into()),
+            ("key".into(), "text".into()),
+            ("version".into(), "integer".into()),
+            ("content_hash".into(), "text".into()),
+            ("deployed_at".into(), "timestamp with time zone".into()),
+            ("bpmn_xml".into(), "text".into()),
+            ("bindings".into(), "jsonb".into()),
+            ("retired_instances".into(), "bigint".into()),
+        ],
+        "rbpmn_v_definition is public API"
+    );
+    assert_eq!(
+        columns("rbpmn_v_definition_decision").await,
+        vec![
+            ("definition_id".into(), "uuid".into()),
+            ("definition_key".into(), "text".into()),
+            ("definition_version".into(), "integer".into()),
+            ("ordinal".into(), "integer".into()),
+            ("dmn_xml".into(), "text".into()),
+        ],
+        "rbpmn_v_definition_decision is public API"
+    );
+
+    for view in ["rbpmn_v_definition", "rbpmn_v_definition_decision"] {
+        let barrier: Option<Vec<String>> =
+            sqlx::query_scalar("select reloptions from pg_class where relname = $1")
+                .bind(view)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(barrier.is_none(), "{view} must carry no reloptions");
+    }
+    db.drop().await;
+}
+
+/// The view hands back exactly what was deployed — same XML, same manifest,
+/// same hash — so an application can reconcile "the model in git" against
+/// "the model that is running" without trusting a copy.
+#[tokio::test]
+async fn the_definition_view_returns_what_was_deployed() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let xml = fixture("accept/01-minimal.bpmn");
+    let bindings = Bindings::new().index("channel");
+    let deployed = engine.deploy(&xml, &bindings).await.unwrap();
+
+    let row: (
+        uuid::Uuid,
+        String,
+        i32,
+        String,
+        String,
+        serde_json::Value,
+        i64,
+    ) = sqlx::query_as(&format!(
+        "select id, key, version, content_hash, bpmn_xml, bindings, retired_instances \
+               from {} where key = $1 and version = $2",
+        rbpmn_engine::DEFINITION_VIEW
+    ))
+    .bind("p")
+    .bind(1)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, deployed.definition_id);
+    assert_eq!((row.1.as_str(), row.2), ("p", 1));
+    assert_eq!(row.4, xml, "the model itself, byte for byte");
+    assert_eq!(row.5, serde_json::to_value(&bindings).unwrap());
+    assert_eq!(row.6, 0);
+
+    // The hash is the idempotency key deploy actually uses: redeploying the
+    // same bundle must not add a row, and the view must not show two.
+    let again = engine.deploy(&xml, &bindings).await.unwrap();
+    assert!(again.reused);
+    let versions: i64 = sqlx::query_scalar(&format!(
+        "select count(*) from {} where key = 'p'",
+        rbpmn_engine::DEFINITION_VIEW
+    ))
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(versions, 1);
+    assert_eq!(row.3.len(), 64, "a sha256 hex digest: {}", row.3);
+    db.drop().await;
+}
+
+/// The DMN half: the artifacts come back in deployment order, and each
+/// version keeps the ones it was validated with.
+#[cfg(feature = "dmn")]
+#[tokio::test]
+async fn the_decision_view_returns_the_artifacts_in_order() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let bundle =
+        rbpmn_engine::Bundle::new(fixture("accept/01-minimal.bpmn")).decision(DECISION_DMN);
+    let first = engine.deploy_bundle(&bundle).await.unwrap();
+
+    let artifacts: Vec<(String, i32, i32, String)> = sqlx::query_as(&format!(
+        "select definition_key, definition_version, ordinal, dmn_xml from {} \
+           where definition_id = $1 order by ordinal",
+        rbpmn_engine::DEFINITION_DECISION_VIEW
+    ))
+    .bind(first.definition_id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(
+        (artifacts[0].0.as_str(), artifacts[0].1, artifacts[0].2),
+        ("p", 1, 0)
+    );
+    assert_eq!(artifacts[0].3, DECISION_DMN);
+
+    // A changed rule is changed content: a new version, and the old one keeps
+    // the artifact it was validated against.
+    let edited = rbpmn_engine::Bundle::new(fixture("accept/01-minimal.bpmn"))
+        .decision(DECISION_DMN.replace("Amount * 0.1", "Amount * 0.2"));
+    let second = engine.deploy_bundle(&edited).await.unwrap();
+    assert_eq!(second.version, first.version + 1);
+
+    let by_version: Vec<(i32, String)> = sqlx::query_as(&format!(
+        "select definition_version, dmn_xml from {} where definition_key = 'p' \
+          order by definition_version",
+        rbpmn_engine::DEFINITION_DECISION_VIEW
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(by_version.len(), 2);
+    assert!(by_version[0].1.contains("0.1"));
+    assert!(by_version[1].1.contains("0.2"));
+
+    // And they go with the definition when it goes.
+    engine.delete_definition("p", 1).await.unwrap();
+    let left: i64 = sqlx::query_scalar(&format!(
+        "select count(*) from {} where definition_version = 1",
+        rbpmn_engine::DEFINITION_DECISION_VIEW
+    ))
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+    db.drop().await;
+}
+
+/// The deployment inventory — the question asked most often, and the shape
+/// that answers it without dragging every model across the wire.
+#[tokio::test]
+async fn the_deployed_now_query_reports_the_latest_of_every_key() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("warn_customer").await.unwrap();
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().index("channel"),
+        )
+        .await
+        .unwrap();
+    engine
+        .deploy(
+            &fixture("accept/35-non-interrupting-on-subprocess.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+
+    let now: Vec<(String, i32)> = sqlx::query_as(&format!(
+        "select key, version from ({}) q order by key",
+        rbpmn_engine::Engine::DEPLOYED_NOW_SQL
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        now,
+        vec![("p".to_string(), 2), ("shipment".to_string(), 1)],
+        "the latest of every key, and only the latest"
+    );
+    db.drop().await;
+}
+
+/// The whole surface joins up: an instance's definition is reachable through
+/// the stable pair, which is what lets one statement answer "what is running,
+/// on which version of which model".
+#[tokio::test]
+async fn an_instance_reaches_its_definition_through_the_stable_pair() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().index("channel"),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let row: (uuid::Uuid, String, i32, String) = sqlx::query_as(&format!(
+        "select i.id, d.key, d.version, d.content_hash \
+           from {inst} i join {def} d \
+             on d.key = i.definition_key and d.version = i.definition_version \
+          where i.id = $1",
+        inst = rbpmn_engine::INSTANCE_VIEW,
+        def = rbpmn_engine::DEFINITION_VIEW,
+    ))
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!((row.0, row.1.as_str(), row.2), (started.id, "p", 1));
+    assert_eq!(row.3.len(), 64);
+    db.drop().await;
+}

@@ -154,8 +154,14 @@ inclusive gateway, block structure, messages-only interaction, build order).
   a bug that predates scopes (two definitions deploying at once both index
   `rbpmn_instance`). The session must be **idle** between attempts; that is
   what lets the holder's build drain.
-- **The published views (`rbpmn_v_instance`, `rbpmn_v_work_item`) are public
-  API and must stay plain inlinable projections.** No WHERE, no volatile
+- **The published views (`rbpmn_v_definition`,
+  `rbpmn_v_definition_decision`, `rbpmn_v_instance`, `rbpmn_v_work_item`,
+  `rbpmn_v_timer`, `rbpmn_v_subscription` — one per wait state, plus the
+  instance and what it was deployed from) are public API and must stay plain
+  inlinable projections.** A 0..N artifact set does not get folded in with an
+  aggregate; it gets a projection of its own (`rbpmn_v_definition_decision`)
+  or stays a documented query (subscription ambiguity), because an aggregate
+  stops the view being inlinable. No WHERE, no volatile
   function, and above all not `security_barrier` — a barrier view refuses to push `variables->>'f' = $1`
   below itself (`jsonb ->>` is not leakproof), which would strand every
   declared index beneath a full scan. Columns may be added, never removed or
@@ -165,7 +171,37 @@ inclusive gateway, block structure, messages-only interaction, build order).
   is the no-SQL convenience beside it and is explicitly not a search
   primitive — its limit lands before any caller-side filter. `queue_depths`
   deliberately does not repeat that shape: its key set is a bound argument and
-  it has no limit at all.
+  it has no limit at all, and timers get no typed call at all.
+- **`rbpmn_v_timer` publishes what is ARMED, and carries no `overdue`
+  column.** Deliberate, and the asymmetry with `claimable` is the reasoning:
+  `claimable` encodes a rule a caller re-deriving would get wrong, `overdue`
+  would be `due_at < now()` and nothing else — and a boolean cannot express
+  the range queries ("due in the next hour") the raw column can, off the same
+  index. `instance_status` **is** a column, because separating "the scheduler
+  is behind" from "the instance is frozen" is the operational question and
+  should not cost a second join. A `due_at` in the past means due-and-not-yet
+  fired, never late-by-definition; and no view can see a node's in-process
+  deferral set, so none of them claims to say what fires next.
+- **Ask a view for the soonest deadline with `order by due_at limit 1`, never
+  `min(due_at)`.** The aggregate-to-index-scan rewrite is refused across a
+  join, before indexes are considered, so `min()` plans a hash join over two
+  sequential scans — measured, 6 buffers against 733. This is the same finding
+  `Engine::next_due_in` records for the scheduler's own query; it survives the
+  view, and `Engine::NEXT_DEADLINE_SQL` writes the right shape out.
+- **`rbpmn_v_subscription` is searched by `correlation_key` alone, and the
+  correlate index cannot serve that.** `rbpmn_subscription_correlate` is
+  `(message_name, correlation_key)`; a predicate on the second column has no
+  leading equality. Migration 0017 adds `rbpmn_subscription_by_key`. Do not
+  delete it as redundant because a local EXPLAIN shows skip scan picking up the
+  correlate index anyway. Two reasons, both needed: skip scan is PostgreSQL 18
+  and development here runs 18 while CI runs 15 and the claimed floor is 13 —
+  so below 18 there is no index path for a key-only predicate at all; and even
+  on 18 it seeks once per distinct message name, so the cost scales with the
+  deployment's model portfolio. Measured on 60 000 subscriptions: 24 buffers
+  at 4 message names, 394 at 400, against 3 through the explicit index either
+  way. Ambiguity (the 409) is deliberately a documented query
+  and not a column: it needs an aggregate, and an aggregate would stop the
+  view being inlinable.
 - **`rbpmn_v_work_item.claimable` is the claim predicate, not a guess at it.**
   `CLAIMABLE` in `lib.rs` is the one source, and it is written **total**
   (`lock_until is not null`) rather than merely correct-in-a-WHERE, because

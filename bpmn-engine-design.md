@@ -505,6 +505,34 @@ current registration state** and fails loudly with the same rule id
   shapes were reproduced as real Postgres deadlocks. The hazard predates
   scoped indexes: two definitions deploying at once already both index
   `rbpmn_instance`. See `spec/README.md`'s lock inventory.
+- **`rbpmn_v_definition`** is the other half of the surface: not what is
+  happening but what is deployed, for the reconciliation question ("is the
+  model running here the one in git?") that `content_hash` answers. Its 0..N
+  DMN artifacts go in a projection of their own rather than an `array_agg`,
+  for the same reason subscription ambiguity stays a query. No index: the
+  table is bounded by deploys, not throughput.
+- **`rbpmn_v_subscription`** closes the set: one view per wait state, so no
+  wait state is reachable only through an undocumented table. Searched by
+  `correlation_key` alone, because that is the shape a support question
+  arrives in, which needed a new index — `rbpmn_subscription_correlate` leads
+  on `message_name` and cannot seek on the second column. Skip scan gives it a path from
+  PostgreSQL 18 but charges one seek per distinct message name, so the cost
+  grows with the model portfolio and below 18 there is no path at all:
+  measured, 24 buffers at 4 names and 394 at 400, against 3 through the
+  explicit index. Ambiguity is a documented query rather than a column, since an
+  aggregate would stop the view being inlinable, and it is tested to name
+  exactly the pairs `correlate` refuses.
+- **`rbpmn_v_timer`** completes the read surface: the third wait state, and
+  the one asked *when does this next happen?* — a deadline an application
+  renders next to its own row. No new index: the scheduler's
+  `rbpmn_timer_pkey` and `rbpmn_timer_due` already serve both questions, which
+  the migration says out loud so it is not re-derived. No `overdue` column
+  either, and the asymmetry with `claimable` is the argument: `claimable`
+  encodes a rule, `overdue` would be `due_at < now()`. What it does carry is
+  `due_spec` — an operator asking *why is it due then* needs the source of the
+  instant — and `instance_status`, so "scheduler behind" and "instance frozen"
+  are one query apart. The `min()`-over-a-join trap `next_due_in` records
+  survives the view and is documented on it.
 - **`rbpmn_v_work_item`** is the queue half of the published read surface, and
   it exists for a query `count_tasks` could only answer T×D times: "for every
   queue this user can work, how many are waiting?". Its `claimable` column is

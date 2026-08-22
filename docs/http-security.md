@@ -80,8 +80,9 @@ deliberately not the default posture.
   (the indexed expression and the `is not null` predicate), and
   `find_by_shared_index` embeds it once. Same validator, same guarantee; the
   looked-up value is a bound parameter.
-- **The published views** (`rbpmn_v_instance`, `rbpmn_v_work_item`) are
-  read-only projections and
+- **The published views** (`rbpmn_v_definition`,
+  `rbpmn_v_definition_decision`, `rbpmn_v_instance`, `rbpmn_v_work_item`,
+  `rbpmn_v_timer`, `rbpmn_v_subscription`) are read-only projections and
   grant nothing on their own — they are visible to whatever role the
   application's connection already uses, and rbpmn does not manage grants.
   They deliberately carry no row filtering: they are **not** a tenancy
@@ -89,7 +90,14 @@ deliberately not the default posture.
   query. Note in particular that `rbpmn_v_instance` exposes the whole variable
   document, exactly as the inspector does, and `rbpmn_v_work_item` exposes
   `lock_owner` and `last_failure` — a handler's error text, which can carry
-  whatever a failing integration put in it. Who may see any of that is the
+  whatever a failing integration put in it. `rbpmn_v_timer` exposes `due_spec`,
+  which for a variable-sourced deadline is the FEEL path rather than the value,
+  but names a field of the variable document all the same. `rbpmn_v_subscription`
+  exposes `correlation_key`, which **is** a business identifier by
+  construction — an order number, a customer reference — and is the most
+  directly identifying column on the whole surface. And `rbpmn_v_definition`
+  exposes `bpmn_xml` and `bindings` — the process models themselves, which for
+  many organisations are the confidential part. Who may see any of that is the
   application's call.
 - **SSRF**: `HttpPostHandler` targets come from operator configuration at
   engine build time, never from request data or model content.
