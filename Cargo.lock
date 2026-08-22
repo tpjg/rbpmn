@@ -1812,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "rbpmn-bench"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "clap",
@@ -1831,7 +1831,7 @@ dependencies = [
 
 [[package]]
 name = "rbpmn-core"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "proptest",
  "rbpmn-core",
@@ -1843,7 +1843,7 @@ dependencies = [
 
 [[package]]
 name = "rbpmn-dmn"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "dsntk-common",
  "dsntk-feel",
@@ -1858,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "rbpmn-engine"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "rbpmn-core",
@@ -1878,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "rbpmn-model"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "roxmltree 0.20.0",
  "serde",
@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "rbpmn-server"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "rbpmn-engine",
@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "rbpmn-ui"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "axum",
  "rbpmn-engine",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "rbpmn-wasm"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "rbpmn-core",
  "rbpmn-dmn",

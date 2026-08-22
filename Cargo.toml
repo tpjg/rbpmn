@@ -37,7 +37,11 @@ default-members = ["crates/rbpmn-core", "crates/rbpmn-dmn", "crates/rbpmn-engine
 exclude = ["feel-parity", "feel-number-parity", "dmn-tck"]
 
 [workspace.package]
-version = "0.1.0"
+# Kept in step with the git tag by hand. Nothing in the tree reads it — no
+# `CARGO_PKG_VERSION`, no generated version file — so a drift here is silent
+# until someone compares a published crate against a release. It drifted three
+# tags wide once for exactly that reason; bump it with the tag.
+version = "0.3.1"
 edition = "2024"
 # One floor for the whole workspace. DMN sets it: `rbpmn-feel-number`,
 # `rbpmn-dmn` and the shims need 1.94 because fastnum does, and DMN is in the
