@@ -7709,16 +7709,10 @@ async fn the_grouped_depth_query_is_index_driven() {
                 .any(|l| l.contains("Index Cond") && l.contains("definition_key")),
             "and definition_key must be an index condition, not a filter:\n{filtered}"
         );
-        // How the instance join executes is deliberately NOT asserted, and
-        // migration 0015's comment is wrong about it. It says the join
-        // "collapses from hashing every instance to a nested loop on the
-        // primary key"; that was measured against a table with no statistics,
-        // and with them the planner hashes several thousand active instances
-        // instead — correctly, because which join wins is a function of how
-        // many are live. The correction lives here rather than there because
-        // a migration's whole text is checksummed (`MigrationDrift`), so
-        // editing a comment in a released one would refuse to boot every
-        // database that already applied it.
+        // How the instance join executes is deliberately NOT asserted: with
+        // a few thousand live instances the planner hashes them rather than
+        // looping on the primary key, and which wins is a function of how
+        // many are live. 0015 carries the reasoning.
     } else {
         warn_out_of_band(
             "the queue-depth index assertions were skipped: they have only \
