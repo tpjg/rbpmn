@@ -153,7 +153,29 @@ never gated.
 Both read a construct's cost as the **difference against a baseline shape**,
 not as an absolute. `exclusive-split` against `sequence-flow` is one gateway
 evaluation; `parallel-join/8` against `parallel-join/2` is what widening a
-join costs.
+join costs; and `exclusive-split-numeric` against `exclusive-split` is what a
+numeric condition costs over one that short-circuits.
+
+That last pair exists because the suite had a blind spot worth naming. Every
+construct benchmark starts its instance with an **empty** variable document,
+so the generator's branch condition (`x1 = 0`) resolves on the FEEL
+type-mismatch path — a missing value against anything but `null` is a
+mismatch, so it answers null and returns before comparing anything.
+`condition/eval` moved 7x when the FEEL number type became decimal-exact
+(`Num` is text and comparison allocates), and *no* construct benchmark could
+see it, because none of them reached a comparison at all. "Nothing else in the
+suite moved" was therefore not evidence the cost was immaterial; it was
+evidence the suite did not measure it.
+
+The pair closes that: the same model and the same single condition, once
+short-circuited and once compared. It carries an `assert!` that the two land
+on different branches, because a benchmark that quietly stopped exercising
+what it names would report an improvement.
+
+A benchmark added after a baseline was recorded is **not gated** — the gate
+iterates the baseline's entries, so a new one shows in criterion's output and
+nowhere in the table until `just bench-baseline` runs. The reverse (a
+baselined benchmark that did not run) *is* reported, as `(not run)`.
 
 Models for both come from **the fixture corpus's own generator**
 (`crates/rbpmn-core/tests/modelgen`), included rather than copied. It is
