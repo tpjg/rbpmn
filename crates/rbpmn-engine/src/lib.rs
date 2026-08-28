@@ -567,9 +567,12 @@ impl Engine {
     /// deletion evicts.
     pub(crate) fn forget_compiled(&self, definition_id: uuid::Uuid) {
         self.inner.compiled.write().unwrap().remove(&definition_id);
-        // A definition's decisions are cached on the same key and are just as
-        // immutable, so they are evicted with it — leaving them behind would
-        // outlive the thing they belong to.
+        // A definition's manifest and its decisions are cached on the same key
+        // and are just as immutable, so they are evicted with it — leaving
+        // either behind would outlive the thing it belongs to. The manifest
+        // matters most of the three: `Bindings::config` is free JSON with no
+        // size limit, so a leaked one is unbounded.
+        self.inner.manifests.write().unwrap().remove(&definition_id);
         #[cfg(feature = "dmn")]
         self.inner.decisions.write().unwrap().remove(&definition_id);
     }
@@ -775,5 +778,41 @@ impl Engine {
 
     fn pool(&self) -> &PgPool {
         &self.inner.pool
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    /// A deleted definition's caches go with it. Asserted here rather than
+    /// through `delete_definition`, because residency is not observable from
+    /// outside the crate: warming the manifest cache needs an instance, and
+    /// deleting an instance retires a record that then refuses the
+    /// definition's own deletion. The property is about these three maps, so
+    /// the test is about these three maps.
+    ///
+    /// The manifest is the one that matters most: `Bindings::config` is free
+    /// JSON with no size limit, so an entry left behind is an unbounded leak
+    /// per deleted version.
+    // A lazy pool builds no connection, but `PgPool` still wants a reactor to
+    // hold its idle timer — hence the runtime, and nothing here talks to a
+    // database.
+    #[tokio::test]
+    async fn forgetting_a_definition_forgets_its_manifest_too() {
+        let engine =
+            Engine::builder(PgPool::connect_lazy("postgres://invalid").expect("lazy pool")).build();
+        let id = uuid::Uuid::new_v4();
+        engine.cache_manifest(
+            id,
+            Arc::new(Bindings::new().config("st", serde_json::json!({}))),
+        );
+        assert!(engine.cached_manifest(id).is_some());
+
+        engine.forget_compiled(id);
+        assert!(
+            engine.cached_manifest(id).is_none(),
+            "a manifest outlived the definition it belongs to"
+        );
     }
 }

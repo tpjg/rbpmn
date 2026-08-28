@@ -158,7 +158,11 @@ function renderElement(container, data, viewer, elementId) {
   // the only place a reader can recover it — and for elements the token has
   // not reached, the only place at all.
   const wiring = wiringFor(data, bo, elementId);
-  const config = data.bindings?.config?.[elementId];
+  // Own keys only: element ids are NCNames and `__proto__` is one, so a plain
+  // lookup would hand back `Object.prototype` and render a Wiring section for
+  // a manifest that configures nothing.
+  const configs = data.bindings?.config;
+  const config = configs && Object.hasOwn(configs, elementId) ? configs[elementId] : undefined;
   if (wiring.length || config !== undefined) {
     const { wrap, body } = section('Wiring');
     for (const [label, value, note] of wiring) body.append(field(label, value, { title: note }));
@@ -210,13 +214,19 @@ function renderElement(container, data, viewer, elementId) {
   container.append(traceWrap);
 }
 
+/// One manifest entry, own keys only — see the note on `config` below for
+/// what a plain lookup does to an element called `__proto__`.
+function own(group, key) {
+  return group != null && Object.hasOwn(group, key) ? group[key] : undefined;
+}
+
 /// What the manifest says about this element, including the default nobody
 /// wrote down: an unmapped service task runs on a topic named after itself.
 function wiringFor(data, bo, elementId) {
   const out = [];
   const bindings = data.bindings ?? {};
   const type = bo?.$type ?? '';
-  const topic = bindings.topics?.[elementId];
+  const topic = own(bindings.topics, elementId);
   if (type === 'bpmn:ServiceTask') {
     out.push(
       topic
@@ -226,7 +236,7 @@ function wiringFor(data, bo, elementId) {
   } else if (topic) {
     out.push(['topic', topic, 'bound in the deployment manifest']);
   }
-  const correlation = bindings.correlations?.[elementId];
+  const correlation = own(bindings.correlations, elementId);
   if (correlation) out.push(['correlation key', correlation, 'FEEL path into the variables']);
   return out;
 }

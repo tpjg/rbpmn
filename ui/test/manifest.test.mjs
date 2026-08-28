@@ -7,6 +7,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  binding,
   emptyManifest,
   formatConfig,
   formatIndexField,
@@ -245,4 +246,23 @@ test('setConfigBinding does not mutate the manifest it was given', () => {
 test('config is not in the orphan warning, because the rule covers it', () => {
   const manifest = { ...emptyManifest(), config: { gone: { template: 'a' } } };
   assert.deepEqual(orphanedBindings(manifest, ['st']), []);
+});
+
+// `__proto__` is a valid NCName, so bpmn-js will hand it out as an element id.
+// Writing it with `=` calls the Object.prototype setter: nothing is stored,
+// nothing serializes, and the read comes back off the prototype chain — so the
+// box looks saved while the manifest is empty.
+test('an element called __proto__ is a key, not a prototype write', () => {
+  const manifest = setConfigBinding(emptyManifest(), '__proto__', '{"template":"a"}');
+  assert.deepEqual(Object.keys(manifest.config), ['__proto__']);
+  assert.equal(formatConfig(manifest, '__proto__'), '{\n  "template": "a"\n}');
+  assert.equal(serializeManifest(manifest).includes('"template": "a"'), true);
+  assert.deepEqual(parseManifest(serializeManifest(manifest)).config.__proto__, { template: 'a' });
+});
+
+test('and an unconfigured __proto__ reads as unconfigured, not as a prototype', () => {
+  assert.equal(formatConfig(emptyManifest(), '__proto__'), '');
+  assert.equal(binding(emptyManifest(), 'topics', '__proto__'), undefined);
+  const topics = setBinding(emptyManifest(), 'topics', '__proto__', 'payments');
+  assert.equal(binding(topics, 'topics', '__proto__'), 'payments');
 });

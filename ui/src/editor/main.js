@@ -19,6 +19,7 @@ import { ensureDi } from '../shared/layout.js';
 import { el } from '../shared/dom.js';
 import { renderProperties } from './properties.js';
 import {
+  binding,
   emptyManifest,
   formatConfig,
   orphanedBindings,
@@ -385,7 +386,13 @@ async function runCheck({ syncXmlBox = true } = {}) {
         payload: { title: `${d.rule}: ${d.message}` },
       }))
   );
-  renderWiring();
+  // Not while someone is typing in it. The wiring pane is rebuilt from
+  // scratch, so a re-render mid-edit replaces the control under the caret
+  // with whatever the manifest last committed — the same hazard the XML and
+  // manifest boxes guard against above, and a worse one here since the config
+  // box holds a whole object rather than one word. A blur commits first, so
+  // nothing is lost by waiting: the next check re-renders it.
+  if (!ui.wiring.contains(document.activeElement)) renderWiring();
   renderTryIt();
 }
 
@@ -483,7 +490,7 @@ function renderWiring() {
   }
 
   if (wantsTopic) {
-    const bound = state.manifest.topics[id];
+    const bound = binding(state.manifest, 'topics', id);
     const effective = bound || id;
     const row = bindingRow(
       'topic',
@@ -514,7 +521,7 @@ function renderWiring() {
   }
 
   if (wantsDecision) {
-    const bound = state.manifest.decisions[id] ?? { decision: '', result: '' };
+    const bound = binding(state.manifest, 'decisions', id) ?? { decision: '', result: '' };
     // The invocables the *bundle* exposes. Unlike topics this needs no
     // server: the artifacts are part of the deployment, so the editor knows
     // the whole answer.
@@ -554,7 +561,7 @@ function renderWiring() {
     ui.wiring.append(
       bindingRow(
         'correlation key',
-        state.manifest.correlations[id] ?? '',
+        binding(state.manifest, 'correlations', id) ?? '',
         'order.id',
         (value) => {
           state.manifest = setBinding(state.manifest, 'correlations', id, value);

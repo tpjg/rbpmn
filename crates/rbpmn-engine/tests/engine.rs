@@ -9079,3 +9079,65 @@ async fn a_claim_is_handed_back_when_the_manifest_cannot_be_read() {
     assert_eq!(row.get::<i64, _>("lease_no"), 1);
     db.drop().await;
 }
+
+/// The manifest is stored as jsonb, and PostgreSQL cannot represent a NUL in
+/// a string. Config is the first manifest field carrying arbitrary
+/// application text — topics resolve against a NUL-free declared set,
+/// correlations are parsed FEEL names, index fields are identifier-validated
+/// — so this boundary became reachable with it, and a well-formed request
+/// must not come back as a raw database error.
+#[tokio::test]
+async fn a_nul_in_the_manifest_is_refused_at_the_boundary() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    match engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().config("review", serde_json::json!({ "note": "a\u{0}b" })),
+        )
+        .await
+    {
+        Err(DeployError::InvalidManifest(message)) => {
+            assert!(message.contains("u0000"), "{message}");
+        }
+        other => panic!("expected InvalidManifest, got {other:?}"),
+    }
+    db.drop().await;
+}
+
+/// Startup re-validation reproduces the deploy gates against stored rows, and
+/// config is one of them: an entry that no longer binds a task would deliver
+/// nothing and say nothing, which is the failure `config-binds-task` exists
+/// to prevent. Reached by editing the row, since deploy refuses to write one.
+#[tokio::test]
+async fn startup_revalidation_sees_a_config_key_that_stopped_binding() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().config("review", serde_json::json!({ "form": "contest" })),
+        )
+        .await
+        .unwrap();
+    assert!(engine.check_active_definitions().await.unwrap().is_empty());
+
+    sqlx::query(
+        "update rbpmn_definition set bindings = \
+         '{\"config\":{\"renamed_away\":{\"form\":\"contest\"}}}'::jsonb",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let diags = Engine::builder(db.pool.clone())
+        .build()
+        .check_active_definitions()
+        .await
+        .unwrap();
+    assert!(
+        diags.iter().any(|d| d.rule == "config-binds-task"),
+        "{diags:?}"
+    );
+    db.drop().await;
+}

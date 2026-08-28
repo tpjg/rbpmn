@@ -4,9 +4,13 @@
 //! check compares this byte-for-byte with what the WASM build produces — the
 //! guarantee that the playground never lies.
 //!
-//! `check_json` runs over the BPMN corpus with an empty manifest, which is the
-//! interesting case: it drives the compile stage (phase gating, correlation
-//! bindings, topic resolution) that `lint_json` never reaches.
+//! `check_json` runs over the BPMN corpus, driving the compile stage (phase
+//! gating, correlation bindings, topic resolution) that `lint_json` never
+//! reaches. Each fixture is paired with its `.bindings.json` sidecar where
+//! the corpus writes one, and an empty manifest otherwise: a `.bpmn` is half
+//! a deployment, and comparing the halves separately would leave the manifest
+//! rules (`decision-has-binding`, `ambiguous-message-arm`,
+//! `config-binds-task`) uncompared between the two builds.
 //!
 //! It also runs over the **DMN corpus**, one artifact at a time against a
 //! fixed minimal process. Decisions are where native and WASM are most likely
@@ -54,8 +58,14 @@ fn main() {
     for dir in ["accept", "reject"] {
         for (file, xml) in fixtures(&bpmn_root.join(dir), "bpmn") {
             let name = format!("{dir}/{file}");
+            let sidecar = bpmn_root
+                .join(dir)
+                .join(file.replace(".bpmn", ".bindings.json"));
+            let bindings = fs::read_to_string(&sidecar)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "{}".to_string());
             lint.insert(name.clone(), rbpmn_wasm::lint_json(&xml));
-            check.insert(name, rbpmn_wasm::check_json(&xml, "{}", "[]"));
+            check.insert(name, rbpmn_wasm::check_json(&xml, &bindings, "[]"));
         }
     }
 

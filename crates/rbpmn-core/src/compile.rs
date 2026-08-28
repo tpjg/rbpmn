@@ -27,7 +27,17 @@ pub type ScopeIx = usize;
 /// fails (`message-has-correlation`) — and neither does [`Bindings::config`],
 /// which is why a config entry binding nothing is an error where a stale
 /// topic is not (`config-binds-task`).
+///
+/// **Unknown groups are refused, not dropped.** A manifest is hand-written
+/// next to the `.bpmn`, and `"cofig"` silently deserializing to nothing is
+/// exactly the failure [`Bindings::config`] exists to prevent: wiring that
+/// looks written and never arrives. The editor has always refused an unknown
+/// key; this is the library, the CLI and `POST /v1/definitions` catching up.
+/// The cost is deliberate too — an older rbpmn reading a manifest a newer one
+/// wrote refuses it rather than running a definition with wiring it cannot
+/// see.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Bindings {
     #[serde(default)]
     pub topics: BTreeMap<String, String>,
@@ -425,9 +435,8 @@ impl TimerSource {
     }
 }
 
-/// How a JSON value reads in an incident message, or in a diagnostic about
-/// a manifest entry that is not the shape it has to be.
-pub(crate) fn describe(value: &serde_json::Value) -> &'static str {
+/// How a JSON value reads in an incident message.
+fn describe(value: &serde_json::Value) -> &'static str {
     match value {
         serde_json::Value::Null => "missing (or null)",
         serde_json::Value::Bool(_) => "a boolean",
@@ -1524,6 +1533,18 @@ mod config_tests {
 
     /// Free JSON, and *free* means the nesting too: rbpmn never looks inside,
     /// so nothing here may depend on the shape below the top level.
+    /// A typo in a group name is a manifest that deploys and delivers
+    /// nothing — the failure this whole feature is built to make impossible,
+    /// arriving one level up.
+    #[test]
+    fn a_misspelled_group_is_refused_rather_than_dropped() {
+        let e = serde_json::from_str::<Bindings>(
+            r#"{"cofig":{"st":{"template":"x"}},"topics":{"st":"payments"}}"#,
+        )
+        .expect_err("a manifest that says something rbpmn does not understand");
+        assert!(e.to_string().contains("cofig"), "{e}");
+    }
+
     #[test]
     fn config_values_are_not_interpreted() {
         let value = json!({"letters": ["a", {"b": [1, 2, null]}], "n": 1.5});

@@ -211,6 +211,18 @@ fn hostile_data_cannot_escape_the_data_block() {
         assert_eq!(parsed["workItems"][0]["lastFailure"], *hostile);
         assert_eq!(parsed["events"][0]["display"], *hostile);
         assert_eq!(parsed["bpmnXml"], inspection.bpmn_xml);
+        // The manifest too, and at depth. Without this the escaping check
+        // above passes when the payload is simply *gone* — a raw-character
+        // scan cannot tell "escaped correctly" from "dropped on the way in".
+        assert_eq!(parsed["bindings"]["topics"][*hostile], *hostile);
+        assert_eq!(
+            parsed["bindings"]["config"][*hostile][*hostile][0],
+            *hostile
+        );
+        assert_eq!(
+            parsed["bindings"]["config"][*hostile][*hostile][1]["deeper"],
+            *hostile
+        );
     }
 }
 

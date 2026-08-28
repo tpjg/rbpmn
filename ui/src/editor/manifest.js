@@ -127,9 +127,7 @@ export function parseManifest(text) {
       throw new Error('"config" must be an object of elementId -> object');
     }
     for (const [key, entry] of Object.entries(value)) {
-      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
-        throw new Error(`"config.${key}" must be a JSON object`);
-      }
+      if (!isConfigEntry(entry)) throw new Error(`"config.${key}" must be a JSON object`);
     }
   }
   const unknown = Object.keys(raw).filter(
@@ -198,7 +196,7 @@ export function setBinding(manifest, group, elementId, value) {
   if (value === null || value === undefined || value.trim() === '') {
     delete next[group][elementId];
   } else {
-    next[group][elementId] = value.trim();
+    put(next[group], elementId, value.trim());
   }
   return next;
 }
@@ -223,18 +221,53 @@ export function setConfigBinding(manifest, elementId, text) {
   } catch (e) {
     throw new Error(`not valid JSON: ${e.message}`);
   }
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+  // One predicate with `parseManifest`, framed for whoever is reading: there
+  // the manifest is a file and the key locates the problem, here it is a box
+  // and an example is more use than a path.
+  if (!isConfigEntry(value)) {
     throw new Error('a config entry is a JSON object, like {"template": "warning_first"}');
   }
-  next.config[elementId] = value;
+  put(next.config, elementId, value);
   return next;
+}
+
+/// The shape rbpmn accepts for one config entry (`config-binds-task`): an
+/// object, and nothing else. What is *inside* is the application's and is
+/// never inspected, at any depth.
+function isConfigEntry(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 /// The box's text for an element: pretty-printed so it is editable, and empty
 /// when nothing is configured.
 export function formatConfig(manifest, elementId) {
-  const entry = manifest.config?.[elementId];
-  return entry === undefined ? '' : JSON.stringify(entry, null, 2);
+  if (!has(manifest.config, elementId)) return '';
+  return JSON.stringify(manifest.config[elementId], null, 2);
+}
+
+/// Element ids are NCNames, and `__proto__` is one. Writing it with `=` calls
+/// the Object.prototype setter instead of creating a key: nothing is stored,
+/// nothing serializes, and the next read gets the object back off the
+/// prototype chain — so the box looks saved while the manifest is empty.
+/// Reading it with `[]` on a manifest that has no such key is the mirror
+/// image, and hands out `Object.prototype`.
+function put(group, key, value) {
+  Object.defineProperty(group, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+function has(group, key) {
+  return group != null && Object.hasOwn(group, key);
+}
+
+/// Read one entry of a manifest group, own keys only — the read half of what
+/// [`put`] guards on the write side.
+export function binding(manifest, group, elementId) {
+  return has(manifest[group], elementId) ? manifest[group][elementId] : undefined;
 }
 
 /// Set one half of a decision binding. Clearing either half removes the whole
@@ -243,15 +276,17 @@ export function formatConfig(manifest, elementId) {
 /// worse than none.
 export function setDecisionBinding(manifest, elementId, field, value) {
   const next = { ...manifest, decisions: { ...manifest.decisions } };
-  const current = next.decisions[elementId] ?? { decision: '', result: '' };
+  const current = has(next.decisions, elementId)
+    ? next.decisions[elementId]
+    : { decision: '', result: '' };
   const updated = { ...current, [field]: (value ?? '').trim() };
   if (!updated.decision || !updated.result) {
     // Keep the partial entry in memory so typing one field does not erase the
     // other, but never let a half-binding reach the serialized manifest.
-    next.decisions[elementId] = updated;
+    put(next.decisions, elementId, updated);
     if (!updated.decision && !updated.result) delete next.decisions[elementId];
   } else {
-    next.decisions[elementId] = updated;
+    put(next.decisions, elementId, updated);
   }
   return next;
 }

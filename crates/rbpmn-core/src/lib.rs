@@ -30,7 +30,7 @@ mod merge_patch;
 mod state;
 mod step;
 
-pub use check::{Checked, DeployCheck, check_deployable};
+pub use check::{Checked, DeployCheck, check_deployable, config_bindings};
 pub use compile::{
     Bindings, CompileError, ExecKind, ExecutableProcess, FlowIx, IndexDeclaration, IndexScope,
     NodeIx, ScopeIx, TimerDue, WorkKind,

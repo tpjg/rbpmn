@@ -188,7 +188,15 @@ defect that is genuinely inert there.
 
 New rule id, nothing renamed. Error severity. Reported through
 `check_deployable`, so the editor's L2 pane, the playground and `deploy` all
-get it from one implementation and `just parity` covers it.
+get it from one implementation — and through `Engine::check_active_definitions`,
+which re-checks stored definitions at startup and must not be the one path
+that skips it.
+
+**It does not gate the compile stage.** Config is not in `ExecutableProcess`;
+compilation never reads it. Letting a config error take the early return would
+make the mildest manifest defect there is hide `unresolved-topic` and
+`message-has-correlation` until the next round trip, so the diagnostics are
+held back and appended after the compile attempt instead.
 
 ### D6 — validated in the core, delivered from the engine's cache
 
@@ -295,8 +303,23 @@ and `definition_version` on `WorkItem`.
 `LockedTask` is `Serialize` with camelCase.
 
 **`rbpmn-wasm` / playground / bpmnlint plugin.** Nothing beyond a rebuild:
-the rule is in the core, so both exports get it and `just parity` compares
-them.
+the rule is in the core, so both exports get it.
+
+What `just parity` covers needed a fix to be worth saying, though. It fed
+`"{}"` as the manifest for every fixture on both sides, so the whole manifest
+half of L2 — `decision-has-binding`, `ambiguous-message-arm`,
+`config-binds-task` — was never compared between the builds. Both sides now
+read each fixture's `.bindings.json` sidecar where the corpus writes one,
+which is verifiable rather than asserted: `accept/28-demo-order.bpmn` moves
+from `decision-has-binding` (no binding) to `unresolved-decision` (bound, no
+artifact bundled in the dump).
+
+That closes the structural gap. It does not make `config-binds-task` *fire* in
+the corpus — no fixture's manifest is deliberately wrong, and inventing one
+would need a convention the corpus does not have, since `expect-diagnostics`
+is a comment in the `.bpmn` and reads L1 only. The rule's messages are covered
+by `check.rs`'s unit tests. Known and waiting, not designed: an L2 expectation
+format for sidecars.
 
 **The editor.** `parseManifest` currently *throws* on an unknown manifest key,
 so an editor build that has not learned `config` refuses a manifest carrying
@@ -342,8 +365,9 @@ Linter rules first, with fixtures, then execution — as always.
   `impl Into<serde_json::Value>`.
 - `rule::CONFIG_BINDS_TASK` + `CATALOGUE` entry.
 - `config-binds-task` in `check_deployable`, beside `decision_bindings`.
-- Fixtures through the `.bindings.json` sidecar convention, plus unit tests in
-  the shape of `check.rs`'s decision-binding tests.
+- Unit tests in the shape of `check.rs`'s decision-binding tests, which is
+  where every other L2 rule's coverage lives: the fixture corpus runner is
+  `rbpmn_model::lint` only, so an L2 rule cannot have a fixture in it.
 - README: manifest table row, catalogue row, D1's deciding question.
 
 Owes: `cargo test`, `just lint`, `just parity`.
@@ -393,11 +417,16 @@ on the warm path. There is no new query to plan.
 |---|---|
 | Empty config does not change the serialized manifest | the existing byte-for-byte test in `compile.rs` |
 | A config entry round-trips, and a non-object entry is refused | `compile.rs` unit tests |
-| `config-binds-task` fires for a missing element, a gateway, a business-rule task | `check.rs` unit tests + a reject fixture with a sidecar |
-| A service task and a user task both accept config | accept fixture with a sidecar |
+| `config-binds-task` fires for a missing element and for a non-task element | `check.rs` unit tests |
+| A service task and a user task both accept config, at any depth | `check.rs` unit tests |
+| A config error does not hide the compile stage's diagnostics | `check.rs` unit tests |
+| A misspelled manifest group is refused, not dropped | `compile.rs` unit test |
+| A NUL in the manifest is refused at deploy, not by Postgres | `engine.rs` |
+| Startup re-validation sees a config key that stopped binding | `engine.rs` |
+| A deleted definition's manifest leaves the cache with it | `lib.rs` unit test |
 | Config reaches a pull claim and a push handler | `crates/rbpmn-engine/tests/engine.rs` |
 | A pinned instance keeps its version's config after a newer deploy | `engine.rs` — the assertion the feature exists for |
-| Native and WASM agree on the new rule | `just parity`, over the corpus |
+| Native and WASM agree over the corpus *with its manifests* | `just parity` |
 | The editor round-trips a config manifest byte for byte | `just ui-test` |
 
 ---
@@ -409,6 +438,13 @@ on the warm path. There is no new query to plan.
   rides in the definition row, the deploy body and the compile cache. No limit
   by D4. If this ever hurts, the number will be measurable rather than
   guessed.
+- **Every claim deep-copies its config.** `LockedTask::config` and
+  `WorkItem::config` are `Option<serde_json::Value>`, so resolving one clones
+  the whole value out of the cache — unbounded, by D4, on the hottest path
+  there is. Kept anyway: an owned `Value` is the API a handler wants, and the
+  fix if a real config ever makes this measurable is known — cache
+  `Arc<Value>` per element and hand that out instead. Named here rather than
+  pre-optimised, because the size at which it matters has not been seen.
 - **Half-strict manifest.** After D5, a stale key is an error in `config` and
   a silent no-op in the other three groups. The asymmetry is principled (a
   default versus no default) but it is still an asymmetry, and the catalogue

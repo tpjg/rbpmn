@@ -125,12 +125,18 @@ pub fn check_deployable(
 
     let mut diagnostics = decided.diagnostics;
     diagnostics.extend(decision_bindings(bindings, &decided.invocables));
-    diagnostics.extend(config_bindings(bindings, &defs.processes[0]));
     diagnostics.extend(rbpmn_model::lint(&defs));
+    // Held back from the gate below rather than added here, deliberately.
+    // Compilation does not read config — it is not in `ExecutableProcess` at
+    // all — so letting a config error skip the compile stage would make the
+    // mildest manifest defect there is hide `unresolved-topic` and
+    // `message-has-correlation` until the next round trip.
+    let config = config_bindings(bindings, &defs.processes[0]);
     // Compilation re-lints, so running it over a model the linter already
     // rejected would only restate those errors. Stop at the first gate, the
     // way deploy does.
     if rbpmn_model::has_errors(&diagnostics) {
+        diagnostics.extend(config);
         return DeployCheck::Checked(Checked {
             key,
             diagnostics,
@@ -142,7 +148,9 @@ pub fn check_deployable(
     // Phase gating + condition/topic/correlation resolution. The mappings
     // below are the contract: a compile failure is reported as the rule a
     // modeler can act on, never as a raw error string.
-    match ExecutableProcess::compile(&defs, &key, bindings) {
+    let compiled = ExecutableProcess::compile(&defs, &key, bindings);
+    diagnostics.extend(config);
+    match compiled {
         Ok(proc) => {
             let topics = proc
                 .service_topics()
@@ -262,7 +270,10 @@ fn decision_bindings(bindings: &Bindings, invocables: &[Invocable]) -> Vec<Diagn
 /// Independent of both lint and compile, deliberately: a manifest that binds
 /// nothing is worth saying on the same trip as the model errors, not on the
 /// one after they are fixed.
-fn config_bindings(bindings: &Bindings, process: &rbpmn_model::model::Process) -> Vec<Diagnostic> {
+pub fn config_bindings(
+    bindings: &Bindings,
+    process: &rbpmn_model::model::Process,
+) -> Vec<Diagnostic> {
     if bindings.config.is_empty() {
         return Vec::new();
     }
@@ -280,7 +291,7 @@ fn config_bindings(bindings: &Bindings, process: &rbpmn_model::model::Process) -
                     "config is {}, and a config entry is a JSON object — a single \
                      value is spelled {{\"template\": \"warning_first\"}}, which \
                      leaves room for a second key without changing the shape",
-                    crate::compile::describe(config)
+                    json_kind(config)
                 ),
             ));
         }
@@ -311,6 +322,24 @@ fn config_bindings(bindings: &Bindings, process: &rbpmn_model::model::Process) -
         }
     }
     diagnostics
+}
+
+/// How a JSON value reads in a diagnostic about a manifest entry.
+///
+/// Deliberately not `compile::describe`, which serves incidents about the
+/// *variable document*: there a missing path and an explicit null are the
+/// same answer, so it says "missing (or null)". A manifest key that is
+/// present with a null value is not missing, and telling a modeller it is
+/// sends them looking for a key they are staring at.
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "a list",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 /// Every element in the process, subprocess bodies included: a config entry
@@ -534,6 +563,51 @@ mod tests {
         assert_eq!(elements, vec!["gone", "gone", "st", "ut"], "{d:?}");
         assert!(d[2].message.contains("a string"), "{:?}", d[2]);
         assert!(d[3].message.contains("a list"), "{:?}", d[3]);
+    }
+
+    /// The mildest manifest defect there is must not hide model errors: a
+    /// config key that binds nothing stops nothing, so the compile stage still
+    /// runs and still reports what only it can see.
+    #[test]
+    fn a_stale_config_key_does_not_hide_the_compile_stage() {
+        let c = checked(
+            TWO_BOUNDARIES,
+            &Bindings::new()
+                .correlation("b1", "order.id")
+                .correlation("b2", "order.id")
+                .config("gone", json!({})),
+        );
+        let rules: Vec<&str> = c.diagnostics.iter().map(|d| d.rule.as_str()).collect();
+        assert!(rules.contains(&rule::CONFIG_BINDS_TASK), "{rules:?}");
+        assert!(rules.contains(&rule::AMBIGUOUS_MESSAGE_ARM), "{rules:?}");
+    }
+
+    /// ...and a model that compiles still resolves its topics, so the
+    /// environment link the caller performs is not skipped either.
+    #[test]
+    fn a_stale_config_key_does_not_hide_the_resolved_topics() {
+        let c = checked(
+            CONFIGURABLE,
+            &Bindings::new()
+                .topic("st", "payments")
+                .config("gone", json!({})),
+        );
+        assert!(!c.ok(), "the config error is still an error");
+        assert!(
+            c.topics
+                .contains(&("st".to_string(), "payments".to_string())),
+            "{:?}",
+            c.topics
+        );
+    }
+
+    /// A manifest key that is present with a null value is not *missing*, and
+    /// saying so sends a modeller looking for a key they are staring at.
+    #[test]
+    fn a_null_config_entry_is_described_as_null() {
+        let d = config_errors(CONFIGURABLE, &Bindings::new().config("st", json!(null)));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("config is null"), "{:?}", d[0]);
     }
 
     /// The JSON path and the fluent path are one manifest and one validation

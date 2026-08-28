@@ -557,20 +557,26 @@ fn scrub_nul(value: &str) -> String {
     value.replace('\u{0}', "\u{fffd}")
 }
 
+/// Does any string anywhere in this document carry a NUL? PostgreSQL jsonb
+/// cannot represent one, so every JSON-into-jsonb boundary asks — the
+/// variables paths through [`reject_nul`], the deploy manifest through
+/// `DeployError::InvalidManifest`, because a manifest is not variables and
+/// must not be reported as if it were.
+pub(crate) fn contains_nul(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::String(s) => s.contains('\u{0}'),
+        serde_json::Value::Array(a) => a.iter().any(contains_nul),
+        serde_json::Value::Object(m) => m
+            .iter()
+            .any(|(k, v)| k.contains('\u{0}') || contains_nul(v)),
+        _ => false,
+    }
+}
+
 /// PostgreSQL jsonb cannot represent NUL in strings; reject it loudly at the
 /// boundary instead of poisoning the step transaction forever.
 fn reject_nul(value: &serde_json::Value) -> Result<(), EngineError> {
-    fn has_nul(v: &serde_json::Value) -> bool {
-        match v {
-            serde_json::Value::String(s) => s.contains('\u{0}'),
-            serde_json::Value::Array(a) => a.iter().any(has_nul),
-            serde_json::Value::Object(m) => {
-                m.iter().any(|(k, v)| k.contains('\u{0}') || has_nul(v))
-            }
-            _ => false,
-        }
-    }
-    if has_nul(value) {
+    if contains_nul(value) {
         return Err(EngineError::InvalidVariables(
             "strings must not contain \\u0000 (PostgreSQL jsonb cannot store it)".to_string(),
         ));
