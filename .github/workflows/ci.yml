@@ -20,6 +20,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # So a run can be started against any branch without opening a PR first.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
