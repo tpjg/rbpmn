@@ -835,13 +835,20 @@ to a browser audience are all the application's job.
 
 ## Developing
 
-`.build.yml` runs these on sourcehut, one CI task per command, so a red build
-names the discipline that broke rather than "tests failed". Two exceptions,
-both deliberate and both stated in the table below: the **benchmarks** are a
-separate track that never gates on absolute numbers, and a shared builder is
-the worst machine to measure on; and **`just dmn-tck`** fetches the DMN TCK,
-dsntk's source and a third-party runner from the network, which makes it the
-gate for a dsntk version bump rather than a per-commit check.
+`.github/workflows/ci.yml` runs these on GitHub Actions, one step per command,
+so a red build names the discipline that broke rather than "tests failed". Two
+exceptions, both deliberate and both stated in the table below: the
+**benchmarks** are a separate track that never gates on absolute numbers, and
+a shared runner is the worst machine to measure on; and **`just dmn-tck`**
+fetches the DMN TCK, dsntk's source and a third-party runner from the network,
+which makes it the gate for a dsntk version bump rather than a per-commit
+check.
+
+Two jobs, split by setup rather than by taste: `build` needs Postgres and a
+browser, `differential` needs a C toolchain and two lockfiles that are
+deliberately outside the workspace. CI runs PostgreSQL 15 against a local 18,
+which is coverage rather than an oversight — 15 exercises the floor the engine
+claims, and an 18-only regression is what the local suite is for.
 
 CI is the backstop, not the workflow: knowing which command a change *owes*
 is what keeps the loop short, because every one of these guards something
