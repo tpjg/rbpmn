@@ -240,6 +240,7 @@ decision error and a model error read the same way.
 | `feel-deterministic` ⁺ | error | No `now()`/`today()` (dsntk answers them from the *node's* local timezone) and no external Java or PMML functions. Time enters a decision as an input, never from a clock. Deliberately conservative: it errs toward refusing. |
 | `decision-has-binding` ⁺ | error | A business-rule task's decision binding lives in the manifest, never in the XML, and must be well-formed: a decision name, and a FEEL qualified name for where the answer lands. |
 | `unresolved-decision` ⁺ | error | Every bound decision names exactly one invocable in the bundled DMN. Unlike `unresolved-topic` this needs no environment — decisions travel *inside* the deployment, so the verdict is complete offline. Ambiguity is refused rather than resolved by picking. |
+| `config-binds-task` ⁺ | error | A manifest config entry is a JSON object keyed by a service or user task — the elements that produce a work item to deliver it on. Stricter than a stale key in the other manifest groups, which is only an editor warning: those have a default, so an override for an element that is not there overrides nothing, while config has none and an entry nothing delivers is wiring that silently never arrives. |
 
 ### The structural rules have counterexamples, not just rationales
 
@@ -276,6 +277,7 @@ server. Two syntaxes, one manifest, one validation path.
 | Message correlation | `Bindings::correlation(element_id, "order.id")` — FEEL qualified name into the instance variables; a message boundary event is bound by its **own** id, not its host's | `message-has-correlation` |
 | Decision | `Bindings::decision(element_id, decision_name, "order.discount")` — which decision a business-rule task invokes, and where its answer lands | `decision-has-binding`, `unresolved-decision` |
 | Filterable fields | `Bindings::index(field)` (this definition) or `Bindings::shared_index(field)` (across definitions) — optional, performance only | — |
+| Task config | `Bindings::config(element_id, json!({"template": "warning_first"}))` — free JSON delivered beside the variables on every work item that element produces, never interpreted | `config-binds-task` |
 
 Per-definition wiring deploys **atomically with the definition** as a small
 JSON bindings manifest (`deploy(bpmn_xml, bindings)` in the library, one
@@ -283,6 +285,35 @@ JSON bindings manifest (`deploy(bpmn_xml, bindings)` in the library, one
 information other engines smear into vendor XML annotations, separated cleanly
 and reviewable in git next to the `.bpmn`. Environment capabilities (handler
 targets, `declare_topic`) are engine/server configuration, not manifest content.
+
+### Config is model content, not runtime configuration
+
+`Bindings::config` is the one manifest group whose value is the application's
+own, so it is the one that attracts things which do not belong in a model. The
+manifest is inside `content_hash` and an instance is pinned to the version it
+started on, which means **changing config is a deploy, by construction**, and
+running instances keep the config they started with.
+
+One deciding question: **must this change with a deploy?**
+
+- **Yes** — a document template, a form name, a threshold that is part of what
+  the model *does*. That is config, and hashing it is the point: two
+  installations on the same `content_hash` are running the same model, letters
+  included.
+- **No** — an endpoint URL, a credential, a per-environment switch. Those are
+  not model content and must not be in the manifest, because the only way to
+  change a hashed manifest is to deploy. They belong to the environment half,
+  or to the application's own store.
+
+For that second case the mechanism is unchanged and fully supported: every
+claimed task carries `definition_id` and `definition_version`, the exact
+version the instance is pinned to, and an application resolves whatever it
+likes against that pair. Config did not replace it — the two answer different
+questions, and `docs/design/task-config.md` (D7) is the long form.
+
+rbpmn never interprets a config value at any depth: no FEEL, no interpolation,
+no defaults per topic. The instance variables travel beside it on the same work
+item; composing the two is the handler's job.
 
 ### Declared indexes have a scope
 

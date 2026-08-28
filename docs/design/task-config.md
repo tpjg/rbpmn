@@ -1,7 +1,7 @@
 # Task config — design round
 
-**Status: design only. No code in this round.** The slices at the bottom are
-the staging; the decisions above them are why.
+**Status: slice 1 landed (the manifest group and `config-binds-task`).**
+The slices at the bottom are the staging; the decisions above them are why.
 
 This round covers **re-usable tasks that carry a little configuration** — one
 handler on one topic, invoked from many call sites, each call site configured
@@ -129,13 +129,24 @@ history, not the specification.)
 ### D4 — entries are JSON objects; rbpmn never looks inside
 
 Each entry is a JSON **object**. Free-form within: keys and values are the
-application's, rbpmn passes them through and never interprets, never
-validates, never resolves.
+application's, and rbpmn passes them through — never interprets, never
+resolves, never evaluates, at any depth.
 
 Object rather than any JSON value, though a bare string would serve the
 one-value case: an object leaves room to add a key later without changing the
 shape, and anyone needing a single value can spell it `{"template": "…"}`.
 That is typing, not interpretation.
+
+**The object rule is a diagnostic, not a type.** The field is
+`BTreeMap<String, serde_json::Value>` and the shape is checked by
+`config-binds-task` (D5). Making it `serde_json::Map` would make a non-object
+unrepresentable, but at two costs: the fluent builder would stop taking
+`json!({…})`, which is the spelling every call site wants; and the JSON path
+would fail as a deserialization error — `bindingsError`, a byte offset, no
+element — where the fluent path failed as a diagnostic. Two syntaxes, one
+manifest, **one validation path** is the older promise, and it wins.
+`DecisionBinding` sets the precedent: its well-formedness is a diagnostic too,
+not a type.
 
 **No size limit.** Deliberate — a limit would be a number nobody has measured
 against a real case, and the cost lands where it is visible (the definition
@@ -144,8 +155,13 @@ row, the compile cache, the deploy body) rather than silently.
 ### D5 — `config-binds-task` ⁺ (error): the key must name a task that
 produces a work item
 
-A config entry keyed by anything that is not a service task or a user task is
-an error at deploy — including an element id that is not in the model at all.
+One rule id, two clauses — the entry is a JSON object (D4), and its key names
+a service task or a user task. An element id that is not in the model at all
+is the second clause's other half. Both clauses on one entry report both
+diagnostics: two defects are two things to fix.
+
+`decision-has-binding` is the precedent for one id covering a binding's shape
+and its resolution.
 Service *and* user: both produce work items, both are claimed through the same
 API, and a user task's config ("which form does this render") is the same
 feature as a service task's. Business-rule tasks, receive tasks, gateways,
@@ -303,8 +319,8 @@ staying green.
 
 Linter rules first, with fixtures, then execution — as always.
 
-- `Bindings::config`, D3's serialization, the fluent builder, strict
-  deserialization (a non-object entry is refused, not repaired).
+- `Bindings::config`, D3's serialization, the fluent builder taking
+  `impl Into<serde_json::Value>`.
 - `rule::CONFIG_BINDS_TASK` + `CATALOGUE` entry.
 - `config-binds-task` in `check_deployable`, beside `decision_bindings`.
 - Fixtures through the `.bindings.json` sidecar convention, plus unit tests in
