@@ -363,9 +363,14 @@ instance's item, assert `warning_first`. Everything else about this feature is
 plumbing; that assertion is the reason it is in the manifest rather than
 beside it.
 
-Owes: `cargo test` (needs Postgres), `just lint`, and a `just bench` sanity
-pass on the claim path — not as a gate, but because the claim path's plan is
-sensitive enough to have surprised this project before.
+Owes: `cargo test` (needs Postgres), `just lint`, and `just tla` — the claim
+path is on the mandatory spec re-read list even when the conclusion is that
+nothing changed.
+
+Not owed: a database benchmark run. The pull claim's statement is unchanged;
+the push claim's gains two columns in its `RETURNING` list, which cannot move
+a plan; and config is resolved outside the statement, from an in-process cache
+on the warm path. There is no new query to plan.
 
 ### Slice 3 — the surfaces
 
@@ -408,6 +413,13 @@ sensitive enough to have surprised this project before.
   a silent no-op in the other three groups. The asymmetry is principled (a
   default versus no default) but it is still an asymmetry, and the catalogue
   entry has to carry the reason or it reads as an oversight.
+- **The micro-benchmark gate does not pass on this branch, and did not pass
+  before it either.** `condition/eval` measures ~7x its recorded baseline —
+  ~137ns against 19.3ns — and the same benchmark measures ~150ns on `main`.
+  The baseline was recorded on `0100837` (2026-08-14) and `condition.rs`
+  changed in `7824168` (the DMN round) after it, which is where to look. It is
+  named here because a stale machine-local baseline is invisible in git and
+  the next person to run the gate will meet it as if it were theirs.
 - **Config is invisible in the runtime tables.** Answering "what was this item
   configured with" means joining `rbpmn_v_definition.bindings` on the
   definition — deliberate under D6, and the inspector's element pane is what

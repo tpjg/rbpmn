@@ -62,7 +62,8 @@ import EXAMPLE_DMN from '../../../crates/rbpmn-dmn/tests/fixtures/accept/09-demo
 ///
 /// So the first screen has all three, already consistent: a business-rule task
 /// bound by name to a decision in the working set, service tasks bound to
-/// topics, an index declared. Every pane in the editor has something in it,
+/// topics, one of them configured, an index declared. Every pane in the
+/// editor has something in it,
 /// deleting is easier than authoring, and "New" is one click away for someone
 /// who wants the bare skeleton instead.
 ///
