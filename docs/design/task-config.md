@@ -333,7 +333,7 @@ is manifest, and "what was this task configured with when it ran" is the
 question an operator asks when a citizen received the wrong letter. Read-only,
 like everything else there.
 
-**Docs.** README's manifest table gains a row and the catalogue gains the
+**Docs.** README's manifest table gains a row and `docs/rules.md` gains the
 rule. D1's deciding question goes next to the manifest table, and D7's two
 mechanisms with it.
 

@@ -9,7 +9,7 @@ inclusive gateway, block structure, messages-only interaction, build order).
 - **Loudly reject, never silently reinterpret.** New capabilities land as
   linter rules first, with fixtures, then execution.
 - **Rule IDs are stable public API.** Never rename one; add new ones. The
-  rules beyond the brief's list are marked ⁺ in README.md's catalogue.
+  rules beyond the brief's list are marked ⁺ in `docs/rules.md`.
 - **Fixtures first.** Every phase starts with fixtures in
   `crates/rbpmn-model/tests/fixtures/{accept,reject}/`. Expected diagnostics
   are embedded in each `.bpmn` as an `expect-diagnostics:` comment; the runner
