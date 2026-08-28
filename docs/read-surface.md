@@ -1,8 +1,5 @@
 # The published read surface
 
-Six views on the same footing as rule ids and the `Display` format of
-`Event`: columns may be added, never removed or repurposed.
-
 Applications legitimately need to *join* rbpmn's state against their own rows.
 A result set of "our tenancy, our ordering, rbpmn's instances" is a SQL join,
 and no API returning data instead of SQL does it as well. The answer to "stop

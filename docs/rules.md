@@ -37,7 +37,7 @@ drawn where it is.
 
 DMN rules apply to the decision artifacts a deployment bundles, and are
 implemented in `rbpmn-dmn` — the one crate where dsntk is allowed
-([docs/dmn.md](../docs/dmn.md)). They report the same `Diagnostic` type, so a
+([docs/dmn.md](dmn.md)). They report the same `Diagnostic` type, so a
 decision error and a model error read the same way.
 
 | Rule | Severity | Meaning |
