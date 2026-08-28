@@ -430,6 +430,30 @@ not percents.
 Recording is **manual** (`just bench-baseline`). A baseline that re-recorded
 itself would ratchet a regression in one accepted percent at a time.
 
+### Accepted regressions
+
+A baseline is gitignored, so re-recording one erases the only evidence that
+something got slower. What was accepted, and why, therefore lives here — a
+regression nobody wrote down is indistinguishable from one nobody noticed, and
+without a record the *next* multiple on the same function has nothing to be
+read against.
+
+**`condition/eval`, ~7x, accepted 2026-08-28.** A baseline recorded on
+`0100837` had it at 19.3 ns; it measures ~139 ns now. The cause is `7824168`
+(the DMN round): FEEL numbers became decimal-exact, so `Num` holds text and
+`compare_decimals` allocates a `String` from each side on every numeric
+comparison. That exactness is the point — it is what `just feel-parity` and
+`just number-parity` verify against dsntk — so it is a price worth paying, not
+a defect.
+
+What it costs where it is actually spent was not measurable when the
+regression appeared, which is why `construct/exclusive-split-numeric` exists.
+On the recording machine the pair reads 222 ns against 277 ns (noise 4.1 and
+7.5), so a numeric condition costs **~55 ns more than one that
+short-circuits**, inside a step that has not yet touched a database. That is
+the number the acceptance rests on. Should it ever matter, the first cut is
+`compare_decimals` taking `&str` on both sides instead of `a.to_string()`.
+
 ---
 
 ## Interpreting the numbers
