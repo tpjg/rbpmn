@@ -480,7 +480,10 @@ async fn task_api_lifecycle_over_http() {
         .oneshot(authed(
             "POST",
             "/v1/definitions",
-            serde_json::json!({ "bpmn": MINIMAL_XML }),
+            serde_json::json!({
+                "bpmn": MINIMAL_XML,
+                "bindings": { "config": { "review": { "form": "contest" } } },
+            }),
         ))
         .await
         .unwrap();
@@ -542,6 +545,9 @@ async fn task_api_lifecycle_over_http() {
     assert_eq!(task["definitionKey"], "p");
     assert_eq!(task["definitionId"], v1["definitionId"]);
     assert_eq!(task["definitionVersion"], 1);
+    // ...and the manifest half of the same idea, which needs no resolution at
+    // all: what this element was configured with on *this* version.
+    assert_eq!(task["config"], serde_json::json!({ "form": "contest" }));
     let task_id = task["id"].as_str().unwrap().to_string();
 
     // Nothing left to claim: 204.

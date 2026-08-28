@@ -578,7 +578,13 @@ fn reject_nul(value: &serde_json::Value) -> Result<(), EngineError> {
     Ok(())
 }
 
-pub(crate) fn compile_row(row: &PgRow, key: &str) -> Result<ExecutableProcess, EngineError> {
+/// A definition row -> the compiled process **and** the manifest it compiled
+/// against. Both, because both are cached and a caller that took only one
+/// would have to read the row again to get the other.
+pub(crate) fn compile_row(
+    row: &PgRow,
+    key: &str,
+) -> Result<(ExecutableProcess, Bindings), EngineError> {
     // A manifest that stopped deserializing is corruption or an unmigrated
     // schema change — loudly reject, never silently run with empty bindings.
     let bindings: Bindings = serde_json::from_value(row.get::<serde_json::Value, _>("bindings"))
@@ -589,7 +595,8 @@ pub(crate) fn compile_row(row: &PgRow, key: &str) -> Result<ExecutableProcess, E
         })?;
     let defs = rbpmn_model::parse(&row.get::<String, _>("bpmn_xml"))
         .map_err(|e| internal(e.to_string()))?;
-    Ok(ExecutableProcess::compile(&defs, key, &bindings)?)
+    let proc = ExecutableProcess::compile(&defs, key, &bindings)?;
+    Ok((proc, bindings))
 }
 
 /// The one lease gate: taken under the instance lock (every caller locks
@@ -650,9 +657,90 @@ pub(crate) async fn compiled_process(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| internal(format!("definition {definition_id} has no row")))?;
-    let proc = std::sync::Arc::new(compile_row(&row, key)?);
+    let (proc, bindings) = compile_row(&row, key)?;
+    let proc = std::sync::Arc::new(proc);
     engine.cache_process(definition_id, proc.clone());
+    // The manifest is already in hand and its cache is keyed the same way,
+    // so fill it here too: on a warm engine a claim then never reads a row
+    // to answer what an element was configured with.
+    engine.cache_manifest(definition_id, std::sync::Arc::new(bindings));
     Ok(proc)
+}
+
+/// The bindings manifest of a definition version, cached like the compiled
+/// process and for the same reason: the row is immutable.
+///
+/// Reads only `bindings`, never the XML — this serves the claim paths, which
+/// want one config entry and would otherwise pay for the whole model. On a
+/// miss the row must be there: work items reference their definition and
+/// `delete_definition` refuses a version in use, so a definition that cannot
+/// be read is corruption and says so rather than answering "no config".
+pub(crate) async fn manifest(
+    engine: &Engine,
+    definition_id: Uuid,
+    definition_key: &str,
+) -> Result<std::sync::Arc<Bindings>, EngineError> {
+    if let Some(bindings) = engine.cached_manifest(definition_id) {
+        return Ok(bindings);
+    }
+    let stored: serde_json::Value =
+        sqlx::query_scalar("select bindings from rbpmn_definition where id = $1")
+            .bind(definition_id)
+            .fetch_optional(engine.pool())
+            .await?
+            .ok_or_else(|| EngineError::CorruptManifest {
+                definition_key: definition_key.to_string(),
+                detail: format!("definition {definition_id} has no row"),
+            })?;
+    let bindings: Bindings =
+        serde_json::from_value(stored).map_err(|e| EngineError::CorruptManifest {
+            definition_key: definition_key.to_string(),
+            detail: e.to_string(),
+        })?;
+    let bindings = std::sync::Arc::new(bindings);
+    engine.cache_manifest(definition_id, bindings.clone());
+    Ok(bindings)
+}
+
+/// What the manifest configured one element with, for a claim that just took
+/// it. `None` when the manifest configures nothing for it — which is every
+/// element of every definition deployed before this existed.
+///
+/// Both claim paths resolve config *after* their claim statement, so this can
+/// fail with an item already locked. When it does the claim is handed back
+/// before the error propagates — the same hand-back the push worker performs
+/// when the environment lost a handler underneath it, and for the same
+/// reason: without it a definition whose manifest cannot be read would let a
+/// retrying worker lock the whole queue one lease at a time. The release's
+/// own failure is swallowed deliberately; the caller needs the reason the
+/// config could not be read, not the reason the apology could not be
+/// delivered, and an unreleased item still comes back when its lease lapses.
+pub(crate) async fn task_config(
+    engine: &Engine,
+    claim: ClaimedItem<'_>,
+) -> Result<Option<serde_json::Value>, EngineError> {
+    let bindings = match manifest(engine, claim.definition_id, claim.definition_key).await {
+        Ok(bindings) => bindings,
+        Err(e) => {
+            let _ = engine
+                .release_task(claim.id, claim.owner, claim.lease_no)
+                .await;
+            return Err(e);
+        }
+    };
+    Ok(bindings.config.get(claim.element_id).cloned())
+}
+
+/// What [`task_config`] needs to answer, and to hand the claim back if it
+/// cannot: which item was taken, by whom, under which lease, and which
+/// element of which definition version it belongs to.
+pub(crate) struct ClaimedItem<'a> {
+    pub id: Uuid,
+    pub owner: &'a str,
+    pub lease_no: i64,
+    pub definition_id: Uuid,
+    pub definition_key: &'a str,
+    pub element_id: &'a str,
 }
 
 /// Locks the instance row and rebuilds the quiescent core state from rows —

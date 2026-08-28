@@ -1,6 +1,7 @@
 # Task config — design round
 
-**Status: slice 1 landed (the manifest group and `config-binds-task`).**
+**Status: slices 1 and 2 landed (the manifest group and
+`config-binds-task`; delivery on both claim paths).**
 The slices at the bottom are the staging; the decisions above them are why.
 
 This round covers **re-usable tasks that carry a little configuration** — one
@@ -223,6 +224,16 @@ item, and `delete_definition` refuses a version in use, so a miss that cannot
 read the row is corruption — `CorruptManifest`, the same as the inspector's
 (`inspect.rs:131`), never a silent `None`.
 
+**And the claim is handed back when it fails.** Resolving after the claim
+means this can fail with an item already locked. Leaving it to lapse would let
+a definition whose manifest cannot be read drain a queue into locked state one
+lease at a time, because the worker loop retries every second and each attempt
+holds a full lease TTL. So a failure releases the claim before propagating —
+the same hand-back the push worker already performs when the environment lost
+a handler underneath it. The release's own failure is swallowed: the caller
+needs the reason the config could not be read, and an unreleased item still
+comes back when its lease lapses.
+
 **Not a column on `rbpmn_v_work_item`.** Config is definition data and is
 already published in `rbpmn_v_definition.bindings`. Joining a third table into
 that view would put the grouped-depth plan the tests assert at risk, for a
@@ -304,12 +315,21 @@ like everything else there.
 rule. D1's deciding question goes next to the manifest table, and D7's two
 mechanisms with it.
 
-**`spec/`.** Read, and expected to need nothing: config is immutable
-definition data resolved after a claim, in process, under no lock. No new lock
-enters the order, the lease is untouched, the scheduler's claim path is
-untouched. The claim path is on the mandatory re-read list, so this is
-recorded as a conclusion reached by reading the models, not by `just tla`
-staying green.
+**`spec/`.** Read, and needs nothing. The conclusion, since running the
+checker is not the same as reading the model:
+
+- No new lock enters the order. Config is resolved outside every transaction,
+  takes no lock, and mutates nothing; `LockOrder.tla` is unaffected.
+- `Lease.tla`'s `Acquire` is still the whole claim. The one state the
+  hand-back adds is "claimed, then released by the claimant" — which is
+  `ReleaseWith(w, leaseNo)`, an action the model already has, reached from
+  the same place a client's own `release_task` reaches it.
+- The failure where even the release fails leaves "locked, and nobody
+  believes it" — strictly weaker than the crashed-holder case the model
+  already covers, where `believes[w]` stays TRUE past `until`. Both end the
+  same way: `Tick` past the lease and the item is `Claimable` again.
+- The scheduler's claim path (`try_fire`) and the timer/subscription teardown
+  models are untouched; nothing here runs inside a step transaction.
 
 ---
 
@@ -335,6 +355,7 @@ Owes: `cargo test`, `just lint`, `just parity`.
   `(definition_id, element_id)`.
 - `LockedTask::config`; `WorkItem::config` plus `definition_id` and
   `definition_version`.
+- The hand-back when the manifest cannot be read.
 - `/tasks/get` response.
 
 The test that earns the feature: deploy v1 with `{"template":"warning_first"}`,

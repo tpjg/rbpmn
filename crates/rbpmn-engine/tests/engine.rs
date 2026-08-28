@@ -8815,3 +8815,267 @@ async fn an_instance_reaches_its_definition_through_the_stable_pair() {
     assert_eq!(row.3.len(), 64);
     db.drop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Task config: manifest wiring delivered on the work item
+// ---------------------------------------------------------------------------
+
+/// The pull claim carries what the manifest configured the element with, and
+/// `None` — never an empty object — when it configured nothing.
+#[tokio::test]
+async fn config_reaches_a_pull_claim() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().config("review", serde_json::json!({ "form": "contest" })),
+        )
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(task.config, Some(serde_json::json!({ "form": "contest" })));
+    db.drop().await;
+}
+
+/// `None`, never an empty object: every element of every definition deployed
+/// before config existed answers this way, and a handler must be able to tell
+/// "nothing was configured" from "configured with nothing".
+#[tokio::test]
+async fn an_unconfigured_element_claims_without_config() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(task.config, None);
+    db.drop().await;
+}
+
+/// The assertion the whole feature exists for. Config is inside
+/// `content_hash` and an instance is pinned to the version it started on, so
+/// a later deploy that changes a template does not change what an in-flight
+/// instance sends. A sidecar keyed by definition *key* would get this wrong.
+#[tokio::test]
+async fn an_instance_keeps_the_config_of_the_version_it_started_on() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let xml = fixture("accept/01-minimal.bpmn");
+
+    let v1 = engine
+        .deploy(
+            &xml,
+            &Bindings::new().config("review", serde_json::json!({ "template": "warning_first" })),
+        )
+        .await
+        .unwrap();
+    let pinned = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // Same diagram, different config: a new version, because the manifest is
+    // hashed with the model.
+    let v2 = engine
+        .deploy(
+            &xml,
+            &Bindings::new().config(
+                "review",
+                serde_json::json!({ "template": "warning_second" }),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!((v1.version, v2.version), (1, 2));
+    assert!(!v2.reused, "a config change is a new definition version");
+
+    let fresh = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let first = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(first.instance_id, pinned.id, "FIFO: the older instance");
+    assert_eq!(first.definition_version, 1);
+    assert_eq!(
+        first.config,
+        Some(serde_json::json!({ "template": "warning_first" }))
+    );
+
+    let second = engine
+        .get_task("review", &GetTaskOptions::new("w2"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(second.instance_id, fresh.id);
+    assert_eq!(second.definition_version, 2);
+    assert_eq!(
+        second.config,
+        Some(serde_json::json!({ "template": "warning_second" }))
+    );
+    db.drop().await;
+}
+
+/// The push handler gets the same value, and — new with it — the pinned
+/// `(definition_id, definition_version)` it could never resolve against
+/// before.
+#[tokio::test]
+async fn config_and_the_pinned_version_reach_a_push_handler() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let seen: Arc<std::sync::Mutex<Vec<WorkItem>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    engine.register_handler(
+        "payments",
+        Arc::new(FnHandler(move |item: WorkItem| {
+            recorder.lock().unwrap().push(item);
+            Ok(serde_json::json!({}))
+        })),
+    );
+    let deployed = engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new()
+                .topic("st", "payments")
+                .config("st", serde_json::json!({ "template": "warning_first" })),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let worker = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.run_worker(worker_options()).await }
+    });
+    wait_for_status(&db.pool, started.id, "completed").await;
+    worker.abort();
+
+    let item = seen
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("the handler ran");
+    assert_eq!(
+        item.config,
+        Some(serde_json::json!({ "template": "warning_first" }))
+    );
+    assert_eq!(item.definition_id, deployed.definition_id);
+    assert_eq!(item.definition_version, 1);
+    db.drop().await;
+}
+
+/// A config entry that binds nothing is refused at deploy, where a stale
+/// `topics` key is not. The asymmetry is deliberate: a topic has a default
+/// to fall back to and config has none.
+#[tokio::test]
+async fn deploy_refuses_config_that_binds_nothing() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let xml = fixture("accept/01-minimal.bpmn");
+
+    match engine
+        .deploy(
+            &xml,
+            &Bindings::new().config("renamed_away", serde_json::json!({ "form": "contest" })),
+        )
+        .await
+    {
+        Err(DeployError::Rejected(diags)) => {
+            assert!(
+                diags.iter().any(|d| d.rule == "config-binds-task"),
+                "{diags:?}"
+            );
+        }
+        other => panic!("expected config-binds-task rejection, got {other:?}"),
+    }
+
+    engine
+        .deploy(&xml, &Bindings::new().topic("renamed_away", "review"))
+        .await
+        .expect("a stale topic key stays lenient");
+    db.drop().await;
+}
+
+/// Config is resolved after the claim statement, so it can fail with an item
+/// already locked. When it does, the claim is handed back rather than left to
+/// lapse — otherwise a definition whose manifest cannot be read would let a
+/// retrying worker lock a whole queue one lease at a time.
+///
+/// Corrupting the row is the only way to reach it: a manifest is written by
+/// `deploy` from a `Bindings`, and startup re-validation refuses to boot on
+/// one that no longer deserializes. The second engine is what makes the read
+/// happen at all — the first one cached the manifest when it compiled the
+/// process to start the instance.
+#[tokio::test]
+async fn a_claim_is_handed_back_when_the_manifest_cannot_be_read() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().config("review", serde_json::json!({ "form": "contest" })),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    sqlx::query("update rbpmn_definition set bindings = '\"corrupt\"'::jsonb")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let cold = Engine::builder(db.pool.clone()).build();
+    let outcome = cold.get_task("review", &GetTaskOptions::new("w1")).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(rbpmn_engine::EngineError::CorruptManifest { .. })
+        ),
+        "{outcome:?}"
+    );
+
+    let row = sqlx::query(
+        "select state, lock_owner, lease_no from rbpmn_work_item where instance_id = $1",
+    )
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "available");
+    assert_eq!(row.get::<Option<String>, _>("lock_owner"), None);
+    // The lease epoch is spent all the same: the claim happened, and a client
+    // holding that number must not be able to act on it.
+    assert_eq!(row.get::<i64, _>("lease_no"), 1);
+    db.drop().await;
+}

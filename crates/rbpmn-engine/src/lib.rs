@@ -171,9 +171,21 @@ pub struct WorkItem {
     pub id: uuid::Uuid,
     pub instance_id: uuid::Uuid,
     pub definition_key: String,
+    /// The definition version the owning instance is pinned to. The same
+    /// pair [`LockedTask`] carries and for the same reason: an instance never
+    /// migrates, so version-pinned metadata on the embedding side must
+    /// resolve against exactly this, never against `max(version)` of the key.
+    pub definition_id: uuid::Uuid,
+    pub definition_version: i32,
     pub element_id: String,
     pub topic: String,
     pub variables: serde_json::Value,
+    /// What the manifest configured this element with (`Bindings::config`),
+    /// or `None` when it configured nothing. Free JSON the engine passes
+    /// through untouched — it is versioned and content-hashed with the
+    /// definition, so it is the same for every item this element produces on
+    /// this version, and it changes only by deploying.
+    pub config: Option<serde_json::Value>,
 }
 
 /// A handler failure; `code` feeds error-boundary matching once the retry
@@ -252,6 +264,7 @@ impl EngineBuilder {
                 retry_backoff: self.retry_backoff,
                 deferrals: std::sync::Mutex::new(BTreeMap::new()),
                 compiled: RwLock::new(BTreeMap::new()),
+                manifests: RwLock::new(BTreeMap::new()),
                 #[cfg(feature = "dmn")]
                 decisions: RwLock::new(BTreeMap::new()),
                 archive: RwLock::new(self.archive),
@@ -278,6 +291,15 @@ struct Inner {
     /// Compiled definitions by definition id — immutable rows, cached
     /// forever; definitions are few, growth is bounded by deploys.
     compiled: RwLock<BTreeMap<uuid::Uuid, Arc<rbpmn_core::ExecutableProcess>>>,
+    /// Bindings manifests by definition id, same lifetime and same reason:
+    /// the row is immutable, so a manifest never needs invalidating.
+    ///
+    /// Separate from `compiled` because it is reached separately. A claim
+    /// wants only `Bindings::config` and has no use for the compiled process,
+    /// and reading the manifest costs one narrow row where compiling costs
+    /// the whole XML and an O(model) parse. Populated by both paths, so a
+    /// warm engine answers a claim without touching Postgres at all.
+    manifests: RwLock<BTreeMap<uuid::Uuid, Arc<Bindings>>>,
     /// Where records go before retention deletes them. On the engine rather
     /// than in `RetentionOptions` so that *every* deletion path passes
     /// through it — an escape hatch that could bypass the audit trail would
@@ -485,7 +507,7 @@ impl Engine {
             let key: String = sqlx::Row::get(row, "key");
             let version: i32 = sqlx::Row::get(row, "version");
             match crate::runtime::compile_row(row, &key) {
-                Ok(proc) => {
+                Ok((proc, _)) => {
                     if proc.service_topics().any(|(_, t)| t == topic) {
                         needed_by.push(format!("{key} v{version}"));
                     }
@@ -654,6 +676,23 @@ impl Engine {
             .write()
             .unwrap()
             .insert(definition_id, proc);
+    }
+
+    pub(crate) fn cached_manifest(&self, definition_id: uuid::Uuid) -> Option<Arc<Bindings>> {
+        self.inner
+            .manifests
+            .read()
+            .unwrap()
+            .get(&definition_id)
+            .cloned()
+    }
+
+    pub(crate) fn cache_manifest(&self, definition_id: uuid::Uuid, bindings: Arc<Bindings>) {
+        self.inner
+            .manifests
+            .write()
+            .unwrap()
+            .insert(definition_id, bindings);
     }
 
     /// Currently backed-off instances plus the time until the earliest
