@@ -1,7 +1,6 @@
 # Task config — design round
 
-**Status: slices 1 and 2 landed (the manifest group and
-`config-binds-task`; delivery on both claim paths).**
+**Status: shipped.** All three slices.**
 The slices at the bottom are the staging; the decisions above them are why.
 
 This round covers **re-usable tasks that carry a little configuration** — one
@@ -370,10 +369,16 @@ sensitive enough to have surprised this project before.
 
 ### Slice 3 — the surfaces
 
-- Editor: `config` in `parseManifest` / `serializeManifest` /
-  `orphanedBindings`, and a JSON box in the wiring pane.
-- Inspector: config in the element pane.
-- `just ui`, `just ui-test`, `just e2e-ui`.
+- Editor: `config` in `parseManifest` / `serializeManifest`, and a JSON box
+  in the wiring pane. **Not** in `orphanedBindings`: deploy rejects a stale
+  config key, so the verdict already names it with the element highlighted
+  and a rule id to look up — adding it there would report one defect twice,
+  once as a rule and once as an editor hunch.
+- Inspector: config in the element pane, as a tree rather than a field row.
+- `just ui`, `just ui-test`, `just e2e-ui`, and the hostile-payload corpus in
+  `crates/rbpmn-ui/tests/documents.rs`, which gains the manifest: `config` is
+  free JSON of the application's shape and lands in a document rbpmn escapes,
+  so it belongs in the corpus that proves the escaping.
 
 ---
 

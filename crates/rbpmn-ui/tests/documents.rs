@@ -150,6 +150,15 @@ fn hostile_data_cannot_escape_the_data_block() {
             *hostile: { "nested": [*hostile, { "deeper": *hostile }] },
             "plain": *hostile,
         });
+        // The manifest is application text too, and `config` is the field
+        // that made that unmissable: free JSON of the application's own
+        // shape, nested as deep as it likes, rendered in the element pane.
+        inspection.bindings = rbpmn_engine::Bindings::new()
+            .topic(*hostile, *hostile)
+            .config(
+                *hostile,
+                serde_json::json!({ *hostile: [*hostile, { "deeper": *hostile }] }),
+            );
         inspection.tokens = vec![TokenView {
             element_id: (*hostile).to_string(),
             wait_kind: (*hostile).to_string(),

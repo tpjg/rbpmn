@@ -20,12 +20,14 @@ import { el } from '../shared/dom.js';
 import { renderProperties } from './properties.js';
 import {
   emptyManifest,
+  formatConfig,
   orphanedBindings,
   parseManifest,
   formatIndexField,
   parseIndexField,
   serializeManifest,
   setBinding,
+  setConfigBinding,
   setDecisionBinding,
 } from './manifest.js';
 import { checkModel, evaluateDecision, initValidator } from './validate.js';
@@ -468,8 +470,12 @@ function renderWiring() {
   const wantsCorrelation =
     type === 'bpmn:ReceiveTask' ||
     (bo.eventDefinitions ?? []).some((d) => d.$type === 'bpmn:MessageEventDefinition');
+  // The two kinds that produce a work item, which is what config is delivered
+  // on. `config-binds-task` refuses it anywhere else, so it is not offered
+  // anywhere else.
+  const wantsConfig = type === 'bpmn:ServiceTask' || type === 'bpmn:UserTask';
 
-  if (!wantsTopic && !wantsCorrelation && !wantsDecision) {
+  if (!wantsTopic && !wantsCorrelation && !wantsDecision && !wantsConfig) {
     ui.wiring.append(el('p', 'empty', 'this element needs no manifest wiring'));
     renderIndexes();
     return;
@@ -558,7 +564,58 @@ function renderWiring() {
       )
     );
   }
+
+  if (wantsConfig) {
+    ui.wiring.append(configRow(id));
+  }
   renderIndexes();
+}
+
+/// The config box: free JSON delivered on every work item this element
+/// produces, and the only control here whose *value* rbpmn never reads.
+///
+/// It is its own row rather than a `bindingRow` because a one-line input
+/// cannot hold an object, and because the commit can fail — bad JSON, or a
+/// value that is not an object. A failed commit shows the reason and leaves
+/// the manifest alone, so the box can never write a shape deploy would
+/// refuse.
+function configRow(id) {
+  const row = el('div', 'prop');
+  row.append(el('span', 'prop-label', 'config'));
+  const input = el('textarea', 'prop-input');
+  input.spellcheck = false;
+  input.rows = 4;
+  input.value = formatConfig(state.manifest, id);
+  input.placeholder = '{\n  "template": "warning_first"\n}';
+  const error = el('div', 'inline-error-text');
+  error.hidden = true;
+  input.addEventListener('blur', () => {
+    if (input.value === formatConfig(state.manifest, id)) return;
+    try {
+      state.manifest = setConfigBinding(state.manifest, id, input.value);
+      error.hidden = true;
+      // Re-format from what was stored: the box now shows what will deploy,
+      // not what was typed at it.
+      input.value = formatConfig(state.manifest, id);
+      syncManifestBox();
+      scheduleCheck();
+    } catch (e) {
+      error.textContent = e.message;
+      error.hidden = false;
+    }
+  });
+  row.append(input);
+  row.append(
+    el(
+      'span',
+      'prop-hint',
+      'free JSON, delivered beside the variables on every work item this ' +
+        'element produces; rbpmn never reads inside it. It is hashed with the ' +
+        'model, so changing it is a deploy. Empty means none.'
+    )
+  );
+  row.append(error);
+  return row;
 }
 
 function bindingRow(label, value, placeholder, commit, hint, options) {

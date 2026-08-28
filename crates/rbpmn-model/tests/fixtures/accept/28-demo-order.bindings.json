@@ -11,5 +11,11 @@
       "decision": "Triage",
       "result": "triage.band"
     }
+  },
+  "config": {
+    "charge": {
+      "gateway": "acquirer-a",
+      "retries": 3
+    }
   }
 }

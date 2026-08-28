@@ -158,9 +158,17 @@ function renderElement(container, data, viewer, elementId) {
   // the only place a reader can recover it — and for elements the token has
   // not reached, the only place at all.
   const wiring = wiringFor(data, bo, elementId);
-  if (wiring.length) {
+  const config = data.bindings?.config?.[elementId];
+  if (wiring.length || config !== undefined) {
     const { wrap, body } = section('Wiring');
     for (const [label, value, note] of wiring) body.append(field(label, value, { title: note }));
+    // A tree rather than a field row: config is free JSON of the
+    // application's own shape, and flattening it to one line is exactly what
+    // the reader of "why did this citizen get that letter" cannot use.
+    if (config !== undefined) {
+      body.append(field('config', 'from the deployed manifest, delivered on every work item here'));
+      body.append(jsonTree(config));
+    }
     container.append(wrap);
   }
 

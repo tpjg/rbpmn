@@ -2,12 +2,11 @@
 // the XML.
 //
 // Everything here operates on a plain object with the shape rbpmn-core's
-// `Bindings` serializes to — `{ topics, correlations, indexes, decisions }` —
-// because
-// that object is the artifact: it is written next to the .bpmn in the user's
-// repository and travels with it to `deploy`. Empty groups are pruned on the
-// way out so a manifest with nothing in it is `{}` rather than three empty
-// containers.
+// `Bindings` serializes to — `{ topics, correlations, indexes, decisions,
+// config }` — because that object is the artifact: it is written next to the
+// .bpmn in the user's repository and travels with it to `deploy`. Empty
+// groups are pruned on the way out so a manifest with nothing in it is `{}`
+// rather than five empty containers.
 
 /// The scopes a declared index can carry. `definition` (the default) indexes
 /// one definition's instances; `shared` indexes the field across every
@@ -39,7 +38,7 @@ export function formatIndexField(entry) {
 }
 
 export function emptyManifest() {
-  return { topics: {}, correlations: {}, indexes: [], decisions: {} };
+  return { topics: {}, correlations: {}, indexes: [], decisions: {}, config: {} };
 }
 
 /// The manifest groups that map an element id to a plain string.
@@ -118,8 +117,23 @@ export function parseManifest(text) {
       }
     }
   }
+  // `config` is free JSON — rbpmn never looks inside one, and neither does
+  // this. The one thing checked is the shape rbpmn checks: an entry is an
+  // object, so a single value is spelled `{"template": "..."}` and there is
+  // room for a second key later.
+  if (raw.config !== undefined) {
+    const value = raw.config;
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('"config" must be an object of elementId -> object');
+    }
+    for (const [key, entry] of Object.entries(value)) {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new Error(`"config.${key}" must be a JSON object`);
+      }
+    }
+  }
   const unknown = Object.keys(raw).filter(
-    (k) => !['topics', 'correlations', 'indexes', 'decisions'].includes(k)
+    (k) => !['topics', 'correlations', 'indexes', 'decisions', 'config'].includes(k)
   );
   if (unknown.length) {
     throw new Error(`unknown manifest key(s): ${unknown.join(', ')}`);
@@ -134,6 +148,7 @@ export function parseManifest(text) {
         { decision: v.decision, result: v.result },
       ])
     ),
+    config: { ...(raw.config ?? {}) },
   };
 }
 
@@ -153,10 +168,18 @@ export function serializeManifest(manifest) {
   const decisions = Object.entries(manifest.decisions ?? {})
     .filter(([, v]) => v && v.decision && v.result)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  // Element order is sorted like every other group; the keys *inside* an
+  // entry are written back exactly as they came in. They are the
+  // application's, not rbpmn's, and reordering them would put noise in a diff
+  // and change nothing about what deploys.
+  const config = Object.entries(manifest.config ?? {}).sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0
+  );
   if (topics.length) out.topics = Object.fromEntries(topics);
   if (correlations.length) out.correlations = Object.fromEntries(correlations);
   if (indexes.length) out.indexes = indexes;
   if (decisions.length) out.decisions = Object.fromEntries(decisions);
+  if (config.length) out.config = Object.fromEntries(config);
   return `${JSON.stringify(out, null, 2)}\n`;
 }
 
@@ -178,6 +201,40 @@ export function setBinding(manifest, group, elementId, value) {
     next[group][elementId] = value.trim();
   }
   return next;
+}
+
+/// Set an element's config from the text of the editor's box. Empty removes
+/// the entry, which is what makes "no config" a single control rather than a
+/// checkbox and a box.
+///
+/// Throws on anything rbpmn would reject — bad JSON, or a value that is not
+/// an object — rather than storing it and letting the verdict find it. The
+/// caller shows the message beside the box; the manifest never holds a shape
+/// that could not deploy.
+export function setConfigBinding(manifest, elementId, text) {
+  const next = { ...manifest, config: { ...manifest.config } };
+  if (!text || !text.trim()) {
+    delete next.config[elementId];
+    return next;
+  }
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`not valid JSON: ${e.message}`);
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('a config entry is a JSON object, like {"template": "warning_first"}');
+  }
+  next.config[elementId] = value;
+  return next;
+}
+
+/// The box's text for an element: pretty-printed so it is editable, and empty
+/// when nothing is configured.
+export function formatConfig(manifest, elementId) {
+  const entry = manifest.config?.[elementId];
+  return entry === undefined ? '' : JSON.stringify(entry, null, 2);
 }
 
 /// Set one half of a decision binding. Clearing either half removes the whole
@@ -202,6 +259,13 @@ export function setDecisionBinding(manifest, elementId, field, value) {
 /// Bindings pointing at elements the model no longer contains. Deploy does
 /// not reject these — an unused entry binds nothing — but they are almost
 /// always a rename that lost its other half, so the editor says so.
+///
+/// `config` is deliberately not among the groups checked here. Deploy *does*
+/// reject a stale config key (`config-binds-task`, because config has no
+/// default to fall back on), so the verdict already carries it — with the
+/// element highlighted and the rule id a reader can look up. Adding it here
+/// would report the same defect twice, once as a rule and once as an editor
+/// hunch.
 export function orphanedBindings(manifest, elementIds) {
   const present = new Set(elementIds);
   const out = [];
