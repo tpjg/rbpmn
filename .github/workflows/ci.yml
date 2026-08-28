@@ -38,12 +38,11 @@ jobs:
     runs-on: ubuntu-latest
 
     services:
-      # 15, not latest, on purpose. The only version-sensitive things in the
-      # schema are `xid8` and `pg_snapshot_xmin` (both 13+), so this exercises
-      # the floor the engine claims. Development runs 18, which is where an
-      # 18-only regression has to be caught.
+      # 18, the version development runs. The schema's floor is 13 (`xid8`,
+      # `pg_snapshot_xmin`) and 15 executes correctly, but plans differ — the
+      # queue-depth index is only chosen from 18, which a run on 15 proved.
       postgres:
-        image: postgres:15
+        image: postgres:18
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports: ['5432:5432']

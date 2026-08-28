@@ -7662,21 +7662,66 @@ async fn the_grouped_depth_query_is_index_driven() {
         "execute depths_f(array['p'])",
     )
     .await;
+    // True on every supported version, and the property that actually
+    // protects the table: whatever index wins, none of them is a full scan.
     assert!(
-        filtered.contains("rbpmn_work_item_depth"),
-        "the filtered depth query must reach the depth index:\n{filtered}"
+        !filtered.contains("Seq Scan on rbpmn_work_item"),
+        "the filtered depth query must not scan every work item:\n{filtered}"
     );
-    assert!(
-        filtered
-            .lines()
-            .any(|l| l.contains("Index Cond") && l.contains("definition_key")),
-        "and definition_key must be an index condition, not a filter:\n{filtered}"
-    );
-    assert!(
-        !filtered.contains("Seq Scan on rbpmn_instance"),
-        "the instance join should be a nested loop on the pkey:\n{filtered}"
-    );
+
+    // The rest is 18-and-up. On 15 the planner takes a bitmap scan on
+    // `rbpmn_work_item_pull` instead, leaving `definition_key` a filter and
+    // hashing every instance — correct, and measurably worse. 13 is the
+    // floor the schema needs, not the version the read paths are tuned
+    // against, so a laptop on 15 gets a warning rather than a red suite while
+    // development and CI both run 18.
+    if server_version_num(&db.pool).await >= 180_000 {
+        assert!(
+            filtered.contains("rbpmn_work_item_depth"),
+            "the filtered depth query must reach the depth index:\n{filtered}"
+        );
+        assert!(
+            filtered
+                .lines()
+                .any(|l| l.contains("Index Cond") && l.contains("definition_key")),
+            "and definition_key must be an index condition, not a filter:\n{filtered}"
+        );
+        assert!(
+            !filtered.contains("Seq Scan on rbpmn_instance"),
+            "the instance join should be a nested loop on the pkey:\n{filtered}"
+        );
+    } else {
+        warn_out_of_band(
+            "this PostgreSQL plans the filtered queue-depth query without \
+             rbpmn_work_item_depth: definition_key stays a filter and every \
+             instance is hashed. Correct, and slower than 18, which is what \
+             development and CI run. The index assertions are skipped here.",
+        );
+    }
     db.drop().await;
+}
+
+/// `server_version_num` — 180000 for 18.0. Two plan assertions have a
+/// version-dependent answer and say so rather than asserting the newest
+/// planner's behaviour everywhere.
+async fn server_version_num(pool: &PgPool) -> i32 {
+    sqlx::query_scalar("select current_setting('server_version_num')::int")
+        .fetch_one(pool)
+        .await
+        .expect("server_version_num")
+}
+
+/// A warning a *passing* test can actually be heard making.
+///
+/// The harness captures `println!` and `eprintln!` and shows them only for
+/// failures or under `--nocapture`, so a warning written that way is a
+/// warning nobody reads. A direct write to the process's stderr is not
+/// captured — verified, not assumed.
+fn warn_out_of_band(message: &str) {
+    use std::io::Write as _;
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "\nwarning: {message}\n");
+    let _ = err.flush();
 }
 
 /// The typed call: the caller's key set is an argument bound into the query,

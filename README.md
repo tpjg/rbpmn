@@ -15,8 +15,9 @@ model, never in a vendor attribute inside it. And **the engine steps inside
 your transaction**, so a process transition and the business write that caused
 it commit together or not at all.
 
-Requires **PostgreSQL 13+**; 18 or newer is recommended (older versions are
-correct, but slower on some read paths).
+Requires **PostgreSQL 13+**. Development and CI both run **18**, which is what
+the read paths are tuned against: older versions execute correctly, but the
+planner does not always reach the declared indexes.
 
 - [bpmn-engine-design.md](bpmn-engine-design.md) — why the subset is drawn
   where it is, and everything still open, in one table.
