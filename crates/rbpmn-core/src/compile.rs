@@ -20,11 +20,24 @@ pub type FlowIx = usize;
 pub type ScopeIx = usize;
 
 /// The per-definition wiring from the deployment manifest: element ->
-/// work-item topic, and message element -> correlation key (a FEEL qualified
-/// name into the instance variables). Unmapped tasks default to their
-/// element id; correlations have **no default** — every message catch must
-/// be mapped or compilation fails (`message-has-correlation`).
+/// work-item topic, message element -> correlation key (a FEEL qualified
+/// name into the instance variables), business-rule task -> decision, and
+/// task -> config. Unmapped tasks default to their element id; correlations
+/// have **no default** — every message catch must be mapped or compilation
+/// fails (`message-has-correlation`) — and neither does [`Bindings::config`],
+/// which is why a config entry binding nothing is an error where a stale
+/// topic is not (`config-binds-task`).
+///
+/// **Unknown groups are refused, not dropped.** A manifest is hand-written
+/// next to the `.bpmn`, and `"cofig"` silently deserializing to nothing is
+/// exactly the failure [`Bindings::config`] exists to prevent: wiring that
+/// looks written and never arrives. The editor has always refused an unknown
+/// key; this is the library, the CLI and `POST /v1/definitions` catching up.
+/// The cost is deliberate too — an older rbpmn reading a manifest a newer one
+/// wrote refuses it rather than running a definition with wiring it cannot
+/// see.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Bindings {
     #[serde(default)]
     pub topics: BTreeMap<String, String>,
@@ -47,6 +60,26 @@ pub struct Bindings {
     /// next to it (`docs/dmn.md`, D5).
     #[serde(default)]
     pub decisions: BTreeMap<String, DecisionBinding>,
+    /// Task -> the configuration it is invoked with: free JSON, delivered
+    /// beside the variables on every work item the element produces, and
+    /// **never interpreted** — not read, not resolved, not evaluated. One
+    /// handler on one topic, configured differently at each call site, which
+    /// is what every other engine writes into the XML as `zeebe:taskHeaders`
+    /// or `flowable:field` (`docs/design/task-config.md`).
+    ///
+    /// It is *model content*, not runtime configuration: it is inside
+    /// `content_hash` and pinned with the instance, so changing it is a
+    /// deploy by construction. Anything that must differ per environment or
+    /// change without one belongs to the environment half, or to the
+    /// application's own store keyed by the `(definition_id,
+    /// definition_version)` every claimed task carries.
+    ///
+    /// Skipped when empty, and that is load-bearing rather than tidy: the
+    /// serialized manifest is hashed, so a group that always appeared would
+    /// change every existing `content_hash` and allocate a new version of
+    /// every definition on the first redeploy after the upgrade.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, serde_json::Value>,
 }
 
 /// What a declared index covers — the difference between
@@ -285,6 +318,24 @@ impl Bindings {
                 result: result.into(),
             },
         );
+        self
+    }
+
+    /// Configure one task: free JSON, delivered on every work item that
+    /// element produces. Must be a JSON **object** — a single value is
+    /// spelled `{"template": "warning_first"}`, which leaves room to add a
+    /// second key later without changing the shape.
+    ///
+    /// The object rule is checked by `config-binds-task` rather than by the
+    /// type, so the fluent path and the JSON path fail the same way, with a
+    /// diagnostic naming the element instead of a parse error naming a byte
+    /// offset.
+    pub fn config(
+        mut self,
+        element_id: impl Into<String>,
+        config: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.config.insert(element_id.into(), config.into());
         self
     }
 }
@@ -1450,5 +1501,55 @@ mod index_declaration_tests {
                 .collect::<Vec<_>>(),
             vec!["alpha", "mike", "zulu"]
         );
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The hash contract, stated from the config side: an empty group must
+    /// not appear in the serialized manifest, or every definition in every
+    /// installation gets a new version on the first redeploy after the
+    /// upgrade that added it. `definition_scoped_manifests_serialize_byte_for_byte`
+    /// is the other half — this one names why the attribute is there.
+    #[test]
+    fn an_empty_config_group_does_not_reach_the_hashed_manifest() {
+        let json = serde_json::to_string(&Bindings::new()).unwrap();
+        assert!(!json.contains("config"), "{json}");
+    }
+
+    #[test]
+    fn config_round_trips() {
+        let b = Bindings::new().config("send_warning", json!({"template": "warning_first"}));
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(
+            json.contains(r#""config":{"send_warning":{"template":"warning_first"}}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Bindings>(&json).unwrap(), b);
+    }
+
+    /// Free JSON, and *free* means the nesting too: rbpmn never looks inside,
+    /// so nothing here may depend on the shape below the top level.
+    /// A typo in a group name is a manifest that deploys and delivers
+    /// nothing — the failure this whole feature is built to make impossible,
+    /// arriving one level up.
+    #[test]
+    fn a_misspelled_group_is_refused_rather_than_dropped() {
+        let e = serde_json::from_str::<Bindings>(
+            r#"{"cofig":{"st":{"template":"x"}},"topics":{"st":"payments"}}"#,
+        )
+        .expect_err("a manifest that says something rbpmn does not understand");
+        assert!(e.to_string().contains("cofig"), "{e}");
+    }
+
+    #[test]
+    fn config_values_are_not_interpreted() {
+        let value = json!({"letters": ["a", {"b": [1, 2, null]}], "n": 1.5});
+        let b = Bindings::new().config("st", value.clone());
+        let back: Bindings = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        assert_eq!(back.config["st"], value);
     }
 }

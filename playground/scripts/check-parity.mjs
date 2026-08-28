@@ -34,7 +34,7 @@ const rust = JSON.parse(
   })
 );
 
-const { fixtures } = loadFixtures();
+const { fixtures, bindings } = loadFixtures();
 let mismatches = 0;
 let total = 0;
 
@@ -57,7 +57,7 @@ const surfaces = [
   {
     name: 'check_deployable',
     inputs: fixtures,
-    run: (xml) => wasm.check_deployable(xml, '{}', '[]'),
+    run: (xml, name) => wasm.check_deployable(xml, bindings[name], '[]'),
     native: rust.check,
   },
   {
@@ -105,7 +105,7 @@ for (const { name, inputs, run, native } of surfaces) {
   }
   for (const [fixture, source] of Object.entries(inputs)) {
     total += 1;
-    if (run(source) !== native[fixture]) {
+    if (run(source, fixture) !== native[fixture]) {
       mismatches += 1;
       console.log(
         `PARITY BROKEN: ${fixture} via ${name} — WASM and native Rust disagree (stale build?)`

@@ -150,6 +150,15 @@ fn hostile_data_cannot_escape_the_data_block() {
             *hostile: { "nested": [*hostile, { "deeper": *hostile }] },
             "plain": *hostile,
         });
+        // The manifest is application text too, and `config` is the field
+        // that made that unmissable: free JSON of the application's own
+        // shape, nested as deep as it likes, rendered in the element pane.
+        inspection.bindings = rbpmn_engine::Bindings::new()
+            .topic(*hostile, *hostile)
+            .config(
+                *hostile,
+                serde_json::json!({ *hostile: [*hostile, { "deeper": *hostile }] }),
+            );
         inspection.tokens = vec![TokenView {
             element_id: (*hostile).to_string(),
             wait_kind: (*hostile).to_string(),
@@ -202,6 +211,18 @@ fn hostile_data_cannot_escape_the_data_block() {
         assert_eq!(parsed["workItems"][0]["lastFailure"], *hostile);
         assert_eq!(parsed["events"][0]["display"], *hostile);
         assert_eq!(parsed["bpmnXml"], inspection.bpmn_xml);
+        // The manifest too, and at depth. Without this the escaping check
+        // above passes when the payload is simply *gone* — a raw-character
+        // scan cannot tell "escaped correctly" from "dropped on the way in".
+        assert_eq!(parsed["bindings"]["topics"][*hostile], *hostile);
+        assert_eq!(
+            parsed["bindings"]["config"][*hostile][*hostile][0],
+            *hostile
+        );
+        assert_eq!(
+            parsed["bindings"]["config"][*hostile][*hostile][1]["deeper"],
+            *hostile
+        );
     }
 }
 

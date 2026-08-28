@@ -7,13 +7,16 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  binding,
   emptyManifest,
+  formatConfig,
   formatIndexField,
   orphanedBindings,
   parseIndexField,
   parseManifest,
   serializeManifest,
   setBinding,
+  setConfigBinding,
   setDecisionBinding,
 } from '../src/editor/manifest.js';
 
@@ -29,6 +32,7 @@ test('missing groups are filled in, present ones preserved', () => {
     correlations: {},
     indexes: [],
     decisions: {},
+    config: {},
   });
 });
 
@@ -43,6 +47,9 @@ test('shapes rbpmn would reject are refused rather than repaired', () => {
   assert.throws(() => parseManifest('{"correlations":{"c":null}}'), /correlations\.c/);
   assert.throws(() => parseManifest('{"indexes":"a"}'), /indexes/);
   assert.throws(() => parseManifest('{"indexes":[1]}'), /indexes/);
+  assert.throws(() => parseManifest('{"config":[]}'), /"config" must be an object/);
+  assert.throws(() => parseManifest('{"config":{"st":"warning"}}'), /"config\.st"/);
+  assert.throws(() => parseManifest('{"config":{"st":[1]}}'), /"config\.st"/);
   assert.throws(() => parseManifest('{"topic":{}}'), /unknown manifest key\(s\): topic/);
 });
 
@@ -61,6 +68,7 @@ test('serialize/parse round-trips', () => {
     correlations: { rt: 'order.id' },
     indexes: [{ field: 'order_no', scope: 'shared' }, { field: 'status', scope: 'definition' }],
     decisions: { brt: { decision: 'Discount', result: 'order.discount' } },
+    config: { st: { template: 'warning_first', copies: 2 } },
   };
   assert.deepEqual(parseManifest(serializeManifest(manifest)), manifest);
   // Sorted by field, and the definition-scoped entry stays a bare string.
@@ -197,4 +205,64 @@ test('the field box round-trips a scope through one line of text', () => {
   assert.equal(formatIndexField({ field: 'order_no', scope: 'shared' }), 'order_no:shared');
   assert.equal(formatIndexField('channel'), 'channel');
   assert.throws(() => parseIndexField('f:sharded'), /definition or shared/);
+});
+
+// Config is free JSON: rbpmn never looks inside one, so neither does this.
+// The only shape checked is the one `config-binds-task` checks.
+test('a config entry is stored verbatim, at any depth', () => {
+  const value = { template: 'warning_first', copies: 2, cc: ['a', { b: null }] };
+  const manifest = setConfigBinding(emptyManifest(), 'st', JSON.stringify(value));
+  assert.deepEqual(manifest.config.st, value);
+  assert.deepEqual(parseManifest(serializeManifest(manifest)).config.st, value);
+});
+
+test('an empty box removes the entry, so "no config" is one control', () => {
+  let manifest = setConfigBinding(emptyManifest(), 'st', '{"template":"a"}');
+  assert.equal('st' in manifest.config, true);
+  manifest = setConfigBinding(manifest, 'st', '   \n ');
+  assert.equal('st' in manifest.config, false);
+  assert.equal(formatConfig(manifest, 'st'), '');
+});
+
+// The box must not be able to write a shape deploy would refuse: a failed
+// commit shows the reason and leaves the manifest alone.
+test('the config box refuses what deploy would refuse', () => {
+  assert.throws(() => setConfigBinding(emptyManifest(), 'st', '{oops'), /not valid JSON/);
+  assert.throws(() => setConfigBinding(emptyManifest(), 'st', '"warning_first"'), /JSON object/);
+  assert.throws(() => setConfigBinding(emptyManifest(), 'st', '[1, 2]'), /JSON object/);
+  assert.throws(() => setConfigBinding(emptyManifest(), 'st', 'null'), /JSON object/);
+});
+
+test('setConfigBinding does not mutate the manifest it was given', () => {
+  const before = emptyManifest();
+  const after = setConfigBinding(before, 'st', '{"template":"a"}');
+  assert.deepEqual(before.config, {});
+  assert.notEqual(before, after);
+});
+
+// Deploy rejects a stale config key (`config-binds-task`), so the verdict
+// already names it with the element highlighted. Reporting it here too would
+// say the same thing twice, once as a rule and once as a hunch.
+test('config is not in the orphan warning, because the rule covers it', () => {
+  const manifest = { ...emptyManifest(), config: { gone: { template: 'a' } } };
+  assert.deepEqual(orphanedBindings(manifest, ['st']), []);
+});
+
+// `__proto__` is a valid NCName, so bpmn-js will hand it out as an element id.
+// Writing it with `=` calls the Object.prototype setter: nothing is stored,
+// nothing serializes, and the read comes back off the prototype chain — so the
+// box looks saved while the manifest is empty.
+test('an element called __proto__ is a key, not a prototype write', () => {
+  const manifest = setConfigBinding(emptyManifest(), '__proto__', '{"template":"a"}');
+  assert.deepEqual(Object.keys(manifest.config), ['__proto__']);
+  assert.equal(formatConfig(manifest, '__proto__'), '{\n  "template": "a"\n}');
+  assert.equal(serializeManifest(manifest).includes('"template": "a"'), true);
+  assert.deepEqual(parseManifest(serializeManifest(manifest)).config.__proto__, { template: 'a' });
+});
+
+test('and an unconfigured __proto__ reads as unconfigured, not as a prototype', () => {
+  assert.equal(formatConfig(emptyManifest(), '__proto__'), '');
+  assert.equal(binding(emptyManifest(), 'topics', '__proto__'), undefined);
+  const topics = setBinding(emptyManifest(), 'topics', '__proto__', 'payments');
+  assert.equal(binding(topics, 'topics', '__proto__'), 'payments');
 });

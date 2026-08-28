@@ -79,13 +79,22 @@ comment on view rbpmn_v_work_item is
 -- It is NOT what saves the unfiltered `group by definition_key, topic`: the
 -- pre-existing `rbpmn_work_item_fifo` carries the same partial predicate, and
 -- with nothing to filter on the planner reasonably picks that instead. Where
--- this index earns its keep is the filtered shape `queue_depths` issues —
--- measured, `definition_key` becomes an index condition rather than a filter,
--- and the instance join collapses from hashing every instance to a nested
--- loop on the primary key. `the_grouped_depth_query_is_index_driven` asserts
--- both halves separately, and by property (no sequential scan, driven by a
--- partial index) for the unfiltered one, because which partial index wins
--- there is the planner's business.
+-- this index earns its keep is the filtered shape `queue_depths` issues:
+-- measured, `definition_key` becomes an index condition rather than a filter.
+--
+-- That holds only when the key set is a *subset*. With one definition in the
+-- table the predicate matches every row, the leading column filters nothing,
+-- and the planner reasonably ignores this index — so
+-- `the_grouped_depth_query_is_index_driven` deploys two definitions, and
+-- asserts the unfiltered case by property (no sequential scan, driven by a
+-- partial index) because which partial index wins there is the planner's
+-- business.
+--
+-- It says nothing about the instance join, deliberately. It used to claim the
+-- join collapses to a nested loop on the primary key; that was measured
+-- against a table with no statistics, and with them the planner hashes a few
+-- thousand live instances instead — correctly. How that join executes is a
+-- function of how many instances are live, not of this index.
 --
 -- Either way the planner has to prove `state in ('available','locked')` from
 -- the claimable expression, which is the whole reason that expression must

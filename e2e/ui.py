@@ -128,6 +128,9 @@ def check_inspector(browser):
     pane = page.inner_text(".element-pane")
     check("ServiceTask" in pane, "element pane shows the model type")
     check("payments" in pane, "element pane shows the manifest topic")
+    # ...and what it was configured with. The topic says which handler ran;
+    # config says what it was told, and it is in the manifest and nowhere else.
+    check("acquirer-a" in pane, "element pane shows the manifest config")
     check("handler answered 502" in pane, "element pane shows the last failure")
 
     # An element the token never reached still shows its wiring — the reason
@@ -248,6 +251,58 @@ def check_editor(browser):
 
     manifest = page.locator("textarea.code-manifest").input_value()
     check('"rt": "order.id"' in manifest, f"the manifest JSON updated ({manifest!r})")
+
+    # Config is the one binding whose value is an object, so it gets a box of
+    # its own — and the box must refuse what deploy would refuse rather than
+    # storing it and letting the verdict find it later.
+    page.click('.djs-element[data-element-id="st"]')
+    config_box = page.locator(".wiring textarea").first
+    config_box.fill('"warning_first"')
+    config_box.blur()
+    page.wait_for_function(
+        "() => document.querySelector('.wiring .inline-error-text')?.textContent"
+        ".includes('JSON object')",
+        timeout=15000,
+    )
+    check(True, "the config box refuses a non-object without touching the manifest")
+    check(
+        '"config"' not in page.locator("textarea.code-manifest").input_value(),
+        "a refused config never reached the manifest",
+    )
+
+    config_box.fill('{"template": "warning_first"}')
+    config_box.blur()
+    page.wait_for_function(
+        "() => document.querySelector('textarea.code-manifest').value"
+        ".includes('warning_first')",
+        timeout=15000,
+    )
+    check(True, "config typed in the wiring pane reaches the manifest")
+
+    # A receive task has wiring of its own (the correlation) but produces no
+    # work item, so there is nothing to deliver config on and the pane does
+    # not offer it — `config-binds-task` would refuse it anyway.
+    page.click('.djs-element[data-element-id="rt"]')
+    check(
+        page.locator(".wiring textarea").count() == 0,
+        "config is offered only where a work item can carry it",
+    )
+
+    # Clearing the box removes the entry, which is what makes "no config" one
+    # control rather than a checkbox and a box. It also has to happen before
+    # the later checks paste a different model over this one: config has no
+    # default, so a key left behind pointing at an element that model does not
+    # contain is `config-binds-task`, and an L2 error stops the verdict before
+    # it reaches the rules those checks are about.
+    page.click('.djs-element[data-element-id="st"]')
+    config_box = page.locator(".wiring textarea").first
+    config_box.fill("")
+    config_box.blur()
+    page.wait_for_function(
+        "() => !document.querySelector('textarea.code-manifest').value.includes('config')",
+        timeout=15000,
+    )
+    check(True, "clearing the config box removes the entry")
 
     SHOTS.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(SHOTS / "ui_editor.png"), full_page=False)

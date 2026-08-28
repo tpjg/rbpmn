@@ -1,6 +1,6 @@
 // Generates src/fixtures.generated.js from the Rust fixture corpus — the
 // single source of truth. Runs automatically before dev/build (npm pre-hooks).
-import { readFileSync, writeFileSync, readdirSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -28,6 +28,7 @@ export function parseExpectations(xml) {
 export function loadFixtures() {
   const fixtures = {};
   const expected = {};
+  const bindings = {};
   for (const dir of ['accept', 'reject']) {
     for (const file of readdirSync(join(fixturesRoot, dir))
       .filter((f) => f.endsWith('.bpmn'))
@@ -36,9 +37,16 @@ export function loadFixtures() {
       const xml = readFileSync(join(fixturesRoot, dir, file), 'utf8');
       fixtures[name] = xml;
       expected[name] = parseExpectations(xml);
+      // A `.bpmn` is half a deployment. Where the corpus writes the other
+      // half down beside it, parity feeds it — otherwise `check_deployable`
+      // would be compared with an empty manifest for every fixture, and the
+      // whole manifest half of L2 (topics, correlations, decisions, config)
+      // would never be compared between the two builds at all.
+      const sidecar = join(fixturesRoot, dir, file.replace(/\.bpmn$/, '.bindings.json'));
+      bindings[name] = existsSync(sidecar) ? readFileSync(sidecar, 'utf8').trim() : '{}';
     }
   }
-  return { fixtures, expected };
+  return { fixtures, expected, bindings };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

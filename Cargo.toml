@@ -41,7 +41,7 @@ exclude = ["feel-parity", "feel-number-parity", "dmn-tck"]
 # `CARGO_PKG_VERSION`, no generated version file — so a drift here is silent
 # until someone compares a published crate against a release. It drifted three
 # tags wide once for exactly that reason; bump it with the tag.
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 # One floor for the whole workspace. DMN sets it: `rbpmn-feel-number`,
 # `rbpmn-dmn` and the shims need 1.94 because fastnum does, and DMN is in the

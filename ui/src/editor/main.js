@@ -19,13 +19,16 @@ import { ensureDi } from '../shared/layout.js';
 import { el } from '../shared/dom.js';
 import { renderProperties } from './properties.js';
 import {
+  binding,
   emptyManifest,
+  formatConfig,
   orphanedBindings,
   parseManifest,
   formatIndexField,
   parseIndexField,
   serializeManifest,
   setBinding,
+  setConfigBinding,
   setDecisionBinding,
 } from './manifest.js';
 import { checkModel, evaluateDecision, initValidator } from './validate.js';
@@ -60,7 +63,8 @@ import EXAMPLE_DMN from '../../../crates/rbpmn-dmn/tests/fixtures/accept/09-demo
 ///
 /// So the first screen has all three, already consistent: a business-rule task
 /// bound by name to a decision in the working set, service tasks bound to
-/// topics, an index declared. Every pane in the editor has something in it,
+/// topics, one of them configured, an index declared. Every pane in the
+/// editor has something in it,
 /// deleting is easier than authoring, and "New" is one click away for someone
 /// who wants the bare skeleton instead.
 ///
@@ -382,7 +386,13 @@ async function runCheck({ syncXmlBox = true } = {}) {
         payload: { title: `${d.rule}: ${d.message}` },
       }))
   );
-  renderWiring();
+  // Not while someone is typing in it. The wiring pane is rebuilt from
+  // scratch, so a re-render mid-edit replaces the control under the caret
+  // with whatever the manifest last committed — the same hazard the XML and
+  // manifest boxes guard against above, and a worse one here since the config
+  // box holds a whole object rather than one word. A blur commits first, so
+  // nothing is lost by waiting: the next check re-renders it.
+  if (!ui.wiring.contains(document.activeElement)) renderWiring();
   renderTryIt();
 }
 
@@ -468,15 +478,19 @@ function renderWiring() {
   const wantsCorrelation =
     type === 'bpmn:ReceiveTask' ||
     (bo.eventDefinitions ?? []).some((d) => d.$type === 'bpmn:MessageEventDefinition');
+  // The two kinds that produce a work item, which is what config is delivered
+  // on. `config-binds-task` refuses it anywhere else, so it is not offered
+  // anywhere else.
+  const wantsConfig = type === 'bpmn:ServiceTask' || type === 'bpmn:UserTask';
 
-  if (!wantsTopic && !wantsCorrelation && !wantsDecision) {
+  if (!wantsTopic && !wantsCorrelation && !wantsDecision && !wantsConfig) {
     ui.wiring.append(el('p', 'empty', 'this element needs no manifest wiring'));
     renderIndexes();
     return;
   }
 
   if (wantsTopic) {
-    const bound = state.manifest.topics[id];
+    const bound = binding(state.manifest, 'topics', id);
     const effective = bound || id;
     const row = bindingRow(
       'topic',
@@ -507,7 +521,7 @@ function renderWiring() {
   }
 
   if (wantsDecision) {
-    const bound = state.manifest.decisions[id] ?? { decision: '', result: '' };
+    const bound = binding(state.manifest, 'decisions', id) ?? { decision: '', result: '' };
     // The invocables the *bundle* exposes. Unlike topics this needs no
     // server: the artifacts are part of the deployment, so the editor knows
     // the whole answer.
@@ -547,7 +561,7 @@ function renderWiring() {
     ui.wiring.append(
       bindingRow(
         'correlation key',
-        state.manifest.correlations[id] ?? '',
+        binding(state.manifest, 'correlations', id) ?? '',
         'order.id',
         (value) => {
           state.manifest = setBinding(state.manifest, 'correlations', id, value);
@@ -558,7 +572,58 @@ function renderWiring() {
       )
     );
   }
+
+  if (wantsConfig) {
+    ui.wiring.append(configRow(id));
+  }
   renderIndexes();
+}
+
+/// The config box: free JSON delivered on every work item this element
+/// produces, and the only control here whose *value* rbpmn never reads.
+///
+/// It is its own row rather than a `bindingRow` because a one-line input
+/// cannot hold an object, and because the commit can fail — bad JSON, or a
+/// value that is not an object. A failed commit shows the reason and leaves
+/// the manifest alone, so the box can never write a shape deploy would
+/// refuse.
+function configRow(id) {
+  const row = el('div', 'prop');
+  row.append(el('span', 'prop-label', 'config'));
+  const input = el('textarea', 'prop-input');
+  input.spellcheck = false;
+  input.rows = 4;
+  input.value = formatConfig(state.manifest, id);
+  input.placeholder = '{\n  "template": "warning_first"\n}';
+  const error = el('div', 'inline-error-text');
+  error.hidden = true;
+  input.addEventListener('blur', () => {
+    if (input.value === formatConfig(state.manifest, id)) return;
+    try {
+      state.manifest = setConfigBinding(state.manifest, id, input.value);
+      error.hidden = true;
+      // Re-format from what was stored: the box now shows what will deploy,
+      // not what was typed at it.
+      input.value = formatConfig(state.manifest, id);
+      syncManifestBox();
+      scheduleCheck();
+    } catch (e) {
+      error.textContent = e.message;
+      error.hidden = false;
+    }
+  });
+  row.append(input);
+  row.append(
+    el(
+      'span',
+      'prop-hint',
+      'free JSON, delivered beside the variables on every work item this ' +
+        'element produces; rbpmn never reads inside it. It is hashed with the ' +
+        'model, so changing it is a deploy. Empty means none.'
+    )
+  );
+  row.append(error);
+  return row;
 }
 
 function bindingRow(label, value, placeholder, commit, hint, options) {

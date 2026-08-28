@@ -153,7 +153,29 @@ never gated.
 Both read a construct's cost as the **difference against a baseline shape**,
 not as an absolute. `exclusive-split` against `sequence-flow` is one gateway
 evaluation; `parallel-join/8` against `parallel-join/2` is what widening a
-join costs.
+join costs; and `exclusive-split-numeric` against `exclusive-split` is what a
+numeric condition costs over one that short-circuits.
+
+That last pair exists because the suite had a blind spot worth naming. Every
+construct benchmark starts its instance with an **empty** variable document,
+so the generator's branch condition (`x1 = 0`) resolves on the FEEL
+type-mismatch path — a missing value against anything but `null` is a
+mismatch, so it answers null and returns before comparing anything.
+`condition/eval` moved 7x when the FEEL number type became decimal-exact
+(`Num` is text and comparison allocates), and *no* construct benchmark could
+see it, because none of them reached a comparison at all. "Nothing else in the
+suite moved" was therefore not evidence the cost was immaterial; it was
+evidence the suite did not measure it.
+
+The pair closes that: the same model and the same single condition, once
+short-circuited and once compared. It carries an `assert!` that the two land
+on different branches, because a benchmark that quietly stopped exercising
+what it names would report an improvement.
+
+A benchmark added after a baseline was recorded is **not gated** — the gate
+iterates the baseline's entries, so a new one shows in criterion's output and
+nowhere in the table until `just bench-baseline` runs. The reverse (a
+baselined benchmark that did not run) *is* reported, as `(not run)`.
 
 Models for both come from **the fixture corpus's own generator**
 (`crates/rbpmn-core/tests/modelgen`), included rather than copied. It is
@@ -407,6 +429,30 @@ not percents.
 
 Recording is **manual** (`just bench-baseline`). A baseline that re-recorded
 itself would ratchet a regression in one accepted percent at a time.
+
+### Accepted regressions
+
+A baseline is gitignored, so re-recording one erases the only evidence that
+something got slower. What was accepted, and why, therefore lives here — a
+regression nobody wrote down is indistinguishable from one nobody noticed, and
+without a record the *next* multiple on the same function has nothing to be
+read against.
+
+**`condition/eval`, ~7x, accepted 2026-08-28.** A baseline recorded on
+`0100837` had it at 19.3 ns; it measures ~139 ns now. The cause is `7824168`
+(the DMN round): FEEL numbers became decimal-exact, so `Num` holds text and
+`compare_decimals` allocates a `String` from each side on every numeric
+comparison. That exactness is the point — it is what `just feel-parity` and
+`just number-parity` verify against dsntk — so it is a price worth paying, not
+a defect.
+
+What it costs where it is actually spent was not measurable when the
+regression appeared, which is why `construct/exclusive-split-numeric` exists.
+On the recording machine the pair reads 222 ns against 277 ns (noise 4.1 and
+7.5), so a numeric condition costs **~55 ns more than one that
+short-circuits**, inside a step that has not yet touched a database. That is
+the number the acceptance rests on. Should it ever matter, the first cut is
+`compare_decimals` taking `&str` on both sides instead of `a.to_string()`.
 
 ---
 

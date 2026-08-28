@@ -31,7 +31,7 @@ pub(crate) const RELEVANT_DEFINITIONS: &str = "select d.key, d.version, d.bindin
 pub struct Bundle {
     /// The process definition.
     pub bpmn: String,
-    /// Its wiring: topics, correlations, indexes, decision bindings.
+    /// Its wiring: topics, correlations, indexes, decision bindings, task config.
     #[serde(default)]
     pub bindings: Bindings,
     /// The DMN artifacts its business-rule tasks invoke, as raw XML.
@@ -104,6 +104,22 @@ impl Engine {
         crate::tasks::validate_index_declarations(&key, &bindings.indexes)
             .map_err(|e| DeployError::InvalidManifest(e.to_string()))?;
 
+        // The manifest is stored as jsonb, and PostgreSQL cannot represent a
+        // NUL in a string. Checked here rather than left to the insert, which
+        // would answer a well-formed request with a raw database error and an
+        // HTTP 500. Every other JSON-into-jsonb boundary asks the same
+        // question; this one became reachable when `Bindings::config` made the
+        // manifest carry arbitrary application strings — topics resolve
+        // against a NUL-free declared set, correlations are parsed FEEL
+        // qualified names, and index fields are identifier-validated.
+        let bindings_json = serde_json::to_value(bindings).expect("bindings serialize");
+        if crate::runtime::contains_nul(&bindings_json) {
+            return Err(DeployError::InvalidManifest(
+                "the manifest must not contain \\u0000 in any string                  (PostgreSQL jsonb cannot store it)"
+                    .to_string(),
+            ));
+        }
+
         if !checked.ok() {
             return Err(DeployError::Rejected(checked.diagnostics));
         }
@@ -117,7 +133,6 @@ impl Engine {
         }
         let warnings = checked.diagnostics;
 
-        let bindings_json = serde_json::to_value(bindings).expect("bindings serialize");
         let mut hasher = Sha256::new();
         hasher.update(xml.as_bytes());
         hasher.update(bindings_json.to_string().as_bytes());
@@ -355,6 +370,21 @@ impl Engine {
                 ));
                 continue;
             };
+            // The manifest half deploy checks, on the path that re-checks
+            // stored definitions. Config has no default, so an entry that
+            // stopped binding a task — a row edited by hand, a migration, a
+            // future `Bindings` shape — would deliver nothing and say
+            // nothing, which is the one failure `config-binds-task` exists to
+            // prevent. It does not gate the compile below, for the reason
+            // `check_deployable` does not either.
+            if let Some(process) = defs.processes.first() {
+                for diagnostic in rbpmn_core::config_bindings(&bindings, process) {
+                    out.push(Diagnostic {
+                        message: format!("definition '{key}' v{version}: {}", diagnostic.message),
+                        ..diagnostic
+                    });
+                }
+            }
             let proc = match ExecutableProcess::compile(&defs, &key, &bindings) {
                 Ok(proc) => proc,
                 Err(e) => {

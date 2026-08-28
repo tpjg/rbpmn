@@ -6309,11 +6309,19 @@ fn plan_lines<'a>(plan: &'a str, needle: &str) -> Vec<&'a str> {
     plan.lines().filter(|l| l.contains(needle)).collect()
 }
 
+/// Both tables the plan assertions are about.
+///
+/// `rbpmn_work_item` was missing here, and that was not cosmetic: without
+/// statistics the planner works from hardcoded defaults, so every plan
+/// asserted below was a plan no real installation gets. It is the same
+/// finding `just bench` records for the claim path, one altitude down.
 async fn analyze(pool: &PgPool) {
-    sqlx::query("analyze rbpmn_instance")
-        .execute(pool)
-        .await
-        .unwrap();
+    for table in ["rbpmn_instance", "rbpmn_work_item"] {
+        sqlx::query(&format!("analyze {table}"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }
 
 /// Bulk instance rows for the planner's benefit.
@@ -7613,6 +7621,22 @@ async fn the_grouped_depth_query_is_index_driven() {
     bulk_instances(&db.pool, "p", "Z-", 2_000).await;
     // 2 open per topic against 18 closed: ~12k open in a ~120k-row table.
     bulk_work_items(&db.pool, "p", &["alpha", "beta", "gamma"], 2, 18).await;
+    // A second definition, three times the size, because "filtered by a key
+    // set" only means anything when the set is a *subset*. With one
+    // definition in the table the predicate matches every row, the leading
+    // index column filters nothing, and the planner is right to ignore
+    // `rbpmn_work_item_depth` — which is what it did, and what this test used
+    // to miss by asserting against a table with no statistics.
+    engine.declare_topic("warn_customer").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/35-non-interrupting-on-subprocess.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    bulk_instances(&db.pool, "shipment", "Y-", 6_000).await;
+    bulk_work_items(&db.pool, "shipment", &["delta", "epsilon", "zeta"], 2, 18).await;
     analyze(&db.pool).await;
 
     let plan = explain_prepared(
@@ -7662,21 +7686,64 @@ async fn the_grouped_depth_query_is_index_driven() {
         "execute depths_f(array['p'])",
     )
     .await;
+    // True on every supported version, and the property that actually
+    // protects the table: whatever index wins, none of them is a full scan.
     assert!(
-        filtered.contains("rbpmn_work_item_depth"),
-        "the filtered depth query must reach the depth index:\n{filtered}"
+        !filtered.contains("Seq Scan on rbpmn_work_item"),
+        "the filtered depth query must not scan every work item:\n{filtered}"
     );
-    assert!(
-        filtered
-            .lines()
-            .any(|l| l.contains("Index Cond") && l.contains("definition_key")),
-        "and definition_key must be an index condition, not a filter:\n{filtered}"
-    );
-    assert!(
-        !filtered.contains("Seq Scan on rbpmn_instance"),
-        "the instance join should be a nested loop on the pkey:\n{filtered}"
-    );
+
+    // The rest is asserted from 18 up, which is what development and CI run
+    // and therefore the only version this plan has been observed on. 13 is
+    // the floor the schema needs, not a version anyone has promised optimal
+    // plans on, so an older laptop warns rather than reddening a suite over a
+    // planner's choice. Un-gate this the day the plan is checked there.
+    if server_version_num(&db.pool).await >= 180_000 {
+        assert!(
+            filtered.contains("rbpmn_work_item_depth"),
+            "the filtered depth query must reach the depth index:\n{filtered}"
+        );
+        assert!(
+            filtered
+                .lines()
+                .any(|l| l.contains("Index Cond") && l.contains("definition_key")),
+            "and definition_key must be an index condition, not a filter:\n{filtered}"
+        );
+        // How the instance join executes is deliberately NOT asserted: with
+        // a few thousand live instances the planner hashes them rather than
+        // looping on the primary key, and which wins is a function of how
+        // many are live. 0015 carries the reasoning.
+    } else {
+        warn_out_of_band(
+            "the queue-depth index assertions were skipped: they have only \
+             been observed on PostgreSQL 18, which is what development and CI \
+             run. Nothing is known to be wrong here — nothing is known at all.",
+        );
+    }
     db.drop().await;
+}
+
+/// `server_version_num` — 180000 for 18.0. Two plan assertions have a
+/// version-dependent answer and say so rather than asserting the newest
+/// planner's behaviour everywhere.
+async fn server_version_num(pool: &PgPool) -> i32 {
+    sqlx::query_scalar("select current_setting('server_version_num')::int")
+        .fetch_one(pool)
+        .await
+        .expect("server_version_num")
+}
+
+/// A warning a *passing* test can actually be heard making.
+///
+/// The harness captures `println!` and `eprintln!` and shows them only for
+/// failures or under `--nocapture`, so a warning written that way is a
+/// warning nobody reads. A direct write to the process's stderr is not
+/// captured — verified, not assumed.
+fn warn_out_of_band(message: &str) {
+    use std::io::Write as _;
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "\nwarning: {message}\n");
+    let _ = err.flush();
 }
 
 /// The typed call: the caller's key set is an argument bound into the query,
@@ -8813,5 +8880,331 @@ async fn an_instance_reaches_its_definition_through_the_stable_pair() {
     .unwrap();
     assert_eq!((row.0, row.1.as_str(), row.2), (started.id, "p", 1));
     assert_eq!(row.3.len(), 64);
+    db.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Task config: manifest wiring delivered on the work item
+// ---------------------------------------------------------------------------
+
+/// The pull claim carries what the manifest configured the element with, and
+/// `None` — never an empty object — when it configured nothing.
+#[tokio::test]
+async fn config_reaches_a_pull_claim() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().config("review", serde_json::json!({ "form": "contest" })),
+        )
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(task.config, Some(serde_json::json!({ "form": "contest" })));
+    db.drop().await;
+}
+
+/// `None`, never an empty object: every element of every definition deployed
+/// before config existed answers this way, and a handler must be able to tell
+/// "nothing was configured" from "configured with nothing".
+#[tokio::test]
+async fn an_unconfigured_element_claims_without_config() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(task.config, None);
+    db.drop().await;
+}
+
+/// The assertion the whole feature exists for. Config is inside
+/// `content_hash` and an instance is pinned to the version it started on, so
+/// a later deploy that changes a template does not change what an in-flight
+/// instance sends. A sidecar keyed by definition *key* would get this wrong.
+#[tokio::test]
+async fn an_instance_keeps_the_config_of_the_version_it_started_on() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let xml = fixture("accept/01-minimal.bpmn");
+
+    let v1 = engine
+        .deploy(
+            &xml,
+            &Bindings::new().config("review", serde_json::json!({ "template": "warning_first" })),
+        )
+        .await
+        .unwrap();
+    let pinned = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // Same diagram, different config: a new version, because the manifest is
+    // hashed with the model.
+    let v2 = engine
+        .deploy(
+            &xml,
+            &Bindings::new().config(
+                "review",
+                serde_json::json!({ "template": "warning_second" }),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!((v1.version, v2.version), (1, 2));
+    assert!(!v2.reused, "a config change is a new definition version");
+
+    let fresh = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let first = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(first.instance_id, pinned.id, "FIFO: the older instance");
+    assert_eq!(first.definition_version, 1);
+    assert_eq!(
+        first.config,
+        Some(serde_json::json!({ "template": "warning_first" }))
+    );
+
+    let second = engine
+        .get_task("review", &GetTaskOptions::new("w2"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(second.instance_id, fresh.id);
+    assert_eq!(second.definition_version, 2);
+    assert_eq!(
+        second.config,
+        Some(serde_json::json!({ "template": "warning_second" }))
+    );
+    db.drop().await;
+}
+
+/// The push handler gets the same value, and — new with it — the pinned
+/// `(definition_id, definition_version)` it could never resolve against
+/// before.
+#[tokio::test]
+async fn config_and_the_pinned_version_reach_a_push_handler() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let seen: Arc<std::sync::Mutex<Vec<WorkItem>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = seen.clone();
+    engine.register_handler(
+        "payments",
+        Arc::new(FnHandler(move |item: WorkItem| {
+            recorder.lock().unwrap().push(item);
+            Ok(serde_json::json!({}))
+        })),
+    );
+    let deployed = engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new()
+                .topic("st", "payments")
+                .config("st", serde_json::json!({ "template": "warning_first" })),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let worker = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.run_worker(worker_options()).await }
+    });
+    wait_for_status(&db.pool, started.id, "completed").await;
+    worker.abort();
+
+    let item = seen
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("the handler ran");
+    assert_eq!(
+        item.config,
+        Some(serde_json::json!({ "template": "warning_first" }))
+    );
+    assert_eq!(item.definition_id, deployed.definition_id);
+    assert_eq!(item.definition_version, 1);
+    db.drop().await;
+}
+
+/// A config entry that binds nothing is refused at deploy, where a stale
+/// `topics` key is not. The asymmetry is deliberate: a topic has a default
+/// to fall back to and config has none.
+#[tokio::test]
+async fn deploy_refuses_config_that_binds_nothing() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let xml = fixture("accept/01-minimal.bpmn");
+
+    match engine
+        .deploy(
+            &xml,
+            &Bindings::new().config("renamed_away", serde_json::json!({ "form": "contest" })),
+        )
+        .await
+    {
+        Err(DeployError::Rejected(diags)) => {
+            assert!(
+                diags.iter().any(|d| d.rule == "config-binds-task"),
+                "{diags:?}"
+            );
+        }
+        other => panic!("expected config-binds-task rejection, got {other:?}"),
+    }
+
+    engine
+        .deploy(&xml, &Bindings::new().topic("renamed_away", "review"))
+        .await
+        .expect("a stale topic key stays lenient");
+    db.drop().await;
+}
+
+/// Config is resolved after the claim statement, so it can fail with an item
+/// already locked. When it does, the claim is handed back rather than left to
+/// lapse — otherwise a definition whose manifest cannot be read would let a
+/// retrying worker lock a whole queue one lease at a time.
+///
+/// Corrupting the row is the only way to reach it: a manifest is written by
+/// `deploy` from a `Bindings`, and startup re-validation refuses to boot on
+/// one that no longer deserializes. The second engine is what makes the read
+/// happen at all — the first one cached the manifest when it compiled the
+/// process to start the instance.
+#[tokio::test]
+async fn a_claim_is_handed_back_when_the_manifest_cannot_be_read() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().config("review", serde_json::json!({ "form": "contest" })),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+
+    sqlx::query("update rbpmn_definition set bindings = '\"corrupt\"'::jsonb")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let cold = Engine::builder(db.pool.clone()).build();
+    let outcome = cold.get_task("review", &GetTaskOptions::new("w1")).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(rbpmn_engine::EngineError::CorruptManifest { .. })
+        ),
+        "{outcome:?}"
+    );
+
+    let row = sqlx::query(
+        "select state, lock_owner, lease_no from rbpmn_work_item where instance_id = $1",
+    )
+    .bind(started.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "available");
+    assert_eq!(row.get::<Option<String>, _>("lock_owner"), None);
+    // The lease epoch is spent all the same: the claim happened, and a client
+    // holding that number must not be able to act on it.
+    assert_eq!(row.get::<i64, _>("lease_no"), 1);
+    db.drop().await;
+}
+
+/// The manifest is stored as jsonb, and PostgreSQL cannot represent a NUL in
+/// a string. Config is the first manifest field carrying arbitrary
+/// application text — topics resolve against a NUL-free declared set,
+/// correlations are parsed FEEL names, index fields are identifier-validated
+/// — so this boundary became reachable with it, and a well-formed request
+/// must not come back as a raw database error.
+#[tokio::test]
+async fn a_nul_in_the_manifest_is_refused_at_the_boundary() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    match engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().config("review", serde_json::json!({ "note": "a\u{0}b" })),
+        )
+        .await
+    {
+        Err(DeployError::InvalidManifest(message)) => {
+            assert!(message.contains("u0000"), "{message}");
+        }
+        other => panic!("expected InvalidManifest, got {other:?}"),
+    }
+    db.drop().await;
+}
+
+/// Startup re-validation reproduces the deploy gates against stored rows, and
+/// config is one of them: an entry that no longer binds a task would deliver
+/// nothing and say nothing, which is the failure `config-binds-task` exists
+/// to prevent. Reached by editing the row, since deploy refuses to write one.
+#[tokio::test]
+async fn startup_revalidation_sees_a_config_key_that_stopped_binding() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/01-minimal.bpmn"),
+            &Bindings::new().config("review", serde_json::json!({ "form": "contest" })),
+        )
+        .await
+        .unwrap();
+    assert!(engine.check_active_definitions().await.unwrap().is_empty());
+
+    sqlx::query(
+        "update rbpmn_definition set bindings = \
+         '{\"config\":{\"renamed_away\":{\"form\":\"contest\"}}}'::jsonb",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let diags = Engine::builder(db.pool.clone())
+        .build()
+        .check_active_definitions()
+        .await
+        .unwrap();
+    assert!(
+        diags.iter().any(|d| d.rule == "config-binds-task"),
+        "{diags:?}"
+    );
     db.drop().await;
 }

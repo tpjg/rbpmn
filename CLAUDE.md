@@ -9,7 +9,7 @@ inclusive gateway, block structure, messages-only interaction, build order).
 - **Loudly reject, never silently reinterpret.** New capabilities land as
   linter rules first, with fixtures, then execution.
 - **Rule IDs are stable public API.** Never rename one; add new ones. The
-  rules beyond the brief's list are marked ⁺ in README.md's catalogue.
+  rules beyond the brief's list are marked ⁺ in `docs/rules.md`.
 - **Fixtures first.** Every phase starts with fixtures in
   `crates/rbpmn-model/tests/fixtures/{accept,reject}/`. Expected diagnostics
   are embedded in each `.bpmn` as an `expect-diagnostics:` comment; the runner
@@ -263,9 +263,11 @@ inclusive gateway, block structure, messages-only interaction, build order).
 
 ## Commands
 
-`.build.yml` is sourcehut CI: one task per command below, in the order a
-developer would run them. `just ui` is a task of its own and must stay first
-— everything that builds `rbpmn-ui` needs it. Two deliberate omissions:
+`.github/workflows/ci.yml` is GitHub Actions CI: one step per command below,
+in the order a developer would run them, split across two jobs by what setup
+they need (`build` = Postgres + browser, `differential` = C toolchain).
+`just ui` is a step of its own and must stay first — everything that builds
+`rbpmn-ui` needs it. Two deliberate omissions:
 benchmarks (`just lint` compiles the harness via `--workspace`, so it cannot
 rot, but nothing runs it) and `just dmn-tck` (it fetches the TCK, dsntk's
 source and a third-party runner from the network — the gate for a dsntk bump,

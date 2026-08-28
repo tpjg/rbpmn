@@ -1,11 +1,12 @@
 //! The deploy verdict, minus the database.
 //!
-//! `deploy` decides six things without touching Postgres — is this BPMN at
+//! `deploy` decides seven things without touching Postgres — is this BPMN at
 //! all, is there exactly one process, do the bundled DMN artifacts validate,
-//! do the decision bindings resolve against them, does the linter pass, and
-//! does the model compile against its bindings manifest — and exactly one
-//! thing with it: are the resolved service topics covered by the environment
-//! as registered right now (`unresolved-topic`).
+//! do the decision bindings resolve against them, does every config entry
+//! bind a task that can carry it, does the linter pass, and does the model
+//! compile against its bindings manifest — and exactly one thing with it: are
+//! the resolved service topics covered by the environment as registered right
+//! now (`unresolved-topic`).
 //!
 //! That split lives here so both callers share it. `Engine::deploy` runs this
 //! and then the environment link; the editor runs this in WASM and does the
@@ -25,6 +26,7 @@
 
 use crate::compile::{Bindings, CompileError, ExecutableProcess};
 use crate::decisions::{DecisionValidator, Invocable};
+use rbpmn_model::model::NodeKind;
 use rbpmn_model::{Diagnostic, ParseError, rule};
 
 /// What can be known about a deployment before the environment is consulted.
@@ -124,10 +126,17 @@ pub fn check_deployable(
     let mut diagnostics = decided.diagnostics;
     diagnostics.extend(decision_bindings(bindings, &decided.invocables));
     diagnostics.extend(rbpmn_model::lint(&defs));
+    // Held back from the gate below rather than added here, deliberately.
+    // Compilation does not read config — it is not in `ExecutableProcess` at
+    // all — so letting a config error skip the compile stage would make the
+    // mildest manifest defect there is hide `unresolved-topic` and
+    // `message-has-correlation` until the next round trip.
+    let config = config_bindings(bindings, &defs.processes[0]);
     // Compilation re-lints, so running it over a model the linter already
     // rejected would only restate those errors. Stop at the first gate, the
     // way deploy does.
     if rbpmn_model::has_errors(&diagnostics) {
+        diagnostics.extend(config);
         return DeployCheck::Checked(Checked {
             key,
             diagnostics,
@@ -139,7 +148,9 @@ pub fn check_deployable(
     // Phase gating + condition/topic/correlation resolution. The mappings
     // below are the contract: a compile failure is reported as the rule a
     // modeler can act on, never as a raw error string.
-    match ExecutableProcess::compile(&defs, &key, bindings) {
+    let compiled = ExecutableProcess::compile(&defs, &key, bindings);
+    diagnostics.extend(config);
+    match compiled {
         Ok(proc) => {
             let topics = proc
                 .service_topics()
@@ -239,6 +250,113 @@ fn decision_bindings(bindings: &Bindings, invocables: &[Invocable]) -> Vec<Diagn
     diagnostics
 }
 
+/// `config-binds-task`, over the manifest and the model.
+///
+/// Two clauses, one rule id — the shape of the entry and what it is keyed by
+/// — the way `decision-has-binding` covers both halves of a decision binding.
+/// A modeller with both defects on one element has two things to fix and is
+/// told both.
+///
+/// **Why this is an error where a stale `topics` key is not.** Those groups
+/// have a default: a topic map is an override table, so an override for an
+/// element that is not there overrides nothing, and the editor's orphan
+/// warning is the right weight for it. Config has no default and no meaning
+/// except delivery, so an entry nothing delivers is not inert — it is the
+/// wiring silently absent from a task that looks configured. And it carries a
+/// failure the other groups cannot have: a key naming an element that *is* in
+/// the model but produces no work item, which no orphan check can see and
+/// which a modeller can point at on the canvas.
+///
+/// Independent of both lint and compile, deliberately: a manifest that binds
+/// nothing is worth saying on the same trip as the model errors, not on the
+/// one after they are fixed.
+pub fn config_bindings(
+    bindings: &Bindings,
+    process: &rbpmn_model::model::Process,
+) -> Vec<Diagnostic> {
+    if bindings.config.is_empty() {
+        return Vec::new();
+    }
+    let mut elements: std::collections::BTreeMap<&str, &NodeKind> =
+        std::collections::BTreeMap::new();
+    collect_elements(&process.body, &mut elements);
+
+    let mut diagnostics = Vec::new();
+    for (element, config) in &bindings.config {
+        if !config.is_object() {
+            diagnostics.push(Diagnostic::error(
+                rule::CONFIG_BINDS_TASK,
+                element,
+                format!(
+                    "config is {}, and a config entry is a JSON object — a single \
+                     value is spelled {{\"template\": \"warning_first\"}}, which \
+                     leaves room for a second key without changing the shape",
+                    json_kind(config)
+                ),
+            ));
+        }
+        match elements.get(element.as_str()) {
+            Some(NodeKind::ServiceTask { .. } | NodeKind::UserTask) => {}
+            // The parenthetical rather than an article, as `NotYetExecutable`
+            // phrases the same shape: "a user task" and "an unsupported
+            // element" cannot both come out of one vowel rule.
+            Some(kind) => diagnostics.push(Diagnostic::error(
+                rule::CONFIG_BINDS_TASK,
+                element,
+                format!(
+                    "'{element}' ({}) produces no work item — config is delivered \
+                     on a work item, so it binds service tasks and user tasks and \
+                     nothing else",
+                    kind.describe()
+                ),
+            )),
+            None => diagnostics.push(Diagnostic::error(
+                rule::CONFIG_BINDS_TASK,
+                element,
+                format!(
+                    "no element '{element}' in this process — config has no default, \
+                     so an entry that binds nothing is wiring that silently never \
+                     arrives (a rename that lost its other half, usually)"
+                ),
+            )),
+        }
+    }
+    diagnostics
+}
+
+/// How a JSON value reads in a diagnostic about a manifest entry.
+///
+/// Deliberately not `compile::describe`, which serves incidents about the
+/// *variable document*: there a missing path and an explicit null are the
+/// same answer, so it says "missing (or null)". A manifest key that is
+/// present with a null value is not missing, and telling a modeller it is
+/// sends them looking for a key they are staring at.
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "a list",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Every element in the process, subprocess bodies included: a config entry
+/// may name a task at any depth, and a boundary event is an element a
+/// manifest can name wrongly.
+fn collect_elements<'a>(
+    scope: &'a rbpmn_model::model::FlowScope,
+    out: &mut std::collections::BTreeMap<&'a str, &'a NodeKind>,
+) {
+    for node in &scope.nodes {
+        out.insert(node.id.as_str(), &node.kind);
+        if let NodeKind::SubProcess(sp) = &node.kind {
+            collect_elements(&sp.body, out);
+        }
+    }
+}
+
 /// One compile failure -> the diagnostics deploy reports for it.
 fn compile_diagnostics(key: &str, e: CompileError) -> Vec<Diagnostic> {
     match e {
@@ -316,6 +434,7 @@ fn compile_diagnostics(key: &str, e: CompileError) -> Vec<Diagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const MINIMAL: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="defs">
@@ -349,6 +468,158 @@ mod tests {
     fn unmapped_service_task_defaults_to_its_element_id() {
         let c = checked(MINIMAL, &Bindings::new());
         assert_eq!(c.topics, vec![("st".to_string(), "st".to_string())]);
+    }
+
+    /// A service task, a user task and a task one scope down, plus elements a
+    /// config entry can name wrongly: the subprocess itself and the start
+    /// event.
+    const CONFIGURABLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="defs">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:serviceTask id="st"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:userTask id="ut"><bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing></bpmn:userTask>
+    <bpmn:subProcess id="sp">
+      <bpmn:incoming>f3</bpmn:incoming><bpmn:outgoing>f4</bpmn:outgoing>
+      <bpmn:startEvent id="s2"><bpmn:outgoing>g1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:serviceTask id="nested"><bpmn:incoming>g1</bpmn:incoming><bpmn:outgoing>g2</bpmn:outgoing></bpmn:serviceTask>
+      <bpmn:endEvent id="e2"><bpmn:incoming>g2</bpmn:incoming></bpmn:endEvent>
+      <bpmn:sequenceFlow id="g1" sourceRef="s2" targetRef="nested" />
+      <bpmn:sequenceFlow id="g2" sourceRef="nested" targetRef="e2" />
+    </bpmn:subProcess>
+    <bpmn:endEvent id="end"><bpmn:incoming>f4</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="st" />
+    <bpmn:sequenceFlow id="f2" sourceRef="st" targetRef="ut" />
+    <bpmn:sequenceFlow id="f3" sourceRef="ut" targetRef="sp" />
+    <bpmn:sequenceFlow id="f4" sourceRef="sp" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    fn config_errors(xml: &str, bindings: &Bindings) -> Vec<Diagnostic> {
+        checked(xml, bindings)
+            .diagnostics
+            .into_iter()
+            .filter(|d| d.rule == rule::CONFIG_BINDS_TASK)
+            .collect()
+    }
+
+    /// Both kinds that produce a work item, at both depths.
+    #[test]
+    fn config_binds_service_and_user_tasks_at_any_depth() {
+        let c = checked(
+            CONFIGURABLE,
+            &Bindings::new()
+                .config("st", json!({"template": "warning_first"}))
+                .config("ut", json!({"form": "contest"}))
+                .config("nested", json!({})),
+        );
+        assert!(c.ok(), "{:?}", c.diagnostics);
+    }
+
+    /// The failure the editor's orphan warning cannot see: the element is
+    /// right there on the canvas, and produces nothing to deliver config on.
+    #[test]
+    fn config_on_an_element_that_produces_no_work_item_is_refused() {
+        let d = config_errors(
+            CONFIGURABLE,
+            &Bindings::new()
+                .config("sp", json!({"a": 1}))
+                .config("start", json!({"a": 1})),
+        );
+        let elements: Vec<&str> = d.iter().map(|d| d.element.as_str()).collect();
+        assert_eq!(elements, vec!["sp", "start"], "{d:?}");
+        assert!(d[0].message.contains("subprocess"), "{:?}", d[0]);
+    }
+
+    /// The stale key. An error here where the same key in `topics` is not:
+    /// a topic has a default to fall back to, config has nothing.
+    #[test]
+    fn config_on_an_element_that_is_not_in_the_model_is_refused() {
+        let d = config_errors(CONFIGURABLE, &Bindings::new().config("gone", json!({})));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].element, "gone");
+    }
+
+    /// ...and the same key in `topics` still is not, which is the asymmetry
+    /// the rule is deliberately taking on.
+    #[test]
+    fn a_stale_topic_key_stays_lenient() {
+        let c = checked(CONFIGURABLE, &Bindings::new().topic("gone", "payments"));
+        assert!(c.ok(), "{:?}", c.diagnostics);
+    }
+
+    /// Shape and target are separate defects and both are reported: a
+    /// modeller with two things to fix hears about two.
+    #[test]
+    fn a_config_entry_must_be_an_object() {
+        let d = config_errors(
+            CONFIGURABLE,
+            &Bindings::new()
+                .config("st", json!("warning_first"))
+                .config("ut", json!([1, 2]))
+                .config("gone", json!(null)),
+        );
+        let elements: Vec<&str> = d.iter().map(|d| d.element.as_str()).collect();
+        assert_eq!(elements, vec!["gone", "gone", "st", "ut"], "{d:?}");
+        assert!(d[2].message.contains("a string"), "{:?}", d[2]);
+        assert!(d[3].message.contains("a list"), "{:?}", d[3]);
+    }
+
+    /// The mildest manifest defect there is must not hide model errors: a
+    /// config key that binds nothing stops nothing, so the compile stage still
+    /// runs and still reports what only it can see.
+    #[test]
+    fn a_stale_config_key_does_not_hide_the_compile_stage() {
+        let c = checked(
+            TWO_BOUNDARIES,
+            &Bindings::new()
+                .correlation("b1", "order.id")
+                .correlation("b2", "order.id")
+                .config("gone", json!({})),
+        );
+        let rules: Vec<&str> = c.diagnostics.iter().map(|d| d.rule.as_str()).collect();
+        assert!(rules.contains(&rule::CONFIG_BINDS_TASK), "{rules:?}");
+        assert!(rules.contains(&rule::AMBIGUOUS_MESSAGE_ARM), "{rules:?}");
+    }
+
+    /// ...and a model that compiles still resolves its topics, so the
+    /// environment link the caller performs is not skipped either.
+    #[test]
+    fn a_stale_config_key_does_not_hide_the_resolved_topics() {
+        let c = checked(
+            CONFIGURABLE,
+            &Bindings::new()
+                .topic("st", "payments")
+                .config("gone", json!({})),
+        );
+        assert!(!c.ok(), "the config error is still an error");
+        assert!(
+            c.topics
+                .contains(&("st".to_string(), "payments".to_string())),
+            "{:?}",
+            c.topics
+        );
+    }
+
+    /// A manifest key that is present with a null value is not *missing*, and
+    /// saying so sends a modeller looking for a key they are staring at.
+    #[test]
+    fn a_null_config_entry_is_described_as_null() {
+        let d = config_errors(CONFIGURABLE, &Bindings::new().config("st", json!(null)));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("config is null"), "{:?}", d[0]);
+    }
+
+    /// The JSON path and the fluent path are one manifest and one validation
+    /// path — a non-object entry deserializes and is then refused by the same
+    /// rule, rather than failing as a parse error naming a byte offset.
+    #[test]
+    fn the_json_spelling_reaches_the_same_rule() {
+        let bindings: Bindings =
+            serde_json::from_str(r#"{"config":{"st":"warning_first"}}"#).expect("manifest parses");
+        let d = config_errors(CONFIGURABLE, &bindings);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].rule, rule::CONFIG_BINDS_TASK);
     }
 
     #[test]

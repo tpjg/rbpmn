@@ -121,6 +121,19 @@ pub mod rule {
     /// naming a decision the bundle actually exposes.
     pub const DECISION_HAS_BINDING: &str = "decision-has-binding";
     pub const UNRESOLVED_DECISION: &str = "unresolved-decision";
+
+    /// A manifest config entry: a JSON object, keyed by an element that
+    /// produces a work item. Deploy-time (L2) like `decision-has-binding`,
+    /// and enforced in `rbpmn_core::check` — the config group is never in
+    /// the XML.
+    ///
+    /// Stricter than a stale key in `topics`, `correlations` or `decisions`,
+    /// which bind nothing and are only warned about by the editor. The
+    /// difference is that those groups have a default and this one does not:
+    /// a topic map is an override table, so an override for an element that
+    /// is not there overrides nothing, while a config entry's only meaning
+    /// is delivery.
+    pub const CONFIG_BINDS_TASK: &str = "config-binds-task";
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -255,5 +268,10 @@ pub const CATALOGUE: &[RuleInfo] = &[
         id: rule::FEEL_DETERMINISTIC,
         severity: Severity::Error,
         summary: "Decisions must be deterministic and self-contained: no now()/today(), and no external Java or PMML functions. Time enters as an input, never from a clock.",
+    },
+    RuleInfo {
+        id: rule::CONFIG_BINDS_TASK,
+        severity: Severity::Error,
+        summary: "A manifest config entry must be a JSON object keyed by a service or user task — the elements that produce a work item to deliver it on. Stricter than the other manifest groups, which have a default and so bind nothing when stale; config has none, so an entry that is never delivered is a silent failure.",
     },
 ];

@@ -100,7 +100,8 @@ impl Engine {
                 join rbpmn_instance i on i.id = w.instance_id \
                 where w.kind = 'service' and w.topic = any($1) and {claimable} \
                 order by w.created_at, w.item_no limit 1 for update of w skip locked) \
-             returning id, instance_id, definition_key, element_id, topic, lease_no, \
+             returning id, instance_id, definition_key, definition_id, \
+               definition_version, element_id, topic, lease_no, \
                (select variables from rbpmn_instance i2 \
                  where i2.id = rbpmn_work_item.instance_id) as variables",
             claimable = crate::CLAIMABLE,
@@ -120,13 +121,35 @@ impl Engine {
         // here as the pull API's does — both paths must, or a pull
         // claimant's stale release could free this worker's live lease.
         let lease_no: i64 = row.get("lease_no");
+        let definition_id: uuid::Uuid = row.get("definition_id");
+        let definition_key: String = row.get("definition_key");
+        let element_id: String = row.get("element_id");
+        // After the claim, not inside it: config is immutable definition data
+        // (the instance is pinned to `definition_id`, which never changes),
+        // so there is no snapshot to take and nothing a second read can race.
+        // On a warm engine this touches no database at all.
+        let config = crate::runtime::task_config(
+            self,
+            crate::runtime::ClaimedItem {
+                id: row.get("id"),
+                owner: &options.owner,
+                lease_no,
+                definition_id,
+                definition_key: &definition_key,
+                element_id: &element_id,
+            },
+        )
+        .await?;
         let item = WorkItem {
             id: row.get("id"),
             instance_id: row.get("instance_id"),
-            definition_key: row.get("definition_key"),
-            element_id: row.get("element_id"),
+            definition_key,
+            definition_id,
+            definition_version: row.get("definition_version"),
+            element_id,
             topic: row.get("topic"),
             variables: row.get("variables"),
+            config,
         };
 
         let Some(handler) = self.handler_for(&item.topic) else {

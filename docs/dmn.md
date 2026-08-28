@@ -1,7 +1,9 @@
 # DMN & FEEL — the dsntk route
 
-**Status: Gate 0a and 0b pass; 0c (the DMN TCK) is the remaining gate.**
-Nothing is shipped. This document records the survey, the decisions taken
+**Status: shipped, and on by default** (D9). Gate 0c, the DMN TCK against the
+fork rbpmn ships, is owed against the current rev and stays owed on every fork
+bump — it is the one gate that is deliberately not a per-commit check.
+This document records the survey, the decisions taken
 before any code, the measured results, and a tracker. The tracker at the
 bottom is the authority on where we are; everything above it is why.
 
@@ -1063,6 +1065,10 @@ compiles and evaluates a decision table inside the VM.
 ## Tracker
 
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
+
+Entries below name files as they were when the work landed: `.build.yml` is
+the sourcehut manifest `.github/workflows/ci.yml` replaced in August 2026, and
+the rule catalogue moved out of README.md to `docs/rules.md` at the same time.
 
 ### Gate 0 — number swap
 

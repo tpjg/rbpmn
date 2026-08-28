@@ -61,7 +61,13 @@ fn sample() -> InstanceInspection {
         // and no work item was ever created to carry it.
         bindings: Bindings::new()
             .topic("st", "payments")
-            .topic("t_fix", "payment-recovery"),
+            .topic("t_fix", "payment-recovery")
+            // The other half of "why did this element do that": the topic
+            // says which handler ran, the config says what it was told.
+            .config(
+                "st",
+                serde_json::json!({ "gateway": "acquirer-a", "retries": 3 }),
+            ),
         tokens: vec![TokenView {
             element_id: "st".to_string(),
             wait_kind: "incident".to_string(),

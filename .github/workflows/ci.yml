@@ -1,0 +1,264 @@
+# GitHub Actions CI for rbpmn.
+#
+# One step per command in README.md's "Developing" table, in the order a
+# developer runs them, so a red build names the discipline it broke rather
+# than "tests failed". Nothing here is a convenience wrapper: every step is a
+# command you are expected to run locally, invoked exactly as you would.
+#
+# Two jobs, not one, and the split is by *setup* rather than by taste: `build`
+# needs Postgres and a browser, `differential` needs a C toolchain and pulls
+# ~170 crates into two lockfiles outside the workspace. They share nothing, so
+# they run in parallel.
+#
+# Benchmarks are deliberately absent. They never gate on absolute numbers and
+# a shared runner is the worst possible machine to measure on — see
+# benchmarks/README.md. `just lint` does *compile* the harness (`--workspace`),
+# so the crate cannot rot; it is never run.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # So a run can be started against any branch without opening a PR first.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The engine's integration tests create and drop throwaway `rbpmn_test_*`
+  # databases; their default admin URL assumes $USER has a role.
+  RBPMN_TEST_ADMIN_URL: postgres://postgres@localhost:5432/postgres
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    services:
+      # 18, the version development runs. The schema's floor is 13 (`xid8`,
+      # `pg_snapshot_xmin`) and 15 executes correctly, but plans differ — the
+      # queue-depth index is only chosen from 18, which a run on 15 proved.
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # The served half of `just e2e-ui` skips itself when Postgres or its
+      # ports are unavailable — right for a developer, wrong here. It went
+      # green on the `file://` half alone once already.
+      RBPMN_E2E_REQUIRE_SERVED: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust
+        # Deliberately not pinned to an exact toolchain: tracking stable
+        # catches new clippy lints the day they land, at the cost that a
+        # stable release can red-build a commit that changed nothing. The fix,
+        # if that becomes annoying, is a rust-toolchain.toml — which also pins
+        # every developer's local build, which is why it is not here.
+        #
+        # `--component clippy,rustfmt` is not optional: a minimal toolchain has
+        # neither, and `just lint` then fails with "'cargo-clippy' is not
+        # installed for the toolchain" three steps into the build.
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustc --version && cargo clippy --version && cargo fmt --version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: just and wasm-pack
+        # `just` pinned, and pinned *older* than the version development runs
+        # on. It is the compatibility floor: the justfile is the interface
+        # every step below goes through, and a recipe that only parses on the
+        # newest release is a recipe that breaks for anyone who installed just
+        # from their distribution. This has already earned its keep —
+        # `*ARGS:` parses on 1.43 and is a hard error on 1.36, and because it
+        # is a *parse* error the whole file is unusable, so the failure
+        # surfaced three recipes away from its cause. Raise it deliberately.
+        #
+        # wasm-pack from its prebuilt installer: `cargo install` compiles it
+        # from source for minutes.
+        run: |
+          JUST_VERSION=1.36.0
+          curl -fsSL "https://github.com/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar xz -C /tmp just
+          sudo mv /tmp/just /usr/local/bin/
+          curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+          just --version && wasm-pack --version
+
+      - name: Postgres role for $USER
+        # A great deal of this repo connects without `-U` and lets libpq fall
+        # back to $USER — `just serve`, `just demo`, e2e/demo.py's psql helper.
+        # True on any developer machine, false on a fresh server. Idempotent,
+        # like every other provisioning step here.
+        run: |
+          sudo apt-get install -qq -y postgresql-client
+          psql "$RBPMN_TEST_ADMIN_URL" -tAc "select 1 from pg_roles where rolname = '$USER'" | grep -q 1 \
+            || psql "$RBPMN_TEST_ADMIN_URL" -c "create role \"$USER\" superuser login"
+          psql -q -h localhost postgres -c 'select 1' >/dev/null
+          echo "psql as $USER without -U: ok"
+
+      - name: Playwright
+        # Its own step so the ~150 MB chromium download is visible as itself
+        # rather than as part of a test that appears to hang.
+        run: |
+          pip install --break-system-packages playwright
+          playwright install --with-deps chromium
+
+      # `just ui` MUST come before anything that builds rbpmn-ui — `just lint`
+      # (--workspace) and `cargo test` both do. The two UI documents are
+      # compile output and gitignored like every other artifact here;
+      # rbpmn-ui's build.rs fails with a message saying exactly this. Its own
+      # step so that failure is unambiguous.
+      - name: just ui
+        run: just ui
+
+      - name: just lint
+        run: just lint
+
+      # DMN is on by default; this is the only thing keeping "optional" true
+      # rather than aspirational, and the previous arrangement rotted in
+      # exactly that way. It asserts the dependency graph in both directions.
+      - name: just no-dmn
+        run: just no-dmn
+
+      - name: cargo test
+        run: cargo test
+
+      # Not a default member, so `cargo test` never reaches it: the gate's
+      # arithmetic, seeded variable documents and percentile edges run here or
+      # nowhere.
+      - name: cargo test -p rbpmn-bench
+        run: cargo test -p rbpmn-bench
+
+      # Byte-parity of native Rust against WASM over the whole corpus, both
+      # exports, plus the bpmnlint plugin's pipeline test. A surface that
+      # reports a verdict must report *the* verdict.
+      - name: just parity
+        run: just parity
+
+      - name: just ui-test
+        run: just ui-test
+
+      # Both documents in a real browser: from file://, then against a served
+      # stack behind an auth-injecting proxy. The Rust tests pin structure and
+      # escaping; none of that notices a blank canvas, and the CSP is only
+      # actually enforced in a browser.
+      - name: just e2e-ui
+        run: just e2e-ui
+
+      - name: Screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screenshots
+          path: e2e/screenshots/
+          if-no-files-found: ignore
+
+      # The DI baker is idempotent, so a diff means a fixture landed without
+      # the diagram interchange that makes it render in bpmn-js and any
+      # standard modeler. Scoped to the corpus: the recipe runs `npm install`
+      # first, which can rewrite a lockfile, and that must not read as a
+      # missing fixture.
+      - name: just fixtures-di
+        run: |
+          just fixtures-di
+          git diff --exit-code -- crates/rbpmn-model/tests/fixtures/ || {
+            echo
+            echo "A fixture is missing its baked-in DI (the diff above is what"
+            echo "'just fixtures-di' had to add). Run it locally and commit the result."
+            exit 1
+          }
+
+      # Nineteen configs, twelve of them *expected* to fail against the
+      # specific violation they demonstrate — a spec that merely stops parsing
+      # must not read as "fails as expected". The specs are hand-written and
+      # will not tell you they drifted, which is why this runs per commit
+      # rather than on demand. java is preinstalled on this image.
+      - name: just tla
+        run: just tla
+
+  differential:
+    # The two checks that verify arithmetic rather than behaviour. Outside the
+    # workspace and outside its lockfile, deliberately: `feel-number-parity`
+    # links Intel's C library, which must never reach this workspace's
+    # lockfile, and both pull ~170 crates that have no business in it.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: C toolchain
+        # cc for dsntk's dfp-number-sys; openssl because dsntk-feel-evaluator
+        # pulls reqwest with default features, so native-tls. The engine itself
+        # is rustls-only and needs none of this. Named explicitly rather than
+        # relying on the runner image carrying them.
+        run: sudo apt-get install -qq -y build-essential pkg-config libssl-dev
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            feel-parity/target
+            feel-number-parity/target
+          key: differential-${{ runner.os }}-${{ hashFiles('feel-parity/Cargo.toml', 'feel-number-parity/Cargo.toml') }}
+          restore-keys: differential-${{ runner.os }}-
+
+      - name: just
+        run: |
+          JUST_VERSION=1.36.0
+          curl -fsSL "https://github.com/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar xz -C /tmp just
+          sudo mv /tmp/just /usr/local/bin/
+
+      # The pure-Rust decimal128 against the C library it replaces: 26 300
+      # comparisons, three named deviation classes, anything outside them
+      # fails. Every decision rbpmn evaluates goes through this arithmetic, so
+      # it runs per commit rather than on demand. Runs `just dsntk-rev` first —
+      # a differential against a rev nobody ships is green and meaningless.
+      - name: just number-parity
+        run: just number-parity
+
+      # The FEEL subset against dsntk over ~8k expression/document pairs.
+      # Last because it is the most expensive thing here.
+      #
+      # `just dmn-tck` is the one owed command with no step anywhere, and
+      # deliberately: it fetches the DMN TCK, dsntk's source and a third-party
+      # runner from the network. It is the gate for a dsntk fork bump, run
+      # deliberately, not a per-commit check.
+      - name: just feel-parity
+        run: just feel-parity

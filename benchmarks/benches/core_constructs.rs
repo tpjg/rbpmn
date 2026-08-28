@@ -40,15 +40,19 @@ fn compile(block: &Block) -> ExecutableProcess {
 /// A started instance with `completed` of its work items already completed —
 /// the setup for measuring the *next* transition rather than the whole run.
 fn primed(proc: &ExecutableProcess, completed: usize) -> InstanceState {
+    primed_with(proc, completed, serde_json::json!({}))
+}
+
+/// The same, started with a variable document rather than an empty one —
+/// which is what it takes to make a generated branch condition actually
+/// *compare* anything. See `exclusive-split-numeric`.
+fn primed_with(
+    proc: &ExecutableProcess,
+    completed: usize,
+    variables: serde_json::Value,
+) -> InstanceState {
     let mut state = InstanceState::new();
-    step(
-        proc,
-        &mut state,
-        Command::Start {
-            variables: serde_json::json!({}),
-        },
-    )
-    .expect("start");
+    step(proc, &mut state, Command::Start { variables }).expect("start");
     for _ in 0..completed {
         let id = first_open(&state).expect("an open work item to complete");
         step(
@@ -66,6 +70,18 @@ fn primed(proc: &ExecutableProcess, completed: usize) -> InstanceState {
 
 fn first_open(state: &InstanceState) -> Option<WorkItemId> {
     state.open_work_items().map(|(id, _)| id).next()
+}
+
+/// Which element the token parks on once the split has been crossed — the
+/// only externally visible evidence of which branch a condition chose.
+fn branch_taken(proc: &ExecutableProcess, variables: &serde_json::Value) -> usize {
+    let mut state = primed_with(proc, 0, variables.clone());
+    complete_one(proc, &mut state);
+    state
+        .open_work_items()
+        .map(|(_, item)| item.element)
+        .next()
+        .expect("a task after the split")
 }
 
 fn complete_one(proc: &ExecutableProcess, state: &mut InstanceState) {
@@ -106,6 +122,47 @@ fn constructs(c: &mut Criterion) {
     group.bench_function("exclusive-split", |b| {
         b.iter_batched_ref(
             || primed(&xor, 0),
+            |state| complete_one(&xor, state),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    // The same split, with its condition actually comparing two numbers.
+    //
+    // `exclusive-split` above starts with an empty variable document, so the
+    // generator's `x1 = 0` resolves on the FEEL type-mismatch path: a missing
+    // value against anything but `null` is a type mismatch, so it answers
+    // null and returns before any comparison happens, and the default flow is
+    // taken. That is a real case — it is what an unset decision variable does
+    // — but it is the cheap one, and it means this group measured no numeric
+    // comparison at all.
+    //
+    // Which is why this exists. `condition/eval` measures numeric comparison
+    // directly and moved 7x when the FEEL number type became decimal-exact
+    // (`Num` is text, and comparison allocates), and *no* construct-level
+    // benchmark could see it. The pair is the point: the same model and the
+    // same single condition, once short-circuited and once compared, so the
+    // difference is what a numeric comparison costs inside a step rather than
+    // in isolation.
+    //
+    // Both take one flow to one task, so the structure either side of the
+    // gateway is the same work; only the branch differs.
+    //
+    // Guarded, because a benchmark that quietly stopped exercising what it
+    // names is worse than no benchmark: if the generator renames its decision
+    // variable, or the condition stops matching, this measures the cheap path
+    // again and reports an improvement. The two must land on different
+    // branches, and `assert!` runs in a release build.
+    let numeric_vars = serde_json::json!({ "x1": 0 });
+    assert_ne!(
+        branch_taken(&xor, &numeric_vars),
+        branch_taken(&xor, &serde_json::json!({})),
+        "the numeric split takes the same branch as the empty one — its \
+         condition is not comparing anything"
+    );
+    group.bench_function("exclusive-split-numeric", |b| {
+        b.iter_batched_ref(
+            || primed_with(&xor, 0, numeric_vars.clone()),
             |state| complete_one(&xor, state),
             criterion::BatchSize::SmallInput,
         );

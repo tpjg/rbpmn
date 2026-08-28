@@ -111,6 +111,16 @@ pub struct LockedTask {
     /// columns of the claimed row (migration 0011), written when the item
     /// was created and immutable after — the claim reads them, it does not
     /// look them up.
+    ///
+    /// This is a first-class mechanism, not a leftover of the one [`config`]
+    /// added: the two answer different questions. Config is *model content*
+    /// — content-hashed, so it can only change by deploying. Everything that
+    /// must not be in that hash (per-environment values, anything that
+    /// changes without a deploy, payloads too large or too dynamic to want
+    /// versioned) resolves against this pair instead, in the application's
+    /// own store. `docs/design/task-config.md` D7 has the long form.
+    ///
+    /// [`config`]: LockedTask::config
     pub definition_id: Uuid,
     pub definition_version: i32,
     pub element_id: String,
@@ -118,6 +128,14 @@ pub struct LockedTask {
     pub kind: String,
     /// The instance's live variables as of the claim.
     pub variables: serde_json::Value,
+    /// What the manifest configured this element with (`Bindings::config`),
+    /// or `None` when it configured nothing.
+    ///
+    /// Definition data, not instance data: it is content-hashed and pinned
+    /// with `definition_id`, so it is identical for every task this element
+    /// produces on this version and changes only by deploying. Free JSON the
+    /// engine never interprets — compose it with `variables` yourself.
+    pub config: Option<serde_json::Value>,
     /// Lease deadline (RFC 3339 UTC, database time). Renew before it.
     pub lock_until: String,
     /// Which claim this is — the item's lease epoch, bumped by every claim
@@ -372,16 +390,37 @@ impl Engine {
         // longer hand back post-claim variables — one claim, one snapshot.
         let instance_id: Uuid = row.get("instance_id");
         let variables: serde_json::Value = row.get("variables");
+        let definition_id: Uuid = row.get("definition_id");
+        let definition_key: String = row.get("definition_key");
+        let element_id: String = row.get("element_id");
+        // After the claim rather than inside it, deliberately: config is
+        // immutable definition data pinned by `definition_id`, so unlike the
+        // variables there is no snapshot for a concurrent step to spoil, and
+        // the claim statement stays the one statement it has always been. On
+        // a warm engine this reads no row.
+        let config = crate::runtime::task_config(
+            self,
+            crate::runtime::ClaimedItem {
+                id: row.get("id"),
+                owner: &options.owner,
+                lease_no: row.get("lease_no"),
+                definition_id,
+                definition_key: &definition_key,
+                element_id: &element_id,
+            },
+        )
+        .await?;
         Ok(Some(LockedTask {
             id: row.get("id"),
             instance_id,
-            definition_key: row.get("definition_key"),
-            definition_id: row.get("definition_id"),
+            definition_key,
+            definition_id,
             definition_version: row.get("definition_version"),
-            element_id: row.get("element_id"),
+            element_id,
             topic: row.get("topic"),
             kind: row.get("kind"),
             variables,
+            config,
             lock_until: row.get("lock_until"),
             lease_no: row.get("lease_no"),
         }))
