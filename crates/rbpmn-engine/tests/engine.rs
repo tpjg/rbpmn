@@ -6309,11 +6309,19 @@ fn plan_lines<'a>(plan: &'a str, needle: &str) -> Vec<&'a str> {
     plan.lines().filter(|l| l.contains(needle)).collect()
 }
 
+/// Both tables the plan assertions are about.
+///
+/// `rbpmn_work_item` was missing here, and that was not cosmetic: without
+/// statistics the planner works from hardcoded defaults, so every plan
+/// asserted below was a plan no real installation gets. It is the same
+/// finding `just bench` records for the claim path, one altitude down.
 async fn analyze(pool: &PgPool) {
-    sqlx::query("analyze rbpmn_instance")
-        .execute(pool)
-        .await
-        .unwrap();
+    for table in ["rbpmn_instance", "rbpmn_work_item"] {
+        sqlx::query(&format!("analyze {table}"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }
 
 /// Bulk instance rows for the planner's benefit.
@@ -7613,6 +7621,22 @@ async fn the_grouped_depth_query_is_index_driven() {
     bulk_instances(&db.pool, "p", "Z-", 2_000).await;
     // 2 open per topic against 18 closed: ~12k open in a ~120k-row table.
     bulk_work_items(&db.pool, "p", &["alpha", "beta", "gamma"], 2, 18).await;
+    // A second definition, three times the size, because "filtered by a key
+    // set" only means anything when the set is a *subset*. With one
+    // definition in the table the predicate matches every row, the leading
+    // index column filters nothing, and the planner is right to ignore
+    // `rbpmn_work_item_depth` — which is what it did, and what this test used
+    // to miss by asserting against a table with no statistics.
+    engine.declare_topic("warn_customer").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/35-non-interrupting-on-subprocess.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    bulk_instances(&db.pool, "shipment", "Y-", 6_000).await;
+    bulk_work_items(&db.pool, "shipment", &["delta", "epsilon", "zeta"], 2, 18).await;
     analyze(&db.pool).await;
 
     let plan = explain_prepared(
@@ -7669,12 +7693,11 @@ async fn the_grouped_depth_query_is_index_driven() {
         "the filtered depth query must not scan every work item:\n{filtered}"
     );
 
-    // The rest is 18-and-up. On 15 the planner takes a bitmap scan on
-    // `rbpmn_work_item_pull` instead, leaving `definition_key` a filter and
-    // hashing every instance — correct, and measurably worse. 13 is the
-    // floor the schema needs, not the version the read paths are tuned
-    // against, so a laptop on 15 gets a warning rather than a red suite while
-    // development and CI both run 18.
+    // The rest is asserted from 18 up, which is what development and CI run
+    // and therefore the only version this plan has been observed on. 13 is
+    // the floor the schema needs, not a version anyone has promised optimal
+    // plans on, so an older laptop warns rather than reddening a suite over a
+    // planner's choice. Un-gate this the day the plan is checked there.
     if server_version_num(&db.pool).await >= 180_000 {
         assert!(
             filtered.contains("rbpmn_work_item_depth"),
@@ -7686,16 +7709,21 @@ async fn the_grouped_depth_query_is_index_driven() {
                 .any(|l| l.contains("Index Cond") && l.contains("definition_key")),
             "and definition_key must be an index condition, not a filter:\n{filtered}"
         );
-        assert!(
-            !filtered.contains("Seq Scan on rbpmn_instance"),
-            "the instance join should be a nested loop on the pkey:\n{filtered}"
-        );
+        // How the instance join executes is deliberately NOT asserted, and
+        // migration 0015's comment is wrong about it. It says the join
+        // "collapses from hashing every instance to a nested loop on the
+        // primary key"; that was measured against a table with no statistics,
+        // and with them the planner hashes several thousand active instances
+        // instead — correctly, because which join wins is a function of how
+        // many are live. The correction lives here rather than there because
+        // a migration's whole text is checksummed (`MigrationDrift`), so
+        // editing a comment in a released one would refuse to boot every
+        // database that already applied it.
     } else {
         warn_out_of_band(
-            "this PostgreSQL plans the filtered queue-depth query without \
-             rbpmn_work_item_depth: definition_key stays a filter and every \
-             instance is hashed. Correct, and slower than 18, which is what \
-             development and CI run. The index assertions are skipped here.",
+            "the queue-depth index assertions were skipped: they have only \
+             been observed on PostgreSQL 18, which is what development and CI \
+             run. Nothing is known to be wrong here — nothing is known at all.",
         );
     }
     db.drop().await;
