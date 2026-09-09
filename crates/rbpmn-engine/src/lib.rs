@@ -163,7 +163,42 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "definition_view",
         include_str!("../migrations/0018_definition_view.sql"),
     ),
+    (
+        19,
+        "retry_policy",
+        include_str!("../migrations/0019_retry_policy.sql"),
+    ),
 ];
+
+/// The retry budget an item gets when its manifest says nothing: the same
+/// number as `rbpmn_work_item.retries`'s column default in migration 0001,
+/// which is what makes this a *restatement* rather than a second policy.
+/// `the_default_attempt_budget_is_the_column_default` asserts they agree —
+/// a Rust const cannot read a migration any more than a migration can read a
+/// const.
+///
+/// It counts **total handler calls**, not calls after the first: the fail
+/// path decrements and then tests, so 3 is three calls and 1 is "no retry".
+/// That is what the manifest's `attempts` names.
+pub(crate) const DEFAULT_ATTEMPTS: i32 = 3;
+
+/// The growth factor a NULL `backoff_multiplier` means — the curve rbpmn has
+/// always had, hardcoded in the fail path before a manifest could say
+/// otherwise.
+pub(crate) const DEFAULT_MULTIPLIER: f64 = 3.0;
+
+/// The ceiling on one retry gap, in seconds (ten years).
+///
+/// Not tidiness. `make_interval` and float8 both have ceilings, and every
+/// input to the gap is now manifest-driven; an overflow would raise inside
+/// the very transaction recording the failure, leaving the item parked and
+/// the failure unrecorded. Capping in SQL is total — it covers pre-existing
+/// rows and any future writer — where a deploy-time bound covers only what
+/// deploy saw.
+///
+/// Unobservable for anything deployed before per-element policies: reaching
+/// the exponent cap takes 21 failures, and every item's budget was 3.
+pub(crate) const MAX_RETRY_GAP_SECONDS: f64 = 315_360_000.0;
 
 /// A claimed unit of service work, as handed to a push-mode handler.
 #[derive(Debug, Clone)]

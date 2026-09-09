@@ -134,6 +134,17 @@ pub mod rule {
     /// is not there overrides nothing, while a config entry's only meaning
     /// is delivery.
     pub const CONFIG_BINDS_TASK: &str = "config-binds-task";
+
+    /// A manifest retry policy: keyed by a service task or by a topic some
+    /// service task resolves to, and setting at least one member, each in
+    /// range. Deploy-time (L2) like `config-binds-task`, enforced in
+    /// `rbpmn_core::check` — the retry group is never in the XML.
+    ///
+    /// An error rather than a warning for `config-binds-task`'s reason: a
+    /// policy that binds nothing is an operator's belief about how a step
+    /// behaves that the engine does not share, and it is discovered during
+    /// the incident it was written to prevent.
+    pub const RETRY_POLICY_BINDS_TASK: &str = "retry-policy-binds-task";
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -273,5 +284,10 @@ pub const CATALOGUE: &[RuleInfo] = &[
         id: rule::CONFIG_BINDS_TASK,
         severity: Severity::Error,
         summary: "A manifest config entry must be a JSON object keyed by a service or user task — the elements that produce a work item to deliver it on. Stricter than the other manifest groups, which have a default and so bind nothing when stale; config has none, so an entry that is never delivered is a silent failure.",
+    },
+    RuleInfo {
+        id: rule::RETRY_POLICY_BINDS_TASK,
+        severity: Severity::Error,
+        summary: "A manifest retry policy must bind a service task (by element id) or a topic some service task resolves to, and must set at least one member in range: attempts 1..=1000, an ISO-8601 backoff of fixed positive length, a multiplier 1..=10. User tasks do not fail through a handler and business-rule tasks have no work item to spend a budget on.",
     },
 ];

@@ -1,10 +1,11 @@
 //! The deploy verdict, minus the database.
 //!
-//! `deploy` decides seven things without touching Postgres — is this BPMN at
+//! `deploy` decides eight things without touching Postgres — is this BPMN at
 //! all, is there exactly one process, do the bundled DMN artifacts validate,
 //! do the decision bindings resolve against them, does every config entry
-//! bind a task that can carry it, does the linter pass, and does the model
-//! compile against its bindings manifest — and exactly one thing with it: are
+//! bind a task that can carry it, does every retry policy bind a task that is
+//! retried, does the linter pass, and does the model compile against its
+//! bindings manifest — and exactly one thing with it: are
 //! the resolved service topics covered by the environment as registered right
 //! now (`unresolved-topic`).
 //!
@@ -24,7 +25,7 @@
 //! identifier policy and stays in the engine. They are a performance
 //! declaration and cannot make a model unexecutable.
 
-use crate::compile::{Bindings, CompileError, ExecutableProcess};
+use crate::compile::{Bindings, CompileError, ExecutableProcess, RetryPolicy};
 use crate::decisions::{DecisionValidator, Invocable};
 use rbpmn_model::model::NodeKind;
 use rbpmn_model::{Diagnostic, ParseError, rule};
@@ -127,16 +128,18 @@ pub fn check_deployable(
     diagnostics.extend(decision_bindings(bindings, &decided.invocables));
     diagnostics.extend(rbpmn_model::lint(&defs));
     // Held back from the gate below rather than added here, deliberately.
-    // Compilation does not read config — it is not in `ExecutableProcess` at
-    // all — so letting a config error skip the compile stage would make the
-    // mildest manifest defect there is hide `unresolved-topic` and
-    // `message-has-correlation` until the next round trip.
-    let config = config_bindings(bindings, &defs.processes[0]);
+    // Compilation reads neither group — neither config nor the retry
+    // policies are in `ExecutableProcess` at all — so letting one of them
+    // skip the compile stage would make the mildest manifest defect there is
+    // hide `unresolved-topic` and `message-has-correlation` until the next
+    // round trip.
+    let mut manifest = config_bindings(bindings, &defs.processes[0]);
+    manifest.extend(retry_policies(bindings, &defs.processes[0]));
     // Compilation re-lints, so running it over a model the linter already
     // rejected would only restate those errors. Stop at the first gate, the
     // way deploy does.
     if rbpmn_model::has_errors(&diagnostics) {
-        diagnostics.extend(config);
+        diagnostics.extend(manifest);
         return DeployCheck::Checked(Checked {
             key,
             diagnostics,
@@ -149,7 +152,7 @@ pub fn check_deployable(
     // below are the contract: a compile failure is reported as the rule a
     // modeler can act on, never as a raw error string.
     let compiled = ExecutableProcess::compile(&defs, &key, bindings);
-    diagnostics.extend(config);
+    diagnostics.extend(manifest);
     match compiled {
         Ok(proc) => {
             let topics = proc
@@ -322,6 +325,149 @@ pub fn config_bindings(
         }
     }
     diagnostics
+}
+
+/// `retry-policy-binds-task`, over the manifest and the model.
+///
+/// Four clauses, one rule id, on `config-binds-task`'s pattern: an element
+/// key names a service task, a topic key names a topic something in this
+/// process runs on, every member is in range, and an entry sets at least one
+/// of them.
+///
+/// **Service tasks only.** A user task does not fail through a handler — its
+/// work item waits for a person, and a budget spent by nobody is a number
+/// that never moves. A business-rule task is decided by the engine inside the
+/// step transaction and produces no work item at all. Both are the kind of
+/// mistake a modeller makes with the element right there on the canvas, which
+/// is why they are refused rather than ignored.
+///
+/// Independent of both lint and compile, deliberately: the resolved topics
+/// this needs are `bindings.resolved_topic` over the model's service tasks,
+/// not the compiler's output, so a manifest defect is reported on the same
+/// trip as the model errors rather than on the one after they are fixed.
+pub fn retry_policies(
+    bindings: &Bindings,
+    process: &rbpmn_model::model::Process,
+) -> Vec<Diagnostic> {
+    if bindings.retries.is_empty() {
+        return Vec::new();
+    }
+    let mut elements: std::collections::BTreeMap<&str, &NodeKind> =
+        std::collections::BTreeMap::new();
+    collect_elements(&process.body, &mut elements);
+    let topics: std::collections::BTreeSet<&str> = elements
+        .iter()
+        .filter(|(_, kind)| matches!(kind, NodeKind::ServiceTask { .. }))
+        .map(|(id, _)| bindings.resolved_topic(id))
+        .collect();
+
+    let mut diagnostics = Vec::new();
+    for (element, policy) in &bindings.retries.by_element {
+        members(&mut diagnostics, element, policy);
+        match elements.get(element.as_str()) {
+            Some(NodeKind::ServiceTask { .. }) => {}
+            Some(kind) => diagnostics.push(Diagnostic::error(
+                rule::RETRY_POLICY_BINDS_TASK,
+                element,
+                format!(
+                    "'{element}' ({}) is not retried through a handler — a retry \
+                     policy binds service tasks and nothing else",
+                    kind.describe()
+                ),
+            )),
+            None => diagnostics.push(Diagnostic::error(
+                rule::RETRY_POLICY_BINDS_TASK,
+                element,
+                format!(
+                    "no element '{element}' in this process — a retry policy has no \
+                     default, so an entry that binds nothing is a budget nobody \
+                     will ever spend (a rename that lost its other half, usually; \
+                     a policy meant for a whole topic goes under \"by_topic\")"
+                ),
+            )),
+        }
+    }
+    for (topic, policy) in &bindings.retries.by_topic {
+        members(&mut diagnostics, topic, policy);
+        if !topics.contains(topic.as_str()) {
+            diagnostics.push(Diagnostic::error(
+                rule::RETRY_POLICY_BINDS_TASK,
+                topic,
+                format!(
+                    "no service task in this process runs on topic '{topic}' — the \
+                     topics here are {} (a task with no \"topics\" entry runs on a \
+                     topic named after its element id)",
+                    if topics.is_empty() {
+                        "none".to_string()
+                    } else {
+                        topics
+                            .iter()
+                            .map(|t| format!("'{t}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                ),
+            ));
+        }
+    }
+    diagnostics
+}
+
+/// The range clauses, shared by both layers — `element` is whichever key the
+/// entry was found under, so the diagnostic points at the thing the author
+/// typed.
+fn members(diagnostics: &mut Vec<Diagnostic>, element: &str, policy: &RetryPolicy) {
+    if policy.is_empty() {
+        diagnostics.push(Diagnostic::error(
+            rule::RETRY_POLICY_BINDS_TASK,
+            element,
+            "this retry policy sets nothing — give it an \"attempts\", a \
+             \"backoff\" or a \"multiplier\", or remove it; an empty entry reads \
+             as a policy that is in force and is not"
+                .to_string(),
+        ));
+    }
+    if let Some(attempts) = policy.attempts
+        && !(RetryPolicy::MIN_ATTEMPTS..=RetryPolicy::MAX_ATTEMPTS).contains(&attempts)
+    {
+        diagnostics.push(Diagnostic::error(
+            rule::RETRY_POLICY_BINDS_TASK,
+            element,
+            format!(
+                "attempts is {attempts}, and it counts the handler calls a step \
+                 gets in total — so 1 is 'no retry' and the range is {}..={}",
+                RetryPolicy::MIN_ATTEMPTS,
+                RetryPolicy::MAX_ATTEMPTS
+            ),
+        ));
+    }
+    if let Some(backoff) = &policy.backoff
+        && let Err(e) = rbpmn_model::iso8601::fixed_length_seconds(backoff)
+    {
+        diagnostics.push(Diagnostic::error(
+            rule::RETRY_POLICY_BINDS_TASK,
+            element,
+            format!(
+                "backoff is not a usable delay: {e} (it is an ISO-8601 duration, \
+                 like PT45S or PT10M, the same spelling a timer uses)"
+            ),
+        ));
+    }
+    if let Some(multiplier) = policy.multiplier
+        && !(RetryPolicy::MIN_MULTIPLIER..=RetryPolicy::MAX_MULTIPLIER).contains(&multiplier)
+    {
+        diagnostics.push(Diagnostic::error(
+            rule::RETRY_POLICY_BINDS_TASK,
+            element,
+            format!(
+                "multiplier is {multiplier}, and the range is {:.0}..={:.0} — 1 keeps \
+                 every gap the same size, 3 is the default curve, and below 1 \
+                 the gaps would shrink toward a hot loop",
+                RetryPolicy::MIN_MULTIPLIER,
+                RetryPolicy::MAX_MULTIPLIER
+            ),
+        ));
+    }
 }
 
 /// How a JSON value reads in a diagnostic about a manifest entry.
@@ -620,6 +766,189 @@ mod tests {
         let d = config_errors(CONFIGURABLE, &bindings);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].rule, rule::CONFIG_BINDS_TASK);
+    }
+
+    fn retry_errors(xml: &str, bindings: &Bindings) -> Vec<Diagnostic> {
+        checked(xml, bindings)
+            .diagnostics
+            .into_iter()
+            .filter(|d| d.rule == rule::RETRY_POLICY_BINDS_TASK)
+            .collect()
+    }
+
+    /// The two layers, at any depth, and the topic layer keyed by a topic
+    /// that is only a topic because a service task was left unmapped.
+    #[test]
+    fn a_policy_binds_a_service_task_by_element_or_by_topic() {
+        let d = retry_errors(
+            CONFIGURABLE,
+            &Bindings::new()
+                .topic("st", "send_message")
+                .retries("nested", RetryPolicy::new().attempts(7))
+                .topic_retries("send_message", RetryPolicy::new().backoff("PT10M"))
+                // `nested` has no topics entry, so its topic is its own id —
+                // the ambiguity the two layers are separated to avoid.
+                .topic_retries("nested", RetryPolicy::new().multiplier(1.0)),
+        );
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    /// A user task waits for a person and a subprocess produces no work item
+    /// at all: both are the mistake a modeller makes with the element right
+    /// there on the canvas.
+    #[test]
+    fn a_policy_on_something_that_is_not_a_service_task_is_refused() {
+        let d = retry_errors(
+            CONFIGURABLE,
+            &Bindings::new()
+                .retries("ut", RetryPolicy::new().attempts(2))
+                .retries("sp", RetryPolicy::new().attempts(2))
+                .retries("start", RetryPolicy::new().attempts(2)),
+        );
+        assert_eq!(d.len(), 3, "{d:?}");
+        assert!(d.iter().any(|x| x.element == "ut"), "{d:?}");
+        assert!(
+            d.iter()
+                .all(|x| x.message.contains("binds service tasks and nothing else")),
+            "{d:?}"
+        );
+    }
+
+    /// A business-rule task is decided inside the step transaction and has no
+    /// work item to spend a budget on. Checked on a model that does not
+    /// compile (the task has no decision binding), which also proves the rule
+    /// does not need the compile stage.
+    #[test]
+    fn a_policy_on_a_business_rule_task_is_refused() {
+        const DECIDING: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="defs">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:businessRuleTask id="brt"><bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing></bpmn:businessRuleTask>
+    <bpmn:endEvent id="end"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="brt" />
+    <bpmn:sequenceFlow id="f2" sourceRef="brt" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let d = retry_errors(
+            DECIDING,
+            &Bindings::new().retries("brt", RetryPolicy::new().attempts(2)),
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].element, "brt");
+    }
+
+    /// A rename that lost its other half, in each layer. The element message
+    /// points at the topic layer, because "I meant all of them" is the likely
+    /// intent behind a key that is a topic name.
+    #[test]
+    fn a_policy_that_binds_nothing_is_refused() {
+        let d = retry_errors(
+            CONFIGURABLE,
+            &Bindings::new()
+                .topic("st", "send_message")
+                .retries("gone", RetryPolicy::new().attempts(2))
+                .topic_retries("lookup", RetryPolicy::new().attempts(2)),
+        );
+        assert_eq!(d.len(), 2, "{d:?}");
+        let element = d.iter().find(|x| x.element == "gone").expect("element");
+        assert!(element.message.contains("by_topic"), "{element:?}");
+        let topic = d.iter().find(|x| x.element == "lookup").expect("topic");
+        // The message lists what the process actually runs on, mapped topic
+        // and defaulted alike.
+        assert!(topic.message.contains("'send_message'"), "{topic:?}");
+        assert!(topic.message.contains("'nested'"), "{topic:?}");
+    }
+
+    /// Each member's range, reported against the key the author typed.
+    #[test]
+    fn a_member_out_of_range_is_refused() {
+        let d = retry_errors(
+            CONFIGURABLE,
+            &Bindings::new()
+                .retries("st", RetryPolicy::new().attempts(0))
+                .topic_retries("nested", RetryPolicy::new().attempts(1001))
+                .retries("sp2", RetryPolicy::new().backoff("P1M").multiplier(0.5)),
+        );
+        // Four range defects, plus 'sp2' naming no element. Several defects
+        // on one entry are several things to fix and are all reported.
+        assert_eq!(d.len(), 5, "{d:?}");
+        assert!(
+            d.iter()
+                .any(|x| x.element == "st" && x.message.contains("attempts is 0")),
+            "{d:?}"
+        );
+        assert!(
+            d.iter()
+                .any(|x| x.element == "nested" && x.message.contains("1..=1000")),
+            "{d:?}"
+        );
+        // A month has no fixed length, which is exactly what a backoff needs.
+        assert!(
+            d.iter()
+                .any(|x| x.element == "sp2" && x.message.contains("backoff is not a usable delay")),
+            "{d:?}"
+        );
+        assert!(
+            d.iter()
+                .any(|x| x.element == "sp2" && x.message.contains("multiplier is 0.5")),
+            "{d:?}"
+        );
+    }
+
+    /// A zero or negative backoff would put `retry_at` at or before the
+    /// failure that set it, and the item would spin.
+    #[test]
+    fn a_non_positive_backoff_is_refused() {
+        for spec in ["PT0S", "P0D"] {
+            let d = retry_errors(
+                CONFIGURABLE,
+                &Bindings::new().retries("st", RetryPolicy::new().backoff(spec)),
+            );
+            assert_eq!(d.len(), 1, "{spec}: {d:?}");
+        }
+    }
+
+    /// An empty entry reads as a policy that is in force and is not.
+    #[test]
+    fn a_policy_that_sets_nothing_is_refused() {
+        let d = retry_errors(
+            CONFIGURABLE,
+            &Bindings::new().retries("st", RetryPolicy::new()),
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("sets nothing"), "{:?}", d[0]);
+    }
+
+    /// The mildest manifest defect there is must not hide the model errors,
+    /// nor the resolved topics the caller links against.
+    #[test]
+    fn a_stale_retry_key_does_not_hide_the_compile_stage() {
+        let c = checked(
+            CONFIGURABLE,
+            &Bindings::new()
+                .topic("st", "payments")
+                .retries("gone", RetryPolicy::new().attempts(2)),
+        );
+        assert!(!c.ok(), "the retry error is still an error");
+        assert!(
+            c.topics
+                .contains(&("st".to_string(), "payments".to_string())),
+            "{:?}",
+            c.topics
+        );
+    }
+
+    /// Two syntaxes, one manifest, one validation path: the hand-written JSON
+    /// reaches the same rule the builder does.
+    #[test]
+    fn the_json_spelling_of_a_retry_policy_reaches_the_same_rule() {
+        let bindings: Bindings =
+            serde_json::from_str(r#"{"retries":{"by_element":{"gone":{"attempts":7}}}}"#)
+                .expect("manifest parses");
+        let d = retry_errors(CONFIGURABLE, &bindings);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].element, "gone");
     }
 
     #[test]

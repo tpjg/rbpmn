@@ -110,6 +110,7 @@ versioned and content-hashed with it, so it is reviewable in git next to the
 | Message correlation | `Bindings::correlation(element, "order.id")` — a FEEL qualified name into the variables | `message-has-correlation` |
 | Decision | `Bindings::decision(element, name, "order.discount")` — which decision, and where the answer lands | `decision-has-binding`, `unresolved-decision` |
 | Task config | `Bindings::config(element, json!({…}))` — free JSON delivered beside the variables, never interpreted | `config-binds-task` |
+| Retry policy | `Bindings::retries(element, …)` / `topic_retries(topic, …)` — how many handler calls, how far apart, growing how fast | `retry-policy-binds-task` |
 | Filterable fields | `Bindings::index(field)` / `shared_index(field)` — optional, performance only | — |
 
 `declare_topic` and `declare_index` are the *environment* half: engine
@@ -122,6 +123,23 @@ document template, yes. An endpoint URL or a credential, no — those belong to
 the environment, or to your own store, keyed by the `definition_id` and
 `definition_version` every claimed task carries.
 [docs/design/task-config.md](docs/design/task-config.md) is the long form.
+
+**A retry policy is model content for the same reason**, and it has two
+layers because retry economics belong to the *dependency being called*, not to
+the call site: `by_topic` says once what a dozen tasks on one topic share, and
+`by_element` narrows it where one call site genuinely differs. Members are
+inherited one from the other and then from the engine, so the smallest useful
+entry is one key:
+
+```json
+{ "retries": { "by_topic": { "send_message": { "attempts": 7, "backoff": "PT10M" } } } }
+```
+
+`attempts` counts handler calls in **total** — 1 is "no retry" — and
+`multiplier` (default 3) is what lets a manifest ask for a flat curve rather
+than only a steeper one. `EngineBuilder::retry_backoff` remains the
+installation's fallback for whatever a manifest does not say.
+[docs/design/retry-policy.md](docs/design/retry-policy.md) is the long form.
 
 ## Reading rbpmn's state
 

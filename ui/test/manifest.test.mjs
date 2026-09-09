@@ -33,6 +33,7 @@ test('missing groups are filled in, present ones preserved', () => {
     indexes: [],
     decisions: {},
     config: {},
+    retries: { by_element: {}, by_topic: {} },
   });
 });
 
@@ -69,6 +70,7 @@ test('serialize/parse round-trips', () => {
     indexes: [{ field: 'order_no', scope: 'shared' }, { field: 'status', scope: 'definition' }],
     decisions: { brt: { decision: 'Discount', result: 'order.discount' } },
     config: { st: { template: 'warning_first', copies: 2 } },
+    retries: { by_element: { st: { attempts: 7 } }, by_topic: {} },
   };
   assert.deepEqual(parseManifest(serializeManifest(manifest)), manifest);
   // Sorted by field, and the definition-scoped entry stays a bare string.
@@ -265,4 +267,73 @@ test('and an unconfigured __proto__ reads as unconfigured, not as a prototype', 
   assert.equal(binding(emptyManifest(), 'topics', '__proto__'), undefined);
   const topics = setBinding(emptyManifest(), 'topics', '__proto__', 'payments');
   assert.equal(binding(topics, 'topics', '__proto__'), 'payments');
+});
+
+// --- retry policies
+//
+// The editor must learn a manifest group in the *same* release the engine
+// does: `parseManifest` throws on an unknown key, so an older editor refuses
+// a manifest carrying this group outright. Safe rather than destructive, and
+// still a release-ordering constraint.
+
+test('a retry manifest round-trips byte for byte', () => {
+  const text = `${JSON.stringify(
+    {
+      topics: { send_notice: 'send_message' },
+      retries: {
+        by_element: { lookup: { attempts: 3, backoff: 'PT5S' } },
+        by_topic: { send_message: { attempts: 7, backoff: 'PT10M', multiplier: 1 } },
+      },
+    },
+    null,
+    2
+  )}\n`;
+  assert.equal(serializeManifest(parseManifest(text)), text);
+});
+
+// The hash contract, from the editor's side: an untouched manifest must come
+// back out with no `retries` key at all, or opening and saving a file in the
+// editor would re-deploy every definition it touches.
+test('an absent retry group does not appear on the way out', () => {
+  assert.equal(serializeManifest(parseManifest('{"topics":{"st":"payments"}}')).includes('retries'), false);
+  assert.equal(serializeManifest(emptyManifest()), '{}\n');
+});
+
+// Refused rather than repaired, exactly as the engine refuses it: an editor
+// that accepted a manifest deploy rejects would be lying about what it
+// validated.
+test('the retry group refuses the shapes rbpmn refuses', () => {
+  assert.throws(() => parseManifest('{"retries":[]}'), /by_element, by_topic/);
+  assert.throws(() => parseManifest('{"retries":{"elements":{}}}'), /by_element and by_topic/);
+  assert.throws(() => parseManifest('{"retries":{"by_element":{"st":{"attemps":7}}}}'), /attemps/);
+  assert.throws(() => parseManifest('{"retries":{"by_topic":{"t":"PT5S"}}}'), /attempts\?, backoff\?, multiplier\?/);
+  assert.throws(() => parseManifest('{"retries":{"by_element":{"st":{"backoff":600}}}}'), /ISO-8601/);
+  assert.throws(() => parseManifest('{"retries":{"by_element":{"st":{"attempts":1.5}}}}'), /whole number/);
+});
+
+// Ranges are the engine's to enforce (`retry-policy-binds-task`). An editor
+// that repeated them would be a second implementation of the verdict, and the
+// two would drift.
+test('the editor does not second-guess the ranges', () => {
+  const manifest = parseManifest('{"retries":{"by_element":{"st":{"attempts":9000}}}}');
+  assert.equal(manifest.retries.by_element.st.attempts, 9000);
+});
+
+// The invariant that failed in a browser before it failed here: `checkModel`
+// stringifies the in-memory manifest straight into the WASM verdict, so the
+// object this module holds must itself be valid manifest syntax. A camelCase
+// convenience for one group reaches the engine as an unknown field and takes
+// the whole verdict down with it — `indexes` gets away with its normalized
+// {field, scope} form precisely because that spelling is valid too.
+test('the in-memory manifest is itself something rbpmn would accept', () => {
+  const manifest = parseManifest(
+    JSON.stringify({
+      topics: { st: 'payments' },
+      indexes: ['channel', { field: 'order_no', scope: 'shared' }],
+      config: { st: { template: 'a' } },
+      retries: { by_topic: { payments: { attempts: 5, backoff: 'PT45S' } } },
+    })
+  );
+  assert.deepEqual(parseManifest(JSON.stringify(manifest)), manifest);
+  assert.deepEqual(Object.keys(manifest.retries), ['by_element', 'by_topic']);
 });

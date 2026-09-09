@@ -21,12 +21,13 @@ pub type ScopeIx = usize;
 
 /// The per-definition wiring from the deployment manifest: element ->
 /// work-item topic, message element -> correlation key (a FEEL qualified
-/// name into the instance variables), business-rule task -> decision, and
-/// task -> config. Unmapped tasks default to their element id; correlations
-/// have **no default** — every message catch must be mapped or compilation
-/// fails (`message-has-correlation`) — and neither does [`Bindings::config`],
-/// which is why a config entry binding nothing is an error where a stale
-/// topic is not (`config-binds-task`).
+/// name into the instance variables), business-rule task -> decision, task ->
+/// config, and service task -> retry policy. Unmapped tasks default to their
+/// element id; correlations have **no default** — every message catch must be
+/// mapped or compilation fails (`message-has-correlation`) — and neither does
+/// [`Bindings::config`] nor [`Bindings::retries`], which is why an entry in
+/// either that binds nothing is an error where a stale topic is not
+/// (`config-binds-task`, `retry-policy-binds-task`).
 ///
 /// **Unknown groups are refused, not dropped.** A manifest is hand-written
 /// next to the `.bpmn`, and `"cofig"` silently deserializing to nothing is
@@ -80,6 +81,143 @@ pub struct Bindings {
     /// every definition on the first redeploy after the upgrade.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub config: BTreeMap<String, serde_json::Value>,
+    /// Service task -> how patiently it is retried: how many handler calls
+    /// before the instance freezes on an incident, and how fast the gaps
+    /// between them widen. Two layers, resolved per member by
+    /// [`Bindings::retry_policy`] (`docs/design/retry-policy.md`).
+    ///
+    /// Skipped when empty for [`Bindings::config`]'s reason: the serialized
+    /// manifest is hashed, and a group that always appeared would allocate a
+    /// new version of every deployed definition on the first redeploy after
+    /// the upgrade.
+    #[serde(default, skip_serializing_if = "RetryPolicies::is_empty")]
+    pub retries: RetryPolicies,
+}
+
+/// The two layers of [`Bindings::retries`], and why there are two of them.
+///
+/// **`by_topic` is the one the motivating case needed.** Retry economics are a
+/// property of the dependency being called — a fast local lookup is either up
+/// or it is not, while a dependency that needs a person to intervene will
+/// still be refusing in an hour — and the topic is what names that
+/// dependency. A flow with a dozen service tasks on one topic says its policy
+/// once.
+///
+/// **`by_element` is the one that keeps a topic from having to split.** Two
+/// call sites on one topic can want different budgets (an urgent notice that
+/// should give up and take an error boundary while a bulk reminder keeps
+/// trying). Without it the answer would be a second topic, which grows the
+/// *environment* with content rather than capability.
+///
+/// **They cannot share a key space**, which is why this is a nested group
+/// rather than two flat ones: an unmapped service task's topic *is* its
+/// element id, so one map keyed by "an element or a topic" would resolve the
+/// wrong layer for the commonest wiring there is, and would do it silently.
+/// `by_element` / `by_topic` rather than `elements` / `topics` because
+/// `topics` already means something else one group up.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryPolicies {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_element: BTreeMap<String, RetryPolicy>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_topic: BTreeMap<String, RetryPolicy>,
+}
+
+impl RetryPolicies {
+    pub fn is_empty(&self) -> bool {
+        self.by_element.is_empty() && self.by_topic.is_empty()
+    }
+}
+
+/// One retry policy: how many times, starting how far apart, growing how
+/// fast. Every member is optional and absent means *inherited* — from the
+/// topic layer, then from the engine — so the smallest useful entry is one
+/// key. An entry that sets nothing at all is refused at deploy
+/// (`retry-policy-binds-task`).
+///
+/// The members are deliberately wide types validated as diagnostics rather
+/// than narrow types validated by serde: `{"attempts": 0}` must be reported
+/// as a rule naming the element, the way `config`'s object rule is, not as a
+/// deserialization error naming a byte offset. Two syntaxes, one manifest,
+/// one validation path.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryPolicy {
+    /// Total handler calls before the budget is spent — **not**
+    /// calls-after-the-first. It is the `rbpmn_work_item.retries` column,
+    /// which has always meant this: the fail path decrements and then tests,
+    /// so 3 is three calls. `attempts: 1` is "no retry".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<i64>,
+    /// The base delay, as an ISO-8601 duration (`PT10M`) — the spelling every
+    /// other duration rbpmn reads uses. Validated by the validator cycles
+    /// use, so months and years are refused: a gap whose length depends on
+    /// where in the calendar it lands is not a backoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<String>,
+    /// The growth factor; absent is 3, which is the curve rbpmn has always
+    /// had. It earns its keep at **1**: a base alone can only move the whole
+    /// curve, never flatten it, and "every ten minutes, twelve times" is a
+    /// policy for a dependency that is simply up or down. Gentler ramps
+    /// (1.5, 2) come out of the same member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiplier: Option<f64>,
+}
+
+impl RetryPolicy {
+    /// The narrowest budget that means anything: one handler call, no retry.
+    pub const MIN_ATTEMPTS: i64 = 1;
+    /// The widest a manifest may declare. A bound on the `retries` **column**
+    /// rather than a judgement: an `int` that overflowed would fail the
+    /// insert inside a step transaction, where a manifest number has no
+    /// business reaching. A thousand is far past the point where every
+    /// further attempt waits the same capped gap anyway.
+    pub const MAX_ATTEMPTS: i64 = 1000;
+    /// A growth factor of 1 keeps every gap the same size — the flat curve a
+    /// base alone cannot express. Below it the gaps would shrink toward a hot
+    /// loop.
+    pub const MIN_MULTIPLIER: f64 = 1.0;
+    /// The steepest a manifest may declare. The engine computes
+    /// `power(multiplier, least(failures, 20))` in SQL, where a float8
+    /// overflow *raises* rather than saturating — and it would raise inside
+    /// the very transaction recording the failure, stranding the item. Ten
+    /// leaves some 270 orders of magnitude of headroom, and is also where the
+    /// exponent cap is reached in three failures.
+    pub const MAX_MULTIPLIER: f64 = 10.0;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn attempts(mut self, attempts: i64) -> Self {
+        self.attempts = Some(attempts);
+        self
+    }
+
+    /// The base delay as an ISO-8601 duration (`"PT10M"`).
+    pub fn backoff(mut self, iso8601: impl Into<String>) -> Self {
+        self.backoff = Some(iso8601.into());
+        self
+    }
+
+    pub fn multiplier(mut self, multiplier: f64) -> Self {
+        self.multiplier = Some(multiplier);
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.attempts.is_none() && self.backoff.is_none() && self.multiplier.is_none()
+    }
+
+    /// This policy over `fallback`, member by member.
+    fn over(&self, fallback: &RetryPolicy) -> RetryPolicy {
+        RetryPolicy {
+            attempts: self.attempts.or(fallback.attempts),
+            backoff: self.backoff.clone().or_else(|| fallback.backoff.clone()),
+            multiplier: self.multiplier.or(fallback.multiplier),
+        }
+    }
 }
 
 /// What a declared index covers — the difference between
@@ -337,6 +475,51 @@ impl Bindings {
     ) -> Self {
         self.config.insert(element_id.into(), config.into());
         self
+    }
+
+    /// Give one task its own retry policy — the precise layer, for a call
+    /// site whose economics differ from the rest of its topic's.
+    pub fn retries(mut self, element_id: impl Into<String>, policy: RetryPolicy) -> Self {
+        self.retries.by_element.insert(element_id.into(), policy);
+        self
+    }
+
+    /// Give every service task on one topic the same retry policy — the layer
+    /// that says the true thing once, because retry economics belong to the
+    /// dependency being called and the topic is what names it.
+    pub fn topic_retries(mut self, topic: impl Into<String>, policy: RetryPolicy) -> Self {
+        self.retries.by_topic.insert(topic.into(), policy);
+        self
+    }
+
+    /// The topic a task runs on: its binding, or its element id. An unmapped
+    /// task defaults to its own id, which is exactly why the two retry layers
+    /// cannot share a key space ([`RetryPolicies`]).
+    pub fn resolved_topic<'a>(&'a self, element_id: &'a str) -> &'a str {
+        self.topics
+            .get(element_id)
+            .map(String::as_str)
+            .unwrap_or(element_id)
+    }
+
+    /// The retry policy in force for one element: its own entry over its
+    /// topic's, **member by member**. A `by_element` entry that sets only
+    /// `attempts` still takes its backoff from the topic layer — the layers
+    /// compose rather than shadowing wholesale, so narrowing one number does
+    /// not silently discard the other two.
+    ///
+    /// Members still absent from the result are the engine's to fill; that
+    /// fallback is deliberately not applied here, because the core has no
+    /// engine and NULL must keep meaning "ask the engine at the time"
+    /// (`docs/design/retry-policy.md`, D6).
+    pub fn retry_policy(&self, element_id: &str) -> RetryPolicy {
+        let topic = self.retries.by_topic.get(self.resolved_topic(element_id));
+        match (self.retries.by_element.get(element_id), topic) {
+            (Some(element), Some(topic)) => element.over(topic),
+            (Some(element), None) => element.clone(),
+            (None, Some(topic)) => topic.clone(),
+            (None, None) => RetryPolicy::default(),
+        }
     }
 }
 
@@ -887,11 +1070,7 @@ impl ExecutableProcess {
                 NodeKind::End(EndKind::Terminate) => ExecKind::TerminateEnd,
                 NodeKind::ServiceTask { .. } => ExecKind::Task {
                     kind: WorkKind::Service,
-                    topic: bindings
-                        .topics
-                        .get(&node.id)
-                        .cloned()
-                        .unwrap_or_else(|| node.id.clone()),
+                    topic: bindings.resolved_topic(&node.id).to_string(),
                 },
                 NodeKind::BusinessRuleTask => {
                     let Some(binding) = bindings.decisions.get(&node.id) else {
@@ -914,11 +1093,7 @@ impl ExecutableProcess {
                 }
                 NodeKind::UserTask => ExecKind::Task {
                     kind: WorkKind::User,
-                    topic: bindings
-                        .topics
-                        .get(&node.id)
-                        .cloned()
-                        .unwrap_or_else(|| node.id.clone()),
+                    topic: bindings.resolved_topic(&node.id).to_string(),
                 },
                 NodeKind::ExclusiveGateway { default_flow } => {
                     // Resolved once flows exist; recorded here so nothing
@@ -1551,5 +1726,118 @@ mod config_tests {
         let b = Bindings::new().config("st", value.clone());
         let back: Bindings = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
         assert_eq!(back.config["st"], value);
+    }
+}
+
+#[cfg(test)]
+mod retry_policy_tests {
+    use super::*;
+
+    /// The hash contract, stated from the retry side: an empty group must not
+    /// appear in the serialized manifest, or every definition in every
+    /// installation gets a new version on the first redeploy after the
+    /// upgrade that added it.
+    #[test]
+    fn an_empty_retry_group_does_not_reach_the_hashed_manifest() {
+        let json = serde_json::to_string(&Bindings::new()).unwrap();
+        assert!(!json.contains("retries"), "{json}");
+    }
+
+    /// The other half of the same contract, byte for byte: a manifest written
+    /// before this feature existed serializes to exactly what it always has.
+    /// `deploy` hashes these bytes, so this is the test that says an upgrade
+    /// re-deploys nothing.
+    #[test]
+    fn a_manifest_without_a_retry_group_serializes_byte_for_byte() {
+        let b = Bindings::new()
+            .topic("charge", "payments")
+            .correlation("await_capture", "order.id")
+            .index("channel")
+            .decision("triage", "Triage", "triage.band")
+            .config("charge", serde_json::json!({"gateway": "acquirer-a"}));
+        assert_eq!(
+            serde_json::to_string(&b).unwrap(),
+            r#"{"topics":{"charge":"payments"},"correlations":{"await_capture":"order.id"},"indexes":["channel"],"decisions":{"triage":{"decision":"Triage","result":"triage.band"}},"config":{"charge":{"gateway":"acquirer-a"}}}"#
+        );
+    }
+
+    /// A policy writes back the narrowest spelling that carries its meaning:
+    /// unset members are absent, and an unused layer does not appear.
+    #[test]
+    fn a_policy_round_trips_narrowly() {
+        let b = Bindings::new().topic_retries(
+            "send_message",
+            RetryPolicy::new().attempts(7).backoff("PT10M"),
+        );
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(
+            json.ends_with(
+                r#""retries":{"by_topic":{"send_message":{"attempts":7,"backoff":"PT10M"}}}}"#
+            ),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Bindings>(&json).unwrap(), b);
+    }
+
+    /// A misspelled member is wiring that looks written and never arrives —
+    /// the failure `deny_unknown_fields` exists to prevent, one level further
+    /// down than the group.
+    #[test]
+    fn a_misspelled_member_is_refused_rather_than_dropped() {
+        let e =
+            serde_json::from_str::<Bindings>(r#"{"retries":{"by_element":{"st":{"attemps":7}}}}"#)
+                .expect_err("a manifest that says something rbpmn does not understand");
+        assert!(e.to_string().contains("attemps"), "{e}");
+
+        let e = serde_json::from_str::<Bindings>(r#"{"retries":{"elements":{}}}"#)
+            .expect_err("the layer names are by_element and by_topic");
+        assert!(e.to_string().contains("elements"), "{e}");
+    }
+
+    /// The resolution D2 promises: element over topic, **member by member**,
+    /// so narrowing one number does not silently discard the other two.
+    #[test]
+    fn the_element_layer_composes_over_the_topic_layer() {
+        let b = Bindings::new()
+            .topic("send_notice", "send_message")
+            .topic_retries(
+                "send_message",
+                RetryPolicy::new()
+                    .attempts(7)
+                    .backoff("PT10M")
+                    .multiplier(3.0),
+            )
+            .retries("send_notice", RetryPolicy::new().attempts(2));
+        let resolved = b.retry_policy("send_notice");
+        assert_eq!(resolved.attempts, Some(2), "the element's own");
+        assert_eq!(
+            resolved.backoff.as_deref(),
+            Some("PT10M"),
+            "inherited from the topic, not discarded"
+        );
+        assert_eq!(resolved.multiplier, Some(3.0));
+    }
+
+    /// Every service task on the topic gets it, including one that reaches
+    /// the topic by the default (its own element id).
+    #[test]
+    fn the_topic_layer_covers_the_tasks_that_resolve_to_it() {
+        let b = Bindings::new()
+            .topic("send_notice", "send_message")
+            .topic_retries("send_message", RetryPolicy::new().attempts(7))
+            .topic_retries("lookup", RetryPolicy::new().attempts(3));
+        assert_eq!(b.retry_policy("send_notice").attempts, Some(7));
+        assert_eq!(b.retry_policy("lookup").attempts, Some(3), "unmapped");
+        assert!(b.retry_policy("something_else").is_empty(), "no policy");
+    }
+
+    /// Absent members stay absent: the engine fills them at fail time, and
+    /// baking its base in here would freeze a runtime setting into a row.
+    #[test]
+    fn unset_members_are_left_for_the_engine() {
+        let b = Bindings::new().retries("st", RetryPolicy::new().backoff("PT5S"));
+        let resolved = b.retry_policy("st");
+        assert_eq!(resolved.attempts, None);
+        assert_eq!(resolved.multiplier, None);
     }
 }

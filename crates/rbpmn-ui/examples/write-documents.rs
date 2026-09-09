@@ -83,6 +83,12 @@ fn sample() -> InstanceInspection {
             topic: "payments".to_string(),
             kind: "service".to_string(),
             retries: 0,
+            failures: 3,
+            retry_at: Some("2026-08-14T09:12:44Z".to_string()),
+            // The manifest's own curve, which is what makes the gaps between
+            // those three attempts legible without reading the definition.
+            backoff_base: Some(45.0),
+            backoff_multiplier: Some(3.0),
             last_failure: Some("handler answered 502 (Bad Gateway), attempt 3".to_string()),
         }],
         timers: Vec::new(),

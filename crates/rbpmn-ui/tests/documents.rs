@@ -171,6 +171,12 @@ fn hostile_data_cannot_escape_the_data_block() {
             topic: (*hostile).to_string(),
             kind: "service".to_string(),
             retries: 0,
+            failures: 3,
+            // A timestamp the engine formats, hostile all the same: it
+            // reaches the document by the same path every other field does.
+            retry_at: Some((*hostile).to_string()),
+            backoff_base: Some(45.0),
+            backoff_multiplier: Some(3.0),
             last_failure: Some((*hostile).to_string()),
         }];
         inspection.events = vec![EventView {
