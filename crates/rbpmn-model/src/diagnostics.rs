@@ -288,6 +288,6 @@ pub const CATALOGUE: &[RuleInfo] = &[
     RuleInfo {
         id: rule::RETRY_POLICY_BINDS_TASK,
         severity: Severity::Error,
-        summary: "A manifest retry policy must bind a service task (by element id) or a topic some service task resolves to, and must set at least one member in range: attempts 1..=1000, an ISO-8601 backoff of fixed positive length, a multiplier 1..=10. User tasks do not fail through a handler and business-rule tasks have no work item to spend a budget on.",
+        summary: "A manifest retry policy must bind a service task (by element id) or a topic some service task resolves to, and must set at least one member in range: attempts 1..=1000, an ISO-8601 backoff of fixed positive length within the ten-year ceiling a retry gap is capped at, a multiplier 1..=10. User tasks do not fail through a handler and business-rule tasks have no work item to spend a budget on.",
     },
 ];

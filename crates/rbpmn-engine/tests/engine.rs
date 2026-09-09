@@ -9612,3 +9612,91 @@ async fn the_inspector_carries_the_retry_curve_and_the_due_instant() {
     assert!(view.retry_at.is_some(), "the due instant is the answer");
     db.drop().await;
 }
+
+/// The rule and the columns say the same thing, and both have to: the rule is
+/// where a modeller hears it, the constraints are what hold for the rows
+/// deploy never saw — a hand-edited row during an incident, a restored dump.
+///
+/// The multiplier bound in particular is not tidiness. `power()` overflows by
+/// *raising* in PostgreSQL, and the `least(...)` ceiling around it cannot help
+/// because it only ever sees the result: an out-of-range row would abort the
+/// transaction recording its own failure, over and over. Reproduced below
+/// rather than asserted, so the day someone drops the constraint this test
+/// says what it costs.
+#[tokio::test]
+async fn the_columns_refuse_what_the_rule_refuses() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("payments").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new().topic("st", "payments"),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let item = open_items(&db.pool, started.id).await[0].0;
+
+    for (column, value) in [
+        ("backoff_base", 0.0),
+        ("backoff_base", -1.0),
+        ("backoff_base", 315_360_001.0),
+        ("backoff_multiplier", 0.5),
+        ("backoff_multiplier", 10.5),
+        ("backoff_multiplier", 1e300),
+    ] {
+        let refused = sqlx::query(&format!(
+            "update rbpmn_work_item set {column} = $2 where id = $1"
+        ))
+        .bind(item)
+        .bind(value)
+        .execute(&db.pool)
+        .await;
+        assert!(
+            refused.is_err(),
+            "{column} = {value} must not be storable — the fail path reads it"
+        );
+    }
+
+    // What the rule allows, the columns allow: the ends of both ranges.
+    for (column, value) in [
+        ("backoff_base", 315_360_000.0),
+        ("backoff_multiplier", 1.0),
+        ("backoff_multiplier", 10.0),
+    ] {
+        sqlx::query(&format!(
+            "update rbpmn_work_item set {column} = $2 where id = $1"
+        ))
+        .bind(item)
+        .bind(value)
+        .execute(&db.pool)
+        .await
+        .unwrap_or_else(|e| panic!("{column} = {value} is in range: {e}"));
+    }
+
+    // And the pair the constraints exist to protect: the widest legal curve
+    // at the deepest exponent still computes rather than raising.
+    sqlx::query(
+        "update rbpmn_work_item set backoff_base = 315360000, \
+         backoff_multiplier = 10, failures = 20 where id = $1",
+    )
+    .bind(item)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    engine
+        .fail_work_item(item, &FailOptions::default())
+        .await
+        .unwrap();
+    // Capped, not overflowed — and the failure was recorded.
+    let gap = retry_gap(&db.pool, item).await;
+    assert!(
+        (gap - 315_360_000.0).abs() < 1.0,
+        "the gap is capped at ten years, got {gap}"
+    );
+    db.drop().await;
+}

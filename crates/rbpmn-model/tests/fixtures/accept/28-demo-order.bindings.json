@@ -15,7 +15,7 @@
   "config": {
     "charge": {
       "gateway": "acquirer-a",
-      "retries": 3
+      "capture": "auto"
     }
   },
   "retries": {

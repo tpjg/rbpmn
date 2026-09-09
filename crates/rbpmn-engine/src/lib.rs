@@ -173,7 +173,8 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
 /// The retry budget an item gets when its manifest says nothing: the same
 /// number as `rbpmn_work_item.retries`'s column default in migration 0001,
 /// which is what makes this a *restatement* rather than a second policy.
-/// `the_default_attempt_budget_is_the_column_default` asserts they agree —
+/// `the_default_budget_is_the_column_default_and_the_engine_agrees` asserts
+/// they do —
 /// a Rust const cannot read a migration any more than a migration can read a
 /// const.
 ///
@@ -187,18 +188,22 @@ pub(crate) const DEFAULT_ATTEMPTS: i32 = 3;
 /// otherwise.
 pub(crate) const DEFAULT_MULTIPLIER: f64 = 3.0;
 
-/// The ceiling on one retry gap, in seconds (ten years).
+/// The ceiling on one computed retry gap, in seconds — the same ten years a
+/// declared base may not exceed, because a gap and a base are the same
+/// quantity measured at different times.
 ///
-/// Not tidiness. `make_interval` and float8 both have ceilings, and every
-/// input to the gap is now manifest-driven; an overflow would raise inside
-/// the very transaction recording the failure, leaving the item parked and
-/// the failure unrecorded. Capping in SQL is total — it covers pre-existing
-/// rows and any future writer — where a deploy-time bound covers only what
-/// deploy saw.
+/// Not tidiness. `make_interval` has a ceiling and every input to the gap is
+/// manifest-driven now; an overflow would raise inside the very transaction
+/// recording the failure, leaving the item parked and the failure unrecorded.
+///
+/// What this does **not** do, and what migration 0019's CHECK constraints are
+/// there for: `least` sees `power`'s *result*, so it cannot save a statement
+/// whose `power` already overflowed. The columns refuse such a value instead,
+/// which is the only place the guard can be total.
 ///
 /// Unobservable for anything deployed before per-element policies: reaching
 /// the exponent cap takes 21 failures, and every item's budget was 3.
-pub(crate) const MAX_RETRY_GAP_SECONDS: f64 = 315_360_000.0;
+pub(crate) const MAX_RETRY_GAP_SECONDS: f64 = rbpmn_core::RetryPolicy::MAX_BACKOFF_SECONDS;
 
 /// A claimed unit of service work, as handed to a push-mode handler.
 #[derive(Debug, Clone)]

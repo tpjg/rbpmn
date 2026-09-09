@@ -66,7 +66,7 @@ fn sample() -> InstanceInspection {
             // says which handler ran, the config says what it was told.
             .config(
                 "st",
-                serde_json::json!({ "gateway": "acquirer-a", "retries": 3 }),
+                serde_json::json!({ "gateway": "acquirer-a", "capture": "auto" }),
             ),
         tokens: vec![TokenView {
             element_id: "st".to_string(),

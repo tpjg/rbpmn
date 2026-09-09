@@ -147,6 +147,11 @@ Every member is optional and absent means inherited (D2), so the minimum
 useful entry is one key. An entry that sets *nothing* is refused (D5): it is
 wiring the author believes is in force and is not.
 
+`multiplier` is a float, and the integer spelling costs nothing: `deploy`
+hashes the manifest it *re-serialized*, so `2` and `2.0` both arrive as `2.0`
+and hash identically. Worth knowing before anyone adds a normalizing
+serializer to fix a problem that is not there — fixture 28 writes `2`.
+
 ### D4 — it must not serialize when empty
 
 `deploy` hashes `serde_json::to_value(bindings).to_string()`. A group that
@@ -174,8 +179,9 @@ with several defects has several things to fix and is told all of them:
   budget on);
 - a `by_topic` key that no service task in this process resolves to;
 - a member out of range: `attempts` below 1 or above 1000, a `backoff` that is
-  not a positive fixed-length ISO-8601 duration, a `multiplier` below 1 or
-  above 10 — and an entry that sets no member at all.
+  not a positive fixed-length ISO-8601 duration *or is longer than the
+  ten-year ceiling* (D7), a `multiplier` below 1 or above 10 — and an entry
+  that sets no member at all.
 
 Error severity, for `config`'s reason: this group has no default in the sense
 that matters. A stale key in `topics` overrides nothing because a topic *has*
@@ -236,15 +242,35 @@ disagree about the same policy. Where the manifest says nothing the engine
 writes `DEFAULT_ATTEMPTS`, whose agreement with the column default from
 migration 0001 is asserted by a test rather than by comment.
 
-### D7 — the delay is capped at ten years, in SQL
+### D7 — ten years, said in three places, because one is not enough
 
-`least(…, 315360000)`. Not tidiness: `make_interval` and float8 both have
-ceilings, and every value feeding this expression is now manifest-driven. The
-cap is total — it protects pre-existing rows, any future writer, and any
-policy — where a deploy-time bound protects only what deploy sees.
+`least(…, MAX_BACKOFF_SECONDS)` caps the *computed* gap: `make_interval` has a
+ceiling and every value feeding the expression is manifest-driven now. It is
+unobservable for existing deployments — reaching the exponent cap needs 21
+failures, and before this round every item had a budget of 3.
 
-It is unobservable for existing deployments: reaching the exponent cap needs
-21 failures, and before this round every item had a budget of 3.
+**The cap alone is not a guard, and saying it was is the mistake this section
+originally made.** `least` sees `power`'s result, so a row whose
+`backoff_multiplier` is large enough raises `value out of range: overflow`
+*before* the cap is consulted — inside the very statement recording the
+failure, which aborts the transaction, loses the failure, and leaves the item
+being retried into the same abort forever. So the ten years is stated three
+times, each covering what the others cannot:
+
+- **`retry-policy-binds-task`** refuses a declared base past it. Capping a
+  base someone *wrote* would be reinterpreting a manifest, which is the one
+  thing this project does not do — the cap exists to keep arithmetic
+  representable, not to edit a modeller's intent.
+- **CHECK constraints on both columns** (migration 0019) refuse the values
+  deploy never saw: a hand-edited row during an incident, a restored dump,
+  "any future writer". This is the only place the guard can be total, because
+  it is the only place that sees every write.
+- **`least` in the fail path** bounds what the arithmetic can produce from
+  inputs that are already legal.
+
+`the_columns_refuse_what_the_rule_refuses` reproduces the overflow case rather
+than asserting it, so the day someone drops a constraint the test says what it
+costs.
 
 ### D8 — the columns are published, and the inspector answers the question
 
@@ -359,6 +385,8 @@ Owes: `cargo test` (needs Postgres), `just lint`, `just tla`.
 | No policy is byte-for-byte today's behaviour, same version on redeploy | `engine.rs` |
 | A per-element policy and the engine default coexist in one engine | `engine.rs` |
 | The view's shape, with the two columns appended | `engine.rs` |
+| The columns refuse what the rule refuses, overflow included | `engine.rs` |
+| A base past the ten-year ceiling is refused, not capped | `check.rs` |
 | Native and WASM agree over the corpus with its manifests | `just parity` |
 | The editor round-trips a retry manifest byte for byte | `just ui-test` |
 
@@ -377,7 +405,11 @@ Owes: `cargo test` (needs Postgres), `just lint`, `just tla`.
   fact.** There is no path that recomputes `retry_at` for a parked item; the
   policy applies from the failure that follows a redeploy, and only to
   instances started against the new version.
-- **`multiplier` is a float and the manifest is hashed**, so `3` and `3.0`
-  serialize differently and are different content hashes for the same policy.
-  Left alone: normalizing would mean a custom serializer for one member, and
-  the redeploy it costs is one version, once.
+- **The retry rules are compared between native and WASM only where they stay
+  silent.** No sidecar in the corpus is deliberately wrong, so `just parity`
+  proves the two builds agree that a *valid* manifest is valid, and nothing
+  about the four refusal clauses or their message text. This is the gap
+  task-config recorded and declined to close — `expect-diagnostics` is a
+  comment in the `.bpmn` and reads L1 only — and this round declines it again
+  rather than inventing a corpus convention on the way past. The messages are
+  covered by `check.rs`'s unit tests, in one build.

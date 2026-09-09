@@ -394,6 +394,11 @@ export function orphanedBindings(manifest, elementIds) {
 
 
 /// One policy with its unset members dropped, in rbpmn's own member order.
+///
+/// A policy left with nothing is dropped by the caller rather than written as
+/// `{}`, the same way `decisions` drops a half-binding: an empty entry is a
+/// shape deploy refuses (`retry-policy-binds-task`), and the manifest this
+/// module writes must never be one the editor's own verdict would reject.
 function narrowPolicy(policy) {
   const out = {};
   for (const member of RETRY_MEMBERS) {

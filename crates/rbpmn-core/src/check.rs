@@ -355,11 +355,17 @@ pub fn retry_policies(
     let mut elements: std::collections::BTreeMap<&str, &NodeKind> =
         std::collections::BTreeMap::new();
     collect_elements(&process.body, &mut elements);
-    let topics: std::collections::BTreeSet<&str> = elements
-        .iter()
-        .filter(|(_, kind)| matches!(kind, NodeKind::ServiceTask { .. }))
-        .map(|(id, _)| bindings.resolved_topic(id))
-        .collect();
+    // Only when a topic layer asks: resolving every service task's topic is
+    // wasted work for the manifests that name elements alone.
+    let topics: std::collections::BTreeSet<&str> = if bindings.retries.by_topic.is_empty() {
+        std::collections::BTreeSet::new()
+    } else {
+        elements
+            .iter()
+            .filter(|(_, kind)| matches!(kind, NodeKind::ServiceTask { .. }))
+            .map(|(id, _)| bindings.resolved_topic(id))
+            .collect()
+    };
 
     let mut diagnostics = Vec::new();
     for (element, policy) in &bindings.retries.by_element {
@@ -441,17 +447,35 @@ fn members(diagnostics: &mut Vec<Diagnostic>, element: &str, policy: &RetryPolic
             ),
         ));
     }
-    if let Some(backoff) = &policy.backoff
-        && let Err(e) = rbpmn_model::iso8601::fixed_length_seconds(backoff)
-    {
-        diagnostics.push(Diagnostic::error(
-            rule::RETRY_POLICY_BINDS_TASK,
-            element,
-            format!(
-                "backoff is not a usable delay: {e} (it is an ISO-8601 duration, \
-                 like PT45S or PT10M, the same spelling a timer uses)"
-            ),
-        ));
+    if let Some(backoff) = &policy.backoff {
+        match rbpmn_model::iso8601::fixed_length_seconds(backoff) {
+            Err(e) => diagnostics.push(Diagnostic::error(
+                rule::RETRY_POLICY_BINDS_TASK,
+                element,
+                format!(
+                    "backoff is not a usable delay: {e} (it is an ISO-8601 duration, \
+                     like PT45S or PT10M, the same spelling a timer uses)"
+                ),
+            )),
+            // Refused rather than capped. The engine caps the *computed* gap
+            // so that no arithmetic can outrun what an interval can hold; a
+            // base that is already past that ceiling is not arithmetic, it is
+            // a manifest saying something, and silently reinterpreting it is
+            // the one thing this project does not do.
+            Ok(seconds) if seconds > RetryPolicy::MAX_BACKOFF_SECONDS => {
+                diagnostics.push(Diagnostic::error(
+                    rule::RETRY_POLICY_BINDS_TASK,
+                    element,
+                    format!(
+                        "backoff '{backoff}' is {seconds:.0} seconds, past the {:.0} \
+                         a retry gap can be — a step that waits a decade has not \
+                         been retried, it has been abandoned",
+                        RetryPolicy::MAX_BACKOFF_SECONDS
+                    ),
+                ));
+            }
+            Ok(_) => {}
+        }
     }
     if let Some(multiplier) = policy.multiplier
         && !(RetryPolicy::MIN_MULTIPLIER..=RetryPolicy::MAX_MULTIPLIER).contains(&multiplier)
@@ -893,6 +917,28 @@ mod tests {
             d.iter()
                 .any(|x| x.element == "sp2" && x.message.contains("multiplier is 0.5")),
             "{d:?}"
+        );
+    }
+
+    /// The other end of the same clause: a base past the ceiling the engine
+    /// can hold is refused, not quietly capped there.
+    #[test]
+    fn a_backoff_past_the_ceiling_is_refused_rather_than_capped() {
+        let d = retry_errors(
+            CONFIGURABLE,
+            // Eleven years, comfortably inside what the duration validator
+            // allows and comfortably past what a retry gap may be.
+            &Bindings::new().retries("st", RetryPolicy::new().backoff("P4015D")),
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("past the"), "{:?}", d[0]);
+        // And the ceiling itself deploys.
+        assert!(
+            retry_errors(
+                CONFIGURABLE,
+                &Bindings::new().retries("st", RetryPolicy::new().backoff("P3650D")),
+            )
+            .is_empty()
         );
     }
 

@@ -185,6 +185,15 @@ impl RetryPolicy {
     /// leaves some 270 orders of magnitude of headroom, and is also where the
     /// exponent cap is reached in three failures.
     pub const MAX_MULTIPLIER: f64 = 10.0;
+    /// The longest base delay a manifest may declare, in seconds (ten years)
+    /// — and the ceiling the engine caps a computed gap at, which is why it
+    /// is one number and not two.
+    ///
+    /// Bounded here rather than only capped there, because capping a base
+    /// that was *declared* larger would be reinterpreting a manifest instead
+    /// of refusing it: the cap exists to keep an arithmetic result
+    /// representable, not to edit what a modeller wrote.
+    pub const MAX_BACKOFF_SECONDS: f64 = 315_360_000.0;
 
     pub fn new() -> Self {
         Self::default()

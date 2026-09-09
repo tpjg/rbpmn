@@ -10,7 +10,15 @@
 //! the corpus writes one, and an empty manifest otherwise: a `.bpmn` is half
 //! a deployment, and comparing the halves separately would leave the manifest
 //! rules (`decision-has-binding`, `ambiguous-message-arm`,
-//! `config-binds-task`) uncompared between the two builds.
+//! `config-binds-task`, `retry-policy-binds-task`) uncompared between the two
+//! builds.
+//!
+//! What that still does *not* cover: no sidecar in the corpus is deliberately
+//! **wrong**, so the manifest rules are compared only where they stay silent.
+//! An L2 expectation format for sidecars is known-and-waiting
+//! (`docs/design/task-config.md`); until there is one, a reject-side manifest
+//! would have to live in a corpus whose `expect-diagnostics` comment reads L1
+//! only, where nothing would check what it expected.
 //!
 //! It also runs over the **DMN corpus**, one artifact at a time against a
 //! fixed minimal process. Decisions are where native and WASM are most likely

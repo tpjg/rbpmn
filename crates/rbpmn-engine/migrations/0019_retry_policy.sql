@@ -23,6 +23,29 @@
 alter table rbpmn_work_item add column backoff_base double precision;
 alter table rbpmn_work_item add column backoff_multiplier double precision;
 
+-- The bounds, declared where nothing can get past them.
+--
+-- Not belt-and-braces over the deploy-time rule: the fail path computes
+-- `power(backoff_multiplier, least(failures, 20))`, and float8 overflow in
+-- PostgreSQL *raises* rather than saturating — inside the very statement
+-- recording the failure, so the transaction aborts, the failure is never
+-- written, and the item is stuck being retried into the same abort. The
+-- `least(...)` ceiling on the result cannot prevent that, because `power` is
+-- evaluated first. The other direction is the same shape: a zero or negative
+-- base would put `retry_at` at or before the failure that set it, and the
+-- item would spin through its whole budget in milliseconds.
+--
+-- `retry-policy-binds-task` refuses both at deploy, which is where a modeller
+-- hears about it. These are for the rows deploy never saw: a hand-edited row
+-- during an incident, a restored dump, a future writer. The numbers repeat
+-- `RetryPolicy`'s constants because a migration is static SQL and cannot read
+-- a Rust const — the same standing arrangement `CLAIMABLE` has, and
+-- `the_columns_refuse_what_the_rule_refuses` is what holds them together.
+alter table rbpmn_work_item add constraint rbpmn_work_item_backoff_base_range
+    check (backoff_base is null or (backoff_base > 0 and backoff_base <= 315360000));
+alter table rbpmn_work_item add constraint rbpmn_work_item_backoff_multiplier_range
+    check (backoff_multiplier is null or (backoff_multiplier >= 1 and backoff_multiplier <= 10));
+
 comment on column rbpmn_work_item.backoff_base is
     'Seconds before the first retry, from the deployment manifest. NULL means the engine''s configured base, read at fail time.';
 comment on column rbpmn_work_item.backoff_multiplier is

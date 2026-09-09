@@ -452,30 +452,34 @@ impl Engine {
         // is what keeps `retry_backoff` a runtime setting and leaves every
         // row written before per-element policies behaving as it always has.
         //
-        // The `least` is a ceiling, not a preference: make_interval and
-        // float8 both have one, and every input here is manifest-driven now.
-        // An overflow would raise inside this very statement — the one
-        // recording the failure — and leave the item parked with nothing
-        // written.
-        let row = sqlx::query(&format!(
+        // The `least` is a ceiling on the gap: make_interval has one, and
+        // every input here is manifest-driven now. It is not what keeps
+        // `power` itself from overflowing — `least` only sees the result —
+        // and that is what migration 0019's CHECK constraints are for.
+        //
+        // The two constants are bound, not interpolated: this runs inside the
+        // held instance lock, so it has no business formatting a statement
+        // per failure, and a bound f64 cannot change the expression's type
+        // the way editing a literal could.
+        let row = sqlx::query(
             "update rbpmn_work_item set retries = retries - 1, failures = failures + 1, \
              state = 'available', lock_owner = null, lock_until = null, \
              retry_at = clock_timestamp() + \
                make_interval(secs => least( \
                  coalesce(backoff_base, $3) \
-                   * power(coalesce(backoff_multiplier, {multiplier}), least(failures, 20)), \
-                 {cap})), \
+                   * power(coalesce(backoff_multiplier, $5), least(failures, 20)), \
+                 $6)), \
              last_failure = coalesce($4, last_failure) \
              where instance_id = $1 and item_no = $2 \
                and state in ('available', 'locked') \
              returning retries, element_id, topic",
-            multiplier = crate::DEFAULT_MULTIPLIER,
-            cap = crate::MAX_RETRY_GAP_SECONDS,
-        ))
+        )
         .bind(instance_id)
         .bind(item_no)
         .bind(self.retry_backoff().as_secs_f64())
         .bind(options.detail.as_deref())
+        .bind(crate::DEFAULT_MULTIPLIER)
+        .bind(crate::MAX_RETRY_GAP_SECONDS)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(EngineError::UnknownWorkItem(work_item))?;
