@@ -418,6 +418,23 @@ body {
   stroke-width: 3px !important;
 }
 
+/* Present but inert: the row is still there — a frozen instance keeps its
+   arms, they are what a repair resumes from — and nothing will act on it,
+   because every gate that would is closed by instance status. Dashes and a
+   muted weight say "shown, not live" while leaving the kind's colour to go on
+   answering *what* is parked here. Must follow the kind rules: same
+   specificity, and it wins on the properties it repeats. */
+.rbpmn-mark-inert .djs-visual > :nth-child(1) {
+  stroke-dasharray: 4 3 !important;
+  stroke-width: 2px !important;
+  opacity: 0.5;
+}
+
+.rbpmn-badge-inert {
+  background: #718096;
+  opacity: 0.75;
+}
+
 .rbpmn-mark-selected .djs-visual > :nth-child(1) {
   stroke: #d69e2e !important;
   stroke-width: 4px !important;

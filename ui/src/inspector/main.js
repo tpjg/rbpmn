@@ -18,6 +18,7 @@ import { ensureDi } from '../shared/layout.js';
 import { clear, el, field, jsonTree, section } from '../shared/dom.js';
 import { describeElement } from '../shared/model-facts.js';
 import { diagnose } from './diagnosis.js';
+import { marksFor } from './marks.js';
 import { onThemeChange, rendererColors } from '../shared/theme.js';
 
 /// One trace line. `display` is the golden-trace format and therefore stable
@@ -81,48 +82,6 @@ function renderDiagnosis(box, data, viewer) {
     box.append(link);
   }
   return elementId;
-}
-
-/// Every annotation the diagram carries, derived from runtime rows only.
-function annotationsFor(data) {
-  const marks = [];
-  for (const token of data.tokens) {
-    marks.push({
-      elementId: token.elementId,
-      kind: token.waitKind === 'incident' ? 'error' : 'token',
-      payload: { title: `token — ${token.waitKind}` },
-    });
-  }
-  for (const item of data.workItems) {
-    if (item.state === 'available' || item.state === 'locked') {
-      marks.push({
-        elementId: item.elementId,
-        kind: 'work',
-        payload: { title: `work item ${item.state} (${item.kind} / ${item.topic})` },
-      });
-    } else if (item.state === 'failed') {
-      marks.push({
-        elementId: item.elementId,
-        kind: 'error',
-        payload: { title: `work item failed: ${item.lastFailure ?? 'no detail recorded'}` },
-      });
-    }
-  }
-  for (const timer of data.timers) {
-    marks.push({
-      elementId: timer.elementId,
-      kind: 'timer',
-      payload: { title: `timer ${timer.dueSpec} — due ${timer.dueAt}` },
-    });
-  }
-  for (const sub of data.subscriptions) {
-    marks.push({
-      elementId: sub.elementId,
-      kind: 'message',
-      payload: { title: `awaiting ${sub.messageName} (key ${sub.correlationKey})` },
-    });
-  }
-  return marks;
 }
 
 /// The element pane: static model facts, the wiring the manifest supplies,
@@ -310,7 +269,7 @@ async function main() {
       canvasNote.hidden = false;
       canvasNote.textContent = `diagram imported with ${warnings.length} warning(s)`;
     }
-    const { missing } = annotate(viewer, annotationsFor(data));
+    const { missing } = annotate(viewer, marksFor(data));
     if (missing.length) {
       canvasNote.hidden = false;
       canvasNote.textContent =
