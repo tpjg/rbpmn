@@ -7302,6 +7302,11 @@ async fn the_published_work_item_view_has_the_documented_shape() {
             ("failures".into(), "integer".into()),
             ("last_failure".into(), "text".into()),
             ("created_at".into(), "timestamp with time zone".into()),
+            // Appended, not slotted in beside `retries`: a view's column
+            // order is part of what `select *` returns, and `create or
+            // replace view` only permits additions at the end.
+            ("backoff_base".into(), "double precision".into()),
+            ("backoff_multiplier".into(), "double precision".into()),
         ],
         "rbpmn_v_work_item is public API"
     );
@@ -9205,6 +9210,493 @@ async fn startup_revalidation_sees_a_config_key_that_stopped_binding() {
     assert!(
         diags.iter().any(|d| d.rule == "config-binds-task"),
         "{diags:?}"
+    );
+    db.drop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Per-element retry policy (docs/design/retry-policy.md)
+// ---------------------------------------------------------------------------
+
+/// start -> (parallel) two service tasks -> join -> end. Two items open at
+/// once, which is what makes "one has a policy and the other does not" a
+/// single observation rather than two.
+const TWO_SERVICE_TASKS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:process id="pr" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="split"/>
+    <bpmn:serviceTask id="notice"/>
+    <bpmn:serviceTask id="lookup"/>
+    <bpmn:parallelGateway id="join"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="split"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="split" targetRef="notice"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="split" targetRef="lookup"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="notice" targetRef="join"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="lookup" targetRef="join"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="join" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+/// `(retries, backoff_base, backoff_multiplier)` as the row carries them.
+async fn retry_columns(pool: &PgPool, item: uuid::Uuid) -> (i32, Option<f64>, Option<f64>) {
+    let row = sqlx::query(
+        "select retries, backoff_base, backoff_multiplier from rbpmn_work_item where id = $1",
+    )
+    .bind(item)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (
+        row.get("retries"),
+        row.get("backoff_base"),
+        row.get("backoff_multiplier"),
+    )
+}
+
+/// Seconds from now until the item is claimable again — the gap the last
+/// failure bought. Read rather than waited for: the curve is what is under
+/// test, not the clock.
+async fn retry_gap(pool: &PgPool, item: uuid::Uuid) -> f64 {
+    sqlx::query_scalar(
+        "select extract(epoch from (retry_at - clock_timestamp()))::float8 \
+         from rbpmn_work_item where id = $1",
+    )
+    .bind(item)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Two numbers, one meaning: `DEFAULT_ATTEMPTS` in lib.rs and the column
+/// default from migration 0001 must agree, because the insert now binds the
+/// column explicitly and nothing else would notice if they drifted apart.
+/// Neither can read the other, so both are pinned here — the column default
+/// from the catalogue, the engine's from an item it actually created.
+#[tokio::test]
+async fn the_default_budget_is_the_column_default_and_the_engine_agrees() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+
+    let column_default: Option<String> = sqlx::query_scalar(
+        "select column_default from information_schema.columns \
+         where table_name = 'rbpmn_work_item' and column_name = 'retries'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(column_default.as_deref(), Some("3"));
+
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let item = open_items(&db.pool, started.id).await[0].0;
+    assert_eq!(retry_columns(&db.pool, item).await, (3, None, None));
+    db.drop().await;
+}
+
+/// The feature, end to end: a manifest says four attempts two seconds apart
+/// doubling, and the budget *and* the widening gaps follow it. The engine's
+/// own base is zero here (the test harness), so every gap observed is the
+/// manifest's and nothing else's.
+#[tokio::test]
+async fn an_element_retry_policy_sets_the_budget_and_widens_the_gaps() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("payments").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new().topic("st", "payments").retries(
+                "st",
+                rbpmn_core::RetryPolicy::new()
+                    .attempts(4)
+                    .backoff("PT2S")
+                    .multiplier(2.0),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let item = open_items(&db.pool, started.id).await[0].0;
+    assert_eq!(
+        retry_columns(&db.pool, item).await,
+        (4, Some(2.0), Some(2.0))
+    );
+
+    let opts = FailOptions {
+        detail: Some("the dependency is down".to_string()),
+        ..FailOptions::default()
+    };
+    // 2 · 2^0, 2 · 2^1, 2 · 2^2 — the exponent is the failure count *before*
+    // this failure, which is why the first gap is the base itself.
+    for (attempt, (left, gap)) in [(3, 2.0), (2, 4.0), (1, 8.0)].into_iter().enumerate() {
+        assert_eq!(
+            engine.fail_work_item(item, &opts).await.unwrap(),
+            FailOutcome::Retrying { retries_left: left },
+            "failure {}",
+            attempt + 1
+        );
+        let seen = retry_gap(&db.pool, item).await;
+        assert!(
+            (seen - gap).abs() < 0.5,
+            "failure {}: expected a gap near {gap}s, got {seen}s",
+            attempt + 1
+        );
+    }
+    // The fourth call spends the budget: four handler calls in total, which
+    // is what `attempts` says and what `retries` has always meant.
+    assert_eq!(
+        engine.fail_work_item(item, &opts).await.unwrap(),
+        FailOutcome::IncidentRaised
+    );
+    wait_for_status(&db.pool, started.id, "failed").await;
+    db.drop().await;
+}
+
+/// The layer the motivating case needed: no entry names this element, and it
+/// is covered anyway because of the topic it runs on.
+#[tokio::test]
+async fn a_topic_retry_policy_reaches_the_tasks_on_that_topic() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("payments").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new().topic("st", "payments").topic_retries(
+                "payments",
+                rbpmn_core::RetryPolicy::new().attempts(7).backoff("PT30S"),
+            ),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let item = open_items(&db.pool, started.id).await[0].0;
+    // The multiplier is unset, so it stays NULL: the engine's default curve
+    // applies to a policy that only said how many and how far apart.
+    assert_eq!(retry_columns(&db.pool, item).await, (7, Some(30.0), None));
+    db.drop().await;
+}
+
+/// One definition, one policy, two service tasks: the unnamed one keeps
+/// exactly what it had before this feature existed, NULLs and all — which is
+/// what makes NULL "ask the engine" rather than "nobody wrote a number here
+/// yet".
+#[tokio::test]
+async fn a_policy_and_the_engine_default_coexist_in_one_definition() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("notice").await.unwrap();
+    engine.declare_topic("lookup").await.unwrap();
+    engine
+        .deploy(
+            TWO_SERVICE_TASKS,
+            &Bindings::new().retries(
+                "notice",
+                rbpmn_core::RetryPolicy::new().attempts(7).backoff("PT10M"),
+            ),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("pr", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let items = open_items(&db.pool, started.id).await;
+    let by_element = |name: &str| {
+        items
+            .iter()
+            .find(|(_, element)| element == name)
+            .expect("both items are open")
+            .0
+    };
+    assert_eq!(
+        retry_columns(&db.pool, by_element("notice")).await,
+        (7, Some(600.0), None)
+    );
+    assert_eq!(
+        retry_columns(&db.pool, by_element("lookup")).await,
+        (3, None, None)
+    );
+
+    // And the difference is visible where it matters: the engine's base is
+    // zero in these tests, so the unpoliced item is claimable again at once
+    // while the policed one waits its ten minutes.
+    let opts = FailOptions::default();
+    engine
+        .fail_work_item(by_element("notice"), &opts)
+        .await
+        .unwrap();
+    engine
+        .fail_work_item(by_element("lookup"), &opts)
+        .await
+        .unwrap();
+    assert!((retry_gap(&db.pool, by_element("notice")).await - 600.0).abs() < 1.0);
+    assert!(retry_gap(&db.pool, by_element("lookup")).await <= 0.0);
+    db.drop().await;
+}
+
+/// The hash contract, from the deploy side. A manifest that says nothing
+/// about retries must hash to what it always did — `compile.rs`'s
+/// `a_manifest_without_a_retry_group_serializes_byte_for_byte` pins the bytes
+/// this hashes, and this pins the consequence: an upgrade re-deploys nothing,
+/// and adding a policy is a new version because it is model content.
+#[tokio::test]
+async fn a_retry_policy_is_content_and_an_absent_one_changes_no_hash() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("payments").await.unwrap();
+    let plain = Bindings::new().topic("st", "payments");
+    let first = engine
+        .deploy(&fixture("accept/16-foreign-binding-warn.bpmn"), &plain)
+        .await
+        .unwrap();
+    let again = engine
+        .deploy(&fixture("accept/16-foreign-binding-warn.bpmn"), &plain)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.version, again.version,
+        "an unchanged manifest must not allocate a version"
+    );
+
+    let policed = plain
+        .clone()
+        .retries("st", rbpmn_core::RetryPolicy::new().attempts(7));
+    let third = engine
+        .deploy(&fixture("accept/16-foreign-binding-warn.bpmn"), &policed)
+        .await
+        .unwrap();
+    assert_eq!(
+        third.version,
+        first.version + 1,
+        "a policy is inside the content hash"
+    );
+    db.drop().await;
+}
+
+/// Loudly reject, never silently reinterpret: every way of binding a policy
+/// to something that will never spend one.
+#[tokio::test]
+async fn deploy_refuses_a_retry_policy_that_binds_nothing() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("st").await.unwrap();
+    engine.declare_topic("payments").await.unwrap();
+
+    let cases: Vec<(&str, Bindings)> = vec![
+        (
+            "a user task",
+            Bindings::new().retries("ut", rbpmn_core::RetryPolicy::new().attempts(2)),
+        ),
+        (
+            "an element that is not there",
+            Bindings::new().retries("gone", rbpmn_core::RetryPolicy::new().attempts(2)),
+        ),
+        (
+            "a topic nothing runs on",
+            Bindings::new().topic_retries("nowhere", rbpmn_core::RetryPolicy::new().attempts(2)),
+        ),
+        (
+            "no attempts at all",
+            Bindings::new().retries("st", rbpmn_core::RetryPolicy::new().attempts(0)),
+        ),
+        (
+            "a backoff of no fixed length",
+            Bindings::new().retries("st", rbpmn_core::RetryPolicy::new().backoff("P1M")),
+        ),
+        (
+            "a shrinking multiplier",
+            Bindings::new().retries("st", rbpmn_core::RetryPolicy::new().multiplier(0.5)),
+        ),
+        (
+            "a policy that sets nothing",
+            Bindings::new().retries("st", rbpmn_core::RetryPolicy::new()),
+        ),
+    ];
+    for (what, bindings) in cases {
+        match engine
+            .deploy(&fixture("accept/07-task-kinds.bpmn"), &bindings)
+            .await
+        {
+            Err(DeployError::Rejected(diags)) => assert!(
+                diags.iter().any(|d| d.rule == "retry-policy-binds-task"),
+                "{what}: {diags:?}"
+            ),
+            other => panic!("{what}: expected a rejection, got {other:?}"),
+        }
+    }
+    db.drop().await;
+}
+
+/// The startup re-check is the one path that must not skip a manifest rule:
+/// a replica booting on a definition whose policy stopped binding says so.
+#[tokio::test]
+async fn startup_revalidation_sees_a_retry_policy_that_stopped_binding() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    assert!(engine.check_active_definitions().await.unwrap().is_empty());
+
+    sqlx::query(
+        "update rbpmn_definition set bindings = \
+         '{\"retries\":{\"by_element\":{\"renamed_away\":{\"attempts\":7}}}}'::jsonb",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let diags = Engine::builder(db.pool.clone())
+        .build()
+        .check_active_definitions()
+        .await
+        .unwrap();
+    assert!(
+        diags.iter().any(|d| d.rule == "retry-policy-binds-task"),
+        "{diags:?}"
+    );
+    db.drop().await;
+}
+
+/// The inspector's element pane is where "why has this not retried yet" is
+/// asked, so the answer — when, and off which curve — has to reach it.
+#[tokio::test]
+async fn the_inspector_carries_the_retry_curve_and_the_due_instant() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("payments").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new().topic("st", "payments").retries(
+                "st",
+                rbpmn_core::RetryPolicy::new().attempts(4).backoff("PT2S"),
+            ),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let item = open_items(&db.pool, started.id).await[0].0;
+    engine
+        .fail_work_item(item, &FailOptions::default())
+        .await
+        .unwrap();
+
+    let inspection = engine.inspect_instance(started.id).await.unwrap();
+    let view = &inspection.work_items[0];
+    assert_eq!(view.retries, 3);
+    assert_eq!(view.failures, 1);
+    assert_eq!(view.backoff_base, Some(2.0));
+    assert_eq!(view.backoff_multiplier, None);
+    assert!(view.retry_at.is_some(), "the due instant is the answer");
+    db.drop().await;
+}
+
+/// The rule and the columns say the same thing, and both have to: the rule is
+/// where a modeller hears it, the constraints are what hold for the rows
+/// deploy never saw — a hand-edited row during an incident, a restored dump.
+///
+/// The multiplier bound in particular is not tidiness. `power()` overflows by
+/// *raising* in PostgreSQL, and the `least(...)` ceiling around it cannot help
+/// because it only ever sees the result: an out-of-range row would abort the
+/// transaction recording its own failure, over and over. Reproduced below
+/// rather than asserted, so the day someone drops the constraint this test
+/// says what it costs.
+#[tokio::test]
+async fn the_columns_refuse_what_the_rule_refuses() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("payments").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new().topic("st", "payments"),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let item = open_items(&db.pool, started.id).await[0].0;
+
+    for (column, value) in [
+        ("backoff_base", 0.0),
+        ("backoff_base", -1.0),
+        ("backoff_base", 315_360_001.0),
+        ("backoff_multiplier", 0.5),
+        ("backoff_multiplier", 10.5),
+        ("backoff_multiplier", 1e300),
+    ] {
+        let refused = sqlx::query(&format!(
+            "update rbpmn_work_item set {column} = $2 where id = $1"
+        ))
+        .bind(item)
+        .bind(value)
+        .execute(&db.pool)
+        .await;
+        assert!(
+            refused.is_err(),
+            "{column} = {value} must not be storable — the fail path reads it"
+        );
+    }
+
+    // What the rule allows, the columns allow: the ends of both ranges.
+    for (column, value) in [
+        ("backoff_base", 315_360_000.0),
+        ("backoff_multiplier", 1.0),
+        ("backoff_multiplier", 10.0),
+    ] {
+        sqlx::query(&format!(
+            "update rbpmn_work_item set {column} = $2 where id = $1"
+        ))
+        .bind(item)
+        .bind(value)
+        .execute(&db.pool)
+        .await
+        .unwrap_or_else(|e| panic!("{column} = {value} is in range: {e}"));
+    }
+
+    // And the pair the constraints exist to protect: the widest legal curve
+    // at the deepest exponent still computes rather than raising.
+    sqlx::query(
+        "update rbpmn_work_item set backoff_base = 315360000, \
+         backoff_multiplier = 10, failures = 20 where id = $1",
+    )
+    .bind(item)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    engine
+        .fail_work_item(item, &FailOptions::default())
+        .await
+        .unwrap();
+    // Capped, not overflowed — and the failure was recorded.
+    let gap = retry_gap(&db.pool, item).await;
+    assert!(
+        (gap - 315_360_000.0).abs() < 1.0,
+        "the gap is capped at ten years, got {gap}"
     );
     db.drop().await;
 }

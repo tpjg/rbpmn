@@ -254,7 +254,7 @@ impl Engine {
         // NOWAIT: a caller transaction (an *_in_tx embedder) may hold this
         // instance's row lock for a while — the sequential drain loop must
         // move on to other instances' timers, not park behind it.
-        let Some((definition, proc, mut state)) =
+        let Some((definition, proc, bindings, mut state)) =
             load_instance_nowait(self, &mut tx, instance_id, true).await?
         else {
             return Ok(Attempt::Busy); // a caller holds the instance row
@@ -293,7 +293,16 @@ impl Engine {
             },
         )
         .await?;
-        persist_step(&mut tx, &proc, &definition, instance_id, &state, &events).await?;
+        persist_step(
+            &mut tx,
+            &proc,
+            &definition,
+            &bindings,
+            instance_id,
+            &state,
+            &events,
+        )
+        .await?;
         tx.commit().await?;
         Ok(Attempt::Fired)
     }

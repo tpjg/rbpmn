@@ -31,7 +31,8 @@ pub(crate) const RELEVANT_DEFINITIONS: &str = "select d.key, d.version, d.bindin
 pub struct Bundle {
     /// The process definition.
     pub bpmn: String,
-    /// Its wiring: topics, correlations, indexes, decision bindings, task config.
+    /// Its wiring: topics, correlations, indexes, decision bindings, task
+    /// config, retry policies.
     #[serde(default)]
     pub bindings: Bindings,
     /// The DMN artifacts its business-rule tasks invoke, as raw XML.
@@ -371,14 +372,17 @@ impl Engine {
                 continue;
             };
             // The manifest half deploy checks, on the path that re-checks
-            // stored definitions. Config has no default, so an entry that
-            // stopped binding a task — a row edited by hand, a migration, a
-            // future `Bindings` shape — would deliver nothing and say
-            // nothing, which is the one failure `config-binds-task` exists to
-            // prevent. It does not gate the compile below, for the reason
+            // stored definitions. Neither group has a default, so an entry
+            // that stopped binding — a row edited by hand, a migration, a
+            // future `Bindings` shape — would take effect nowhere and say
+            // nothing, which is the one failure both rules exist to prevent.
+            // Neither gates the compile below, for the reason
             // `check_deployable` does not either.
             if let Some(process) = defs.processes.first() {
-                for diagnostic in rbpmn_core::config_bindings(&bindings, process) {
+                let manifest = rbpmn_core::config_bindings(&bindings, process)
+                    .into_iter()
+                    .chain(rbpmn_core::retry_policies(&bindings, process));
+                for diagnostic in manifest {
                     out.push(Diagnostic {
                         message: format!("definition '{key}' v{version}: {}", diagnostic.message),
                         ..diagnostic

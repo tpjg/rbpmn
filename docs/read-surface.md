@@ -111,6 +111,7 @@ definitions cost T×D round trips. Here it is one statement.
 | `lock_owner`, `lock_until` | who holds it, until when |
 | `retry_at`, `retries`, `failures`, `last_failure` | why it is stuck |
 | `created_at` | |
+| `backoff_base`, `backoff_multiplier` | the retry curve it was deployed with; NULL is the engine's own setting |
 
 **`claimable` is computed by the engine**, and that is the point of the
 column. It is not `state = 'available'`: it accounts for a lapsed lease
@@ -119,6 +120,15 @@ states (never), and an instance frozen on an incident (never — which is why
 the view joins instances). A dashboard whose depths disagree with what
 `get_task` hands out is worse than no dashboard, so it is the same expression
 the claim path uses, and a test differentials the two row for row.
+
+The two backoff columns are the manifest's answer to "and why is the wait
+that long" (`docs/design/retry-policy.md`). NULL in either means the engine's
+configured value, read at the moment of failure rather than frozen into the
+row — so an item created before a definition declared a policy, or under an
+engine whose base was later changed, keeps behaving as the installation says.
+Published rather than left to a join, for `claimable`'s reason: the
+alternative is every application re-implementing element-then-topic-then-
+engine resolution against `rbpmn_v_definition.bindings`.
 
 `in_progress` is about the **lease alone**, so `waiting + in_progress` is not
 "every open item" — work belonging to a frozen instance is in neither bucket.

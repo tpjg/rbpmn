@@ -184,6 +184,21 @@ function renderElement(container, data, viewer, elementId) {
   for (const w of data.workItems.filter((w) => w.elementId === elementId)) {
     runtime.push([`work item (${w.kind})`, `${w.state} · topic ${w.topic} · retries ${w.retries}`]);
     if (w.lastFailure) runtime.push(['last failure', w.lastFailure]);
+    // "Why has this not retried yet" is answered by *when*, and "why is the
+    // wait that long" by the curve it was deployed with. Both are here or
+    // neither is useful: a retry_at on its own reads as arbitrary.
+    //
+    // Open items only, and that is not cosmetic. The fail path writes
+    // `retry_at` on *every* failure including the budget-exhausting one — it
+    // updates first and tests `retries > 0` after — so a failed item carries
+    // a due instant in the future that nothing will ever act on. Printing it
+    // would promise a retry to the operator standing in front of the
+    // incident, which is precisely the reader this pane was extended for.
+    if (OPEN_ITEM_STATES.includes(w.state)) {
+      if (w.retryAt) runtime.push(['retry due', `${w.retryAt} · ${w.failures} failure(s) so far`]);
+      const curve = retryCurve(w);
+      if (curve) runtime.push(['retry policy', curve]);
+    }
   }
   for (const t of data.timers.filter((t) => t.elementId === elementId)) {
     runtime.push(['timer', `${t.dueSpec} — due ${t.dueAt}`]);
@@ -324,4 +339,23 @@ if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', main);
 } else {
   main();
+}
+
+/// The states in which an item can still be handed out — the same two
+/// `claimable` is built on. A closed item's lease and retry columns are
+/// whatever they were when it closed, and mean nothing now.
+const OPEN_ITEM_STATES = ['available', 'locked'];
+
+/// The retry curve an item carries, in the manifest's own words. Null when it
+/// carries none — the engine's settings then decide, and they are process
+/// configuration the inspector cannot see and must not invent a number for.
+function retryCurve(item) {
+  const parts = [];
+  if (item.backoffBase !== null && item.backoffBase !== undefined) {
+    parts.push(`base ${item.backoffBase}s`);
+  }
+  if (item.backoffMultiplier !== null && item.backoffMultiplier !== undefined) {
+    parts.push(`x${item.backoffMultiplier} each failure`);
+  }
+  return parts.length ? parts.join(' · ') : null;
 }

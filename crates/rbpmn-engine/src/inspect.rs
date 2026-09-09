@@ -75,6 +75,18 @@ pub struct WorkItemView {
     pub topic: String,
     pub kind: String,
     pub retries: i32,
+    /// How many failures this item has already taken, and when it becomes
+    /// claimable again (RFC 3339, from database time). `retry_at` is the
+    /// answer to "why has this not retried yet"; the two policy fields below
+    /// are the answer to "and why is the wait that long".
+    pub failures: i32,
+    pub retry_at: Option<String>,
+    /// The retry curve this item was created with, from its definition's
+    /// manifest. `None` in both means the engine's own settings — the same
+    /// reading the columns have (`docs/design/retry-policy.md`, D6), and what
+    /// every item created before per-element policies carries.
+    pub backoff_base: Option<f64>,
+    pub backoff_multiplier: Option<f64>,
     pub last_failure: Option<String>,
 }
 
@@ -165,7 +177,9 @@ impl Engine {
         .collect();
 
         let work_items = sqlx::query(
-            "select id, element_id, state, topic, kind, retries, last_failure from rbpmn_work_item \
+            "select id, element_id, state, topic, kind, retries, failures, \
+             to_char(retry_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as retry_at, \
+             backoff_base, backoff_multiplier, last_failure from rbpmn_work_item \
              where instance_id = $1 order by item_no",
         )
         .bind(id)
@@ -179,6 +193,10 @@ impl Engine {
             topic: r.get("topic"),
             kind: r.get("kind"),
             retries: r.get("retries"),
+            failures: r.get("failures"),
+            retry_at: r.get("retry_at"),
+            backoff_base: r.get("backoff_base"),
+            backoff_multiplier: r.get("backoff_multiplier"),
             last_failure: r.get("last_failure"),
         })
         .collect();

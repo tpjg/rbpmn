@@ -15,7 +15,21 @@
   "config": {
     "charge": {
       "gateway": "acquirer-a",
-      "retries": 3
+      "capture": "auto"
+    }
+  },
+  "retries": {
+    "by_element": {
+      "score": {
+        "attempts": 2
+      }
+    },
+    "by_topic": {
+      "payments": {
+        "attempts": 5,
+        "backoff": "PT45S",
+        "multiplier": 2
+      }
     }
   }
 }

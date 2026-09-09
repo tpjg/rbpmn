@@ -118,6 +118,7 @@ impl Engine {
             version: row.get("version"),
         };
         let proc = compiled_process(self, &mut *tx, definition_id, key).await?;
+        let bindings = manifest_in_tx(self, &mut *tx, definition_id, key).await?;
 
         let instance_id: Uuid = sqlx::query(
             "insert into rbpmn_instance \
@@ -143,7 +144,16 @@ impl Engine {
             Command::Start { variables },
         )
         .await?;
-        persist_step(tx, &proc, &definition, instance_id, &state, &events).await?;
+        persist_step(
+            tx,
+            &proc,
+            &definition,
+            &bindings,
+            instance_id,
+            &state,
+            &events,
+        )
+        .await?;
 
         Ok(StartedInstance {
             id: instance_id,
@@ -191,7 +201,8 @@ impl Engine {
         // Lock the instance first: every step on an instance serializes
         // here, in the same order engine-wide (instance row, then item row
         // — the one order that can never deadlock the scheduler or a fail).
-        let (definition, proc, mut state) = load_instance(self, &mut *tx, instance_id).await?;
+        let (definition, proc, bindings, mut state) =
+            load_instance(self, &mut *tx, instance_id).await?;
         let item_state = guard_lease(&mut *tx, instance_id, item_no, owner, work_item).await?;
 
         // The idempotent no-op comes before every other gate: a retried,
@@ -222,7 +233,16 @@ impl Engine {
             },
         )
         .await?;
-        persist_step(tx, &proc, &definition, instance_id, &state, &events).await?;
+        persist_step(
+            tx,
+            &proc,
+            &definition,
+            &bindings,
+            instance_id,
+            &state,
+            &events,
+        )
+        .await?;
         Ok(Completion::Advanced(events))
     }
 
@@ -315,7 +335,8 @@ impl Engine {
         let instance_id: Uuid = row.get("instance_id");
         let subscription_no: i64 = row.get("subscription_no");
 
-        let (definition, proc, mut state) = load_instance(self, &mut *tx, instance_id).await?;
+        let (definition, proc, bindings, mut state) =
+            load_instance(self, &mut *tx, instance_id).await?;
         if state.status == InstanceStatus::Failed {
             return Err(EngineError::IncidentOpen(instance_id));
         }
@@ -344,7 +365,16 @@ impl Engine {
             Command::DeliverMessage { id: sub_id, patch },
         )
         .await?;
-        persist_step(tx, &proc, &definition, instance_id, &state, &events).await?;
+        persist_step(
+            tx,
+            &proc,
+            &definition,
+            &bindings,
+            instance_id,
+            &state,
+            &events,
+        )
+        .await?;
         Ok(Correlation {
             instance_id,
             events,
@@ -390,7 +420,8 @@ impl Engine {
         let instance_id: Uuid = item.get("instance_id");
         let item_no: i64 = item.get("item_no");
 
-        let (definition, proc, mut state) = load_instance(self, &mut *tx, instance_id).await?;
+        let (definition, proc, bindings, mut state) =
+            load_instance(self, &mut *tx, instance_id).await?;
         let item_state = guard_lease(
             &mut *tx,
             instance_id,
@@ -415,11 +446,29 @@ impl Engine {
 
         // SET expressions see pre-update values: the backoff exponent uses
         // the failure count before this failure.
+        //
+        // The curve is the item's own where the manifest gave it one, and the
+        // engine's where it did not — NULL means *ask the engine now*, which
+        // is what keeps `retry_backoff` a runtime setting and leaves every
+        // row written before per-element policies behaving as it always has.
+        //
+        // The `least` is a ceiling on the gap: make_interval has one, and
+        // every input here is manifest-driven now. It is not what keeps
+        // `power` itself from overflowing — `least` only sees the result —
+        // and that is what migration 0019's CHECK constraints are for.
+        //
+        // The two constants are bound, not interpolated: this runs inside the
+        // held instance lock, so it has no business formatting a statement
+        // per failure, and a bound f64 cannot change the expression's type
+        // the way editing a literal could.
         let row = sqlx::query(
             "update rbpmn_work_item set retries = retries - 1, failures = failures + 1, \
              state = 'available', lock_owner = null, lock_until = null, \
              retry_at = clock_timestamp() + \
-               make_interval(secs => $3 * power(3, least(failures, 20))), \
+               make_interval(secs => least( \
+                 coalesce(backoff_base, $3) \
+                   * power(coalesce(backoff_multiplier, $5), least(failures, 20)), \
+                 $6)), \
              last_failure = coalesce($4, last_failure) \
              where instance_id = $1 and item_no = $2 \
                and state in ('available', 'locked') \
@@ -429,6 +478,8 @@ impl Engine {
         .bind(item_no)
         .bind(self.retry_backoff().as_secs_f64())
         .bind(options.detail.as_deref())
+        .bind(crate::DEFAULT_MULTIPLIER)
+        .bind(crate::MAX_RETRY_GAP_SECONDS)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(EngineError::UnknownWorkItem(work_item))?;
@@ -468,7 +519,16 @@ impl Engine {
                 },
             )
             .await?;
-            persist_step(tx, &proc, &definition, instance_id, &state, &events).await?;
+            persist_step(
+                tx,
+                &proc,
+                &definition,
+                &bindings,
+                instance_id,
+                &state,
+                &events,
+            )
+            .await?;
             if events
                 .iter()
                 .any(|e| matches!(e, Event::IncidentRaised { .. }))
@@ -689,10 +749,32 @@ pub(crate) async fn manifest(
     if let Some(bindings) = engine.cached_manifest(definition_id) {
         return Ok(bindings);
     }
+    // The connection is taken only on a miss: the claim paths run this on
+    // every claim, and a warm engine must not touch the pool to answer.
+    let mut conn = engine.pool().acquire().await?;
+    manifest_in_tx(engine, &mut conn, definition_id, definition_key).await
+}
+
+/// [`manifest`] over a connection the caller already has.
+///
+/// This is the implementation of both: a step path must not reach for a
+/// second pool connection while it holds the instance lock, so its miss is
+/// read through `tx`. In practice a step path never misses — it loads the
+/// instance first, and that populates this cache alongside the compiled
+/// process, from the same row.
+pub(crate) async fn manifest_in_tx(
+    engine: &Engine,
+    tx: &mut PgConnection,
+    definition_id: Uuid,
+    definition_key: &str,
+) -> Result<std::sync::Arc<Bindings>, EngineError> {
+    if let Some(bindings) = engine.cached_manifest(definition_id) {
+        return Ok(bindings);
+    }
     let stored: serde_json::Value =
         sqlx::query_scalar("select bindings from rbpmn_definition where id = $1")
             .bind(definition_id)
-            .fetch_optional(engine.pool())
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| EngineError::CorruptManifest {
                 definition_key: definition_key.to_string(),
@@ -760,6 +842,7 @@ pub(crate) async fn load_instance(
     (
         DefinitionRef,
         std::sync::Arc<ExecutableProcess>,
+        std::sync::Arc<Bindings>,
         InstanceState,
     ),
     EngineError,
@@ -785,6 +868,7 @@ pub(crate) async fn load_instance_nowait(
     Option<(
         DefinitionRef,
         std::sync::Arc<ExecutableProcess>,
+        std::sync::Arc<Bindings>,
         InstanceState,
     )>,
     EngineError,
@@ -817,6 +901,8 @@ pub(crate) async fn load_instance_nowait(
         version: inst.get("definition_version"),
     };
     let proc = compiled_process(engine, &mut *tx, definition.id, &key).await?;
+    // Free after `compiled_process`: it fills both caches from the one row.
+    let bindings = manifest_in_tx(engine, &mut *tx, definition.id, &key).await?;
     let status = status_from_db(&inst.get::<String, _>("status"))?;
 
     let mut timers = Vec::new();
@@ -1037,11 +1123,55 @@ pub(crate) async fn load_instance_nowait(
             next_scope: inst.get::<i64, _>("next_scope") as u64,
         },
     );
-    Ok(Some((definition, proc, state)))
+    Ok(Some((definition, proc, bindings, state)))
+}
+
+/// A manifest policy's budget, as the `retries` column holds it.
+///
+/// Out of range falls back to the default rather than wrapping or failing:
+/// deploy and startup re-validation both refuse such a manifest
+/// (`retry-policy-binds-task`), so reaching this at all means something got
+/// past both — and a step transaction is the wrong place to discover it. The
+/// item then behaves exactly as it did before policies existed, which is the
+/// one outcome that cannot strand it.
+fn attempts(policy: &rbpmn_core::RetryPolicy) -> i32 {
+    policy
+        .attempts
+        .filter(|a| {
+            (rbpmn_core::RetryPolicy::MIN_ATTEMPTS..=rbpmn_core::RetryPolicy::MAX_ATTEMPTS)
+                .contains(a)
+        })
+        .and_then(|a| i32::try_from(a).ok())
+        .unwrap_or(crate::DEFAULT_ATTEMPTS)
+}
+
+/// A manifest policy's base delay in seconds, or `None` for "ask the engine".
+/// Unparseable is `None` for [`attempts`]'s reason — deploy validated this
+/// text with the same function.
+fn backoff_seconds(policy: &rbpmn_core::RetryPolicy) -> Option<f64> {
+    policy
+        .backoff
+        .as_deref()
+        .and_then(|spec| rbpmn_model::iso8601::fixed_length_seconds(spec).ok())
+}
+
+/// A manifest policy's growth factor, or `None` for the default curve. Out of
+/// range is `None`: an overflowing `power()` would abort the transaction
+/// recording the failure.
+fn multiplier(policy: &rbpmn_core::RetryPolicy) -> Option<f64> {
+    policy.multiplier.filter(|m| {
+        (rbpmn_core::RetryPolicy::MIN_MULTIPLIER..=rbpmn_core::RetryPolicy::MAX_MULTIPLIER)
+            .contains(m)
+    })
 }
 
 /// Projects a completed step: instance columns, token snapshot, work-item
-/// transitions from the events, and the append-only event rows. Timer and
+/// transitions from the events, and the append-only event rows.
+///
+/// `bindings` is the manifest the instance's definition version was deployed
+/// with — the same value the definition cache hands the claim paths. A
+/// created service item reads its retry policy out of it here, once, because
+/// this is where the row is written and the budget is a column. Timer and
 /// subscription rows follow the events too — armed rows insert (with
 /// `due_at` resolved from **database time**), fired/received/cancelled rows
 /// delete, in the same transaction as the step that decided it.
@@ -1049,6 +1179,7 @@ pub(crate) async fn persist_step(
     tx: &mut PgConnection,
     proc: &ExecutableProcess,
     definition: &DefinitionRef,
+    bindings: &Bindings,
     instance_id: Uuid,
     state: &InstanceState,
     events: &[Event],
@@ -1205,12 +1336,25 @@ pub(crate) async fn persist_step(
                     .find(|(wid, _)| wid == id)
                     .map(|(_, w)| w.token.0 as i64)
                     .ok_or_else(|| internal("created work item missing from state".into()))?;
+                // The retry policy is bound here, at creation, and only
+                // for service items: a user task waits for a person and does
+                // not fail through a handler, so a budget on one is a number
+                // nobody spends (deploy refuses to bind one at all). The
+                // backoff columns stay NULL when the manifest is silent —
+                // NULL means "ask the engine at fail time", never the
+                // engine's current value frozen into the row.
+                let policy = match work_kind {
+                    WorkKind::Service => bindings.retry_policy(element),
+                    WorkKind::User => rbpmn_core::RetryPolicy::default(),
+                };
                 sqlx::query(
                     "insert into rbpmn_work_item \
                      (instance_id, item_no, definition_id, definition_key, \
                       definition_version, token_no, \
-                      kind, topic, element_id, state) \
-                     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'available')",
+                      kind, topic, element_id, state, \
+                      retries, backoff_base, backoff_multiplier) \
+                     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'available', \
+                             $10, $11, $12)",
                 )
                 .bind(instance_id)
                 .bind(id.0 as i64)
@@ -1221,6 +1365,9 @@ pub(crate) async fn persist_step(
                 .bind(work_kind.to_string())
                 .bind(topic)
                 .bind(element)
+                .bind(attempts(&policy))
+                .bind(backoff_seconds(&policy))
+                .bind(multiplier(&policy))
                 .execute(&mut *tx)
                 .await?;
                 if *work_kind == WorkKind::Service {

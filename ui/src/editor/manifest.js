@@ -3,10 +3,10 @@
 //
 // Everything here operates on a plain object with the shape rbpmn-core's
 // `Bindings` serializes to — `{ topics, correlations, indexes, decisions,
-// config }` — because that object is the artifact: it is written next to the
-// .bpmn in the user's repository and travels with it to `deploy`. Empty
-// groups are pruned on the way out so a manifest with nothing in it is `{}`
-// rather than five empty containers.
+// config, retries }` — because that object is the artifact: it is written
+// next to the .bpmn in the user's repository and travels with it to `deploy`.
+// Empty groups are pruned on the way out so a manifest with nothing in it is
+// `{}` rather than six empty containers.
 
 /// The scopes a declared index can carry. `definition` (the default) indexes
 /// one definition's instances; `shared` indexes the field across every
@@ -38,8 +38,29 @@ export function formatIndexField(entry) {
 }
 
 export function emptyManifest() {
-  return { topics: {}, correlations: {}, indexes: [], decisions: {}, config: {} };
+  return {
+    topics: {},
+    correlations: {},
+    indexes: [],
+    decisions: {},
+    config: {},
+    retries: { by_element: {}, by_topic: {} },
+  };
 }
+
+/// The members of one retry policy, in the order rbpmn writes them back.
+const RETRY_MEMBERS = ['attempts', 'backoff', 'multiplier'];
+
+/// The two layers, spelled as rbpmn spells them — and held that way too.
+/// Everything in a manifest object must be something `Bindings` deserializes,
+/// because `checkModel` stringifies this object straight into the WASM
+/// verdict; a camelCase convenience here would reach the engine as an unknown
+/// field. (`indexes` is normalized in memory and gets away with it for
+/// exactly this reason: `{field, scope}` is valid manifest syntax too.)
+///
+/// They are separate maps because they cannot share a key space: an unmapped
+/// service task's topic *is* its element id.
+const RETRY_LAYERS = ['by_element', 'by_topic'];
 
 /// The manifest groups that map an element id to a plain string.
 const STRING_GROUPS = ['topics', 'correlations'];
@@ -130,8 +151,50 @@ export function parseManifest(text) {
       if (!isConfigEntry(entry)) throw new Error(`"config.${key}" must be a JSON object`);
     }
   }
+  // `retries` is checked for shape, never for range: 1..=1000 attempts and a
+  // 1..=10 multiplier are the engine's numbers, and duplicating them here is
+  // how an editor starts disagreeing with the verdict it displays. What is
+  // checked is what a *shape* mistake would otherwise turn into — a policy
+  // silently dropped, or a layer name nobody notices is wrong.
+  if (raw.retries !== undefined) {
+    const value = raw.retries;
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('"retries" must be an object of { by_element, by_topic }');
+    }
+    const extraLayers = Object.keys(value).filter((k) => !RETRY_LAYERS.includes(k));
+    if (extraLayers.length) {
+      throw new Error(
+        `unknown key(s) in "retries": ${extraLayers.join(', ')} — the layers are by_element and by_topic`
+      );
+    }
+    for (const wire of RETRY_LAYERS) {
+      const layer = value[wire];
+      if (layer === undefined) continue;
+      if (layer === null || typeof layer !== 'object' || Array.isArray(layer)) {
+        throw new Error(`"retries.${wire}" must be an object of key -> policy`);
+      }
+      for (const [key, policy] of Object.entries(layer)) {
+        if (policy === null || typeof policy !== 'object' || Array.isArray(policy)) {
+          throw new Error(`"retries.${wire}.${key}" must be { attempts?, backoff?, multiplier? }`);
+        }
+        const extra = Object.keys(policy).filter((k) => !RETRY_MEMBERS.includes(k));
+        if (extra.length) {
+          throw new Error(`unknown key(s) in "retries.${wire}.${key}": ${extra.join(', ')}`);
+        }
+        if (policy.attempts !== undefined && !Number.isInteger(policy.attempts)) {
+          throw new Error(`"retries.${wire}.${key}.attempts" must be a whole number of handler calls`);
+        }
+        if (policy.backoff !== undefined && typeof policy.backoff !== 'string') {
+          throw new Error(`"retries.${wire}.${key}.backoff" must be an ISO-8601 duration, like PT10M`);
+        }
+        if (policy.multiplier !== undefined && typeof policy.multiplier !== 'number') {
+          throw new Error(`"retries.${wire}.${key}.multiplier" must be a number`);
+        }
+      }
+    }
+  }
   const unknown = Object.keys(raw).filter(
-    (k) => !['topics', 'correlations', 'indexes', 'decisions', 'config'].includes(k)
+    (k) => !['topics', 'correlations', 'indexes', 'decisions', 'config', 'retries'].includes(k)
   );
   if (unknown.length) {
     throw new Error(`unknown manifest key(s): ${unknown.join(', ')}`);
@@ -147,6 +210,9 @@ export function parseManifest(text) {
       ])
     ),
     config: { ...(raw.config ?? {}) },
+    retries: Object.fromEntries(
+      RETRY_LAYERS.map((layer) => [layer, { ...(raw.retries?.[layer] ?? {}) }])
+    ),
   };
 }
 
@@ -178,6 +244,20 @@ export function serializeManifest(manifest) {
   if (indexes.length) out.indexes = indexes;
   if (decisions.length) out.decisions = Object.fromEntries(decisions);
   if (config.length) out.config = Object.fromEntries(config);
+  // Sorted by key like every other group, and each policy written back in the
+  // narrowest spelling that carries it: unset members are absent, an empty
+  // layer does not appear, and an empty group does not either. That is not
+  // tidiness — `deploy` hashes these bytes, so a group that always appeared
+  // would allocate a new version of every definition that never changed.
+  const retries = {};
+  for (const layer of RETRY_LAYERS) {
+    const entries = Object.entries(manifest.retries?.[layer] ?? {})
+      .map(([key, policy]) => [key, narrowPolicy(policy)])
+      .filter(([, policy]) => Object.keys(policy).length)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    if (entries.length) retries[layer] = Object.fromEntries(entries);
+  }
+  if (Object.keys(retries).length) out.retries = retries;
   return `${JSON.stringify(out, null, 2)}\n`;
 }
 
@@ -308,6 +388,22 @@ export function orphanedBindings(manifest, elementIds) {
     for (const elementId of Object.keys(manifest[group] ?? {})) {
       if (!present.has(elementId)) out.push({ group, elementId });
     }
+  }
+  return out;
+}
+
+
+/// One policy with its unset members dropped, in rbpmn's own member order.
+///
+/// A policy left with nothing is dropped by the caller rather than written as
+/// `{}`, the same way `decisions` drops a half-binding: an empty entry is a
+/// shape deploy refuses (`retry-policy-binds-task`), and the manifest this
+/// module writes must never be one the editor's own verdict would reject.
+function narrowPolicy(policy) {
+  const out = {};
+  for (const member of RETRY_MEMBERS) {
+    const value = policy?.[member];
+    if (value !== undefined && value !== null && value !== '') out[member] = value;
   }
   return out;
 }

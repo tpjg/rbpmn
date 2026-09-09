@@ -77,6 +77,13 @@ ASSUME MaxTime \in Nat
 ASSUME MaxLeases \in Nat /\ MaxLeases > 0
 ASSUME UncheckedRelease \in BOOLEAN
 ASSUME EpochlessRelease \in BOOLEAN
+\* Stated rather than assumed silently, because a manifest supplies these
+\* now: a zero backoff would let a failed item be re-claimed in the same
+\* instant it failed, and a zero budget would freeze the instance without
+\* ever delivering the item. `retry-policy-binds-task` is what keeps both
+\* true of the engine.
+ASSUME Backoff \in Nat /\ Backoff > 0
+ASSUME Retries \in Nat
 
 VARIABLES
     state,        \* "available" | "locked" | "done" | "cancelled" | "failed"
@@ -102,6 +109,23 @@ vars ==
 \* would be an infinite state space. Two is already enough to express the
 \* bug (claim, release, re-claim, replay).
 Leases == 0..MaxLeases
+
+\* NOTE, and it matters now that a manifest can set these per element
+\* (`docs/design/retry-policy.md`): `Backoff` and `Retries` are constants
+\* here because this model is about ONE item, and per-item values change
+\* which numbers an item carries, not which transitions exist. What the
+\* engine must keep true for the model to describe it: the backoff is
+\* positive and finite (or `retryAt` leaves `Deadline`, and in the engine
+\* leaves `make_interval`), and the budget is at least one.
+\*
+\* `Retries` is NOT the `retries` column. It is what its comment says —
+\* failures *before* the freeze — so `Retries = N` allows N `Fail` steps and
+\* then a freezing one, where the column allows N failed deliveries in total.
+\* No property counts deliveries, so nothing here is wrong; a reader mapping
+\* the constant onto the column (or onto the manifest's `attempts`, which is
+\* the column) one-for-one would be. Left as it is deliberately: aligning it
+\* would mean bumping `Retries` in five configs, four of which exist to
+\* produce one specific counterexample.
 
 Time == 0..MaxTime
 Deadline == 0..(MaxTime + TTL + Backoff)

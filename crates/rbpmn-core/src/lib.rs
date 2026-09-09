@@ -30,10 +30,10 @@ mod merge_patch;
 mod state;
 mod step;
 
-pub use check::{Checked, DeployCheck, check_deployable, config_bindings};
+pub use check::{Checked, DeployCheck, check_deployable, config_bindings, retry_policies};
 pub use compile::{
     Bindings, CompileError, ExecKind, ExecutableProcess, FlowIx, IndexDeclaration, IndexScope,
-    NodeIx, ScopeIx, TimerDue, WorkKind,
+    NodeIx, RetryPolicies, RetryPolicy, ScopeIx, TimerDue, WorkKind,
 };
 pub use decisions::{DecisionCheck, DecisionValidator, Invocable, NoDecisions};
 pub use event::Event;
