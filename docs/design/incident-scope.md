@@ -1,10 +1,10 @@
 # Incident scope — design round
 
-**Status: D1 and D2 shipped, and the price of D3 is checked.** The catch-all error boundary and the warning
-that ships with it are in. The freeze stays instance-wide, and the way out of
-an incident is a repair API rather than a narrower freeze (D3); everything from D4 down is the shape
-that round will start from, not a commitment to build it now. The
-alternatives that were weighed and refused are at the bottom, briefly,
+**Status: D1 and D2 shipped, and the price of D3 is checked. D4–D13, repair,
+are decided, and slices 3–6 build them.** The catch-all error boundary
+and the warning that ships with it are in. The freeze stays instance-wide, and
+the way out of an incident is a repair API rather than a narrower freeze (D3).
+The alternatives that were weighed and refused are at the bottom, briefly,
 because the reasoning for not taking them is the part worth keeping.
 
 This round covers **what an incident freezes, and how an instance gets out of
@@ -16,7 +16,9 @@ one**. It was read against `crates/rbpmn-core/src/step.rs` (`freeze`,
 resolution, `fail_work_item_in_tx`, token persistence), `scheduler.rs`,
 `retention.rs`, `worker.rs`, `ui/src/inspector/`, `spec/Lease.tla`, and
 `docs/design/boundary-messages.md` §2.3, which supplies the proof the
-question turns on.
+question turns on. The repair decisions were read against every `freeze`
+call site, `persist_step` and `insert_timer`, `step_answering_decisions`,
+`worker.rs`'s kept lease, and the replay harness's `commands_from`.
 
 ---
 
@@ -179,13 +181,58 @@ So the direction is a repair API, and the freeze is what makes one sound:
 - **The variable document is the one that failed.** Nothing patched it,
   because nothing ran. A repair resumes into exactly the world its operator
   is looking at.
-- **Repair races nothing.** The freeze is a global barrier — no step, no
-  delivery, no timer, no claim — so two operators repairing two tokens
-  serialize on the instance lock and contend with nothing else.
+- **Repair races nothing but itself.** The freeze is a global barrier — no
+  step, no delivery, no timer, no claim — so a repair contends only with
+  another repair of the same incident; the instance lock serializes those,
+  and D9 gives the loser a typed answer.
 
 Narrowing the freeze does not buy a cheaper repair. It buys a harder one, and
 it does nothing at all for a main-flow incident, which is the case a repair
 has to handle anyway.
+
+### What repair has to fit — four things in the code
+
+**1. There is only ever one incident.** Every freeze has exactly one token as
+its cause; whatever else it parks — a move still in flight, a decision still
+pending — is collateral. A frozen instance takes no step until a repair, and
+a repair is one step: it lands the instance active or freezes it again with a
+new cause. So a repair names the instance and its incident, never a token —
+token ids are internal, and choosing among five of them is what D7 spares an
+operator.
+
+**2. Where a token failed is not always where it resumes.** `freeze` parks
+the cause at the element that failed, which is what inspection must show.
+Resuming means entering an element again, and for two failures that is
+another one:
+
+| Failure | Parked at | Resumes at |
+|---|---|---|
+| a work item's error, uncaught | the task | the task |
+| a decision with no usable answer | the business-rule task | the same task |
+| a catch that cannot arm — deadline, key, duplicate | the catch | the catch |
+| a host's boundary that cannot arm, on entry | the boundary | its host |
+| an event-gateway alternative that cannot arm | the alternative | the gateway |
+
+Both redirections are static — a boundary has one host, and lint gives an
+event-gateway target exactly one incoming flow — so the cause needs no new
+state. The resume point is *R* below.
+
+**3. Collateral comes in two shapes, and the freeze keeps neither's resume
+point.** A move in flight has not entered its node: it resumes by entering
+it, and a parallel join needs the flow it arrived on, which the freeze drops.
+A pending decision has entered its node (`element-started`,
+`decision-requested`): it resumes by asking again, and must not start the
+element a second time. Both park as `Incident`, indistinguishable from the
+cause and from each other.
+
+**4. One freeze makes something vanish.** A non-interrupting message boundary
+re-arms on every delivery, evaluating its key against the document the
+delivery just patched. When that fails — the patch left the key unusable, or
+moved it onto another open `(message, key)` — `freeze` takes the **host's**
+token: it cancels the host's open work item, perhaps leased with its handler
+running, and tears down a subprocess host's live body. It is the one freeze
+that breaks token conservation (guarantee 3), and a repair at the host would
+re-run work already under way. D11 removes it.
 
 ### D4 — a repair is a `Command`, never a state edit
 
@@ -196,88 +243,161 @@ reports the instance as healthy. That is a state **the core cannot produce by
 itself**, which is what makes it wrong: a stuck instance wearing an active
 status is worse than a frozen one, which at least tells the truth.
 
-So every repair is a command whose effects go through `Advancer` like any
-other, which keeps every reachable state one normal execution could have
-reached, and keeps the history re-derivable — `chaos.rs` replays through the
-pure core, and an `UPDATE` would put the instance beyond it.
+So a repair is `Command::Repair { incident, disposition, reason }`, stepped
+through `Advancer` like any other command. Every state it reaches is one a
+normal execution could have reached, and the history re-derives: its event,
+`incident-repaired`, carries what `commands_from` needs to rebuild it, as
+`work-item-failed` does for `RaiseError`, so `chaos.rs` replays a repaired
+instance through the pure core like any other. `reason` is required, opaque
+to the engine, and travels in the event's payload, outside the stable
+`Display` line.
 
-### D5 — four dispositions, and a fifth verb for the instance
+### D5 — five dispositions
 
-| Disposition | What it does | For |
+Each acts at the resume point *R*. Every refusal is typed and comes before
+any mutation.
+
+| Disposition | At *R* | Refused when |
 |---|---|---|
-| **Retry** `{ patch?, reason }` | patch the variables, then re-enter the node as if for the first time | the world was fixed, or the data was wrong and the patch fixes it |
-| **Advance** `{ result, reason }` | treat the node as completed with an operator-supplied result and leave along its outgoing flow | "the step was carried out by hand"; and the decision case, where `result` is the answer the projection could not produce |
-| **Divert** `{ code, reason }` | raise `code` at the node so a boundary catches it and the model handles the failure | the author drew a handling path; refused loudly when nothing matches, because diverting into nothing is what this engine never does |
-| **Abandon** `{ reason }` | consume the token | refused unless removing it is provably safe — the side-path proof, or emptying its scope |
+| **Retry** `{ patch? }` | merge the patch, then enter *R* as if for the first time: a new work item with the manifest's retry budget, the decision asked again, a deadline or key resolved against the patched document | never — failing again is a new incident |
+| **Advance** `{ patch? }` or `{ answer }` | complete *R* and leave along its outgoing flow: a task, catch or subprocess as though it had finished, `patch` merged; a business-rule task with `answer` written by replacement, as a decision's answer always is | *R* is an event-based gateway, which has no single way on; `patch` for a decision, `answer` for anything else |
+| **Divert** `{ code? }` | raise the error at *R* and walk outward exactly as `RaiseError` does, exact code before catch-all at each host | nothing catches it — diverting into nothing is what this engine never does |
+| **Abandon** | consume the token as though it reached an end event: its scope completes if it was the last, and the parent moves on | a join could be left waiting for it. Allowed on a side path — nothing there joins, because `boundary-side-path` ends it in nothing and refuses a parallel block on it — and for the last token of its scope |
+| **Abandon instance** | end the instance as `Terminated`, exactly as a terminate end at the root does | never, on a frozen instance |
 
-Plus **`abandon_instance`**, ending it as `Terminated`. Not a convenience:
-`failed` is never swept at any age, so an unrepairable incident is immortal
-today, and `Terminated` is `DUE`, so an abandoned instance retires normally
-with its history intact.
+`Advance` takes `patch` or `answer`, never one "result": merge and
+replacement are the engine's two write semantics, a decision's answer needs
+the second, and `docs/dmn.md` records the bugs the first produced there.
 
-**Repair never reopens a closed item; it creates a new one.** `Retry`
-re-enters the node, minting a fresh work item with the budget the manifest
-declares, and the `failed` row stays closed forever. This dissolves by
-construction the hazard `freeze` warns about — *a repair API that clears the
-incident would hand a worker an item whose token is parked at
-`WaitKind::Incident`* — and a worker holding a stale item id gets the
-ordinary `AlreadyClosed`.
+**Abandon instance** is not a convenience: `failed` is never swept at any
+age, so an unrepairable incident is immortal today, and `Terminated` is
+`DUE`, so an abandoned instance retires normally with its history intact. It
+ends a frozen instance only; ending a running one is its own question (what a
+lease holder is told, for one).
+
+**Repair never reopens a closed item; it creates a new one.** The `failed`
+row stays closed, and a worker holding its id gets the ordinary
+`AlreadyClosed`. That dissolves by construction the hazard `freeze` warns
+about — a repair that cleared the incident would hand a worker an item whose
+token is parked at `Incident`.
 
 ### D6 — the instance goes active because nothing is parked at an incident
 
-There is deliberately no `resume` verb. Status is derived, exactly as
-completion is (`step.rs:564`): the instance returns to `Active` when no token
-remains at `Incident`. An operator cannot set it, and a partially repaired
-instance stays frozen, so there is no half-open window.
+There is no `resume` verb. Status is derived, as completion is: an instance
+is `Failed` exactly when one token is at `Incident`, and `Halted` tokens
+exist only on a failed instance — invariants the explorer and the fsck both
+check. A repair sets the instance `Active` before its moves run, so the
+ordinary tests apply after it: an Abandon that empties the root completes the
+instance, and a Retry that fails again freezes it under a new incident. There
+is no half-repaired state; a repair lands or re-freezes within its step.
 
-One consequence to state rather than discover: during a partial repair a
-repaired token advances immediately and may create an `available` work item
-on a still-`failed` instance. The claim gate is what makes that safe. It
-inverts an invariant `freeze` currently maintains by closing such items, and
-it is relied on here deliberately rather than inherited.
+A repair that re-freezes can leave a resumed sibling's fresh work item
+`available` on a `failed` instance. That shape exists already — a parallel
+sibling that parked at a task before another branch froze — and the claim
+gate is what makes it safe.
 
-The alternative — record each token's disposition and apply them together at
-the end — is refused: stored intent is a state the core cannot produce, which
-is the thing D4 is organised around.
+The alternative — record each token's disposition and apply them together
+at the end — is refused: stored intent is a state the core cannot produce,
+which is the thing D4 is organised around.
 
 ### D7 — cause and collateral are different states
 
-`freeze` parks more than the failing token at `Incident`: siblings still in
-transit park at their target nodes, and any token at `WaitKind::Decision` is
-converted. Those are bystanders, and an operator must not hand-repair five of
-them.
+`WaitKind::Incident` means the cause and nothing else. Collateral becomes
+`WaitKind::Halted`, carrying its resume point (finding 3):
 
-The state cannot currently tell them apart — `IncidentRaised` names the
-failing element, but the token set does not, and matching by node is
-ambiguous across scopes. So `WaitKind` gains a second variant (`Halted`) for
-the bystanders, leaving `Incident` meaning the cause. `wait_kind` is a text
-column behind a CHECK (`runtime.rs:1266`), so this is a migration widening
-the CHECK rather than a serde break, and rows written before it read as
-`Incident`, which is the safe reading.
+- **`Halt::InFlight { via }`** — a move that had not entered its node. It
+  resumes by entering, on the flow it was on.
+- **`Halt::AwaitingDecision`** — a decision that was pending. It resumes by
+  asking again; the element has already started.
 
-Collateral then resumes with the last cause: re-entering a bystander's target
-node is what would have happened anyway, and re-asking a bystander's decision
-is sound because the document has not moved. Tokens in ordinary wait states
-were never converted — they are inert through instance status alone and
-become live again with no work.
+Collateral resumes after the cause, in token order, whatever the
+disposition: re-entering a bystander's target node is what would have
+happened anyway, and re-asking its decision is sound because the document
+has not moved. Tokens in ordinary wait states were never converted — they are
+inert through instance status alone and become live again with no work.
+
+`wait_kind` is a text column behind a CHECK, so this is a migration adding
+`halted` (its flow in `arrived_via`) and `halted_decision`, not a serde
+break. Rows written before it read as `incident`, the safe reading. An
+instance frozen before the migration with more than one `incident` token
+cannot tell its cause from its collateral, so a repair refuses it, typed;
+abandoning it still works.
 
 ### D8 — resume is a re-arm
 
 A frozen instance keeps its armed timers with absolute `due_at`, excluded
 from firing by status alone. Resume one frozen for three weeks and every
-deadline inside that window is due at once; cycles are worse, because a cycle
-re-arms from its **previous due**, so a weekly reminder fires three times in
-succession, each re-arm landing in the past.
+deadline inside that window is due at once; cycles are worse, because a
+cycle re-arms from its **previous due**, so a weekly reminder fires three
+times in succession, each re-arm landing in the past.
 
-The policy is the rule the cycle design already states, applied to resume as
-if it were an arm — *the first due is the first occurrence at or after the
-arm, no catch-up*. Relative deadlines shift by the outage, cycles
-resynchronise to the next occurrence after resume, and absolute `timeDate`
-deadlines fire once, because that deadline genuinely passed. Reusing a
-decided rule beats inventing one, and the outage is derivable from
-`incident-raised`'s timestamp.
+So the instance's clock stops while it is frozen:
 
-### D9 — what repair does not cover
+- a **duration** moves by the outage, keeping exactly the time it had left;
+- a **cycle** steps along its own grid to the first occurrence at or after
+  the resume — the re-arm rule the cycle design already states, missed
+  occurrences skipped rather than replayed, which costs a bounded `R<n>`
+  nothing because it counts fires;
+- a **`timeDate`** keeps its instant and fires once if it passed, because
+  that deadline genuinely did.
+
+The core owns no instants — `due_at` has always been the projection's — so
+this lives in `persist_step`: every repair step first re-arms the instance's
+timers by these rules, measuring the outage from `frozen_at`, then writes
+the step's own. `frozen_at` is a column each freeze sets: runtime truth in a
+row, not a read of the event log. A repair that re-freezes has already moved
+the timers past the outage behind it, so the next moves them only by the
+outage after. The core's timer state never changes, so replay needs nothing.
+
+Work items keep their columns: a retry backoff running when the instance
+froze has usually elapsed by the resume, and a lease still held is completed
+or extended as before.
+
+### D9 — every incident has a number
+
+Two repairs of one incident serialize on the instance lock, and the second
+must not land on whatever the first left behind. That is not only two
+operators: an HTTP client whose repair committed but whose response was lost
+sends it again, and if the Retry it asked for failed again at the same
+element, the resend would repair the new incident as though it were the old
+one — or, as an abandon, terminate an instance someone has since repaired.
+`release_task` shipped that exact bug with its lease, and an epoch fixed it.
+
+So each freeze mints the next incident number — a per-instance counter
+persisted beside the other allocators, carried in `incident-raised`'s
+payload — and a repair names the incident it repairs. Any other number, or an
+instance no longer frozen, is answered `IncidentNotOpen` (409, carrying the
+open incident if there is one) before the core mutates anything. An instance
+frozen before the migration holds incident 0.
+
+### D10 — the surfaces
+
+- **`Engine::repair(instance, incident, disposition, reason)`** and its
+  `_in_tx` twin, returning what the step did: landed, completed, terminated,
+  or frozen again under a new number.
+- **`POST /v1/instances/{id}/repair`**, the same four fields as JSON.
+- **What a repair would do is a read.** `rbpmn_core` answers, for the open
+  incident, its number, *R*, and each disposition allowed or refused with the
+  reason; `inspect_instance` carries it and the inspector shows it as text.
+  Offering the button is not a read (D13).
+
+### D11 — a delivery that would leave its boundary unable to re-arm is refused
+
+Finding 4 is an incident with its caller standing next to it. The key a
+non-interrupting boundary re-arms with comes from the document *after* the
+delivery's own patch, and the core can resolve it before touching anything.
+When it will not re-arm, the delivery is refused the way `correlate` already
+refuses what it cannot step — typed, naming the key and why — and nothing
+changes: the subscription stays open, the host keeps waiting, the patch is
+not applied. No freeze then ever takes a waiting host, and the scope a
+freeze owns is always the empty one an entry had just opened.
+
+The alternative keeps the freeze and makes the side activation the incident
+instead of the host: a fresh token at the boundary, the host left parked. It
+keeps `correlate`'s contract, and needs the incident to record its host's
+token — a column, for a failure whose cause can be told directly.
+
+### D12 — what repair does not cover
 
 - **Model bugs.** A wrong topic or an unresolvable timer expression is fixed
   in a new definition version, and a running instance pins its version. That
@@ -291,12 +411,12 @@ The catch-all is the author saying in advance that a failure is survivable;
 repair is an operator deciding about one nobody anticipated. D1 is much the
 cheaper, which is why it goes first.
 
-### D10 — non-goals
+### D13 — non-goals
 
 - **No repair button.** The inspector is read-only, and a repair API is
   exactly the pressure the standing rule anticipates; the element pane is
-  where it will arrive. Diagnosing which dispositions are legal for a token
-  is a read. Offering the button is not.
+  where it will arrive. Diagnosing which dispositions are legal is a read
+  (D10). Offering the button is not.
 - **No authenticated actor.** The engine does not know identities; the
   embedding application does. `reason` is an opaque string that travels with
   the evidence, which is what makes the history an audit trail rather than a
@@ -366,12 +486,19 @@ database clock, so the transcription checked is the one the engine runs.
   stranded by it. `LeaseSiblings_CaughtIsReachable.cfg` shows that case is
   reached rather than assumed.
 
-What repair adds later: a transition out of `active = FALSE`, which no model
-has today because the freeze is currently terminal. Its own module, because
-the property that matters is that a repaired token never resumes into an
-instance that has meanwhile completed — the same shape as `BoundaryExit`'s
-*a late call of either verb is answered typed, never stepped*. `LockOrder`
-needs nothing at either arity: no new lock enters the order.
+What repair adds is a transition out of `active = FALSE`, which no model has
+today because the freeze is terminal. `spec/Repair.tla` models it: one
+instance with a sibling item leased across the freeze, and operators whose
+requests name an incident and may arrive twice. A repair lands or freezes the
+instance again under a new number; an abandon terminates it. The module
+checks that a repair or an abandon lands only on the incident it named — a
+resent or stale request is answered typed, never stepped: `BoundaryExit`'s
+`LateCallsAreTyped` and `Lease`'s `ReleaseFreesOnlyTheLeaseItNamed` in one
+shape — and that a landed repair leaves the sibling claimable or completable
+again. A config without the number check is its counterexample. D8's re-arm
+races nothing: the scheduler never picks a frozen instance's timer, and the
+move commits with the repair. `LockOrder` needs nothing at either arity: a
+repair is a step — the instance row, then its rows.
 
 ## The guarantees this preserves
 
@@ -387,8 +514,13 @@ needs nothing at either arity: no new lock enters the order.
 4. **One gate**: `i.status = 'active'`, in five places, each provably
    complete.
 5. No instance is ever half-done without saying so.
+6. **A repair is exact**: it lands only on the incident it names (D9), it
+   resumes every token the freeze held (D7), and the instance's clock stood
+   still while it was frozen (D8).
 
-D1 spends none of them. The rejected alternatives spend (2) and (3).
+D1 spends none of them, and neither does repair: it resumes into (2) and
+depends on (3), which D11 makes whole. The rejected alternatives spend (2)
+and (3).
 
 ## What the operator sees
 
@@ -434,7 +566,34 @@ half of what it does, and the round trip is worth a test. Owes `just ui`,
 
 **Slice 2 — the failing `Lease` config: shipped** as `spec/LeaseSiblings.tla`.
 
-**Slice 3 — repair.** Its own round, starting from D4–D9.
+**Slice 3 — repair in the core.** Scenarios first, red by design: a
+`repair` action in the scenario runner, and golden traces for each
+disposition at each row of finding 2's table; the refusals (Advance at a
+gateway, Divert into nothing, Abandon on a main-flow branch, a stale
+incident); collateral resuming — an in-flight sibling completing a join, a
+pending decision asked again; a repair that re-freezes; and D11's refused
+delivery. Then the core: `WaitKind::Halted`, the incident counter,
+`Command::Repair`, `incident-repaired` (a new stable `Display` line),
+side-path membership in compile, D11's check in `DeliverMessage`. The
+explorer takes every repair as a stimulus on every failed state and asserts
+D6 over the whole space. No lint change: repair is not a model capability.
+
+**Slice 4 — through the engine.** The migration (two wait kinds, the incident
+counter, `frozen_at`), persistence, `Engine::repair`, D8 in `persist_step`,
+the typed errors and D11's refusal on `correlate`, the HTTP route, and
+`commands_from` rebuilding the command so replay covers it. Engine tests: a
+sibling's lease completing after a repair, the timer move, a resent repair.
+Storm and chaos repair some of what they freeze. The README's upgrade note
+gains the new wait kinds, which an older engine cannot load.
+
+**Slice 5 — `spec/Repair.tla`**, its counterexample config, `spec/README`,
+and `LockOrder` re-read.
+
+**Slice 6 — what the operator sees.** The inspection carries the open
+incident and what each disposition would do (D10); the inspector shows it as
+text, draws halted tokens as frozen collateral, and a repaired failure as
+repaired rather than "handled by a boundary". `bpmn-engine-design.md`'s
+incident-freeze paragraph and `docs/dmn.md`'s pointer follow.
 
 ## Test plan
 
@@ -449,6 +608,9 @@ half of what it does, and the round trip is worth a test. Owes `just ui`,
 - **`just parity`**, because the rule is new surface on both exports.
 - **UI**: `marksFor` is covered under node (`ui/test/marks.test.mjs`); the
   served e2e half already asserts mark counts on an active instance.
+- **Repair**: slices 3–5 — scenarios per disposition and resume shape, the
+  explorer over every repaired state, engine and HTTP tests, repaired
+  instances replayed after storm and chaos, and `spec/Repair.tla`.
 
 ## Known warts, stated up front
 
@@ -485,3 +647,16 @@ half of what it does, and the round trip is worth a test. Owes `just ui`,
   through writing it. The freeze sidesteps it by stopping everything; repair
   sidesteps it by resuming into the same document. Neither checks it, and no
   option on the table could.
+- **A Retry runs the handler again.** At-least-once, as ever: a repair does
+  not change what a handler must tolerate.
+- **A sibling's handler may run twice.** A worker whose completion was
+  refused during the freeze keeps its lease (`worker.rs`); if the lease
+  lapses before the repair, the item is claimed again after it.
+- **Advance at a host whose boundary could not arm completes work that never
+  ran.** The operator is saying so, and the event records why.
+- **An instance frozen before the migration with several `incident` tokens
+  can only be abandoned** (D7).
+- **D11 moves one failure to the sender.** When some other branch has left
+  a boundary's key unusable, every delivery to it is refused until the
+  document changes — loud at the sender, and invisible to anyone reading the
+  instance.
