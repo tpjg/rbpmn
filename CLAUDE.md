@@ -338,7 +338,7 @@ not a per-commit check). CI is the backstop; the point of the table in README's
   demonstration: UI routes are behind the bearer, browsers cannot send it on a
   navigation, and supplying it is the embedding application's job.
 - `just tla` — TLA+ model checking of the concurrency protocol (`spec/`).
-  Twenty-one configs; thirteen are *expected* to fail, each matched against the
+  Twenty-two configs; fourteen are *expected* to fail, each matched against the
   specific violation it demonstrates (a spec that stops parsing must not read
   as "fails as expected"). Three reproduce bugs that were real. The lock order
   is checked at two arities. `Lease.tla` models the process withdrawing a

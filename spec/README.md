@@ -10,7 +10,7 @@ Run with `just tla` (needs `java`; fetches `tla2tools.jar` on first use).
 |---|---|---|
 | `LockOrder.tla` | **every lock-taking transaction shape in the engine** — step, timer claim, work claim, retention, deploy — over per-instance rows plus the definition and floor rows | nobody holds rows while still needing the instance row; no AB/BA deadlock; every transaction returns to idle |
 | `Lease.tla` | the work-item lease: TTL, renewal, expiry, completion, the voluntary hand-back, the **process withdrawing the item** (interrupting boundary, terminate, teardown), and clients retrying their own requests | no double delivery; exactly-once completion under at-least-once delivery; a live lease ends only by the clock, its own holder, or the process; a cancelled item is never completed; a release frees only the lease it named; never stranded — an open item is always claimable or completable |
-| `LeaseSiblings.tla` | two work items on one instance — `Lease` instantiated twice, sharing the instance's status and the database clock | each item keeps its own safety; a stranded item is always its sibling's freeze; a frozen instance advances nothing — no claim, completion, failure or cancel, only a holder handing its lease back |
+| `LeaseSiblings.tla` | two work items on one instance — `Lease` instantiated twice, sharing the instance's status and the database clock | each item keeps its own safety; a stranded item is always its sibling's freeze; a frozen instance advances nothing — no claim, completion, failure or cancel, only a holder handing its lease back; an active instance strands nobody, a caught failure included |
 | `TimerTeardown.tla` | the unlocked pick of an **arm row** — a timer by the scheduler, a boundary subscription by `correlate` — racing a scope teardown, and a claim transaction that rolls back after its re-check | no armed row — timer or subscription — outlives the token it is armed on; no arm ever fires with its token gone |
 | `BoundaryExit.tla` | one token at a host work item with an interrupting boundary subscription; `complete_task` and `correlate` racing to end the wait, from any node | exactly one exit ever reaches `step`; an armed row always means an open host; a late call of either verb is answered typed (`AlreadyClosed`, `NoSubscription`), never stepped |
 | `Retention.tla` | a retention pass across its transaction-free archive gap | nothing deleted without an archive; the truncation floor covers every deletion and invents none; only due records go |
@@ -28,6 +28,7 @@ checks are known to have teeth rather than passing vacuously:
 | `Lease_EpochlessRelease.cfg` | **violation** | `release_task` without its lease epoch — a retried release freeing the claim that replaced it |
 | `Lease_CancelIgnoresGuard.cfg` | **violation** | completion without its `AlreadyClosed` check — a clerk's decision landing on a task the process had withdrawn |
 | `LeaseSiblings.cfg` | holds | the shipped lease, two items at a time |
+| `LeaseSiblings_CaughtIsReachable.cfg` | **violation** | not a bug: a final failure a boundary caught, on an instance still active, is reached — so `ActiveStrandsNobody` is not vacuous |
 | `LeaseSiblings_Stranded.cfg` | **violation** | not a bug: the price of the instance-wide freeze — a sibling's open item, perhaps leased mid-handler, stranded until an operator acts |
 | `TimerTeardown.cfg` | holds | the shipped teardown |
 | `TimerTeardown_Buggy.cfg` | **violation** | the phase-6 bug: teardown reaping tokens but not their timers |
@@ -428,3 +429,8 @@ fails. What a frozen instance's items can still do is exactly what that
 property allows and no more: a holder extending or handing back its lease,
 because `release_task` and `extend_lock` are single statements that never read
 instance status.
+
+`FailCaught` is a final failure a boundary takes: the item closes as failed
+and the instance stays active. `ActiveStrandsNobody` holds over it, and
+`LeaseSiblings_CaughtIsReachable.cfg` shows the case is reached rather than
+assumed.

@@ -34,6 +34,11 @@
 (* still take is its holder handing it back, because `release_task` and    *)
 (* `extend_lock` are single statements that never read instance status —   *)
 (* so that is exactly what the property allows, and no more.               *)
+(*                                                                         *)
+(* And `ActiveStrandsNobody` holds: a final failure a boundary catches     *)
+(* (`Lease`'s FailCaught) closes its item and freezes nothing, so no       *)
+(* sibling is stranded by it. LeaseSiblings_CaughtIsReachable.cfg shows    *)
+(* that case is reached, not assumed.                                      *)
 (***************************************************************************)
 EXTENDS Naturals
 
@@ -89,6 +94,17 @@ StrandedOnlyByASiblingsFreeze ==
 
 \* Deliberately FALSE — LeaseSiblings_Stranded.cfg expects the violation.
 SiblingNeverStranded == I1!NeverStranded /\ I2!NeverStranded
+
+\* While the instance is active nobody is stranded, whatever has failed and
+\* been caught. `Lease`'s FailCaught closes an item without freezing — the
+\* catch-all's whole point — and this is its sibling staying claimable or
+\* completable through it.
+ActiveStrandsNobody == active => SiblingNeverStranded
+
+\* Deliberately FALSE — LeaseSiblings_CaughtIsReachable.cfg expects the
+\* violation. It proves ActiveStrandsNobody is not vacuous over the case it
+\* is there for: an item failed past its budget on an instance still active.
+NoFailureWasCaught == ~((state1 = "failed" \/ state2 = "failed") /\ active)
 
 FreezeAdvancesNothing ==
     [][ ~active =>

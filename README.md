@@ -82,6 +82,10 @@ gaps, each with its status in the design brief's
 cross-definition messaging (message start/throw between definitions lint clean
 but refuse to compile) and the instance migration API.
 
+Upgrading: once a model with a catch-all error boundary (no `errorRef`) is
+deployed, every engine process must be on this release — an older one refuses
+to start.
+
 ## Workspace
 
 | Crate / package | Purpose |

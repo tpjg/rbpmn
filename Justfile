@@ -160,7 +160,7 @@ parity: wasm
 # on a developer's machine and would make past hold/fail verdicts
 # irreproducible. To move to a new TLA+ release, bump both constants — the
 # recipe refuses to run on a mismatch rather than trusting the download.
-# Thirteen of the twenty-one configs are EXPECTED to fail — they are the
+# Fourteen of the twenty-two configs are EXPECTED to fail — they are the
 # counterexamples that show the checks have teeth, and three of them
 # reproduce bugs that were real (the AB/BA timer-claim sketch, the phase-6
 # scope teardown that left a timer row behind, and release_task guarded by
@@ -240,6 +240,7 @@ tla:
     # (docs/design/incident-scope.md, D3).
     check "lease siblings: stranded only by a sibling's freeze" LeaseSiblings.cfg          LeaseSiblings.tla hold "" -deadlock
     check "lease siblings: the freeze strands a sibling"        LeaseSiblings_Stranded.cfg LeaseSiblings.tla fail "Invariant SiblingNeverStranded is violated" -deadlock
+    check "lease siblings: a caught failure is reached"         LeaseSiblings_CaughtIsReachable.cfg LeaseSiblings.tla fail "Invariant NoFailureWasCaught is violated" -deadlock
     # -deadlock: a terminal state is legitimate here (everything torn down,
     # nothing armed). Deadlock freedom is a property under test only for
     # LockOrder, where the flag is deliberately absent.

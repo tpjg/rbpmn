@@ -382,6 +382,24 @@ FailFinally(w) ==
     /\ named' = NoLease
     /\ UNCHANGED <<owner, until, retryAt, retries, now, completions, leaseNo, issued>>
 
+\* RaiseError that a boundary catches: the item closes as `failed` exactly as
+\* above, and the instance stays active — the boundary's path runs instead of
+\* the freeze. Which of the two a final failure becomes depends on the model's
+\* boundaries, which this spec does not see, so both are enabled wherever a
+\* final failure is: FailFinally is the uncaught branch, FailCaught the caught
+\* one (docs/design/incident-scope.md, D1).
+FailCaught(w) ==
+    /\ state = "locked"
+    /\ GuardAllows(w)
+    /\ active          \* refused on a frozen instance: IncidentOpen
+    /\ retries = 0
+    /\ state' = "failed"
+    /\ believes' = [believes EXCEPT ![w] = FALSE]
+    /\ lastActor' = w
+    /\ named' = NoLease
+    /\ UNCHANGED <<owner, until, retryAt, retries, active, now, completions,
+                   leaseNo, issued>>
+
 \* The process withdraws the item: an interrupting boundary on the host, a
 \* terminate end, the teardown of an enclosing scope. Transcribed from
 \* `persist_step`'s handling of `WorkItemCancelled` — `set_work_item_state(...,
@@ -411,7 +429,7 @@ Next ==
         \/ Acquire(w) \/ Extend(w) \/ ExtendLost(w)
         \/ ReleaseWith(w, leaseNo) \/ ReleaseReplay(w) \/ ReleaseLost(w)
         \/ Complete(w) \/ CompleteRefused(w) \/ CompleteAlreadyClosed(w)
-        \/ Fail(w) \/ FailFinally(w)
+        \/ Fail(w) \/ FailFinally(w) \/ FailCaught(w)
 
 Spec == Init /\ [][Next]_vars
 

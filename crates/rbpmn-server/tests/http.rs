@@ -10,6 +10,8 @@ const TOKEN: &str = "test-token-0123456789abcdef-0123456789abcdef";
 const INCLUSIVE_XML: &str =
     include_str!("../../rbpmn-model/tests/fixtures/reject/inclusive-gateway.bpmn");
 const MINIMAL_XML: &str = include_str!("../../rbpmn-model/tests/fixtures/accept/01-minimal.bpmn");
+const CATCH_ALL_XML: &str =
+    include_str!("../../rbpmn-model/tests/fixtures/accept/44-catch-all-error-boundary.bpmn");
 /// A user task with an interrupting message boundary: the payment that ends
 /// a contested ticket while a clerk holds the task.
 const BOUNDARY_XML: &str =
@@ -1211,5 +1213,108 @@ async fn deploy_carries_decision_artifacts() {
             .any(|d| d["rule"] == "unresolved-decision"),
         "{body}"
     );
+    db.drop().await;
+}
+
+/// The catch-all over HTTP (docs/design/incident-scope.md, D1): a failure
+/// reported with no `errorCode` is caught once its budget is spent, answered
+/// `errorCaught`, and the instance carries on. Before catch-alls a codeless
+/// failure could only ever end as an incident.
+#[tokio::test]
+async fn a_codeless_failure_is_caught_over_http() {
+    let (app, db) = test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/topics",
+            serde_json::json!({ "name": "st" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/definitions",
+            serde_json::json!({ "bpmn": CATCH_ALL_XML }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/instances",
+            serde_json::json!({ "definitionKey": "p", "variables": {} }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let instance_id = body_json(resp).await["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let inspect = format!("/v1/instances/{instance_id}/inspect");
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &inspect, serde_json::json!({})))
+        .await
+        .unwrap();
+    let work_item = body_json(resp).await["workItems"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The default budget is three attempts, and none of them names a code.
+    for expected in ["retrying", "retrying", "errorCaught"] {
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                &format!("/v1/work-items/{work_item}/fail"),
+                serde_json::json!({ "errorMessage": "no code given" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["outcome"], expected);
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &inspect, serde_json::json!({})))
+        .await
+        .unwrap();
+    let inspection = body_json(resp).await;
+    assert_eq!(inspection["status"], "active");
+    let open: Vec<&serde_json::Value> = inspection["workItems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["state"] == "available")
+        .collect();
+    assert_eq!(open.len(), 1, "only the handler's task is open");
+    assert_eq!(open[0]["elementId"], "th");
+    let handler = open[0]["id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/work-items/{handler}/complete"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["outcome"], "advanced");
+    let resp = app
+        .oneshot(authed("GET", &inspect, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["status"], "completed");
     db.drop().await;
 }

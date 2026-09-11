@@ -361,6 +361,10 @@ database clock, so the transcription checked is the one the engine runs.
   is its holder handing it back. Composing it is what showed `Lease`'s `Fail`
   and `FailFinally` lacked the `active` conjunct the fail path has
   (`IncidentOpen`) — invisible with one item, whose only freeze closes it.
+- `ActiveStrandsNobody` holds: a final failure a boundary catches (`Lease`'s
+  `FailCaught`) closes its item and freezes nothing, so no sibling is
+  stranded by it. `LeaseSiblings_CaughtIsReachable.cfg` shows that case is
+  reached rather than assumed.
 
 What repair adds later: a transition out of `active = FALSE`, which no model
 has today because the freeze is currently terminal. Its own module, because

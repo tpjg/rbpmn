@@ -441,6 +441,200 @@ async fn exhausted_retries_take_a_matching_error_boundary() {
     db.drop().await;
 }
 
+/// What the published claim predicate says about one element's item right
+/// now — `rbpmn_v_work_item.claimable`, the column `CLAIMABLE` projects.
+async fn claimable_now(pool: &PgPool, instance: uuid::Uuid, element: &str) -> bool {
+    sqlx::query_scalar(
+        "select claimable from rbpmn_v_work_item where instance_id = $1 and element_id = $2",
+    )
+    .bind(instance)
+    .bind(element)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The catch-all, end to end (docs/design/incident-scope.md, D1): an error
+/// boundary with no errorRef takes a failure that carries no code — the shape
+/// of the one nobody anticipated, and one no coded boundary can match. One
+/// attempt, so the engine's trace is the core's golden trace with nothing of
+/// the retry bookkeeping between.
+#[tokio::test]
+async fn a_catch_all_takes_a_failure_with_no_code() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("st").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/44-catch-all-error-boundary.bpmn"),
+            &Bindings::new().retries("st", rbpmn_core::RetryPolicy::new().attempts(1)),
+        )
+        .await
+        .unwrap();
+
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let id = open_items(&db.pool, started.id).await[0].0;
+    match engine
+        .fail_work_item(id, &FailOptions::default())
+        .await
+        .unwrap()
+    {
+        FailOutcome::ErrorCaught(events) => {
+            assert!(events.iter().any(|e| e.to_string() == "element-started be"));
+        }
+        other => panic!("expected ErrorCaught, got {other:?}"),
+    }
+    assert_eq!(status_of(&db.pool, started.id).await, "active");
+
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["th"]
+    );
+    engine
+        .complete_work_item(open[0].0, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("44-catch-all-codeless.json")
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// The motivating case of the incident-scope round, through the real engine:
+/// a side path's task fails past its budget with no code, the catch-all on it
+/// takes the side path to an end of its own, and the flow the side path exists
+/// to leave alone never notices — the instance stays active, the review is
+/// still claimable, and the process finishes.
+#[tokio::test]
+async fn a_contained_side_path_failure_leaves_the_process_running() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("notify").await.unwrap();
+    let xml = fixture("accept/46-side-path-failure-contained.bpmn").replace("PT1H", "PT0S");
+    engine
+        .deploy(
+            &xml,
+            &Bindings::new().retries("notify", rbpmn_core::RetryPolicy::new().attempts(1)),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    let notify = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .find(|(_, e)| e == "notify")
+        .expect("the side token reached notify")
+        .0;
+    assert!(matches!(
+        engine
+            .fail_work_item(notify, &FailOptions::default())
+            .await
+            .unwrap(),
+        FailOutcome::ErrorCaught(_)
+    ));
+
+    // What the freeze would have taken: the instance is still active, and the
+    // review is still on offer.
+    assert_eq!(status_of(&db.pool, started.id).await, "active");
+    assert!(claimable_now(&db.pool, started.id, "review").await);
+    let review = engine
+        .get_task("review", &rbpmn_engine::GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .expect("the review is still claimable");
+    assert!(matches!(
+        engine
+            .complete_task(review.id, "clerk", serde_json::json!({}))
+            .await
+            .unwrap(),
+        Completion::Advanced(_)
+    ));
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("46-side-path-failure-contained.json")
+            .into_iter()
+            .map(|e| e.replace("timer-armed remind PT1H", "timer-armed remind PT0S"))
+            .collect::<Vec<_>>()
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// The contrast, and the cost the freeze is kept for (D3). The host's
+/// catch-all does not reach its side path — side tokens run beside the host,
+/// and an error walks outward, never sideways — so a failure with no code on
+/// the side path finds nothing to catch it and freezes the instance, exactly
+/// as every codeless failure did before catch-alls existed. The host's own
+/// item is then what `spec/LeaseSiblings.tla` calls stranded: still open,
+/// neither claimable nor completable.
+#[tokio::test]
+async fn a_side_path_failure_the_host_cannot_catch_freezes_the_instance() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("work").await.unwrap();
+    engine.declare_topic("notify").await.unwrap();
+    let xml = fixture("accept/48-side-path-failure-escapes.bpmn").replace("PT1H", "PT0S");
+    engine
+        .deploy(
+            &xml,
+            &Bindings::new().retries("notify", rbpmn_core::RetryPolicy::new().attempts(1)),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    let items = open_items(&db.pool, started.id).await;
+    let item = |name: &str| items.iter().find(|(_, e)| e == name).expect(name).0;
+    assert!(
+        claimable_now(&db.pool, started.id, "work").await,
+        "the host's item is on offer until the freeze"
+    );
+    assert!(matches!(
+        engine
+            .fail_work_item(item("notify"), &FailOptions::default())
+            .await
+            .unwrap(),
+        FailOutcome::IncidentRaised
+    ));
+    assert_eq!(status_of(&db.pool, started.id).await, "failed");
+
+    // Stranded: still open, no longer on offer, and refused if completed.
+    assert_eq!(item_state(&db.pool, started.id, "work").await, "available");
+    assert!(!claimable_now(&db.pool, started.id, "work").await);
+    assert!(matches!(
+        engine
+            .complete_work_item(item("work"), serde_json::json!({}))
+            .await,
+        Err(rbpmn_engine::EngineError::IncidentOpen(_))
+    ));
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("48-host-catch-all-does-not-reach-side-path.json")
+            .into_iter()
+            .map(|e| e.replace("timer-armed remind PT1H", "timer-armed remind PT0S"))
+            .collect::<Vec<_>>()
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
 /// The incident-livelock fix: siblings of a frozen instance are never
 /// claimed, and a retried completion still converges on AlreadyClosed.
 #[tokio::test]
