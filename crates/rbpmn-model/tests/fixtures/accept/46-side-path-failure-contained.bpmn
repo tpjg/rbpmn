@@ -1,63 +1,75 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
-  warn side-path-failure-escapes @ remind
-  error timer-iso8601 @ b
 -->
-<!-- 'R0/P7D' is outside the cycle subset rbpmn executes: R[n]/P… or
-     R[n]/<datetime>/P…, n at least one, a fixed-length period (weeks, days,
-     hours, minutes, seconds). The projection steps a cycle by epoch
-     arithmetic — previous due plus period — so a month has no length it can
-     use, a zero repeat count never fires, and the /end forms are refused
-     rather than narrowed silently. -->
+<!-- A side path that contains its own failure. While the review is open a
+     timer spawns a side token through notify; if notify fails — with any
+     code or none — the catch-all takes the side path to its own end and the
+     review is untouched. The model says, on the diagram, that this step is
+     not worth stopping the process for. Without the catch-all, accept/48 is
+     what the same failure does. -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
   <bpmn:process id="p" isExecutable="true">
     <bpmn:startEvent id="start">
       <bpmn:outgoing>f1</bpmn:outgoing>
     </bpmn:startEvent>
-    <bpmn:userTask id="ut" name="Await">
+    <bpmn:userTask id="review" name="Review">
       <bpmn:incoming>f1</bpmn:incoming>
       <bpmn:outgoing>f2</bpmn:outgoing>
     </bpmn:userTask>
-    <bpmn:boundaryEvent id="b" cancelActivity="false" attachedToRef="ut">
+    <bpmn:boundaryEvent id="remind" cancelActivity="false" attachedToRef="review">
       <bpmn:outgoing>f3</bpmn:outgoing>
       <bpmn:timerEventDefinition>
-        <bpmn:timeCycle>R0/P7D</bpmn:timeCycle>
+        <bpmn:timeDuration>PT1H</bpmn:timeDuration>
       </bpmn:timerEventDefinition>
     </bpmn:boundaryEvent>
-    <bpmn:serviceTask id="remind" name="Remind">
+    <bpmn:serviceTask id="notify" name="Notify">
       <bpmn:incoming>f3</bpmn:incoming>
       <bpmn:outgoing>f4</bpmn:outgoing>
     </bpmn:serviceTask>
-    <bpmn:endEvent id="end">
+    <bpmn:boundaryEvent id="notify_failed" name="Did not notify" attachedToRef="notify">
+      <bpmn:outgoing>f5</bpmn:outgoing>
+      <bpmn:errorEventDefinition />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="reviewed">
       <bpmn:incoming>f2</bpmn:incoming>
     </bpmn:endEvent>
-    <bpmn:endEvent id="reminded">
+    <bpmn:endEvent id="notified">
       <bpmn:incoming>f4</bpmn:incoming>
     </bpmn:endEvent>
-    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ut" />
-    <bpmn:sequenceFlow id="f2" sourceRef="ut" targetRef="end" />
-    <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="remind" />
-    <bpmn:sequenceFlow id="f4" sourceRef="remind" targetRef="reminded" />
+    <bpmn:endEvent id="not_notified">
+      <bpmn:incoming>f5</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="review" />
+    <bpmn:sequenceFlow id="f2" sourceRef="review" targetRef="reviewed" />
+    <bpmn:sequenceFlow id="f3" sourceRef="remind" targetRef="notify" />
+    <bpmn:sequenceFlow id="f4" sourceRef="notify" targetRef="notified" />
+    <bpmn:sequenceFlow id="f5" sourceRef="notify_failed" targetRef="not_notified" />
   </bpmn:process>
   <bpmndi:BPMNDiagram id="BPMNDiagram_p">
     <bpmndi:BPMNPlane id="BPMNPlane_p" bpmnElement="p">
       <bpmndi:BPMNShape id="start_di" bpmnElement="start">
         <dc:Bounds x="57" y="52" width="36" height="36" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="ut_di" bpmnElement="ut">
+      <bpmndi:BPMNShape id="review_di" bpmnElement="review">
         <dc:Bounds x="175" y="30" width="100" height="80" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="b_di" bpmnElement="b">
+      <bpmndi:BPMNShape id="remind_di" bpmnElement="remind">
         <dc:Bounds x="207" y="92" width="36" height="36" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+      <bpmndi:BPMNShape id="reviewed_di" bpmnElement="reviewed">
         <dc:Bounds x="357" y="52" width="36" height="36" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="remind_di" bpmnElement="remind">
+      <bpmndi:BPMNShape id="notify_di" bpmnElement="notify">
         <dc:Bounds x="325" y="170" width="100" height="80" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="reminded_di" bpmnElement="reminded">
+      <bpmndi:BPMNShape id="notify_failed_di" bpmnElement="notify_failed">
+        <dc:Bounds x="357" y="232" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="notified_di" bpmnElement="notified">
         <dc:Bounds x="507" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="not_notified_di" bpmnElement="not_notified">
+        <dc:Bounds x="507" y="332" width="36" height="36" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
         <di:waypoint x="93" y="70" />
@@ -75,6 +87,11 @@
       <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4">
         <di:waypoint x="425" y="210" />
         <di:waypoint x="507" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f5_di" bpmnElement="f5">
+        <di:waypoint x="375" y="268" />
+        <di:waypoint x="375" y="350" />
+        <di:waypoint x="507" y="350" />
       </bpmndi:BPMNEdge>
     </bpmndi:BPMNPlane>
   </bpmndi:BPMNDiagram>

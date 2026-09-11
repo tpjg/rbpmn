@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
+  warn side-path-failure-escapes @ handle_note
 -->
 <!-- reject/side-path-parallel-block, repaired: the parallel block sits inside
      an embedded subprocess on the side path, so each activation of the

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
+  warn side-path-failure-escapes @ warn_customer
 -->
 <!-- A non-interrupting boundary on a subprocess: the escalation runs beside
      the work rather than instead of it. The sibling token is spawned in the

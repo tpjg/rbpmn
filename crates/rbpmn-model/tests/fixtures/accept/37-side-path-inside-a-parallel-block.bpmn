@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
+  warn side-path-failure-escapes @ chase
 -->
 <!-- A side path inside a parallel block, and the fixture that makes the
      region analysis' non-interrupting rule necessary rather than merely

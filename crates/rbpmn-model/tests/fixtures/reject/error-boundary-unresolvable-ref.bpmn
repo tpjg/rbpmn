@@ -1,63 +1,51 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
-  warn side-path-failure-escapes @ remind
-  error timer-iso8601 @ b
+  error bpmn-structure @ be
 -->
-<!-- 'R0/P7D' is outside the cycle subset rbpmn executes: R[n]/P… or
-     R[n]/<datetime>/P…, n at least one, a fixed-length period (weeks, days,
-     hours, minutes, seconds). The projection steps a cycle by epoch
-     arithmetic — previous due plus period — so a month has no length it can
-     use, a zero repeat count never fires, and the /end forms are refused
-     rather than narrowed silently. -->
+<!-- An absent errorRef is a catch-all; a present one that resolves to
+     nothing is a typo, and is refused as it always was. Relaxing the rule
+     must not blur that line: a mistyped reference silently turning into
+     "catch everything" would be the worst possible reading of it. -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:error id="err_declined" name="CardDeclined" errorCode="CARD_DECLINED" />
   <bpmn:process id="p" isExecutable="true">
     <bpmn:startEvent id="start">
       <bpmn:outgoing>f1</bpmn:outgoing>
     </bpmn:startEvent>
-    <bpmn:userTask id="ut" name="Await">
+    <bpmn:serviceTask id="st" name="Charge card">
       <bpmn:incoming>f1</bpmn:incoming>
       <bpmn:outgoing>f2</bpmn:outgoing>
-    </bpmn:userTask>
-    <bpmn:boundaryEvent id="b" cancelActivity="false" attachedToRef="ut">
-      <bpmn:outgoing>f3</bpmn:outgoing>
-      <bpmn:timerEventDefinition>
-        <bpmn:timeCycle>R0/P7D</bpmn:timeCycle>
-      </bpmn:timerEventDefinition>
-    </bpmn:boundaryEvent>
-    <bpmn:serviceTask id="remind" name="Remind">
-      <bpmn:incoming>f3</bpmn:incoming>
-      <bpmn:outgoing>f4</bpmn:outgoing>
     </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="be" attachedToRef="st">
+      <bpmn:outgoing>f3</bpmn:outgoing>
+      <bpmn:errorEventDefinition />
+    </bpmn:boundaryEvent>
     <bpmn:endEvent id="end">
       <bpmn:incoming>f2</bpmn:incoming>
     </bpmn:endEvent>
-    <bpmn:endEvent id="reminded">
-      <bpmn:incoming>f4</bpmn:incoming>
+    <bpmn:endEvent id="e2">
+      <bpmn:incoming>f3</bpmn:incoming>
     </bpmn:endEvent>
-    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ut" />
-    <bpmn:sequenceFlow id="f2" sourceRef="ut" targetRef="end" />
-    <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="remind" />
-    <bpmn:sequenceFlow id="f4" sourceRef="remind" targetRef="reminded" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="st" />
+    <bpmn:sequenceFlow id="f2" sourceRef="st" targetRef="end" />
+    <bpmn:sequenceFlow id="f3" sourceRef="be" targetRef="e2" />
   </bpmn:process>
   <bpmndi:BPMNDiagram id="BPMNDiagram_p">
     <bpmndi:BPMNPlane id="BPMNPlane_p" bpmnElement="p">
       <bpmndi:BPMNShape id="start_di" bpmnElement="start">
         <dc:Bounds x="57" y="52" width="36" height="36" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="ut_di" bpmnElement="ut">
+      <bpmndi:BPMNShape id="st_di" bpmnElement="st">
         <dc:Bounds x="175" y="30" width="100" height="80" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="b_di" bpmnElement="b">
+      <bpmndi:BPMNShape id="be_di" bpmnElement="be">
         <dc:Bounds x="207" y="92" width="36" height="36" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNShape id="end_di" bpmnElement="end">
         <dc:Bounds x="357" y="52" width="36" height="36" />
       </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="remind_di" bpmnElement="remind">
-        <dc:Bounds x="325" y="170" width="100" height="80" />
-      </bpmndi:BPMNShape>
-      <bpmndi:BPMNShape id="reminded_di" bpmnElement="reminded">
-        <dc:Bounds x="507" y="192" width="36" height="36" />
+      <bpmndi:BPMNShape id="e2_di" bpmnElement="e2">
+        <dc:Bounds x="357" y="192" width="36" height="36" />
       </bpmndi:BPMNShape>
       <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
         <di:waypoint x="93" y="70" />
@@ -70,11 +58,7 @@
       <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
         <di:waypoint x="225" y="128" />
         <di:waypoint x="225" y="210" />
-        <di:waypoint x="325" y="210" />
-      </bpmndi:BPMNEdge>
-      <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4">
-        <di:waypoint x="425" y="210" />
-        <di:waypoint x="507" y="210" />
+        <di:waypoint x="357" y="210" />
       </bpmndi:BPMNEdge>
     </bpmndi:BPMNPlane>
   </bpmndi:BPMNDiagram>

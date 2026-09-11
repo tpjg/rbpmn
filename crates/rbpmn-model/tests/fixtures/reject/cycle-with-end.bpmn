@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
+  warn side-path-failure-escapes @ remind
   error timer-iso8601 @ b
 -->
 <!-- 'R/P7D/2026-12-31T00:00:00Z' is outside the cycle subset rbpmn executes: R[n]/P… or

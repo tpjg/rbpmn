@@ -1,0 +1,27 @@
+{
+  "fixture": "accept/45-exact-code-beats-catch-all.bpmn",
+  "actions": [
+    {
+      "fail": "charge"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started charge",
+      "work-item-created charge service charge",
+      "work-item-failed charge",
+      "element-started be_any",
+      "element-completed be_any",
+      "flow-taken f3",
+      "element-started failed",
+      "element-completed failed",
+      "instance-completed"
+    ]
+  }
+}

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
+  warn side-path-failure-escapes @ file_note
 -->
 <!-- A note arriving while a review is open must be filed, not answered: the
      boundary is non-interrupting, so the reviewer's task is untouched and a

@@ -1,0 +1,42 @@
+{
+  "fixture": "accept/50-enclosing-catch-all-tears-down-the-host.bpmn",
+  "actions": [
+    {
+      "fire": "remind"
+    },
+    {
+      "fail": "notify"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started case",
+      "element-started c_start",
+      "element-completed c_start",
+      "flow-taken fi1",
+      "element-started review",
+      "work-item-created review user review",
+      "timer-armed remind PT1H",
+      "timer-fired remind",
+      "element-started remind",
+      "element-completed remind",
+      "flow-taken fi3",
+      "element-started notify",
+      "work-item-created notify service notify",
+      "work-item-failed notify",
+      "work-item-cancelled review",
+      "element-started case_failed",
+      "element-completed case_failed",
+      "flow-taken f3",
+      "element-started abandoned",
+      "element-completed abandoned",
+      "instance-completed"
+    ]
+  }
+}

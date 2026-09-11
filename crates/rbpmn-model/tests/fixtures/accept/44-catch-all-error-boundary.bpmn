@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
-  error bpmn-structure @ be
 -->
+<!-- The catch-all: an error boundary with no errorRef catches any error,
+     which is standard BPMN. It also catches a failure that carries no code
+     at all — the shape of the failure nobody anticipated, and one no coded
+     boundary can match. -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
   <bpmn:process id="p" isExecutable="true">
     <bpmn:startEvent id="start">

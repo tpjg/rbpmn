@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
+  warn side-path-failure-escapes @ chase
   warn side-path-message-arm @ wait_ack
 -->
 <!-- accept/39, one scope deeper. The reminder's side path runs an embedded

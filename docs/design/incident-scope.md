@@ -125,12 +125,16 @@ Four things it must get right:
 boundaries of activities on the path, so a catch-all on a side-path task must
 end inside the side path like everything else there.
 
-### D2 — `side-path-freezes-instance` ⁺ (warning), shipping *with* D1
+### D2 — `side-path-failure-escapes` ⁺ (warning), shipping *with* D1
 
-An activity on a side path with no catch-all can freeze the whole instance.
-That is exactly the surprise the motivating case is made of, and a warning is
-the honest way to say it: it is legal BPMN, the standalone linter serves
-models targeting other engines, and the fix is now drawable.
+A failure on a side path that no catch-all *on the side path* contains
+escapes it: with nothing further out it freezes the whole instance, and with
+a catch-all further out it tears down the scope around the host — the very
+flow the side path existed to leave alone. That is exactly the surprise the
+motivating case is made of, and a warning is the honest way to say it: it is
+legal BPMN, the standalone linter serves models targeting other engines, and
+the fix is now drawable. The name says *escapes* rather than *freezes*
+because the second outcome is not a freeze and is no better.
 
 **Ordering matters**, the same way the expression-timer round records it: the
 warning ships with the capability, never before it, or it names a fix that
@@ -384,7 +388,7 @@ refused, two catch-alls on one host refused, a codeless failure caught, an
 exact code preferred over the catch-all at the same host, and the outward
 walk trying both at each step. Then `ExecKind::ErrorBoundary`'s
 `Option<String>`, `error_boundary`'s match order, `RaiseError`'s codeless
-path, and the `side-path-freezes-instance` warning with its own fixtures.
+path, and the `side-path-failure-escapes` warning with its own fixtures.
 Editor: the pane already
 produces one — clearing the *error code* field writes `errorRef: undefined`
 (`properties.js:414`), so today it authors a model the linter then refuses.
