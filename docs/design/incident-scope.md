@@ -310,10 +310,13 @@ which is the thing D4 is organised around.
 - **`Halt::AwaitingDecision`** — a decision that was pending. It resumes by
   asking again; the element has already started.
 
-Collateral resumes after the cause, in token order, whatever the
-disposition: re-entering a bystander's target node is what would have
-happened anyway, and re-asking its decision is sound because the document
-has not moved. Tokens in ordinary wait states were never converted — they are
+Collateral resumes after the cause, whatever the disposition: first every
+move in flight, in token order, entering its node on the flow it was on; then,
+once those moves have settled, every pending decision, asked again — unless a
+move froze the instance again, and then the decisions stay halted for the next
+repair. Re-entering a bystander's target node is what would have happened
+anyway, and re-asking its decision is sound because the document has not
+moved. Tokens in ordinary wait states were never converted — they are
 inert through instance status alone and become live again with no work.
 
 `wait_kind` is a text column behind a CHECK, so this is a migration adding
