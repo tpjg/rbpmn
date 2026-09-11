@@ -155,7 +155,9 @@ because the second outcome is not a freeze and is no better.
 It lands on the activity that can fail: a service or user task directly on
 the path, or — once, naming what escapes it — a subprocess on the path whose
 body lets a failure through, because a catch-all on the subprocess is the one
-fix for all of it. A user task cannot carry an error boundary, so its message
+fix for all of it. When side paths nest, a node of the inner one is
+reported once, under the innermost boundary, whose activations are what run
+it. A user task cannot carry an error boundary, so its message
 says to wrap it. It speaks only for well-formed side paths, since a
 `boundary-side-path` error is enough on its own; and only for the error class:
 decision, timer and correlation incidents are not errors, no boundary catches

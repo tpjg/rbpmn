@@ -768,6 +768,22 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
 /// in the message, and a merge reported at every node downstream of it would
 /// be the same fix repeated.
 fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
+    // Every side path in the scope, up front. P is the forward closure from
+    // B over flows and every boundary pseudo-edge (a boundary on an activity
+    // of the side path belongs to it too) — the traversal connectivity uses,
+    // so the two cannot disagree. That same closure means a side path started
+    // on an activity of another one lies wholly inside it, so its nodes are
+    // on both. They belong to the innermost, whose boundary's activations are
+    // what run them: each warning below fires once per node, not once per
+    // enclosing side path.
+    let side_paths: Vec<_> = (0..g.scope.nodes.len())
+        .filter(|&b| {
+            matches!(&g.node(b).kind, NodeKind::Boundary(d) if !d.cancel_activity)
+                && g.host_of[b].is_some()
+        })
+        .map(|b| (b, reach(g.scope.nodes.len(), &[b], |v| g.succs(v))))
+        .collect();
+
     for b in 0..g.scope.nodes.len() {
         let NodeKind::Boundary(data) = &g.node(b).kind else {
             continue;
@@ -780,10 +796,18 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
         let boundary_id = &g.node(b).id;
         let host_id = &g.node(host).id;
 
-        // P: forward closure from B over flows and every boundary pseudo-edge
-        // (a boundary on an activity of the side path belongs to it too) —
-        // the same traversal connectivity uses, so the two cannot disagree.
-        let in_path = reach(g.scope.nodes.len(), &[b], |v| g.succs(v));
+        let Some((_, in_path)) = side_paths.iter().find(|(s, _)| *s == b) else {
+            continue;
+        };
+        // What this path's warnings speak for: its own nodes, minus those
+        // strictly inside a side path nested in it. The nested *boundary*
+        // stays — it is armed once per activation of this one, which is this
+        // path's to say.
+        let nested: Vec<_> = side_paths
+            .iter()
+            .filter(|(s, _)| *s != b && in_path[*s])
+            .collect();
+        let owned = |v: usize| in_path[v] && v != b && !nested.iter().any(|(s, p)| v != *s && p[v]);
 
         // Disjointness: nothing outside the side path may reach into it. `B`
         // itself is exempt and is the only exemption — its one predecessor is
@@ -856,7 +880,7 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
         // the whole instance, so a scope of its own buys an arm nothing.
         // `lint_scope` reaches that body on its own, with no idea it sits on
         // a side path, which is why the walk happens from here.
-        for v in (0..g.scope.nodes.len()).filter(|&v| in_path[v] && v != b) {
+        for v in (0..g.scope.nodes.len()).filter(|&v| owned(v)) {
             let mut arms: Vec<&FlowNode> = Vec::new();
             if g.node(v).kind.is_message_arm() {
                 arms.push(g.node(v));
@@ -904,7 +928,7 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
         // incidents no boundary can catch, so a warning here could name no
         // remedy — `side-path-message-arm` and `timer-expression` already
         // speak for the two of them a model can see.
-        for v in (0..g.scope.nodes.len()).filter(|&v| plain_end && in_path[v] && v != b) {
+        for v in (0..g.scope.nodes.len()).filter(|&v| plain_end && owned(v)) {
             if has_catch_all(g, v) {
                 continue;
             }
