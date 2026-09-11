@@ -553,7 +553,8 @@ impl Engine {
     /// disposition the resume point does not allow is
     /// `StepError::RepairRefused` with its cause. Both are typed and come
     /// before anything changes, so a resent or stale request is answered
-    /// rather than stepped (D9).
+    /// rather than stepped (D9) — model checked in `spec/Repair.tla`
+    /// (`RepairLandsOnlyOnTheIncidentItNamed`).
     pub async fn repair(
         &self,
         instance: Uuid,
@@ -1675,6 +1676,11 @@ pub(crate) async fn persist_step(
 /// All of it is epoch arithmetic: `timestamptz - timestamptz` is a
 /// days-and-hours interval, and adding it back adds calendar days in the
 /// session's time zone — an hour wrong across a daylight-saving change.
+///
+/// A row the scheduler picked while due can be moved later by a freeze and
+/// a repair committing between its pick and its lock; the claim's
+/// `due_at <= now()` re-check is what keeps it from firing early
+/// (`spec/RepairClock.tla`, `NeverFiresEarly`).
 async fn resume_after_freeze(tx: &mut PgConnection, instance_id: Uuid) -> Result<(), EngineError> {
     sqlx::query(
         "update rbpmn_timer t set due_at = to_timestamp(extract(epoch from t.due_at) \

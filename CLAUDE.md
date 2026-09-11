@@ -338,7 +338,7 @@ not a per-commit check). CI is the backstop; the point of the table in README's
   demonstration: UI routes are behind the bearer, browsers cannot send it on a
   navigation, and supplying it is the embedding application's job.
 - `just tla` — TLA+ model checking of the concurrency protocol (`spec/`).
-  Twenty-two configs; fourteen are *expected* to fail, each matched against the
+  Twenty-seven configs; seventeen are *expected* to fail, each matched against the
   specific violation it demonstrates (a spec that stops parsing must not read
   as "fails as expected"). Three reproduce bugs that were real. The lock order
   is checked at two arities. `Lease.tla` models the process withdrawing a
@@ -346,8 +346,10 @@ not a per-commit check). CI is the backstop; the point of the table in README's
   on one token; both came with message boundaries, and `Lease`'s old
   "only by its holder" property turned out never to have been true of the
   shipped engine — a model with no action for an actor proves nothing about
-  it. Needs java; the jar is pinned and
-  checksum-verified.
+  it. `Repair.tla` models the one transition out of a frozen instance — a
+  request lands only on the incident it names, the lease survives the thaw —
+  and `RepairClock.tla` a repair moving a kept timer under the scheduler's
+  claim. Needs java; the jar is pinned and checksum-verified.
 - `just fixtures-di` — fixtures carry baked-in BPMN DI so they render
   everywhere; new fixtures without a `bpmndi:BPMNDiagram` section get theirs
   from this (idempotent; two reject fixtures have hand-written DI — see the
@@ -398,6 +400,11 @@ So: **touching any of these means re-reading `spec/` and re-running
   a reaped token's arms are withdrawn *with* it
 - retention's plan/archive/execute split, the DUE re-check under the row
   lock, or how the truncation floor is advanced (`retention.rs`)
+- a repair's incident check or what it may land on (`step.rs`'s
+  `Command::Repair`, `runtime.rs`'s `repair_in_tx`) — `spec/Repair.tla`
+- how a repair moves the timers a freeze kept (`resume_after_freeze`), or the
+  claim's `due_at <= now()` re-check that keeps a moved one from firing
+  early — `spec/RepairClock.tla`
 
 Each of those sites carries a comment naming the spec and the property. Two
 distinctions the models make that prose kept blurring, worth knowing before

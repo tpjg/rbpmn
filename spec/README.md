@@ -14,6 +14,8 @@ Run with `just tla` (needs `java`; fetches `tla2tools.jar` on first use).
 | `TimerTeardown.tla` | the unlocked pick of an **arm row** — a timer by the scheduler, a boundary subscription by `correlate` — racing a scope teardown, and a claim transaction that rolls back after its re-check | no armed row — timer or subscription — outlives the token it is armed on; no arm ever fires with its token gone |
 | `BoundaryExit.tla` | one token at a host work item with an interrupting boundary subscription; `complete_task` and `correlate` racing to end the wait, from any node | exactly one exit ever reaches `step`; an armed row always means an open host; a late call of either verb is answered typed (`AlreadyClosed`, `NoSubscription`), never stepped |
 | `Retention.tla` | a retention pass across its transaction-free archive gap | nothing deleted without an archive; the truncation floor covers every deletion and invents none; only due records go |
+| `Repair.tla` | the one transition out of a frozen instance: operators whose requests name an incident and may arrive twice, a repair that lands or freezes the instance again, an abandon, and a sibling item — `Lease` instantiated — across the thaw | a request lands only on the incident it named; the sibling keeps every lease guarantee across the thaw; a landed repair strands nobody; an abandon leaves nothing open; a frozen instance advances nothing until a request lands |
+| `RepairClock.tla` | a repair moving a timer the freeze kept (D8), racing the scheduler's unlocked pick and locked re-check | a moved timer never fires before its due |
 
 Each spec ships with a companion config that is **expected to fail**, so the
 checks are known to have teeth rather than passing vacuously:
@@ -40,6 +42,11 @@ checks are known to have teeth rather than passing vacuously:
 | `Retention.cfg` | holds | the shipped pass |
 | `Retention_FloorFromPlan.cfg` | **violation** | advancing the floor from the plan instead of the deletions |
 | `Retention_NoRecheck.cfg` | **violation** | trusting the plan's DUE verdict across the archive gap |
+| `Repair.cfg` | holds | the shipped repair |
+| `Repair_UncheckedIncident.cfg` | **violation** | a request landing whenever the instance is frozen: a repair of incident 0 fails again into incident 1, and its resend lands there |
+| `Repair_ThawIsReachable.cfg` | **violation** | not a bug: a repair lands while the stranded sibling is open, and the sibling then completes — so `ActiveStrandsNobody` is not vacuous |
+| `RepairClock.cfg` | holds | the shipped claim against the shipped move |
+| `RepairClock_NoDueRecheck.cfg` | **violation** | the claim's re-check without `due_at <= now()`: a cycle occurrence picked at the freeze's own instant, stepped past now by the repair, fired early |
 
 ## What DMN changed here, and what it did not
 
@@ -434,3 +441,48 @@ instance status.
 and the instance stays active. `ActiveStrandsNobody` holds over it, and
 `LeaseSiblings_CaughtIsReachable.cfg` shows the case is reached rather than
 assumed.
+
+## What repair added
+
+Every model before it treated the freeze as terminal. Repair
+(`docs/design/incident-scope.md`, D4–D9) is the one transition out, and the
+standing warning applies to it twice over — it adds a step path, and it moves
+timer rows the scheduler claims.
+
+**`Repair.tla`.** `Lease` again, instantiated for a sibling item as
+`LeaseSiblings` does it, with the freeze made reversible: operators send
+requests naming the open incident, requests arrive at least once, and a
+repair lands the instance active or freezes it again under the next number.
+`RepairLandsOnlyOnTheIncidentItNamed` is the property `release_task` taught:
+a resend and a fresh request are the same request, so only what the landing
+step named — against what was open when it arrived — tells a stale one apart.
+`Repair_UncheckedIncident.cfg` lands whatever is frozen, and TLC finds the
+resend in five states: freeze, send a repair of incident 0, land it as a
+Retry that fails again into incident 1, and land the same request there. The
+sibling's lease properties are checked through the thaw — `active` had never
+gone from FALSE to TRUE in any model — and hold; `ActiveStrandsNobody` is
+`LeaseSiblings_Stranded.cfg`'s price paid back, and
+`Repair_ThawIsReachable.cfg` shows the paying case reached.
+
+**`RepairClock.tla`.** The claim path is `TimerTeardown`'s — pick with no lock,
+lock NOWAIT, re-check — and what is new is a row picked while due being moved
+later in the window, by a freeze and a repair both committing between the
+pick and the lock. The move is `resume_after_freeze`'s, transcribed. For a
+duration it cannot matter: a row due at the pick moves by exactly the outage
+and is still due at resume — checked, the no-re-check config holds with
+durations alone. For a cycle it can, at one instant: `frozen_at` is the
+freezing transaction's clock, taken before its commit makes the freeze
+visible, so a scheduler still reading the instance as active can pick an
+occurrence due at or after it, and the repair steps that occurrence past now.
+`RepairClock_NoDueRecheck.cfg` drops the claim's `due_at <= now()` and TLC
+fires it early in six states. The conjunct was written for "timers never
+reschedule", which D8 made false; it is load-bearing now, and the claim path's
+comment says so.
+
+**Re-read, unchanged.** `LockOrder` needs nothing at either arity: a repair is
+a step — the instance row `FOR UPDATE`, then its per-instance rows, the timer
+moves among them. `TimerTeardown` stands: a repair's teardown (a Divert into
+an enclosing scope) reaps a token's arms with it through the same
+`tear_down_scope`, and a moved row is still armed on a live token. Bounds:
+one operator (a resend is what matters, not a second sender), two incidents
+(what a Retry that fails again needs), and `LeaseSiblings`' lease bounds.

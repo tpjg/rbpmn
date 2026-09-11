@@ -495,19 +495,23 @@ database clock, so the transcription checked is the one the engine runs.
   stranded by it. `LeaseSiblings_CaughtIsReachable.cfg` shows that case is
   reached rather than assumed.
 
-What repair adds is a transition out of `active = FALSE`, which no model has
-today because the freeze is terminal. `spec/Repair.tla` models it: one
-instance with a sibling item leased across the freeze, and operators whose
-requests name an incident and may arrive twice. A repair lands or freezes the
-instance again under a new number; an abandon terminates it. The module
-checks that a repair or an abandon lands only on the incident it named — a
-resent or stale request is answered typed, never stepped: `BoundaryExit`'s
-`LateCallsAreTyped` and `Lease`'s `ReleaseFreesOnlyTheLeaseItNamed` in one
-shape — and that a landed repair leaves the sibling claimable or completable
-again. A config without the number check is its counterexample. D8's re-arm
-races nothing: the scheduler never picks a frozen instance's timer, and the
-move commits with the repair. `LockOrder` needs nothing at either arity: a
-repair is a step — the instance row, then its rows.
+Repair is the one transition out of `active = FALSE`, and two modules check
+it. `spec/Repair.tla` composes `Lease` for a sibling item with operators
+whose requests name an incident and may arrive twice; a repair lands or
+freezes the instance again under a new number, an abandon terminates it. A
+request lands only on the incident it named — `Repair_UncheckedIncident.cfg`
+drops the check and TLC finds the resend, a repair of incident 0 that failed
+again landing on incident 1 — and the sibling keeps every lease guarantee
+across the thaw and is claimable or completable once a repair lands.
+`spec/RepairClock.tla` checks D8's move against the scheduler's claim: a row
+picked while due can be moved later between the pick and the lock, by a
+freeze and a repair both committing in the window. A duration stays due; a
+cycle occurrence due at the freeze's own instant — `frozen_at` is stamped
+before the freeze commits — is stepped past now, so the claim's
+`due_at <= now()` re-check is load-bearing, and
+`RepairClock_NoDueRecheck.cfg` fires it early without it. `LockOrder` needs
+nothing at either arity: a repair is a step — the instance row, then its
+rows.
 
 ## The guarantees this preserves
 
