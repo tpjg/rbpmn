@@ -1397,6 +1397,18 @@ impl ExecutableProcess {
             .map(|(_, b)| *b)
     }
 
+    /// Every error boundary on `host`, coded or catch-all — for callers that
+    /// walk each exit of an activity rather than match one failure (the
+    /// state-space explorer's side-path closure). Matching is
+    /// [`Self::error_boundary`]'s.
+    pub fn error_boundaries(&self, host: NodeIx) -> impl Iterator<Item = NodeIx> + '_ {
+        self.error_boundaries
+            .get(&host)
+            .into_iter()
+            .flatten()
+            .map(|(_, b)| *b)
+    }
+
     /// Where execution begins inside a static scope.
     pub fn scope_start(&self, scope: ScopeIx) -> NodeIx {
         self.scope_starts[scope]

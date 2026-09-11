@@ -277,6 +277,23 @@ pub fn canonical(proc: &ExecutableProcess, s: &InstanceState) -> String {
 
 // ------------------------------------------------------------------ stimuli
 
+/// Every error code a model declares, in document order: the codes worth
+/// raising when exploring it, beside the codeless failure `explore` always
+/// adds. Read off the XML because the compiled process keeps codes only on
+/// the boundaries that match them.
+pub fn declared_error_codes(xml: &str) -> Vec<String> {
+    let mut codes = Vec::new();
+    for part in xml.split("errorCode=\"").skip(1) {
+        if let Some(end) = part.find('"') {
+            let code = part[..end].to_string();
+            if !codes.contains(&code) {
+                codes.push(code);
+            }
+        }
+    }
+    codes
+}
+
 /// Walk every node reachable from the start, boundary events included, and
 /// collect the conditions on their outgoing flows.
 pub fn reachable_conditions(proc: &ExecutableProcess, codes: &[String]) -> Vec<Expr> {
@@ -360,11 +377,18 @@ pub fn patch_alphabet(proc: &ExecutableProcess, codes: &[String]) -> Vec<Value> 
 /// The nodes reachable from `boundary` over sequence flows: the side path a
 /// non-interrupting boundary spawns tokens onto.
 fn side_path(proc: &ExecutableProcess, boundary: NodeIx) -> HashSet<NodeIx> {
+    // The closure the linter's `boundary-side-path` computes: sequence flows
+    // *and* the boundaries on the path's own activities. Flows alone lose any
+    // token a boundary takes — a side token whose failure a catch-all catches
+    // lands on a path this set never counted, the saturation check stops
+    // seeing it, and a re-arming boundary is offered delivery after delivery
+    // without end.
     let mut seen = HashSet::from([boundary]);
     let mut queue = vec![boundary];
     while let Some(n) = queue.pop() {
-        for &f in &proc.node(n).outgoing {
-            let target = proc.flow(f).target;
+        let flows = proc.node(n).outgoing.iter().map(|&f| proc.flow(f).target);
+        let arms = proc.boundaries(n).iter().copied();
+        for target in flows.chain(arms).chain(proc.error_boundaries(n)) {
             if seen.insert(target) {
                 queue.push(target);
             }

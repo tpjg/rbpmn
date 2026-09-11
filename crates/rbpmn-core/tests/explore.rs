@@ -8,7 +8,7 @@ mod explorer;
 mod modelgen;
 
 use explorer::assert_clean;
-use modelgen::{Block, Decisions, build, initial_variables};
+use modelgen::{Block, Catch, Decisions, build, initial_variables};
 use rbpmn_core::*;
 use serde::Deserialize;
 use serde_json::Value;
@@ -29,20 +29,6 @@ struct Scenario {
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../rbpmn-model/tests/fixtures")
-}
-
-/// Error codes the model declares — the alphabet for `RaiseError`.
-fn declared_error_codes(xml: &str) -> Vec<String> {
-    let mut codes = Vec::new();
-    for part in xml.split("errorCode=\"").skip(1) {
-        if let Some(end) = part.find('"') {
-            let code = part[..end].to_string();
-            if !codes.contains(&code) {
-                codes.push(code);
-            }
-        }
-    }
-    codes
 }
 
 /// Every scenario's (fixture, bindings, variables) triple is a distinct
@@ -84,7 +70,7 @@ fn corpus_state_spaces_hold_the_invariants() {
             &sc.fixture,
             &proc,
             sc.variables.clone(),
-            &declared_error_codes(&xml),
+            &explorer::declared_error_codes(&xml),
         );
         explored += 1;
     }
@@ -110,7 +96,12 @@ fn explore_block(label: &str, block: &Block) -> usize {
     let defs = rbpmn_model::parse(&g.xml).expect("generated model parses");
     let proc = ExecutableProcess::compile(&defs, "p", &g.bindings)
         .expect("generated model is block-structured and must compile");
-    assert_clean(label, &proc, initial_variables(&Decisions::default()), &[])
+    assert_clean(
+        label,
+        &proc,
+        initial_variables(&Decisions::default()),
+        &explorer::declared_error_codes(&g.xml),
+    )
 }
 
 /// `Par(branches x depth)` — the concurrency-scaling shape, now expressed in
@@ -196,6 +187,44 @@ fn generated_models_hold_the_invariants() {
         (
             "side boundary".into(),
             Block::SideBoundary(Box::new(Block::Task)),
+        ),
+        // Error boundaries, over every code the model declares and none: which
+        // boundary takes each failure, and that a caught one — on the host or
+        // one scope out — leaves nothing stuck.
+        (
+            "coded and catch-all on one host".into(),
+            Block::ErrBoundary {
+                catch: Catch::Both,
+                scoped: false,
+                body: Box::new(Block::Task),
+            },
+        ),
+        (
+            "catch-all one scope out, in a parallel branch".into(),
+            Block::Par(vec![
+                Block::ErrBoundary {
+                    catch: Catch::All,
+                    scoped: true,
+                    body: Box::new(Block::Task),
+                },
+                Block::Task,
+            ]),
+        ),
+        (
+            "catch-all on a side path".into(),
+            Block::SideBoundary(Box::new(Block::ErrBoundary {
+                catch: Catch::All,
+                scoped: false,
+                body: Box::new(Block::Task),
+            })),
+        ),
+        (
+            "loop around a coded error boundary one scope out".into(),
+            Block::Loop(Box::new(Block::ErrBoundary {
+                catch: Catch::Coded,
+                scoped: true,
+                body: Box::new(Block::Task),
+            })),
         ),
         (
             "side boundary inside a parallel branch".into(),

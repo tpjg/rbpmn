@@ -25,7 +25,7 @@
 mod explorer;
 mod modelgen;
 
-use modelgen::{Block, Builder, Decisions, Kind, Rng, build, initial_variables};
+use modelgen::{Block, Builder, Catch, Decisions, Kind, Rng, build, initial_variables};
 use proptest::prelude::*;
 use rbpmn_core::{Bindings, CompileError, ExecutableProcess};
 use serde_json::json;
@@ -81,7 +81,11 @@ fn execute(xml: &str, bindings: &Bindings) -> Outcome {
         // hazard, just nothing to run.
         Err(_) => return Outcome::Inconclusive,
     };
-    let report = explorer::explore(&proc, initial_variables(&Decisions::default()), &[]);
+    let report = explorer::explore(
+        &proc,
+        initial_variables(&Decisions::default()),
+        &explorer::declared_error_codes(xml),
+    );
     if !report.violations.is_empty() {
         return Outcome::Hazard(report.violations.join("; "));
     }
@@ -178,7 +182,7 @@ fn implicit_split(b: &mut Builder, rng: &mut Rng) -> bool {
     let tasks: Vec<String> = b
         .elements
         .iter()
-        .filter(|e| e.kind == Kind::UserTask)
+        .filter(|e| matches!(e.kind, Kind::UserTask | Kind::ServiceTask))
         .map(|e| e.id.clone())
         .collect();
     if tasks.is_empty() {
@@ -285,6 +289,17 @@ const MUTATIONS: &[(&str, Mutation)] = &[
     ("starve_join", starve_join),
 ];
 
+/// proptest reads `PROPTEST_CASES` only into `ProptestConfig::default()`; the
+/// struct literal below would silently override it, so a fuzz run asked for
+/// thousands of mutants would quietly run 512 (the trap `tests/generator.rs`
+/// documents, which caught it there first). The environment wins when set.
+fn cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 fn any_block() -> impl Strategy<Value = Block> {
     let leaf = Just(Block::Task);
     leaf.prop_recursive(3, 16, 3, |inner| {
@@ -293,6 +308,20 @@ fn any_block() -> impl Strategy<Value = Block> {
             prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Xor),
             prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Par),
             inner.clone().prop_map(|b| Block::Sub(Box::new(b))),
+            // Error boundaries: a mutant that moves their flows, or their
+            // host's, is what `boundary-on-supported-host` and the region
+            // analysis are asked about, and `execute` raises every code the
+            // mutant declares.
+            (
+                prop_oneof![Just(Catch::Coded), Just(Catch::All), Just(Catch::Both)],
+                any::<bool>(),
+                inner.clone(),
+            )
+                .prop_map(|(catch, scoped, body)| Block::ErrBoundary {
+                    catch,
+                    scoped,
+                    body: Box::new(body),
+                }),
             // Reachable only now that `execute` takes the generator's
             // manifest: a mutation that moves the boundary's flow, or its
             // host's, is the shape `boundary-side-path` and the boundary
@@ -303,7 +332,7 @@ fn any_block() -> impl Strategy<Value = Block> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: cases(512), ..ProptestConfig::default() })]
 
     /// §3c. One structural mutation per valid model; the dichotomy must hold.
     #[test]
