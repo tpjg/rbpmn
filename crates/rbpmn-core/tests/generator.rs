@@ -47,7 +47,7 @@
 mod modelgen;
 
 use modelgen::{
-    Block, Catch, Decisions, HostOutcome, Rng, boundary_hosts, build, decide, error_hosts,
+    Block, Catch, Decisions, HostOutcome, Repairs, Rng, boundary_hosts, build, decide, error_hosts,
     expected_executions, run, side_boundary_hosts,
 };
 use proptest::prelude::*;
@@ -275,8 +275,12 @@ proptest! {
             // Every driver step is exactly one unit of work — a work item
             // completed, or a message delivered to a boundary — so the step
             // count must equal the total executions: a guard against a run
-            // that silently did nothing.
-            prop_assert_eq!(actual.steps, expected.values().sum::<usize>());
+            // that silently did nothing. A Retry is the one step that
+            // completes nothing: its task is completed later, and counted then.
+            prop_assert_eq!(
+                actual.steps,
+                expected.values().sum::<usize>() + actual.repairs.retried
+            );
             prop_assert_eq!(
                 &actual.executions,
                 &expected,
@@ -596,7 +600,7 @@ fn known_shapes_lint_clean_and_match_the_oracle() {
             );
             assert_eq!(
                 actual.steps,
-                expected.values().sum::<usize>(),
+                expected.values().sum::<usize>() + actual.repairs.retried,
                 "{name} (seed {seed})"
             );
             assert_eq!(
@@ -824,6 +828,9 @@ struct Sweep {
     exact_beat_catch_all: usize,
     caught_by_catch_all_with_code: usize,
     caught_by_catch_all_without_code: usize,
+    /// Repairs: each one the production makes, counted from what the engine
+    /// did.
+    repairs: Repairs,
 }
 
 /// Deterministic on purpose — `TestRunner::deterministic()` and the seeded
@@ -889,7 +896,11 @@ fn sweep(models: usize, rounds: u64) -> Sweep {
                 .unwrap_or_else(|e| panic!("{}", report("driving failed", &block, &g.xml, &e)));
 
             assert_eq!(actual.status, InstanceStatus::Completed, "model {i}");
-            assert_eq!(actual.steps, expected.values().sum::<usize>(), "model {i}");
+            assert_eq!(
+                actual.steps,
+                expected.values().sum::<usize>() + actual.repairs.retried,
+                "model {i}"
+            );
             assert_eq!(
                 actual.executions,
                 expected,
@@ -912,6 +923,7 @@ fn sweep(models: usize, rounds: u64) -> Sweep {
             sw.exact_beat_catch_all += actual.exact_beat_catch_all;
             sw.caught_by_catch_all_with_code += actual.caught_by_catch_all_with_code;
             sw.caught_by_catch_all_without_code += actual.caught_by_catch_all_without_code;
+            sw.repairs.add(&actual.repairs);
         }
     }
     sw
@@ -1064,6 +1076,47 @@ fn the_error_boundary_production_takes_every_exit() {
             sw.runs
         );
     }
+}
+
+/// **Non-vacuity for repair** (docs/design/incident-scope.md, D5). Every repair
+/// the production makes must land somewhere in the sweep: a plain task retried
+/// and advanced, a coded-only host's codeless failure diverted into its own
+/// boundary — and along the way a frozen instance must have refused a
+/// sibling's completion and a stale repair. Counted from what the engine did;
+/// the oracle comparison above is what says each one landed *right*.
+#[test]
+fn the_repair_production_takes_every_repair() {
+    let sw = sweep(200, 4);
+    let r = &sw.repairs;
+    println!(
+        "across {} runs the instance froze {} times: {} retried, {} advanced, {} \
+         diverted; frozen, it refused {} sibling completions and {} stale repairs",
+        sw.runs, r.frozen, r.retried, r.advanced, r.diverted, r.siblings_refused, r.stale_refused
+    );
+    for (count, what) in [
+        (r.retried, "no frozen task was ever retried"),
+        (r.advanced, "no frozen task was ever advanced"),
+        (
+            r.diverted,
+            "no codeless failure was ever diverted into its boundary",
+        ),
+        (
+            r.siblings_refused,
+            "no sibling's completion was ever tried on a frozen instance",
+        ),
+        (r.stale_refused, "no stale repair was ever tried"),
+    ] {
+        assert!(
+            count > 0,
+            "{what} in {} runs — that repair went untested",
+            sw.runs
+        );
+    }
+    assert_eq!(
+        r.frozen,
+        r.retried + r.advanced + r.diverted,
+        "every freeze is repaired, once"
+    );
 }
 
 proptest! {

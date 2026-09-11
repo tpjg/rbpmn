@@ -1092,6 +1092,11 @@ pub enum HostOutcome {
     FailsWithAnotherCode,
     /// Fails with no code at all: the shape only a catch-all can take.
     FailsWithNoCode,
+    /// Fails with no code on a coded-only host: nothing catches it, the
+    /// instance freezes, and a repair diverts the host's own code into its
+    /// boundary (docs/design/incident-scope.md, D5) — which must land exactly
+    /// where `FailsWithItsCode` would have.
+    FrozenThenDiverted,
 }
 
 /// Which exit of an error-boundary host an outcome takes.
@@ -1106,13 +1111,13 @@ pub enum Taker {
 
 impl Catch {
     /// The outcomes worth scheduling: a completion, and every failure some
-    /// boundary on this host takes. A coded-only host is never failed with a
-    /// code it cannot catch — that is the incident path, which the scenarios
-    /// and `spec/LeaseSiblings.tla` cover, not a run that must complete.
+    /// boundary on this host takes. A coded-only host fails uncaught only as
+    /// `FrozenThenDiverted`: the incident is raised, then repaired by
+    /// diverting the host's own code, so the run still completes.
     pub fn outcomes(self) -> &'static [HostOutcome] {
         use HostOutcome::*;
         match self {
-            Catch::Coded => &[Completes, FailsWithItsCode],
+            Catch::Coded => &[Completes, FailsWithItsCode, FrozenThenDiverted],
             Catch::All => &[Completes, FailsWithAnotherCode, FailsWithNoCode],
             Catch::Both => &[
                 Completes,
@@ -1130,6 +1135,7 @@ impl Catch {
         match (self, outcome) {
             (_, HostOutcome::Completes) => Taker::Host,
             (Catch::Coded | Catch::Both, HostOutcome::FailsWithItsCode) => Taker::Boundary,
+            (Catch::Coded, HostOutcome::FrozenThenDiverted) => Taker::Boundary,
             (Catch::All, _) => Taker::Boundary,
             (Catch::Both, _) => Taker::CatchAll,
             (Catch::Coded, other) => {
@@ -1372,6 +1378,104 @@ fn control_tasks(root: &Node) -> BTreeMap<String, String> {
     out
 }
 
+/// What the repair production did, counted from what the engine did — never
+/// from what was scheduled (docs/design/incident-scope.md, D5).
+#[derive(Debug, Default, Clone)]
+pub struct Repairs {
+    pub frozen: usize,
+    pub retried: usize,
+    pub advanced: usize,
+    pub diverted: usize,
+    /// A sibling's completion refused while the instance was frozen, with
+    /// nothing changed: `FreezeAdvancesNothing` at the core.
+    pub siblings_refused: usize,
+    /// A repair naming any incident but the open one, refused (D9).
+    pub stale_refused: usize,
+}
+
+impl Repairs {
+    pub fn add(&mut self, other: &Repairs) {
+        self.frozen += other.frozen;
+        self.retried += other.retried;
+        self.advanced += other.advanced;
+        self.diverted += other.diverted;
+        self.siblings_refused += other.siblings_refused;
+        self.stale_refused += other.stale_refused;
+    }
+}
+
+/// Fail `id` with nothing to catch it, and check the freeze: the incident is
+/// the next number this run minted, a sibling's completion is refused with
+/// nothing changed, and so is a repair naming any other incident. Returns the
+/// open incident, for the repair the caller makes.
+fn freeze_and_check(
+    proc: &ExecutableProcess,
+    state: &mut InstanceState,
+    id: WorkItemId,
+    element: &str,
+    open: &[(WorkItemId, String)],
+    tally: &mut Repairs,
+) -> Result<u64, String> {
+    let events = step(proc, state, Command::RaiseError { id, code: None })
+        .map_err(|e| format!("failing {element}: {e}"))?;
+    let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+    if state.status != InstanceStatus::Failed
+        || trace.last() != Some(&format!("incident-raised {element}"))
+    {
+        return Err(format!(
+            "failing '{element}' with nothing to catch it did not freeze the instance: {}",
+            trace.join(", ")
+        ));
+    }
+    let incident = tally.frozen as u64;
+    tally.frozen += 1;
+    if state.open_incident() != Some(incident) {
+        return Err(format!(
+            "the instance froze on incident {:?}, not {incident} — each freeze mints the next",
+            state.open_incident()
+        ));
+    }
+    let frozen = state.clone();
+    if let Some((sibling, at)) = open.iter().find(|(w, _)| *w != id) {
+        match step(
+            proc,
+            state,
+            Command::CompleteWorkItem {
+                id: *sibling,
+                patch: json!({}),
+            },
+        ) {
+            Err(StepError::InstanceNotActive(InstanceStatus::Failed)) if *state == frozen => {
+                tally.siblings_refused += 1;
+            }
+            other => {
+                return Err(format!(
+                    "completing '{at}' on an instance frozen at '{element}' answered {other:?}"
+                ));
+            }
+        }
+    }
+    match step(
+        proc,
+        state,
+        Command::Repair {
+            incident: incident + 1,
+            disposition: Disposition::Retry { patch: json!({}) },
+            reason: "stale".to_string(),
+        },
+    ) {
+        Err(StepError::IncidentNotOpen { .. }) if *state == frozen => tally.stale_refused += 1,
+        other => {
+            return Err(format!(
+                "a repair of incident {} on an instance frozen at incident {incident} \
+                 answered {other:?}",
+                incident + 1
+            ));
+        }
+    }
+    Ok(incident)
+}
+
 pub struct Run {
     pub executions: BTreeMap<String, usize>,
     pub status: InstanceStatus,
@@ -1399,6 +1503,7 @@ pub struct Run {
     pub exact_beat_catch_all: usize,
     pub caught_by_catch_all_with_code: usize,
     pub caught_by_catch_all_without_code: usize,
+    pub repairs: Repairs,
 }
 
 /// Drive the engine to completion under `dec`, acting on whichever open work
@@ -1425,6 +1530,7 @@ pub fn run(
         (0usize, 0usize, 0usize);
     let (mut caught_by_catch_all_with_code, mut caught_by_catch_all_without_code) =
         (0usize, 0usize);
+    let mut repairs = Repairs::default();
     // Per non-interrupting boundary: which activation of its host we are in,
     // and how many of that activation's deliveries have been made. One
     // delivery per driver step, like every other unit of work, so the
@@ -1621,6 +1727,41 @@ pub fn run(
             let activation = err_activations.entry(host.boundary.clone()).or_default();
             let outcome = dec.host_outcome(&host.boundary, *activation);
             *activation += 1;
+            // A coded-only host's codeless failure: nothing catches it, the
+            // instance freezes, and a repair diverts the host's own code —
+            // which must land where `FailsWithItsCode` would have, walking out
+            // to the enclosing subprocess for a scoped host (D5).
+            if outcome == HostOutcome::FrozenThenDiverted {
+                let incident =
+                    freeze_and_check(proc, &mut state, id, &element, &open, &mut repairs)?;
+                let events = step(
+                    proc,
+                    &mut state,
+                    Command::Repair {
+                        incident,
+                        disposition: Disposition::Divert {
+                            code: Some(host.code.clone()),
+                        },
+                        reason: "generated".to_string(),
+                    },
+                )
+                .map_err(|e| format!("diverting {element}: {e}"))?;
+                let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+                if !trace
+                    .iter()
+                    .any(|e| *e == format!("element-started {}", host.boundary))
+                {
+                    return Err(format!(
+                        "diverting '{}' at '{element}' did not take '{}': {}",
+                        host.code,
+                        host.boundary,
+                        trace.join(", ")
+                    ));
+                }
+                repairs.diverted += 1;
+                *executions.entry(host.boundary.clone()).or_default() += 1;
+                continue;
+            }
             if outcome != HostOutcome::Completes {
                 let code = match outcome {
                     HostOutcome::FailsWithItsCode => Some(host.code.clone()),
@@ -1746,6 +1887,43 @@ pub fn run(
             hosts_completed += 1;
         }
 
+        // A plain task: now and then it fails with nothing to catch it, the
+        // instance freezes, and a repair brings it back — Retry or Advance,
+        // the two whose outcome the oracle already predicts (D5). A retried
+        // task is completed later like any other, so this step completes
+        // nothing; an advanced one counts as completed here.
+        let plain = !hosts.contains_key(&element)
+            && !side_hosts.contains_key(&element)
+            && !err_hosts.contains_key(&element);
+        let repair = plain && rng.below(4) == 0;
+        if repair && rng.below(2) == 0 {
+            let incident = freeze_and_check(proc, &mut state, id, &element, &open, &mut repairs)?;
+            let events = step(
+                proc,
+                &mut state,
+                Command::Repair {
+                    incident,
+                    disposition: Disposition::Retry { patch: json!({}) },
+                    reason: "generated".to_string(),
+                },
+            )
+            .map_err(|e| format!("retrying {element}: {e}"))?;
+            let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+            let reopened = state
+                .open_work_items()
+                .any(|(w, item)| w != id && proc.node_id(item.element) == element);
+            if trace.first() != Some(&format!("incident-repaired {element} retry"))
+                || !reopened
+                || state.status != InstanceStatus::Active
+            {
+                return Err(format!(
+                    "retrying '{element}' did not open it again on an active instance: {}",
+                    trace.join(", ")
+                ));
+            }
+            repairs.retried += 1;
+            continue;
+        }
         let patch = match controls.get(&element) {
             None => json!({}),
             Some(var) => {
@@ -1762,8 +1940,37 @@ pub fn run(
             }
         };
         *executions.entry(element.clone()).or_default() += 1;
-        let events = step(proc, &mut state, Command::CompleteWorkItem { id, patch })
-            .map_err(|e| format!("completing {element}: {e}"))?;
+        let events = if repair {
+            let incident = freeze_and_check(proc, &mut state, id, &element, &open, &mut repairs)?;
+            let events = step(
+                proc,
+                &mut state,
+                Command::Repair {
+                    incident,
+                    disposition: Disposition::Advance {
+                        patch,
+                        answer: None,
+                    },
+                    reason: "generated".to_string(),
+                },
+            )
+            .map_err(|e| format!("advancing {element}: {e}"))?;
+            let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+            if trace.first() != Some(&format!("incident-repaired {element} advance"))
+                || !trace.contains(&format!("element-completed {element}"))
+                || state.status == InstanceStatus::Failed
+            {
+                return Err(format!(
+                    "advancing '{element}' did not complete it: {}",
+                    trace.join(", ")
+                ));
+            }
+            repairs.advanced += 1;
+            events
+        } else {
+            step(proc, &mut state, Command::CompleteWorkItem { id, patch })
+                .map_err(|e| format!("completing {element}: {e}"))?
+        };
 
         if let Some(host) = side_hosts.get(&element) {
             // The arm goes with the host, and only the arm: side tokens
@@ -1814,5 +2021,6 @@ pub fn run(
         exact_beat_catch_all,
         caught_by_catch_all_with_code,
         caught_by_catch_all_without_code,
+        repairs,
     })
 }

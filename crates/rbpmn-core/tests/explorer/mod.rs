@@ -543,6 +543,10 @@ pub struct Report {
     pub violations: Vec<String>,
     /// Hit the state budget: the exploration is incomplete, not clean.
     pub capped: bool,
+    /// Repairs that landed, by disposition (docs/design/incident-scope.md,
+    /// D5): what tells a clean report apart from one in which every repair
+    /// was refused and nothing past a freeze was ever reached.
+    pub repairs: BTreeMap<String, usize>,
 }
 
 pub fn explore(proc: &ExecutableProcess, initial: Value, codes: &[String]) -> Report {
@@ -560,6 +564,7 @@ pub fn explore(proc: &ExecutableProcess, initial: Value, codes: &[String]) -> Re
         terminals: 0,
         violations: Vec::new(),
         capped: false,
+        repairs: BTreeMap::new(),
     };
 
     while let Some(s) = frontier.pop_front() {
@@ -580,7 +585,11 @@ pub fn explore(proc: &ExecutableProcess, initial: Value, codes: &[String]) -> Re
         for cmd in stimuli(proc, &s, &patches, &codes_opt) {
             let mut next = s.clone();
             match step(proc, &mut next, cmd.clone()) {
-                Ok(_) => {}
+                Ok(_) => {
+                    if let Command::Repair { disposition, .. } = &cmd {
+                        *r.repairs.entry(disposition.kind().to_string()).or_default() += 1;
+                    }
+                }
                 // A typed refusal is the engine correctly declining an illegal
                 // stimulus — not a finding. `Invariant` is one by definition:
                 // lint-clean models cannot reach it.
@@ -610,6 +619,16 @@ pub fn assert_clean(
     initial: Value,
     codes: &[String],
 ) -> usize {
+    assert_clean_report(label, proc, initial, codes).states
+}
+
+/// [`assert_clean`], handing back the whole report.
+pub fn assert_clean_report(
+    label: &str,
+    proc: &ExecutableProcess,
+    initial: Value,
+    codes: &[String],
+) -> Report {
     let r = explore(proc, initial, codes);
     assert!(
         !r.capped,
@@ -627,5 +646,5 @@ pub fn assert_clean(
         "{label}: explored {} states but reached no terminal state",
         r.states
     );
-    r.states
+    r
 }
