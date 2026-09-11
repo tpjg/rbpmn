@@ -206,6 +206,25 @@ async fn a_storm_holds_every_global_invariant() {
         .await
         .unwrap();
 
+    // The catch-all (docs/design/incident-scope.md, D1): the side path whose
+    // task fails into a catch-all while the review beside it is decided. The
+    // consumers claim `notify` like any other topic and, in rotation, fail it
+    // with a code, fail it without one, or complete it — one attempt each, so
+    // every failure reaches the catch-all — while other consumers race the
+    // review on the same instance. The reminder is due at once.
+    setup.declare_topic("notify").await.unwrap();
+    setup
+        .deploy(
+            &with_process_id(
+                &fixture("accept/46-side-path-failure-contained.bpmn").replace("PT1H", "PT0S"),
+                "contained",
+            ),
+            &rbpmn_core::Bindings::new()
+                .retries("notify", rbpmn_core::RetryPolicy::new().attempts(1)),
+        )
+        .await
+        .unwrap();
+
     // Crank with RBPMN_STORM_ROUNDS when hunting; 20 keeps the suite quick.
     let rounds: u32 = std::env::var("RBPMN_STORM_ROUNDS")
         .ok()
@@ -238,12 +257,14 @@ async fn a_storm_holds_every_global_invariant() {
 
     // Pull-mode consumers competing for the same user-task topics.
     let completed = Arc::new(AtomicUsize::new(0));
+    let notify_calls = Arc::new(AtomicUsize::new(0));
     for w in 0..6 {
         let (node, stop, completed) = (
             nodes[w % nodes.len()].clone(),
             stop.clone(),
             completed.clone(),
         );
+        let notify_calls = notify_calls.clone();
         actors.push(tokio::spawn(async move {
             let options = rbpmn_engine::GetTaskOptions::new(format!("worker-{w}"));
             while !stop.load(Ordering::Relaxed) {
@@ -260,9 +281,30 @@ async fn a_storm_holds_every_global_invariant() {
                     "review",
                     "file_note",
                     "add_late_fee",
+                    "notify",
                 ] {
                     if let Ok(Some(task)) = node.get_task(topic, &options).await {
                         idle = false;
+                        // `notify` is the catch-all's: in rotation it fails
+                        // with a code, fails without one, or completes, so
+                        // both shapes a catch-all takes run through the storm.
+                        if topic == "notify" {
+                            let (owner, id) = (&options.owner, task.id);
+                            let _ = match notify_calls.fetch_add(1, Ordering::Relaxed) % 3 {
+                                0 => node
+                                    .fail_task(id, owner, Some("STORM".into()), None)
+                                    .await
+                                    .map(|_| ()),
+                                1 => node.fail_task(id, owner, None, None).await.map(|_| ()),
+                                _ => node
+                                    .complete_task(id, owner, serde_json::json!({}))
+                                    .await
+                                    .map(|_| {
+                                        completed.fetch_add(1, Ordering::Relaxed);
+                                    }),
+                            };
+                            continue;
+                        }
                         // Completion may lose a race with a boundary timer;
                         // that is a legal outcome, not a failure.
                         if node
@@ -319,7 +361,7 @@ async fn a_storm_holds_every_global_invariant() {
     for round in 0..rounds {
         let node = &nodes[round as usize % nodes.len()];
         let empty = serde_json::json!({});
-        for key in ["par", "timed", "nested"] {
+        for key in ["par", "timed", "nested", "contained"] {
             let id = node.start(key, None, empty.clone()).await.unwrap().id;
             instances.push((id, empty.clone()));
         }
@@ -506,6 +548,59 @@ async fn a_storm_holds_every_global_invariant() {
     assert_eq!(
         double_deliveries, 0,
         "a message was delivered more than once"
+    );
+
+    // The catch-all through the storm: each shape of failure it takes and the
+    // success path beside them, exactly one catch per failure, and no
+    // `contained` instance left unfinished by a failure its model caught.
+    let caught_with_code = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'work-item-failed' \
+         and element_id = 'notify' and payload->>'code' is not null",
+    )
+    .await;
+    let caught_without_code = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'work-item-failed' \
+         and element_id = 'notify' and payload->>'code' is null",
+    )
+    .await;
+    let catches = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'element-started' \
+         and element_id = 'notify_failed'",
+    )
+    .await;
+    let notified = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'element-started' \
+         and element_id = 'notified'",
+    )
+    .await;
+    assert!(
+        caught_with_code > 0 && caught_without_code > 0 && notified > 0,
+        "the side-path catch-all never saw every shape through the storm \
+         ({caught_with_code} failures with a code, {caught_without_code} without, \
+         {notified} notifications that succeeded)"
+    );
+    assert_eq!(
+        catches,
+        caught_with_code + caught_without_code,
+        "every failure of notify is taken by its catch-all exactly once"
+    );
+    let unfinished = count(
+        &db.pool,
+        "select count(*) from rbpmn_instance where definition_key = 'contained' \
+         and status <> 'completed'",
+    )
+    .await;
+    assert_eq!(
+        unfinished, 0,
+        "a caught side-path failure left a `contained` instance unfinished"
+    );
+    println!(
+        "storm catch-all: {caught_with_code} failures with a code and \
+         {caught_without_code} without, all caught; {notified} notified"
     );
 
     // Non-vacuity: the storm must actually have raced. The boundary-timer

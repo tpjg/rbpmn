@@ -178,6 +178,26 @@ async fn the_engine_converges_through_chaos() {
         .await
         .unwrap();
 
+    // The catch-all (docs/design/incident-scope.md, D1), in the shape the
+    // incident-scope round was about: a side path whose task fails into a
+    // catch-all while the review beside it is claimed and completed. `notify`
+    // runs on the chaotic handler under a one-attempt policy, so its
+    // OUT_OF_STOCK failures reach the catch-all with a code and its panics
+    // without one — the shape only a catch-all can take. The reminder is due
+    // at once, so the side token spawns while the review is still open.
+    setup
+        .deploy(
+            &with_process_id(
+                &fixture("accept/46-side-path-failure-contained.bpmn").replace("PT1H", "PT0S"),
+                "contained",
+            ),
+            &rbpmn_core::Bindings::new()
+                .topic("notify", "chaos")
+                .retries("notify", rbpmn_core::RetryPolicy::new().attempts(1)),
+        )
+        .await
+        .unwrap();
+
     let deadlocks_before = deadlocks(&db.pool).await;
     let rounds: u32 = std::env::var("RBPMN_CHAOS_ROUNDS")
         .ok()
@@ -338,7 +358,7 @@ async fn the_engine_converges_through_chaos() {
     // cannot lose a start we are counting on.
     let mut instances: Vec<(Uuid, serde_json::Value)> = Vec::new();
     for round in 0..rounds {
-        for key in ["par", "timed", "svc", "scoped"] {
+        for key in ["par", "timed", "svc", "scoped", "contained"] {
             let vars = serde_json::json!({});
             let id = setup.start(key, None, vars.clone()).await.unwrap().id;
             instances.push((id, vars));
@@ -547,6 +567,63 @@ async fn the_engine_converges_through_chaos() {
     assert_eq!(
         side_paths, notes,
         "one side token per delivered note, crashes included"
+    );
+
+    // The catch-all through the crashes: a side token's failure taken on its
+    // own side path — with a code and without — while the review beside it is
+    // claimed under a 10ms lease and nodes are killed underneath both. Each
+    // shape must have happened, the success path too; every failure must be
+    // caught exactly once (the failure and its catch are one transaction, so
+    // a killed backend takes both or neither); and no `contained` instance may
+    // be left unfinished by a failure its model caught.
+    let caught_with_code = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'work-item-failed' \
+         and element_id = 'notify' and payload->>'code' is not null",
+    )
+    .await;
+    let caught_without_code = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'work-item-failed' \
+         and element_id = 'notify' and payload->>'code' is null",
+    )
+    .await;
+    let catches = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'element-started' \
+         and element_id = 'notify_failed'",
+    )
+    .await;
+    let notified = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'element-started' \
+         and element_id = 'notified'",
+    )
+    .await;
+    assert!(
+        caught_with_code > 0 && caught_without_code > 0 && notified > 0,
+        "the side-path catch-all never saw every shape through chaos \
+         ({caught_with_code} failures with a code, {caught_without_code} without, \
+         {notified} notifications that succeeded)"
+    );
+    assert_eq!(
+        catches,
+        caught_with_code + caught_without_code,
+        "every failure of notify is taken by its catch-all exactly once, crashes included"
+    );
+    let unfinished = count(
+        &db.pool,
+        "select count(*) from rbpmn_instance where definition_key = 'contained' \
+         and status <> 'completed'",
+    )
+    .await;
+    assert_eq!(
+        unfinished, 0,
+        "a caught side-path failure left a `contained` instance unfinished"
+    );
+    println!(
+        "chaos catch-all: {caught_with_code} failures with a code and \
+         {caught_without_code} without, all caught; {notified} notified"
     );
 
     let statuses: Vec<(String, i64)> = sqlx::query(

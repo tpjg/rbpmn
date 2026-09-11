@@ -216,7 +216,9 @@ side-path closure following sequence flows only: a side token a catch-all
 takes lands on a path the saturation count never saw, and a re-arming
 boundary was offered delivery after delivery without end. The closure now
 follows boundary pseudo-edges too — the linter's own `boundary-side-path`
-definition.
+definition. Storm and chaos carry the catch-all as well —
+fixture 46's contained side path, failing with a code and without — and
+assert each shape was taken, one catch per failure.
 
 Not yet generated, and why: error and timer boundaries (single-shot or
 `timeCycle`), and `EventGateway`.
