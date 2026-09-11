@@ -1028,10 +1028,10 @@ pub struct Decisions {
     /// is no "it fired, that was that" to record.
     pub side: BTreeMap<String, Vec<usize>>,
     /// Per error boundary, one outcome per activation of its host: complete,
-    /// or fail — with the host's own code, another, or none. Only failures
-    /// some boundary on the host will take are ever scheduled
-    /// ([`Catch::outcomes`]), so every run still completes and the oracle
-    /// has an answer for it.
+    /// or fail — with the host's own code, another, or none. A failure is
+    /// scheduled only where a boundary on the host takes it, at once or once
+    /// a repair diverts the host's own code into it ([`Catch::outcomes`]), so
+    /// every run still completes and the oracle has an answer for it.
     pub fail: BTreeMap<String, Vec<HostOutcome>>,
 }
 
@@ -1909,9 +1909,11 @@ pub fn run(
             )
             .map_err(|e| format!("retrying {element}: {e}"))?;
             let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
-            let reopened = state
-                .open_work_items()
-                .any(|(w, item)| w != id && proc.node_id(item.element) == element);
+            // A new item, not merely another open one at the same element:
+            // two side tokens can both be waiting at one task.
+            let reopened = state.open_work_items().any(|(w, item)| {
+                proc.node_id(item.element) == element && !open.iter().any(|(o, _)| *o == w)
+            });
             if trace.first() != Some(&format!("incident-repaired {element} retry"))
                 || !reopened
                 || state.status != InstanceStatus::Active
