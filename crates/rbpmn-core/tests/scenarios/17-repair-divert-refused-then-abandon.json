@@ -1,0 +1,38 @@
+{
+  "fixture": "accept/17-message-catch.bpmn",
+  "bindings": {
+    "correlations": {
+      "c": "order.id"
+    }
+  },
+  "variables": {},
+  "actions": [
+    {
+      "repair": 0,
+      "disposition": "divert",
+      "code": "NO_ACK",
+      "reason": "no ack is coming",
+      "refused": "RepairRefused(NothingCatches)"
+    },
+    {
+      "repair": 0,
+      "disposition": "abandon",
+      "reason": "shipped without an ack"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started c",
+      "correlation-failed c order.id",
+      "incident-raised c",
+      "incident-repaired c abandon",
+      "instance-completed"
+    ]
+  }
+}

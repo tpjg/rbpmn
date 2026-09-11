@@ -19,25 +19,8 @@
     {
       "repair": 0,
       "disposition": "advance",
-      "reason": "priced by hand",
-      "refused": "RepairRefused(DecisionNeedsAnAnswer)"
-    },
-    {
-      "repair": 0,
-      "disposition": "advance",
-      "patch": {
-        "order": {
-          "discount": 30
-        }
-      },
-      "reason": "priced by hand",
-      "refused": "RepairRefused(DecisionNeedsAnAnswer)"
-    },
-    {
-      "repair": 0,
-      "disposition": "advance",
-      "answer": 30,
-      "reason": "priced by hand"
+      "answer": null,
+      "reason": "no discount applies"
     }
   ],
   "expect": {
@@ -45,7 +28,7 @@
     "variables": {
       "Amount": 250,
       "order": {
-        "discount": 30
+        "discount": null
       }
     },
     "trace": [

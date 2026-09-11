@@ -18,35 +18,20 @@
     },
     {
       "repair": 0,
-      "disposition": "advance",
-      "reason": "priced by hand",
-      "refused": "RepairRefused(DecisionNeedsAnAnswer)"
+      "disposition": "divert",
+      "reason": "route it to pricing",
+      "refused": "RepairRefused(NothingCatches)"
     },
     {
       "repair": 0,
-      "disposition": "advance",
-      "patch": {
-        "order": {
-          "discount": 30
-        }
-      },
-      "reason": "priced by hand",
-      "refused": "RepairRefused(DecisionNeedsAnAnswer)"
-    },
-    {
-      "repair": 0,
-      "disposition": "advance",
-      "answer": 30,
-      "reason": "priced by hand"
+      "disposition": "abandon",
+      "reason": "the order was withdrawn"
     }
   ],
   "expect": {
     "status": "completed",
     "variables": {
-      "Amount": 250,
-      "order": {
-        "discount": 30
-      }
+      "Amount": 250
     },
     "trace": [
       "instance-started",
@@ -56,11 +41,7 @@
       "element-started decide",
       "decision-requested decide Discount",
       "incident-raised decide",
-      "incident-repaired decide advance",
-      "element-completed decide",
-      "flow-taken f2",
-      "element-started end",
-      "element-completed end",
+      "incident-repaired decide abandon",
       "instance-completed"
     ]
   }

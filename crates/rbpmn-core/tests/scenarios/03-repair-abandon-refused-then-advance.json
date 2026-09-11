@@ -8,7 +8,8 @@
     {
       "repair": 0,
       "disposition": "abandon",
-      "refused": "RepairRefused"
+      "reason": "nobody packs any more",
+      "refused": "RepairRefused(AJoinWouldWait)"
     },
     {
       "repair": 0,

@@ -15,6 +15,7 @@
     {
       "repair": 0,
       "disposition": "advance",
+      "reason": "acked by phone",
       "refused": "IncidentNotOpen"
     },
     {

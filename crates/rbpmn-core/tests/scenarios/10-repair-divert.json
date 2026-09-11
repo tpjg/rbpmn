@@ -10,7 +10,8 @@
       "repair": 0,
       "disposition": "divert",
       "code": "NOT_DECLARED",
-      "refused": "RepairRefused"
+      "reason": "hand it to the payment desk",
+      "refused": "RepairRefused(NothingCatches)"
     },
     {
       "repair": 0,

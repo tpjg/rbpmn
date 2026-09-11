@@ -10,13 +10,14 @@
       "repair": 0,
       "disposition": "advance",
       "answer": 1,
-      "refused": "RepairRefused"
+      "reason": "charged at the till",
+      "refused": "RepairRefused(AnswerOnlyForADecision)"
     },
     {
       "repair": 0,
       "disposition": "advance",
       "reason": " ",
-      "refused": "RepairRefused"
+      "refused": "RepairRefused(NoReason)"
     },
     {
       "repair": 0,

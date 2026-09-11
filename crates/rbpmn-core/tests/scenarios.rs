@@ -66,7 +66,9 @@ struct DeliverAction {
 /// Repair the instance's open incident (`docs/design/incident-scope.md`,
 /// D4–D5). `repair` is the incident number the request names (D9), and
 /// `refused`, as on a delivery, is the `StepError` variant the step must
-/// answer with — typed, before any mutation.
+/// answer with — typed, before any mutation, and naming its cause
+/// (`RepairRefused(NothingCatches)`), so a refusal fired by the wrong rule
+/// does not pass.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)] // read once the core takes `Command::Repair`
@@ -75,7 +77,7 @@ struct RepairAction {
     disposition: String,
     #[serde(default)]
     patch: Option<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     answer: Option<Value>,
     #[serde(default)]
     code: Option<String>,
@@ -83,6 +85,13 @@ struct RepairAction {
     reason: Option<String>,
     #[serde(default)]
     refused: Option<String>,
+}
+
+/// A field that is present is `Some`, even when it is `null`: an Advance may
+/// answer a decision with null, which is an answer, where leaving the field
+/// out gives none.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize)]

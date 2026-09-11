@@ -1,0 +1,34 @@
+{
+  "fixture": "accept/23-timer-from-variable.bpmn",
+  "variables": {},
+  "actions": [
+    {
+      "repair": 0,
+      "disposition": "divert",
+      "reason": "escalate instead",
+      "refused": "RepairRefused(NothingCatches)"
+    },
+    {
+      "repair": 0,
+      "disposition": "abandon",
+      "reason": "the review is moot"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started review",
+      "work-item-created review user review",
+      "timer-resolve-failed sla order.slaDuration",
+      "work-item-cancelled review",
+      "incident-raised sla",
+      "incident-repaired sla abandon",
+      "instance-completed"
+    ]
+  }
+}
