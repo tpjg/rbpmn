@@ -1677,11 +1677,11 @@ pub(crate) async fn persist_step(
 /// days-and-hours interval, and adding it back adds calendar days in the
 /// session's time zone — an hour wrong across a daylight-saving change.
 ///
-/// `frozen_at` is stamped inside the freezing transaction, so a row the
-/// scheduler picks after the stamp but before the freeze commits — it still
-/// reads the instance as active — is moved past the resume; the claim's
-/// `due_at <= now()` re-check is what keeps it from firing early
-/// (`spec/RepairClock.tla`, `NeverFiresEarly`).
+/// `frozen_at` is stamped inside the freezing transaction, so a row that
+/// came due after the stamp can be picked before the freeze commits — the
+/// scheduler still reads the instance as active — and is moved past the
+/// resume; the claim's `due_at <= now()` re-check is what keeps it from
+/// firing early (`spec/RepairClock.tla`, `NeverFiresEarly`).
 async fn resume_after_freeze(tx: &mut PgConnection, instance_id: Uuid) -> Result<(), EngineError> {
     sqlx::query(
         "update rbpmn_timer t set due_at = to_timestamp(extract(epoch from t.due_at) \

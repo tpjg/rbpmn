@@ -30,7 +30,7 @@ checks are known to have teeth rather than passing vacuously:
 | `Lease_EpochlessRelease.cfg` | **violation** | `release_task` without its lease epoch — a retried release freeing the claim that replaced it |
 | `Lease_CancelIgnoresGuard.cfg` | **violation** | completion without its `AlreadyClosed` check — a clerk's decision landing on a task the process had withdrawn |
 | `LeaseSiblings.cfg` | holds | the shipped lease, two items at a time |
-| `LeaseSiblings_CaughtIsReachable.cfg` | **violation** | not a bug: a final failure a boundary caught, on an instance still active, is reached — so `ActiveStrandsNobody` is not vacuous |
+| `LeaseSiblings_CaughtIsReachable.cfg` | **violation** | not a bug: a final failure a boundary caught, on an instance still active, is reached |
 | `LeaseSiblings_Stranded.cfg` | **violation** | not a bug: the price of the instance-wide freeze — a sibling's open item, perhaps leased mid-handler, stranded until an operator acts |
 | `TimerTeardown.cfg` | holds | the shipped teardown |
 | `TimerTeardown_Buggy.cfg` | **violation** | the phase-6 bug: teardown reaping tokens but not their timers |
@@ -461,11 +461,13 @@ resend in five states: freeze, send a repair of incident 0, land it as a
 Retry that fails again into incident 1, and land the same request there. The
 sibling's lease properties are checked through the thaw — `active` had never
 gone from FALSE to TRUE in any model — and hold; `ActiveStrandsNobody` is
-`LeaseSiblings_Stranded.cfg`'s price paid back, but it holds by the lease's
-guards once `active` does: what it pins is that the thaw restores `active`.
-A thaw's real stranding — a lease that lapsed during the freeze, nobody woken
-for it — is latency no model here sees, and `resume_after_freeze`'s wake
-answers it. `Repair_ThawIsReachable.cfg` shows the case reached.
+`LeaseSiblings_Stranded.cfg`'s price paid back, but it restates the lease's
+guards: it holds whenever `active` does, and trivially while frozen, so it
+cannot tell a thaw from none. `Repair_ThawIsReachable.cfg` is what pins the
+thaw, by reaching a stranded sibling that completes after one — make the
+repair leave the instance frozen and it finds nothing. A thaw's real
+stranding — a lease that lapsed during the freeze, nobody woken for it — is
+latency no model here sees, and `resume_after_freeze`'s wake answers it.
 
 **`RepairClock.tla`.** The claim path is `TimerTeardown`'s — pick with no lock,
 lock NOWAIT, re-check — and what is new is a row picked while due being moved
@@ -481,8 +483,7 @@ along its grid. `RepairClock_NoDueRecheck.cfg` drops the claim's
 never reschedule", which D8 made false; it is load-bearing now, and the claim
 path's comment says so. The freeze has to be two steps for the model to see
 any of this: an atomic one has no window, and concludes that a duration
-cannot be moved past now — which is wrong, and was this module's first
-version until review split it.
+cannot be moved past now.
 
 **Re-read, unchanged.** `LockOrder` needs nothing at either arity: a repair is
 a step — the instance row `FOR UPDATE`, then its per-instance rows, the timer

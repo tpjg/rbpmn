@@ -104,8 +104,8 @@ SiblingNeverStranded == I1!NeverStranded /\ I2!NeverStranded
 ActiveStrandsNobody == active => SiblingNeverStranded
 
 \* Deliberately FALSE — LeaseSiblings_CaughtIsReachable.cfg expects the
-\* violation. It proves ActiveStrandsNobody is not vacuous over the case it
-\* is there for: an item failed past its budget on an instance still active.
+\* violation. It shows the case ActiveStrandsNobody speaks of is reached: an
+\* item failed past its budget on an instance still active.
 NoFailureWasCaught == ~((state1 = "failed" \/ state2 = "failed") /\ active)
 
 FreezeAdvancesNothing ==
