@@ -13,11 +13,11 @@
 //! until then). Remote (HTTP) callers cannot share a transaction by nature;
 //! their contract is per-call atomicity plus idempotent retries.
 
-use crate::{Completion, Correlation, Engine, EngineError, FailOutcome, StartedInstance};
+use crate::{Completion, Correlation, Engine, EngineError, FailOutcome, Repaired, StartedInstance};
 use rbpmn_core::{
-    Bindings, Command, Counters, Event, ExecutableProcess, Halt, InstanceState, InstanceStatus,
-    ScopeId, ScopeState, SubscriptionId, SubscriptionState, TimerDue, TimerId, TimerState, Token,
-    TokenId, WaitKind, WorkItemId, WorkItemState, WorkKind, step,
+    Bindings, Command, Counters, Disposition, Event, ExecutableProcess, Halt, InstanceState,
+    InstanceStatus, ScopeId, ScopeState, SubscriptionId, SubscriptionState, TimerDue, TimerId,
+    TimerState, Token, TokenId, WaitKind, WorkItemId, WorkItemState, WorkKind, step,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
@@ -541,6 +541,98 @@ impl Engine {
             }
         };
         Ok(outcome)
+    }
+
+    /// Repair the instance's open incident (docs/design/incident-scope.md,
+    /// D4–D5): the disposition acts at the incident's resume point in one
+    /// step under the instance lock, like every other step path, so a
+    /// repaired history replays through the core like any other.
+    ///
+    /// `incident` is the number the request names. Any other number, or an
+    /// instance no longer frozen, is `StepError::IncidentNotOpen`; a
+    /// disposition the resume point does not allow is
+    /// `StepError::RepairRefused` with its cause. Both are typed and come
+    /// before anything changes, so a resent or stale request is answered
+    /// rather than stepped (D9).
+    pub async fn repair(
+        &self,
+        instance: Uuid,
+        incident: u64,
+        disposition: Disposition,
+        reason: &str,
+    ) -> Result<Repaired, EngineError> {
+        let mut tx = self.pool().begin().await?;
+        let repaired = self
+            .repair_in_tx(&mut tx, instance, incident, disposition, reason)
+            .await?;
+        tx.commit().await?;
+        Ok(repaired)
+    }
+
+    /// [`Engine::repair`] inside the caller's transaction.
+    pub async fn repair_in_tx(
+        &self,
+        tx: &mut PgConnection,
+        instance_id: Uuid,
+        incident: u64,
+        disposition: Disposition,
+        reason: &str,
+    ) -> Result<Repaired, EngineError> {
+        // What the core cannot know: a patch is a merge patch into a stored
+        // document, so it must be an object — a scalar would replace every
+        // variable — and nothing stored may hold a NUL. An answer is any
+        // value, as a decision's is.
+        match &disposition {
+            Disposition::Retry { patch } | Disposition::Advance { patch, .. } => {
+                reject_nul(patch)?;
+                require_object(patch, "repair patch")?;
+            }
+            _ => {}
+        }
+        if let Disposition::Advance {
+            answer: Some(answer),
+            ..
+        } = &disposition
+        {
+            reject_nul(answer)?;
+        }
+        reject_nul_text(reason, "repair reason")?;
+        let (definition, proc, bindings, mut state) =
+            match load_instance(self, &mut *tx, instance_id).await {
+                Ok(loaded) => loaded,
+                Err(EngineError::Db(sqlx::Error::RowNotFound)) => {
+                    return Err(EngineError::UnknownInstance(instance_id));
+                }
+                Err(e) => return Err(e),
+            };
+        let events = step_answering_decisions(
+            self,
+            tx,
+            &proc,
+            &definition,
+            &mut state,
+            Command::Repair {
+                incident,
+                disposition,
+                reason: reason.to_string(),
+            },
+        )
+        .await?;
+        persist_step(
+            tx,
+            &proc,
+            &definition,
+            &bindings,
+            instance_id,
+            &state,
+            &events,
+        )
+        .await?;
+        Ok(Repaired {
+            status: state.status,
+            incident: state.open_incident(),
+            events,
+        })
     }
 }
 

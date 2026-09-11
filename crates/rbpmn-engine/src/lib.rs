@@ -38,7 +38,8 @@ mod worker;
 
 pub use definitions::{DEFINITION_DECISION_VIEW, DEFINITION_VIEW};
 pub use error::{
-    Completion, Correlation, DeployError, Deployment, EngineError, FailOutcome, StartedInstance,
+    Completion, Correlation, DeployError, Deployment, EngineError, FailOutcome, Repaired,
+    StartedInstance,
 };
 pub use events::{EventCursor, EventRecord};
 #[cfg(feature = "http")]
@@ -47,7 +48,9 @@ pub use inspect::{
     EventView, InstanceInspection, ScopeView, SubscriptionView, TimerView, TokenView, WorkItemView,
 };
 pub use instances::{INSTANCE_VIEW, InstanceMatch, MAX_FIND_LIMIT};
-pub use rbpmn_core::{Bindings, Event, IndexDeclaration, IndexScope};
+pub use rbpmn_core::{
+    Bindings, Disposition, Event, IndexDeclaration, IndexScope, InstanceStatus, Refusal, StepError,
+};
 pub use retention::{
     ArchiveBatch, ArchiveError, InstanceRecord, PrunableDefinition, RetentionArchive,
     RetentionBatch, RetentionOptions, RetentionPolicy, RetentionReport,

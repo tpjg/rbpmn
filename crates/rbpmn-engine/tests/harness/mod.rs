@@ -5,7 +5,9 @@
 // Shared by several test binaries; each uses a different part.
 #![allow(dead_code)]
 
-use rbpmn_core::{Command, Event, ExecutableProcess, InstanceState, InstanceStatus};
+use rbpmn_core::{
+    Command, Disposition, Event, ExecutableProcess, InstanceState, InstanceStatus, RepairKind,
+};
 use rbpmn_engine::Engine;
 use sqlx::{PgPool, Row};
 use std::fs;
@@ -261,7 +263,7 @@ pub async fn core_events(pool: &PgPool, instance: Uuid) -> Vec<Event> {
 }
 
 /// Reconstruct the command sequence from the history. Most events are
-/// consequences; only these four are stimuli the outside world supplied. A
+/// consequences; only these five are stimuli the outside world supplied. A
 /// `variables-patched` immediately following its trigger carries that
 /// command's merge patch — `step` emits them adjacently.
 ///
@@ -295,6 +297,32 @@ pub fn commands_from(events: &[Event]) -> Vec<Command> {
             Event::MessageReceived { id, .. } => commands.push(Command::DeliverMessage {
                 id: *id,
                 patch: patch_after(i),
+            }),
+            // A repair names its incident and disposition in its own event;
+            // a patch it applied is the `variables-patched` right after it,
+            // as for every command (docs/design/incident-scope.md, D4).
+            Event::IncidentRepaired {
+                incident,
+                disposition,
+                code,
+                answer,
+                reason,
+                ..
+            } => commands.push(Command::Repair {
+                incident: *incident,
+                disposition: match disposition {
+                    RepairKind::Retry => Disposition::Retry {
+                        patch: patch_after(i),
+                    },
+                    RepairKind::Advance => Disposition::Advance {
+                        patch: patch_after(i),
+                        answer: answer.clone(),
+                    },
+                    RepairKind::Divert => Disposition::Divert { code: code.clone() },
+                    RepairKind::Abandon => Disposition::Abandon,
+                    RepairKind::AbandonInstance => Disposition::AbandonInstance,
+                },
+                reason: reason.clone(),
             }),
             Event::DecisionEvaluated { element, .. } => panic!(
                 "replay cannot reconstruct the decision at {element:?}: a decision's \

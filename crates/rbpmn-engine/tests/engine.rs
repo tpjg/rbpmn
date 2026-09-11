@@ -7,8 +7,9 @@ mod harness;
 use rbpmn_core::Bindings;
 use rbpmn_engine::testing::TestDb;
 use rbpmn_engine::{
-    Completion, DeployError, Engine, FailOptions, FailOutcome, HandlerFailure, HttpPostHandler,
-    ServiceTaskHandler, WorkItem, WorkerOptions,
+    Completion, DeployError, Disposition, Engine, EngineError, FailOptions, FailOutcome,
+    HandlerFailure, HttpPostHandler, InstanceStatus, ServiceTaskHandler, StepError, WorkItem,
+    WorkerOptions,
 };
 use sqlx::{PgPool, Row};
 use std::fs;
@@ -2007,6 +2008,309 @@ async fn a_delivery_that_would_break_its_boundary_is_refused() {
         open(open_items(&db.pool, started.id).await),
         ["review", "file_note"]
     );
+    db.drop().await;
+}
+
+/// Fail `item` with no code until its budget is spent and the instance
+/// freezes on it.
+async fn freeze_on(engine: &Engine, item: uuid::Uuid) {
+    for _ in 0..5 {
+        if engine
+            .fail_work_item(item, &FailOptions::default())
+            .await
+            .unwrap()
+            == FailOutcome::IncidentRaised
+        {
+            return;
+        }
+    }
+    panic!("failing {item} five times never raised an incident");
+}
+
+/// A repair is a command (docs/design/incident-scope.md, D4–D5), and a
+/// retried incident enters its task as if for the first time: a new work item
+/// with the budget the manifest gives it, while the failed row stays failed —
+/// a worker holding its id gets the ordinary `AlreadyClosed`. The repaired
+/// history replays through the pure core like any other.
+#[tokio::test]
+async fn a_retried_incident_mints_a_new_work_item_with_its_budget() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("st").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/10-error-boundary.bpmn"),
+            &Bindings::new().retries("st", rbpmn_core::RetryPolicy::new().attempts(2)),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    let (failed, _) = open_items(&db.pool, started.id).await[0].clone();
+    assert_eq!(
+        engine
+            .fail_work_item(failed, &fail_code("UNKNOWN_CODE"))
+            .await
+            .unwrap(),
+        FailOutcome::Retrying { retries_left: 1 }
+    );
+    assert_eq!(
+        engine
+            .fail_work_item(failed, &fail_code("UNKNOWN_CODE"))
+            .await
+            .unwrap(),
+        FailOutcome::IncidentRaised
+    );
+
+    let repaired = engine
+        .repair(
+            started.id,
+            0,
+            Disposition::Retry {
+                patch: serde_json::json!({"card": "renewed"}),
+            },
+            "the card was renewed",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (repaired.status, repaired.incident),
+        (InstanceStatus::Active, None)
+    );
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    let (fresh, element) = open[0].clone();
+    assert_eq!(element, "st");
+    assert_ne!(fresh, failed, "a repair creates an item, never reopens one");
+    let row = |id: uuid::Uuid| {
+        sqlx::query_as::<_, (String, i32)>(
+            "select state, retries from rbpmn_work_item where id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db.pool)
+    };
+    assert_eq!(row(fresh).await.unwrap(), ("available".to_string(), 2));
+    assert_eq!(row(failed).await.unwrap().0, "failed");
+    assert!(matches!(
+        engine
+            .complete_work_item(failed, serde_json::json!({}))
+            .await
+            .unwrap(),
+        Completion::AlreadyClosed { .. }
+    ));
+
+    engine
+        .complete_work_item(fresh, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// The price of the instance-wide freeze, paid back (D3, and
+/// `spec/LeaseSiblings.tla`'s stranded sibling): a clerk holding a sibling's
+/// task cannot record it while the instance is frozen, and can — with the
+/// same lease — the moment a repair lands.
+#[tokio::test]
+async fn a_repair_frees_the_sibling_the_freeze_stranded() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/03-parallel-gateway.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    let held = engine
+        .get_task("tb", &GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .expect("tb is on offer");
+    let (ta, _) = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .find(|(_, element)| element == "ta")
+        .unwrap();
+    freeze_on(&engine, ta).await;
+    assert!(matches!(
+        engine
+            .complete_task(held.id, "clerk", serde_json::json!({}))
+            .await,
+        Err(EngineError::IncidentOpen(_))
+    ));
+
+    let repaired = engine
+        .repair(
+            started.id,
+            0,
+            Disposition::Advance {
+                patch: serde_json::json!({}),
+                answer: None,
+            },
+            "packed by hand",
+        )
+        .await
+        .unwrap();
+    assert_eq!(repaired.status, InstanceStatus::Active);
+    engine
+        .complete_task(held.id, "clerk", serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// A repair names the incident it repairs (D9). Another number, an instance
+/// that is not frozen and no instance at all are answered typed, before
+/// anything changes, and so is a patch that is not an object. A Retry that
+/// fails again freezes under the next number, which is then the one to name.
+#[tokio::test]
+async fn a_repair_names_its_incident() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/17-message-catch.bpmn"),
+            &Bindings::new().correlation("c", "order.id"),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    assert_eq!(status_of(&db.pool, started.id).await, "failed");
+    let retry = |patch: serde_json::Value| Disposition::Retry { patch };
+    let empty = || serde_json::json!({});
+
+    assert!(matches!(
+        engine.repair(started.id, 1, retry(empty()), "resent").await,
+        Err(EngineError::Step(StepError::IncidentNotOpen {
+            named: 1,
+            open: Some(0)
+        }))
+    ));
+    assert!(matches!(
+        engine
+            .repair(uuid::Uuid::new_v4(), 0, retry(empty()), "nobody")
+            .await,
+        Err(EngineError::UnknownInstance(_))
+    ));
+    assert!(matches!(
+        engine
+            .repair(
+                started.id,
+                0,
+                retry(serde_json::json!(["a", "list"])),
+                "bad"
+            )
+            .await,
+        Err(EngineError::InvalidVariables(_))
+    ));
+
+    let again = engine
+        .repair(started.id, 0, retry(empty()), "try again")
+        .await
+        .unwrap();
+    assert_eq!(
+        (again.status, again.incident),
+        (InstanceStatus::Failed, Some(1))
+    );
+    assert!(matches!(
+        engine.repair(started.id, 0, retry(empty()), "resent").await,
+        Err(EngineError::Step(StepError::IncidentNotOpen {
+            named: 0,
+            open: Some(1)
+        }))
+    ));
+
+    let fixed = engine
+        .repair(
+            started.id,
+            1,
+            retry(serde_json::json!({"order": {"id": "o-17"}})),
+            "the order id was missing",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (fixed.status, fixed.incident),
+        (InstanceStatus::Active, None)
+    );
+    engine
+        .correlate("WarehouseAck", "o-17", empty())
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert!(matches!(
+        engine.repair(started.id, 1, retry(empty()), "late").await,
+        Err(EngineError::Step(StepError::IncidentNotOpen {
+            named: 1,
+            open: None
+        }))
+    ));
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// Abandoning a frozen instance ends it as `Terminated` (D5): the sibling's
+/// open item is cancelled with everything else, and the instance becomes
+/// retention's to retire, which a `failed` one never is.
+#[tokio::test]
+async fn abandoning_a_frozen_instance_hands_it_to_retention() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/03-parallel-gateway.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    let items = open_items(&db.pool, started.id).await;
+    let item_at = |element: &str| items.iter().find(|(_, e)| e == element).unwrap().0;
+    let (ta, tb) = (item_at("ta"), item_at("tb"));
+    freeze_on(&engine, ta).await;
+
+    let repaired = engine
+        .repair(started.id, 0, Disposition::AbandonInstance, "written off")
+        .await
+        .unwrap();
+    assert_eq!(
+        (repaired.status, repaired.incident),
+        (InstanceStatus::Terminated, None)
+    );
+    let (status, closed): (String, bool) =
+        sqlx::query_as("select status, completed_at is not null from rbpmn_instance where id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!((status.as_str(), closed), ("terminated", true));
+    let tb_state: String = sqlx::query_scalar("select state from rbpmn_work_item where id = $1")
+        .bind(tb)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(tb_state, "cancelled");
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
     db.drop().await;
 }
 
