@@ -1220,9 +1220,9 @@ async fn deploy_carries_decision_artifacts() {
 
 /// Repair over HTTP (docs/design/incident-scope.md, D10). An instance frozen on
 /// a correlation it could never make is repaired by naming its incident: a
-/// stale number is 409 with the incident to name instead, a field the
-/// disposition does not take is 400, a disposition the incident does not
-/// allow is 422 — and the Retry that fixes the key lands.
+/// stale number is 409 with the incident to name instead, a malformed body or
+/// a field the disposition does not take is 400, a disposition the incident
+/// does not allow is 422 — and the Retry that fixes the key lands.
 #[tokio::test]
 async fn an_incident_is_repaired_over_http() {
     let (app, db) = test_app().await;
@@ -1267,6 +1267,17 @@ async fn an_incident_is_repaired_over_http() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A malformed body is 400 as well — a typo must not read as a refusal.
+    for malformed in [
+        serde_json::json!({ "incident": 0, "disposition": "advance", "anwser": 1, "reason": "typo" }),
+        serde_json::json!({ "incident": 0, "disposition": "retry" }),
+        serde_json::json!({ "incident": -1, "disposition": "retry", "reason": "negative" }),
+    ] {
+        let resp = post(repair.clone(), malformed).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(resp).await["error"].is_string());
+    }
 
     let resp = post(
         repair.clone(),

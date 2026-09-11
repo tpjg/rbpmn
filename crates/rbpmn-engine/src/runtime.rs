@@ -1722,13 +1722,17 @@ async fn resume_after_freeze(tx: &mut PgConnection, instance_id: Uuid) -> Result
     // Wake whoever the freeze put to sleep: a timer the moves made due, and a
     // service item that became claimable again, would otherwise wait out a
     // poll interval — their own NOTIFY was spent while the instance was
-    // frozen. Items this step creates notify for themselves.
+    // frozen. Claimable again includes a lease that lapsed during the freeze:
+    // a worker whose completion the freeze refused keeps its lease rather
+    // than re-run the handler, and that lease runs out. Items this step
+    // creates notify for themselves.
     sqlx::query("select pg_notify('rbpmn_timer', '')")
         .execute(&mut *tx)
         .await?;
     let topics: Vec<String> = sqlx::query_scalar(
         "select distinct topic from rbpmn_work_item \
-         where instance_id = $1 and state = 'available' and kind = 'service'",
+         where instance_id = $1 and kind = 'service' \
+           and (state = 'available' or (state = 'locked' and lock_until < now()))",
     )
     .bind(instance_id)
     .fetch_all(&mut *tx)

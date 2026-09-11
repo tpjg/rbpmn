@@ -494,8 +494,21 @@ fn disposition_of(
 pub async fn repair(
     State(engine): State<Engine>,
     Path(id): Path<Uuid>,
-    Json(body): Json<RepairBody>,
+    payload: Result<Json<RepairBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    // A malformed body is the caller's mistake, 400 like a field the
+    // disposition does not take — never the extractor's 422, which on this
+    // route means the incident refused the disposition.
+    let Json(body) = match payload {
+        Ok(body) => body,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": rejection.body_text() })),
+            )
+                .into_response();
+        }
+    };
     let disposition = match disposition_of(&body.disposition, body.patch, body.answer, body.code) {
         Ok(disposition) => disposition,
         Err(message) => {
