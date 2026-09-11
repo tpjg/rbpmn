@@ -84,8 +84,9 @@ but refuse to compile) and the instance migration API.
 
 Upgrading: once a model with a catch-all error boundary (no `errorRef`) is
 deployed, every engine process must be on this release — an older one refuses
-to start. The same holds from migration 0020 (repair): an older engine can
-neither load a halted token nor number the incidents a repair names.
+to start. Migration 0020 (repair) needs every engine on this release too: an
+older one still starts, but cannot load a halted token or number the
+incidents a repair names.
 
 ## Workspace
 

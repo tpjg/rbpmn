@@ -496,18 +496,24 @@ pub async fn repair(
     Path(id): Path<Uuid>,
     payload: Result<Json<RepairBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    // A malformed body is the caller's mistake, 400 like a field the
+    // Malformed JSON is the caller's mistake, 400 like a field the
     // disposition does not take — never the extractor's 422, which on this
-    // route means the incident refused the disposition.
+    // route means the incident refused the disposition. Every other
+    // rejection keeps the framework's own answer (413 for a body over the
+    // limit, 415 without a JSON content type), which clients switch on.
     let Json(body) = match payload {
         Ok(body) => body,
-        Err(rejection) => {
+        Err(
+            rejection @ (axum::extract::rejection::JsonRejection::JsonDataError(_)
+            | axum::extract::rejection::JsonRejection::JsonSyntaxError(_)),
+        ) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": rejection.body_text() })),
             )
                 .into_response();
         }
+        Err(rejection) => return rejection.into_response(),
     };
     let disposition = match disposition_of(&body.disposition, body.patch, body.answer, body.code) {
         Ok(disposition) => disposition,

@@ -1278,6 +1278,21 @@ async fn an_incident_is_repaired_over_http() {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(body_json(resp).await["error"].is_string());
     }
+    // ...while the framework's own answers stand: no JSON content type is 415.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(&repair)
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::from(
+                    serde_json::json!({ "incident": 0, "disposition": "retry", "reason": "r" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
     let resp = post(
         repair.clone(),
