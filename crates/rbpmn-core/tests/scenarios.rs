@@ -6,7 +6,9 @@
 //! Traces are compared line by line — the `Display` format of `Event` is
 //! stable API, like rule IDs.
 
-use rbpmn_core::{Bindings, Command, ExecutableProcess, InstanceState, InstanceStatus, step};
+use rbpmn_core::{
+    Bindings, Command, Disposition, ExecutableProcess, InstanceState, InstanceStatus, step,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fmt::Write as _;
@@ -71,7 +73,6 @@ struct DeliverAction {
 /// does not pass.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)] // read once the core takes `Command::Repair`
 struct RepairAction {
     repair: u64,
     disposition: String,
@@ -92,6 +93,55 @@ struct RepairAction {
 /// out gives none.
 fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
     Value::deserialize(d).map(Some)
+}
+
+/// The command a repair action states. A field its disposition does not take
+/// is a scenario error, never ignored.
+fn repair_command(r: &RepairAction) -> Command {
+    let patch = r.patch.clone().unwrap_or_else(|| serde_json::json!({}));
+    let takes_no = |absent: bool, what: &str| {
+        assert!(
+            absent,
+            "repair of incident {}: {} takes no {what}",
+            r.repair, r.disposition
+        );
+    };
+    let disposition = match r.disposition.as_str() {
+        "retry" => {
+            takes_no(r.answer.is_none() && r.code.is_none(), "answer or code");
+            Disposition::Retry { patch }
+        }
+        "advance" => {
+            takes_no(r.code.is_none(), "code");
+            Disposition::Advance {
+                patch,
+                answer: r.answer.clone(),
+            }
+        }
+        "divert" => {
+            takes_no(r.patch.is_none() && r.answer.is_none(), "patch or answer");
+            Disposition::Divert {
+                code: r.code.clone(),
+            }
+        }
+        "abandon" | "abandon-instance" => {
+            takes_no(
+                r.patch.is_none() && r.answer.is_none() && r.code.is_none(),
+                "patch, answer or code",
+            );
+            if r.disposition == "abandon" {
+                Disposition::Abandon
+            } else {
+                Disposition::AbandonInstance
+            }
+        }
+        other => panic!("repair of incident {}: no disposition '{other}'", r.repair),
+    };
+    Command::Repair {
+        incident: r.repair,
+        disposition,
+        reason: r.reason.clone().unwrap_or_else(|| "scenario".to_string()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -158,6 +208,7 @@ fn run_scenario(path: &Path, failures: &mut String) {
             Action::Repair(r) => r.refused.as_deref(),
             _ => None,
         };
+        let label: String;
         let (element, command) = match action {
             Action::Complete(CompleteAction { complete, patch }) => {
                 let node = proc
@@ -224,13 +275,9 @@ fn run_scenario(path: &Path, failures: &mut String) {
                 let patch = patch.clone().unwrap_or_else(|| serde_json::json!({}));
                 (deliver, Command::DeliverMessage { id, patch })
             }
-            Action::Repair(_) => {
-                writeln!(
-                    failures,
-                    "{name}: a repair action needs `Command::Repair`, which the core does not have"
-                )
-                .unwrap();
-                return;
+            Action::Repair(r) => {
+                label = format!("incident {}", r.repair);
+                (&label, repair_command(r))
             }
         };
         let before = state.clone();

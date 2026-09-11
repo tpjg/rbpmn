@@ -1380,3 +1380,72 @@ fn the_history_records_what_the_instance_started_with() {
     assert_eq!(payload["kind"], "instance-started");
     assert_eq!(payload["variables"], opening);
 }
+
+/// An instance frozen before repair existed may hold several tokens at an
+/// incident, and its cause cannot be told from its collateral: a repair is
+/// refused, typed, and only abandoning the instance — which needs no cause —
+/// lands (docs/design/incident-scope.md, D7).
+#[test]
+fn a_frozen_instance_with_two_incident_tokens_can_only_be_abandoned() {
+    let proc = compile("accept/03-parallel-gateway.bpmn");
+    let at = |id: &str| Token {
+        node: proc.node_by_id(id).unwrap(),
+        scope: ScopeId::ROOT,
+        wait: WaitKind::Incident,
+    };
+    let legacy = InstanceState::rehydrate(
+        InstanceStatus::Failed,
+        json!({}),
+        [(TokenId(1), at("ta")), (TokenId(2), at("tb"))],
+        [],
+        [],
+        [],
+        [],
+        Counters {
+            next_token: 3,
+            next_work_item: 2,
+            next_incident: 1,
+            ..Counters::default()
+        },
+    );
+    let repair = |disposition| Command::Repair {
+        incident: 0,
+        disposition,
+        reason: "frozen before the upgrade".to_string(),
+    };
+    let mut state = legacy.clone();
+    assert_eq!(
+        step(
+            &proc,
+            &mut state,
+            repair(Disposition::Retry { patch: json!({}) })
+        ),
+        Err(StepError::RepairRefused(Refusal::CauseUnknown))
+    );
+    assert_eq!(state, legacy);
+    let events = step(&proc, &mut state, repair(Disposition::AbandonInstance)).unwrap();
+    assert_eq!(state.status, InstanceStatus::Terminated);
+    assert_eq!(
+        events.last().map(|e| e.to_string()),
+        Some("instance-terminated".to_string())
+    );
+}
+
+/// `incident-repaired` keeps a null answer apart from none: an Advance may
+/// answer a decision with null, and a replay must rebuild exactly that.
+#[test]
+fn a_repair_event_keeps_a_null_answer_apart_from_none() {
+    let with = |answer| Event::IncidentRepaired {
+        incident: 0,
+        element: "decide".to_string(),
+        disposition: RepairKind::Advance,
+        code: None,
+        answer,
+        reason: "priced by hand".to_string(),
+    };
+    for event in [with(Some(Value::Null)), with(Some(json!(30))), with(None)] {
+        let stored = serde_json::to_value(&event).unwrap();
+        assert_eq!(serde_json::from_value::<Event>(stored).unwrap(), event);
+    }
+    assert_eq!(with(None).to_string(), "incident-repaired decide advance");
+}

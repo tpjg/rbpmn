@@ -1493,6 +1493,9 @@ pub(crate) async fn persist_step(
             | Event::FlowTaken { .. }
             | Event::VariablesPatched { .. }
             | Event::IncidentRaised { .. }
+            // A repair's rows move with the events that follow it; this one
+            // records who decided what there, and why.
+            | Event::IncidentRepaired { .. }
             | Event::CorrelationFailed { .. }
             // Recorded, never projected: the freeze that follows is what
             // changes rows. These carry the *reason* an operator needs.

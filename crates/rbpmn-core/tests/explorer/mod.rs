@@ -451,6 +451,34 @@ pub fn stimuli(
     codes: &[Option<String>],
 ) -> Vec<Command> {
     let mut out = Vec::new();
+    // A frozen instance takes one kind of command: a repair of its open
+    // incident — every disposition over the alphabet everything else gets
+    // (docs/design/incident-scope.md, D5). Refusals are typed and skipped
+    // like any other; a repair that lands is explored like any other step.
+    if let Some(incident) = s.open_incident() {
+        let repair = |disposition| Command::Repair {
+            incident,
+            disposition,
+            reason: "explored".to_string(),
+        };
+        for p in patches {
+            out.push(repair(Disposition::Retry { patch: p.clone() }));
+            out.push(repair(Disposition::Advance {
+                patch: p.clone(),
+                answer: None,
+            }));
+            out.push(repair(Disposition::Advance {
+                patch: json!({}),
+                answer: Some(p.clone()),
+            }));
+        }
+        for c in codes {
+            out.push(repair(Disposition::Divert { code: c.clone() }));
+        }
+        out.push(repair(Disposition::Abandon));
+        out.push(repair(Disposition::AbandonInstance));
+        return out;
+    }
     for (id, _) in s.open_work_items() {
         for p in patches {
             out.push(Command::CompleteWorkItem {
@@ -541,9 +569,13 @@ pub fn explore(proc: &ExecutableProcess, initial: Value, codes: &[String]) -> Re
                 return r;
             }
         }
+        // A frozen instance is a terminal of the run that froze it and the
+        // start of every repair (D5): counted, then expanded.
         if s.status != InstanceStatus::Active {
             r.terminals += 1;
-            continue;
+            if s.status != InstanceStatus::Failed {
+                continue;
+            }
         }
         for cmd in stimuli(proc, &s, &patches, &codes_opt) {
             let mut next = s.clone();

@@ -16,7 +16,7 @@
 //! and poisons the state.
 
 use crate::compile::{ExecKind, ExecutableProcess, FlowIx, NodeIx, TimerDue};
-use crate::event::Event;
+use crate::event::{Event, RepairKind};
 use crate::merge_patch::merge_patch;
 use crate::state::{
     Halt, InstanceState, InstanceStatus, ScopeId, ScopeState, SubscriptionId, SubscriptionState,
@@ -76,6 +76,91 @@ pub enum Command {
         answer: Option<Value>,
         reason: Option<String>,
     },
+    /// Repair the instance's open incident (docs/design/incident-scope.md,
+    /// D4–D5). Never a state edit: the disposition acts at the incident's
+    /// resume point through the advancer every command uses, so every state
+    /// it reaches is one a normal execution could have, and a history with
+    /// repairs in it replays through this core. `incident` is the number the
+    /// request names (D9); any other is refused, so a resent or stale request
+    /// is answered rather than stepped.
+    Repair {
+        incident: u64,
+        disposition: Disposition,
+        reason: String,
+    },
+}
+
+/// What a repair does at its incident's resume point
+/// (docs/design/incident-scope.md, D5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Disposition {
+    /// Merge the patch, then enter the resume point as if for the first
+    /// time: a new work item with the manifest's budget, the decision asked
+    /// again, arms resolved against the patched document.
+    Retry { patch: Value },
+    /// Complete the resume point and leave along its outgoing flow: a task,
+    /// catch or subprocess with `patch` merged; a business-rule task with the
+    /// `answer` its decision could not give, written by replacement, and no
+    /// patch.
+    Advance { patch: Value, answer: Option<Value> },
+    /// Raise the error at the resume point and walk outward as `RaiseError`
+    /// does; `None` is caught by a catch-all only.
+    Divert { code: Option<String> },
+    /// Consume the token as though it reached an end event.
+    Abandon,
+    /// End the instance as `Terminated`.
+    AbandonInstance,
+}
+
+impl Disposition {
+    /// Which disposition this is, as `incident-repaired` records it.
+    pub fn kind(&self) -> RepairKind {
+        match self {
+            Disposition::Retry { .. } => RepairKind::Retry,
+            Disposition::Advance { .. } => RepairKind::Advance,
+            Disposition::Divert { .. } => RepairKind::Divert,
+            Disposition::Abandon => RepairKind::Abandon,
+            Disposition::AbandonInstance => RepairKind::AbandonInstance,
+        }
+    }
+}
+
+/// Why a repair was refused, before anything changed (D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Refusal {
+    #[error("a repair needs a reason: it is what makes the history an audit trail")]
+    NoReason,
+    #[error(
+        "the instance froze before repair existed, with several tokens at an incident, so its \
+         cause cannot be told from its collateral — abandon the instance instead"
+    )]
+    CauseUnknown,
+    #[error("an event-based gateway has no single way on — retry it, or divert")]
+    GatewayHasNoSingleWayOn,
+    #[error(
+        "a business-rule task advances with the answer its decision could not give, and no \
+         patch"
+    )]
+    DecisionNeedsAnAnswer,
+    #[error("only a business-rule task takes an answer — advance anything else with a patch")]
+    AnswerOnlyForADecision,
+    #[error(
+        "no boundary catches it here or further out, and diverting into nothing would lose \
+         the token"
+    )]
+    NothingCatches,
+    #[error(
+        "a join could wait for this token forever — abandon only on a side path, or the last \
+         token of its scope"
+    )]
+    AJoinWouldWait,
+}
+
+fn open_incident_text(open: &Option<u64>) -> String {
+    match open {
+        Some(n) => format!("the open incident is {n}"),
+        None => "the instance is not frozen".to_string(),
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -102,6 +187,14 @@ pub enum StepError {
     /// (docs/design/incident-scope.md, D11).
     #[error("delivery refused: boundary '{element}' could not re-arm — {reason}")]
     BoundaryCannotRearm { element: String, reason: String },
+    /// A repair named an incident that is not the open one: resent, stale,
+    /// or for an instance no longer frozen (docs/design/incident-scope.md,
+    /// D9).
+    #[error("incident {named} is not open — {}", open_incident_text(.open))]
+    IncidentNotOpen { named: u64, open: Option<u64> },
+    /// A repair the incident's resume point does not allow (D5).
+    #[error("repair refused: {0}")]
+    RepairRefused(Refusal),
     #[error("internal invariant violated: {0} — state is poisoned")]
     Invariant(String),
 }
@@ -202,6 +295,34 @@ fn arm_key(
         });
     }
     Ok((message.to_string(), key_value))
+}
+
+/// The error boundary that catches `code` raised at `host`, and the token it
+/// interrupts: on `host` itself, else on the nearest enclosing subprocess —
+/// an exact code before a catch-all at each — whose parked token is then the
+/// one interrupted, its whole scope torn down with it. `None` is uncaught.
+fn catcher(
+    proc: &ExecutableProcess,
+    state: &InstanceState,
+    host: NodeIx,
+    token: TokenId,
+    scope: ScopeId,
+    code: Option<&str>,
+) -> Option<(TokenId, NodeIx)> {
+    let (mut host, mut target, mut scope) = (host, token, scope);
+    loop {
+        if let Some(boundary) = proc.error_boundary(host, code) {
+            return Some((target, boundary));
+        }
+        let enclosing = state.scopes.get(&scope)?;
+        host = enclosing.element;
+        target = enclosing.token;
+        scope = enclosing.parent;
+    }
+}
+
+fn is_empty(patch: &Value) -> bool {
+    *patch == Value::Object(serde_json::Map::new())
 }
 
 pub fn step(
@@ -386,27 +507,12 @@ pub fn step(
             // can only ever meet a catch-all, and the walk runs for it too:
             // it is the shape of the failure nobody anticipated, which is
             // what a catch-all exists for.
-            let mut caught = None;
-            let mut host = element;
-            let mut target = token_id;
-            let mut scope = state
+            let scope = state
                 .tokens
                 .get(&token_id)
                 .map(|t| t.scope)
                 .unwrap_or(ScopeId::ROOT);
-            loop {
-                if let Some(boundary) = proc.error_boundary(host, code.as_deref()) {
-                    caught = Some((target, boundary));
-                    break;
-                }
-                let Some(enclosing) = state.scopes.get(&scope) else {
-                    break; // reached the instance root uncaught
-                };
-                host = enclosing.element;
-                target = enclosing.token;
-                scope = enclosing.parent;
-            }
-            match caught {
+            match catcher(proc, state, element, token_id, scope, code.as_deref()) {
                 Some((target, boundary_ix)) => {
                     // When the catcher is an enclosing subprocess, the
                     // failing task's token is inside the doomed scope, so
@@ -426,6 +532,164 @@ pub fn step(
                     Ok(adv.events)
                 }
             }
+        }
+        Command::Repair {
+            incident,
+            disposition,
+            reason,
+        } => {
+            // Everything is checked before anything changes, as for every
+            // refusal here: the incident named, the reason, and whether the
+            // disposition is one the incident's resume point allows
+            // (docs/design/incident-scope.md, D5, D9).
+            let open = state.open_incident();
+            if open != Some(incident) {
+                return Err(StepError::IncidentNotOpen {
+                    named: incident,
+                    open,
+                });
+            }
+            if reason.trim().is_empty() {
+                return Err(StepError::RepairRefused(Refusal::NoReason));
+            }
+            // One cause per incident (D6). An instance frozen before repair
+            // existed may hold several tokens at an incident and nothing to
+            // tell its cause from its collateral; only abandoning it, which
+            // needs no cause, is left — and its event names the first.
+            let causes: Vec<TokenId> = state
+                .tokens()
+                .filter(|(_, t)| t.wait == WaitKind::Incident)
+                .map(|(id, _)| id)
+                .collect();
+            let Some(&cause) = causes.first() else {
+                return Err(StepError::Invariant(
+                    "a frozen instance has no token at an incident".to_string(),
+                ));
+            };
+            if causes.len() > 1 && disposition != Disposition::AbandonInstance {
+                return Err(StepError::RepairRefused(Refusal::CauseUnknown));
+            }
+            let parked = state.tokens[&cause].clone();
+            let resume = proc.resume_point(parked.node);
+            let mut diverted_to = None;
+            match &disposition {
+                Disposition::Retry { .. } | Disposition::AbandonInstance => {}
+                Disposition::Advance { patch, answer } => {
+                    let decision = matches!(proc.node(resume).kind, ExecKind::BusinessRule { .. });
+                    if matches!(proc.node(resume).kind, ExecKind::EventBasedGateway) {
+                        return Err(StepError::RepairRefused(Refusal::GatewayHasNoSingleWayOn));
+                    }
+                    if decision && (answer.is_none() || !is_empty(patch)) {
+                        return Err(StepError::RepairRefused(Refusal::DecisionNeedsAnAnswer));
+                    }
+                    if !decision && answer.is_some() {
+                        return Err(StepError::RepairRefused(Refusal::AnswerOnlyForADecision));
+                    }
+                }
+                Disposition::Divert { code } => {
+                    diverted_to =
+                        catcher(proc, state, resume, cause, parked.scope, code.as_deref());
+                    if diverted_to.is_none() {
+                        return Err(StepError::RepairRefused(Refusal::NothingCatches));
+                    }
+                }
+                Disposition::Abandon => {
+                    let last_of_its_scope = !state
+                        .tokens()
+                        .any(|(id, t)| id != cause && t.scope == parked.scope);
+                    if !proc.on_side_path(resume) && !last_of_its_scope {
+                        return Err(StepError::RepairRefused(Refusal::AJoinWouldWait));
+                    }
+                }
+            }
+
+            let mut adv = Advancer::new(proc);
+            adv.events.push(Event::IncidentRepaired {
+                incident,
+                element: proc.node_id(parked.node).to_string(),
+                disposition: disposition.kind(),
+                code: match &disposition {
+                    Disposition::Divert { code } => code.clone(),
+                    _ => None,
+                },
+                answer: match &disposition {
+                    Disposition::Advance { answer, .. } => answer.clone(),
+                    _ => None,
+                },
+                reason,
+            });
+            if let Disposition::Retry { patch } | Disposition::Advance { patch, .. } = &disposition
+                && !is_empty(patch)
+            {
+                merge_patch(&mut state.variables, patch);
+                adv.events.push(Event::VariablesPatched {
+                    patch: patch.clone(),
+                });
+            }
+            // Status is derived (D6): once the cause moves nothing is parked
+            // at an incident, so the instance is active before its moves run
+            // and the ordinary tests apply after them — an emptied root
+            // completes, a Retry that fails again freezes under a new number.
+            state.status = InstanceStatus::Active;
+            adv.scope = parked.scope;
+            match disposition {
+                Disposition::Retry { .. } => {
+                    state.tokens.remove(&cause);
+                    adv.queue.push_back(Move {
+                        token: cause,
+                        node: resume,
+                        via: None,
+                        scope: parked.scope,
+                    });
+                }
+                Disposition::Advance { answer, .. } => {
+                    state.tokens.remove(&cause);
+                    if let (Some(answer), ExecKind::BusinessRule { result, .. }) =
+                        (answer, &proc.node(resume).kind)
+                    {
+                        assign(&mut state.variables, result, answer);
+                    }
+                    adv.element_completed(resume);
+                    adv.leave_single(state, cause, resume)?;
+                }
+                Disposition::Divert { .. } => {
+                    let (target, boundary) = diverted_to.expect("checked above");
+                    adv.interrupt_to_boundary(state, target, boundary)?;
+                }
+                Disposition::Abandon => {
+                    state.tokens.remove(&cause);
+                    adv.complete_scope_if_empty(state, parked.scope)?;
+                }
+                Disposition::AbandonInstance => {
+                    adv.terminate(state);
+                    return Ok(adv.events);
+                }
+            }
+            // Collateral resumes with the cause, whatever the disposition,
+            // in token order (D7): a move in flight enters its node on the
+            // flow it was on; a pending decision is asked again once the
+            // moves have settled.
+            let halted: Vec<(TokenId, Token)> = state
+                .tokens()
+                .filter(|(_, t)| matches!(t.wait, WaitKind::Halted(_)))
+                .map(|(id, t)| (id, t.clone()))
+                .collect();
+            for (id, t) in halted {
+                match t.wait {
+                    WaitKind::Halted(Halt::InFlight { via }) => {
+                        state.tokens.remove(&id);
+                        adv.queue.push_back(Move {
+                            token: id,
+                            node: t.node,
+                            via,
+                            scope: t.scope,
+                        });
+                    }
+                    WaitKind::Halted(Halt::AwaitingDecision) => adv.reask.push(id),
+                    _ => unreachable!("filtered to halted tokens"),
+                }
+            }
+            adv.run(state)
         }
         Command::FireTimer { id } => {
             if state.status != InstanceStatus::Active {
@@ -644,6 +908,9 @@ struct Advancer<'a> {
     /// signature. The two places that *do* change scope — entering a
     /// subprocess and resuming its parent — set it explicitly.
     scope: ScopeId,
+    /// Halted decisions a repair asks again once its moves have settled
+    /// (docs/design/incident-scope.md, D7).
+    reask: Vec<TokenId>,
 }
 
 impl<'a> Advancer<'a> {
@@ -653,6 +920,7 @@ impl<'a> Advancer<'a> {
             events: Vec::new(),
             queue: VecDeque::new(),
             scope: ScopeId::ROOT,
+            reask: Vec::new(),
         }
     }
 
@@ -663,6 +931,24 @@ impl<'a> Advancer<'a> {
             }
             self.scope = mv.scope;
             self.enter(state, mv.token, mv.node, mv.via)?;
+        }
+        // A repair's halted decisions are asked again once its moves have
+        // settled — unless one of those froze the instance again, and then
+        // they stay halted for the next repair.
+        if state.status == InstanceStatus::Active {
+            for token in std::mem::take(&mut self.reask) {
+                let Some(t) = state.tokens.get_mut(&token) else {
+                    continue; // reaped by a teardown one of the moves ran
+                };
+                t.wait = WaitKind::Decision;
+                let node = t.node;
+                if let ExecKind::BusinessRule { decision, .. } = &self.proc.node(node).kind {
+                    self.events.push(Event::DecisionRequested {
+                        element: self.proc.node_id(node).to_string(),
+                        decision: decision.clone(),
+                    });
+                }
+            }
         }
         if state.status == InstanceStatus::Active && state.tokens.is_empty() {
             state.status = InstanceStatus::Completed;
@@ -919,26 +1205,32 @@ impl<'a> Advancer<'a> {
                     self.tear_down_scope(state, scope);
                     return self.complete_scope(state, scope);
                 }
-                let open: Vec<WorkItemId> = state
-                    .work_items
-                    .iter()
-                    .filter(|(_, w)| w.open)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in open {
-                    self.cancel_work_item(state, id);
-                }
-                // Everything of the instance goes in one transaction:
-                // tokens, work items, timers, subscriptions, scopes.
-                self.withdraw_arms(state, None);
-                state.tokens.clear();
-                state.scopes.clear();
-                self.queue.clear();
-                state.status = InstanceStatus::Terminated;
-                self.events.push(Event::InstanceTerminated);
+                self.terminate(state);
                 Ok(())
             }
         }
+    }
+
+    /// End the instance as `Terminated`: every open work item cancelled,
+    /// every arm withdrawn, every token and scope gone — everything of the
+    /// instance in one transaction. A terminate end at the root and the
+    /// abandon-instance repair both end here.
+    fn terminate(&mut self, state: &mut InstanceState) {
+        let open: Vec<WorkItemId> = state
+            .work_items
+            .iter()
+            .filter(|(_, w)| w.open)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in open {
+            self.cancel_work_item(state, id);
+        }
+        self.withdraw_arms(state, None);
+        state.tokens.clear();
+        state.scopes.clear();
+        self.queue.clear();
+        state.status = InstanceStatus::Terminated;
+        self.events.push(Event::InstanceTerminated);
     }
 
     /// Parallel join: arrivals park silently; the join executes once, when

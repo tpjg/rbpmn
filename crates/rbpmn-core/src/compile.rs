@@ -803,6 +803,13 @@ pub struct ExecutableProcess {
     /// `error_boundaries` stays separate — it is matched by code (or taken by
     /// the catch-all), never armed.
     boundaries: BTreeMap<NodeIx, Vec<NodeIx>>,
+    /// boundary node -> its host, for every boundary kind: where a token
+    /// parked at a boundary that could not arm resumes.
+    hosts: BTreeMap<NodeIx, NodeIx>,
+    /// Nodes on some non-interrupting boundary's side path, in that
+    /// boundary's own scope. `boundary-side-path` ends such a path in nothing
+    /// and refuses a parallel block on it, so no join waits for a token there.
+    side_path: Vec<bool>,
     /// Each static scope's start event; index 0 is the process root. The
     /// rest of the scope tree (parents, owners) is only needed while
     /// compiling, so it does not survive into the runtime model.
@@ -1270,11 +1277,13 @@ impl ExecutableProcess {
         }
 
         let mut error_boundaries: BTreeMap<NodeIx, Vec<(Option<String>, NodeIx)>> = BTreeMap::new();
+        let mut hosts: BTreeMap<NodeIx, NodeIx> = BTreeMap::new();
         let mut boundaries: BTreeMap<NodeIx, Vec<NodeIx>> = BTreeMap::new();
         for (boundary_ix, host_id) in boundary_hosts {
             let host = *node_ix.get(host_id.as_str()).ok_or_else(|| {
                 CompileError::Internal(format!("boundary host '{host_id}' missing"))
             })?;
+            hosts.insert(boundary_ix, host);
             match &nodes[boundary_ix].kind {
                 ExecKind::ErrorBoundary { code } => {
                     // Errors originate from failing work items — a service
@@ -1327,6 +1336,43 @@ impl ExecutableProcess {
             }
         }
 
+        // Side-path membership: the closure `boundary-side-path` reasons
+        // about, from each non-interrupting boundary over sequence flows and
+        // the boundaries attached to the path's own activities. Flows never
+        // leave a scope and a subprocess body is entered only through its
+        // start, so the closure stays in the boundary's scope — a body is a
+        // block of its own, where a join may well wait.
+        let mut side_path = vec![false; nodes.len()];
+        for &b in hosts.keys() {
+            if nodes[b].kind.boundary_interrupts() {
+                continue;
+            }
+            let mut seen = vec![false; nodes.len()];
+            let mut queue = vec![b];
+            seen[b] = true;
+            while let Some(v) = queue.pop() {
+                let onward = nodes[v]
+                    .outgoing
+                    .iter()
+                    .map(|&f| flows[f].target)
+                    .chain(boundaries.get(&v).into_iter().flatten().copied())
+                    .chain(
+                        error_boundaries
+                            .get(&v)
+                            .into_iter()
+                            .flatten()
+                            .map(|(_, e)| *e),
+                    );
+                for w in onward {
+                    if !seen[w] {
+                        seen[w] = true;
+                        side_path[w] = true;
+                        queue.push(w);
+                    }
+                }
+            }
+        }
+
         // Node indices line up with `flat` here: the one `continue` in the
         // node pass (a business-rule task without a binding) already returned
         // above with `MissingDecision`.
@@ -1360,6 +1406,8 @@ impl ExecutableProcess {
             ids,
             error_boundaries,
             boundaries,
+            hosts,
+            side_path,
             scope_starts,
             start,
         })
@@ -1426,6 +1474,39 @@ impl ExecutableProcess {
     /// catch-all — and never armed.
     pub fn boundaries(&self, host: NodeIx) -> &[NodeIx] {
         self.boundaries.get(&host).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The host `boundary` is attached to.
+    pub fn host_of(&self, boundary: NodeIx) -> Option<NodeIx> {
+        self.hosts.get(&boundary).copied()
+    }
+
+    /// Where a repair re-enters for an incident parked at `node`
+    /// (docs/design/incident-scope.md, finding 2): a boundary that could not
+    /// arm resumes at its host, an event-gateway alternative that could not
+    /// arm at the gateway — lint gives such a target exactly one incoming
+    /// flow — and anything else at itself.
+    pub fn resume_point(&self, node: NodeIx) -> NodeIx {
+        if let Some(host) = self.host_of(node) {
+            return host;
+        }
+        match self.nodes[node].incoming.as_slice() {
+            [f] if matches!(
+                self.nodes[self.flows[*f].source].kind,
+                ExecKind::EventBasedGateway
+            ) =>
+            {
+                self.flows[*f].source
+            }
+            _ => node,
+        }
+    }
+
+    /// Is `node` on a non-interrupting boundary's side path, in that
+    /// boundary's own scope? Nothing there joins, so consuming a token at it
+    /// leaves no join waiting (D5's Abandon).
+    pub fn on_side_path(&self, node: NodeIx) -> bool {
+        self.side_path[node]
     }
 
     /// What `node` subscribes with, if anything — see
