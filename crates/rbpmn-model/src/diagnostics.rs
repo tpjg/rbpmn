@@ -94,6 +94,13 @@ pub mod rule {
     /// key (a delivery patch can). Not always wrong, so a warning — with the
     /// consequence named.
     pub const SIDE_PATH_MESSAGE_ARM: &str = "side-path-message-arm";
+    /// A failure on a side path that nothing *on the side path* catches
+    /// escapes it: with no boundary further out it freezes the whole
+    /// instance, and with a catch-all further out it tears down the scope
+    /// around the host — the flow the side path exists to leave alone. Legal
+    /// BPMN and sometimes meant, so a warning; the remedy is a catch-all on
+    /// the side path (`docs/design/incident-scope.md`, D2).
+    pub const SIDE_PATH_FAILURE_ESCAPES: &str = "side-path-failure-escapes";
     /// Two message arms for the same message *and* the same correlation
     /// binding that can be live at once. Deploy-time (L2) like
     /// `unresolved-decision`: with *different* bindings both arms resolve to
@@ -224,6 +231,11 @@ pub const CATALOGUE: &[RuleInfo] = &[
         id: rule::SIDE_PATH_MESSAGE_ARM,
         severity: Severity::Warn,
         summary: "A message arm on a side path is armed once per activation of its non-interrupting boundary; unless each activation changes the correlation key, the second arm freezes the instance (duplicate-subscription).",
+    },
+    RuleInfo {
+        id: rule::SIDE_PATH_FAILURE_ESCAPES,
+        severity: Severity::Warn,
+        summary: "A failure on a side path that nothing on the side path catches escapes it — freezing the whole instance, or tearing down the scope around the host if a catch-all further out catches it. Give the failing activity, or an embedded subprocess around it on the side path, a catch-all (an error boundary with no errorRef).",
     },
     RuleInfo {
         id: rule::AMBIGUOUS_MESSAGE_ARM,

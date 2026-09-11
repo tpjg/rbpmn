@@ -95,17 +95,17 @@ per-branch.
 ### D1 — the catch-all error boundary (decided)
 
 An error boundary with no `errorRef` catches any error. That is standard
-BPMN; the parse already carries it (`model.rs:240`, `error_ref: Option<Id>`)
-and one L1 rule refuses it (`lint/mod.rs:689`). The rule relaxes: an **absent**
-`errorRef` is a catch-all; a **present but unresolvable** one stays the error
-it is today.
+BPMN, and the parse carries it (`model.rs:240`, `error_ref: Option<Id>`).
+Under `bpmn-structure`, an **absent** `errorRef` is a catch-all and a
+**present but unresolvable** one is an error: a typo must never read as
+"catch everything".
 
 This is the answer to the motivating case, and it is a modelling answer
 rather than an engine one: the author says on the diagram that a failure here
 is survivable, and a reviewer sees them say it. Nothing about the freeze
 changes — a model that does not draw one behaves exactly as now.
 
-Four things it must get right:
+Five things it must get right:
 
 - **It catches the codeless failure.** `RaiseError` today only looks for a
   boundary when the failure carries a code (`step.rs:309`), so a handler
@@ -121,6 +121,21 @@ Four things it must get right:
   anything" is a shape rather than a sentinel string a model could collide
   with.
 
+- **A round trip must not be what makes one.** bpmn-moddle reports a
+  reference that resolves to nothing only as an import warning and drops it
+  on export. With an absent `errorRef` meaning *catch everything*, a mistyped
+  reference passed through any bpmn-js modeler comes back as a catch-all, and
+  nothing in the XML is left to say it was a typo. The linter cannot see what
+  is no longer there, so the tools that round-trip must: `just fixtures-di`
+  refuses anything moddle warns about, and the editor reports a dropped
+  `errorRef` as an error on its boundary until the boundary has a code again
+  (`ui/src/editor/dropped-refs.js`). bpmnlint shares the blind spot — its
+  rules see only the tree moddle built — so the plugin lists that fixture
+  beside `duplicate-id` as something only deploy can catch. What no tool here
+  can reach is a third-party modeler that saves after importing: that has
+  made the catch-all real, and nothing downstream can tell it from one drawn
+  on purpose.
+
 `boundary-side-path` needs no change: its closure already includes the
 boundaries of activities on the path, so a catch-all on a side-path task must
 end inside the side path like everything else there.
@@ -135,6 +150,15 @@ motivating case is made of, and a warning is the honest way to say it: it is
 legal BPMN, the standalone linter serves models targeting other engines, and
 the fix is now drawable. The name says *escapes* rather than *freezes*
 because the second outcome is not a freeze and is no better.
+
+It lands on the activity that can fail: a service or user task directly on
+the path, or — once, naming what escapes it — a subprocess on the path whose
+body lets a failure through, because a catch-all on the subprocess is the one
+fix for all of it. A user task cannot carry an error boundary, so its message
+says to wrap it. It speaks only for well-formed side paths, since a
+`boundary-side-path` error is enough on its own; and only for the error class:
+decision, timer and correlation incidents are not errors, no boundary catches
+them, and a warning there could name no remedy.
 
 **Ordering matters**, the same way the expression-timer round records it: the
 warning ships with the capability, never before it, or it names a fix that
@@ -417,6 +441,11 @@ cheap.
 
 ## Known warts, stated up front
 
+- **D2 warns on nearly every side path.** Ten of the eleven side-path
+  fixtures that predate it carry it, because a side path exists to run a task
+  and the task is what fails. None of them is a false positive. It ships as
+  it is deliberately: it is the lesson the motivating case teaches, and the
+  fix is one boundary.
 - **D1 relocates the question, it does not dissolve it.** A catch-all must be
   drawn on every activity of every side path, and a model that forgets one
   behaves exactly as today. That is what makes D2 a warning rather than

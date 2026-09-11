@@ -18,6 +18,7 @@ import { annotate, focus } from '../shared/annotations.js';
 import { ensureDi } from '../shared/layout.js';
 import { el } from '../shared/dom.js';
 import { renderProperties } from './properties.js';
+import { droppedErrorRefDiagnostic, droppedErrorRefs } from './dropped-refs.js';
 import {
   binding,
   emptyManifest,
@@ -133,6 +134,10 @@ const STARTER = `<?xml version="1.0" encoding="UTF-8"?>
 
 const state = {
   manifest: emptyManifest(),
+  /// errorRefs the last import could not resolve, which the round trip has
+  /// since dropped — each one silently turned its boundary into a catch-all
+  /// (`dropped-refs.js`). Reset by every import.
+  droppedErrorRefs: [],
   /// The DMN artifacts this deployment carries: `[{ name, xml }]`. They
   /// travel *inside* the deployment, which is why the editor can validate
   /// them completely without a server.
@@ -364,6 +369,14 @@ async function runCheck({ syncXmlBox = true } = {}) {
       element: elementId,
       message: `the manifest binds ${group}.${elementId}, which is not an element in this model`,
     });
+  }
+
+  // Until the boundary has a code again (or is gone), the catch-all it
+  // became on import is not something the modeller chose.
+  for (const dropped of state.droppedErrorRefs) {
+    const element = modeler.get('elementRegistry').get(dropped.boundaryId);
+    const definition = element?.businessObject.eventDefinitions?.[0];
+    if (definition && !definition.errorRef) diagnostics.push(droppedErrorRefDiagnostic(dropped));
   }
 
   renderDiagnostics(diagnostics);
@@ -981,6 +994,10 @@ function fitClearOfPalette() {
 
 async function importXml(xml) {
   try {
+    // Read the text as given, before anything round-trips it: once moddle
+    // has exported it, a dangling errorRef is gone and cannot be found.
+    const { warnings } = await modeler.get('moddle').fromXML(xml);
+    state.droppedErrorRefs = droppedErrorRefs(warnings);
     // Hand-written models carry no diagram; laying one out beats rendering an
     // empty canvas.
     const renderable = await ensureDi(xml);

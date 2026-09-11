@@ -42,11 +42,20 @@ function parseExpectations(xml) {
     .sort();
 }
 
-// Known limitation of every moddle-based tool (bpmnlint included): bpmn-moddle
-// silently repairs duplicate ids on import, so this fixture's defect never
-// reaches the linter here. Deploy reads the raw XML and does reject it — the
-// plugin is a preview, deploy is the authority.
-const MODDLE_BLIND_SPOTS = new Set(['reject/duplicate-id.bpmn']);
+// Known limitations of every moddle-based tool (bpmnlint included): bpmn-moddle
+// rewrites the model on import, so these fixtures' defects never reach the
+// linter here. Deploy reads the raw XML and does reject both — the plugin is a
+// preview, deploy is the authority.
+//
+// - Duplicate ids are silently repaired.
+// - A reference that resolves to nothing is dropped. For an errorRef the shape
+//   left behind is a legal catch-all, so this preview cannot see the typo at
+//   all — and a modeler that saves after importing has made it one for good
+//   (`docs/design/incident-scope.md`, D1).
+const MODDLE_BLIND_SPOTS = new Set([
+  'reject/duplicate-id.bpmn',
+  'reject/error-boundary-unresolvable-ref.bpmn',
+]);
 
 let failures = 0;
 let total = 0;
