@@ -344,10 +344,16 @@ CompleteAlreadyClosed(w) ==
                    completions, leaseNo, issued>>
 
 \* fail_work_item_in_tx: back to available behind a backoff, budget spent.
-\* Exhausting it raises an incident, which freezes the instance.
+\* Exhausting it raises an incident, which freezes the instance. Like
+\* completion, it is refused on a frozen instance (`IncidentOpen`) — the
+\* `active` conjunct. A one-item model cannot tell it is there: its only
+\* freeze is this item's own FailFinally, which closes the item. With a
+\* sibling it matters, and LeaseSiblings.tla's FreezeAdvancesNothing fails
+\* without it.
 Fail(w) ==
     /\ state = "locked"
     /\ GuardAllows(w)
+    /\ active          \* refused on a frozen instance: IncidentOpen
     /\ retries > 0
     /\ state' = "available"
     /\ owner' = NoOne
@@ -367,6 +373,7 @@ Fail(w) ==
 FailFinally(w) ==
     /\ state = "locked"
     /\ GuardAllows(w)
+    /\ active          \* refused on a frozen instance: IncidentOpen
     /\ retries = 0
     /\ state' = "failed"
     /\ active' = FALSE          \* incident: the instance freezes for repair
@@ -450,8 +457,10 @@ NoLiveForeignCompletion ==
 (*                                                                          *)
 (* What it does not say: the engine does have stranded items — a SIBLING    *)
 (* branch's open task on an instance this item froze — and a one-item model *)
-(* cannot express that. It would need a second item and a property about    *)
-(* `~active` on it; until then this is the one-item truth, not the whole.   *)
+(* cannot express that: its only freeze is its own final failure, which     *)
+(* closes it. LeaseSiblings.tla composes two of these items on one          *)
+(* instance: `StrandedOnlyByASiblingsFreeze` holds there, and               *)
+(* LeaseSiblings_Stranded.cfg fails on exactly that stranding.              *)
 (***************************************************************************)
 Open == state \in {"available", "locked"}
 

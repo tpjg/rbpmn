@@ -160,12 +160,14 @@ parity: wasm
 # on a developer's machine and would make past hold/fail verdicts
 # irreproducible. To move to a new TLA+ release, bump both constants — the
 # recipe refuses to run on a mismatch rather than trusting the download.
-# Eight of the thirteen configs are EXPECTED to fail — they are the
+# Thirteen of the twenty-one configs are EXPECTED to fail — they are the
 # counterexamples that show the checks have teeth, and three of them
 # reproduce bugs that were real (the AB/BA timer-claim sketch, the phase-6
 # scope teardown that left a timer row behind, and release_task guarded by
 # owner alone, which shipped and which a review caught before the model
 # could — the model had no notion of a retried request to catch it with).
+# One more prices a design decision rather than a bug: LeaseSiblings_Stranded,
+# the instance-wide freeze stranding a sibling.
 tla:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -231,6 +233,13 @@ tla:
     # A cancelled item (interrupting boundary, terminate, teardown) is the
     # second terminal state the lease configs reach; same -deadlock reason.
     check "lease: completing a cancelled item"      Lease_CancelIgnoresGuard.cfg Lease.tla fail "Action property NoCompletionAfterCancel is violated" -deadlock
+    # Two items on one instance: the lease above, instantiated twice and
+    # sharing the instance's status. -deadlock for the lease reason, and
+    # because a frozen instance is terminal here — the model has no repair.
+    # The failing config is not a bug: it prices the instance-wide freeze
+    # (docs/design/incident-scope.md, D3).
+    check "lease siblings: stranded only by a sibling's freeze" LeaseSiblings.cfg          LeaseSiblings.tla hold "" -deadlock
+    check "lease siblings: the freeze strands a sibling"        LeaseSiblings_Stranded.cfg LeaseSiblings.tla fail "Invariant SiblingNeverStranded is violated" -deadlock
     # -deadlock: a terminal state is legitimate here (everything torn down,
     # nothing armed). Deadlock freedom is a property under test only for
     # LockOrder, where the flag is deliberately absent.

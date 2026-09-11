@@ -1,6 +1,6 @@
 # Incident scope — design round
 
-**Status: D1 and D2 shipped.** The catch-all error boundary and the warning
+**Status: D1 and D2 shipped, and the price of D3 is checked.** The catch-all error boundary and the warning
 that ships with it are in. The freeze stays instance-wide, and the way out of
 an incident is a repair API rather than a narrower freeze (D3); everything from D4 down is the shape
 that round will start from, not a commitment to build it now. The
@@ -342,23 +342,23 @@ be answered once.
 
 ## What `spec/` says, having re-read it
 
-`Lease.tla` already writes the cost down, in `NeverStranded`'s own comment
-(`spec/Lease.tla:458`): the engine does have stranded items — a sibling
-branch's open task on an instance this item froze — and a one-item model
-cannot express it.
+`Lease.tla`'s `NeverStranded` comment records the cost: the engine does have
+stranded items — a sibling branch's open task on an instance this item froze
+— and a one-item model cannot express it. `spec/LeaseSiblings.tla` does:
+`Lease` instantiated twice on one instance, sharing its status and the
+database clock, so the transcription checked is the one the engine runs.
 
-That gap is worth closing whether or not repair is built, because it turns
-the price of D3 from an argument into a check. Two items, `active` per
-instance as today, and
-
-```
-SiblingStrandedByAFreeze ==
-    Open(i2) => (Claimable(i2) \/ \E w \in Workers : Completable(w, i2))
-```
-
-as a config **expected to fail**, matched to the counterexample it
-demonstrates — the motivating case, in the idiom the other twelve failing
-configs already use.
+- `LeaseSiblings_Stranded.cfg` fails, and is meant to. It is `NeverStranded`
+  asked of both items, and its trace is the motivating case: one item fails
+  past its budget, and the other — open, perhaps leased mid-handler — can be
+  neither claimed nor completed. The price of D3, checked instead of argued.
+- `StrandedOnlyByASiblingsFreeze` holds: a stranded item is always its
+  sibling's freeze, never its own doing.
+- `FreezeAdvancesNothing` holds: on a frozen instance nothing is claimed,
+  completed, failed or cancelled, and the one change an item can still take
+  is its holder handing it back. Composing it is what showed `Lease`'s `Fail`
+  and `FailFinally` lacked the `active` conjunct the fail path has
+  (`IncidentOpen`) — invisible with one item, whose only freeze closes it.
 
 What repair adds later: a transition out of `active = FALSE`, which no model
 has today because the freeze is currently terminal. Its own module, because
@@ -369,10 +369,13 @@ needs nothing at either arity: no new lock enters the order.
 
 ## The guarantees this preserves
 
-1. An incident is **total**: after it, nothing about the instance changes
-   except by an operator.
+1. An incident is **total**: after it, nothing on the instance is claimed,
+   completed, failed or cancelled until an operator acts. The one change its
+   items can still take is a holder extending or handing back its lease
+   (`FreezeAdvancesNothing`, `spec/LeaseSiblings.tla`).
 2. **Frozen evidence**: what is inspected is the state at the moment of
-   failure, and it is the state a repair resumes into.
+   failure — leases aside, the one thing (1) says still moves — and it is
+   the state a repair resumes into.
 3. **Token conservation**: nothing is lost, so a repair can be total and has
    exactly one shape to resume from.
 4. **One gate**: `i.status = 'active'`, in five places, each provably
@@ -423,8 +426,7 @@ D1 makes that reachable rather than broken; the field's hint gains the second
 half of what it does, and the round trip is worth a test. Owes `just ui`,
 `just parity` and `docs/rules.md`.
 
-**Slice 2 — the failing `Lease` config.** Independent of everything else, and
-cheap.
+**Slice 2 — the failing `Lease` config: shipped** as `spec/LeaseSiblings.tla`.
 
 **Slice 3 — repair.** Its own round, starting from D4–D9.
 
