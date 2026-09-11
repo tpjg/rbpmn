@@ -1,12 +1,12 @@
 # Incident scope — design round
 
-**Status: one decision taken.** D1 — the catch-all error boundary — is
-decided and owed as a slice. The freeze stays instance-wide (D2), and the way
-out of an incident is a repair API rather than a narrower freeze (D3);
-everything from D4 down is the shape that round will start from, not a
-commitment to build it now. The alternatives that were weighed and refused
-are at the bottom, briefly, because the reasoning for not taking them is the
-part worth keeping.
+**Status: decided and in progress.** D1 — the catch-all error boundary —
+and D2, the warning that ships with it, are decided and owed as a slice. The
+freeze stays instance-wide, and the way out of an incident is a repair API
+rather than a narrower freeze (D3); everything from D4 down is the shape
+that round will start from, not a commitment to build it now. The
+alternatives that were weighed and refused are at the bottom, briefly,
+because the reasoning for not taking them is the part worth keeping.
 
 This round covers **what an incident freezes, and how an instance gets out of
 one**. It was read against `crates/rbpmn-core/src/step.rs` (`freeze`,
@@ -323,7 +323,7 @@ branch's open task on an instance this item froze — and a one-item model
 cannot express it.
 
 That gap is worth closing whether or not repair is built, because it turns
-the price of D2 from an argument into a check. Two items, `active` per
+the price of D3 from an argument into a check. Two items, `active` per
 instance as today, and
 
 ```

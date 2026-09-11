@@ -5,7 +5,10 @@
 <!-- An absent errorRef is a catch-all; a present one that resolves to
      nothing is a typo, and is refused as it always was. Relaxing the rule
      must not blur that line: a mistyped reference silently turning into
-     "catch everything" would be the worst possible reading of it. -->
+     "catch everything" would be the worst possible reading of it.
+     Never regenerate this file's DI: bpmn-moddle reports a dangling reference
+     only as an import warning and drops it on export, which is precisely how
+     a round trip would turn this fixture into accept/44. -->
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
   <bpmn:error id="err_declined" name="CardDeclined" errorCode="CARD_DECLINED" />
   <bpmn:process id="p" isExecutable="true">
@@ -18,7 +21,7 @@
     </bpmn:serviceTask>
     <bpmn:boundaryEvent id="be" attachedToRef="st">
       <bpmn:outgoing>f3</bpmn:outgoing>
-      <bpmn:errorEventDefinition />
+      <bpmn:errorEventDefinition errorRef="err_missing" />
     </bpmn:boundaryEvent>
     <bpmn:endEvent id="end">
       <bpmn:incoming>f2</bpmn:incoming>

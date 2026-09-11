@@ -8,7 +8,16 @@
 import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { BpmnModdle } from 'bpmn-moddle';
 import { ensureDi } from '../src/layout.js';
+
+// Layout round-trips the model through bpmn-moddle, which reports a dangling
+// reference only as an import warning and then drops it on export. For an
+// errorRef that is not cosmetic: an error boundary with no errorRef is a
+// catch-all, so the round trip would turn a mistyped reference into "catch
+// everything" and rewrite what the fixture asserts. Anything moddle warns
+// about is therefore refused here, and gets its DI written by hand.
+const moddle = new BpmnModdle();
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixturesRoot = join(here, '..', '..', 'crates', 'rbpmn-model', 'tests', 'fixtures');
@@ -31,6 +40,14 @@ for (const dir of ['accept', 'reject']) {
     const header = original.slice(0, defsStart);
 
     try {
+      const { warnings } = await moddle.fromXML(original);
+      if (warnings.length) {
+        failed.push([
+          `${dir}/${file}`,
+          `bpmn-moddle would rewrite it (${warnings.map((w) => w.message).join('; ')})`,
+        ]);
+        continue;
+      }
       const laidOut = await ensureDi(original);
       const body = laidOut.replace(/^<\?xml[^>]*\?>\s*/, '');
       writeFileSync(path, header + body + (body.endsWith('\n') ? '' : '\n'));
