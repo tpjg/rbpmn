@@ -1677,8 +1677,9 @@ pub(crate) async fn persist_step(
 /// days-and-hours interval, and adding it back adds calendar days in the
 /// session's time zone — an hour wrong across a daylight-saving change.
 ///
-/// A row the scheduler picked while due can be moved later by a freeze and
-/// a repair committing between its pick and its lock; the claim's
+/// `frozen_at` is stamped inside the freezing transaction, so a row the
+/// scheduler picks after the stamp but before the freeze commits — it still
+/// reads the instance as active — is moved past the resume; the claim's
 /// `due_at <= now()` re-check is what keeps it from firing early
 /// (`spec/RepairClock.tla`, `NeverFiresEarly`).
 async fn resume_after_freeze(tx: &mut PgConnection, instance_id: Uuid) -> Result<(), EngineError> {

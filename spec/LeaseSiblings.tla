@@ -98,7 +98,9 @@ SiblingNeverStranded == I1!NeverStranded /\ I2!NeverStranded
 \* While the instance is active nobody is stranded, whatever has failed and
 \* been caught. `Lease`'s FailCaught closes an item without freezing — the
 \* catch-all's whole point — and this is its sibling staying claimable or
-\* completable through it.
+\* completable through it. It follows from the lease's guards once `active`
+\* holds; LeaseSiblings_CaughtIsReachable.cfg is what shows a caught failure
+\* leaves the instance active.
 ActiveStrandsNobody == active => SiblingNeverStranded
 
 \* Deliberately FALSE — LeaseSiblings_CaughtIsReachable.cfg expects the

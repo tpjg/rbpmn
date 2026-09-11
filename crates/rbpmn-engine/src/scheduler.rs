@@ -268,7 +268,7 @@ impl Engine {
         // (docs/design/incident-scope.md, D8). `due_at <= now()` is what
         // keeps a moved timer from firing early (`spec/RepairClock.tla`,
         // NeverFiresEarly; RepairClock_NoDueRecheck.cfg drops it and TLC
-        // fires a stepped cycle occurrence early).
+        // fires a moved timer early).
         let still_armed = sqlx::query(
             "select 1 from rbpmn_timer where instance_id = $1 and timer_no = $2 \
              and due_at <= now()",

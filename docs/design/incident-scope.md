@@ -505,11 +505,12 @@ again landing on incident 1 — and the sibling keeps every lease guarantee
 across the thaw and is claimable or completable once a repair lands.
 `spec/RepairClock.tla` checks D8's move against the scheduler's claim: a row
 picked while due can be moved later between the pick and the lock, by a
-freeze and a repair both committing in the window. A duration stays due; a
-cycle occurrence due at the freeze's own instant — `frozen_at` is stamped
-before the freeze commits — is stepped past now, so the claim's
-`due_at <= now()` re-check is load-bearing, and
-`RepairClock_NoDueRecheck.cfg` fires it early without it. `LockOrder` needs
+freeze and a repair both committing in the window. `frozen_at` is stamped
+inside the freezing transaction, before its commit makes the freeze visible,
+so a row that came due after the stamp can be picked while the instance
+still reads active, and the repair moves it past the resume — a duration and
+a cycle alike. The claim's `due_at <= now()` re-check is what keeps it from
+firing early, and `RepairClock_NoDueRecheck.cfg` fires it early without it. `LockOrder` needs
 nothing at either arity: a repair is a step — the instance row, then its
 rows.
 

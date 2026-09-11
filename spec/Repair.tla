@@ -18,10 +18,11 @@
 (*                                                                          *)
 (* The sibling comes back whole. `LeaseSiblings_Stranded.cfg` prices the    *)
 (* freeze: a sibling's open item, perhaps leased to a worker whose handler  *)
-(* is running, can be neither claimed nor completed. A landed repair must   *)
-(* pay that back — `ActiveStrandsNobody` — and must not cost the lease any  *)
-(* of its own guarantees on the way: `active` has never gone from FALSE to  *)
-(* TRUE in any model before this one.                                       *)
+(* is running, can be neither claimed nor completed. A landed repair pays   *)
+(* that back by restoring `active` — `ActiveStrandsNobody`, which the       *)
+(* lease's guards then make true — and must not cost the lease any of its   *)
+(* own guarantees on the way: `active` has never gone from FALSE to TRUE in *)
+(* any model before this one.                                               *)
 (*                                                                          *)
 (* The sibling is `Lease` itself, instantiated as `LeaseSiblings` does it,  *)
 (* so the lease checked here is the transcription the engine runs. The      *)
@@ -207,7 +208,14 @@ SiblingLeaseActions ==
     /\ S!ReleaseFreesOnlyTheLeaseItNamed
 
 \* The price of the freeze, paid back: once a repair lands the instance
-\* active, the sibling is claimable or completable again.
+\* active, the sibling is claimable or completable again. This follows from
+\* the lease's own guards — on an active instance an available item is
+\* anyone's to complete and a locked one its holder's — so what it pins is
+\* that the thaw restores `active`, the one precondition the freeze took
+\* away, and nothing more. The way a thaw really strands a worker is
+\* latency: a lease that lapsed during the freeze, and nobody woken for it.
+\* No model here sees a poll interval; `resume_after_freeze`'s wake answers
+\* it.
 ActiveStrandsNobody == active => S!NeverStranded
 
 \* While frozen, nothing of the sibling moves but its holder handing it back
@@ -221,7 +229,8 @@ AbandonedLeavesNothingOpen == closed => ~S!Open
 
 \* Deliberately FALSE — Repair_ThawIsReachable.cfg expects the violation. A
 \* repair lands while the sibling is open, and the sibling then completes:
-\* ActiveStrandsNobody is not vacuous over the case it exists for.
+\* the thaw's case, reached. ActiveStrandsNobody holds by the guards once
+\* the instance is active; this is what gives it a reached case to hold over.
 NoStrandedSiblingCompletes == ~(openAtThaw /\ sstate = "done")
 
 =============================================================================
