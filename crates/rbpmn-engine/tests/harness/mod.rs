@@ -166,6 +166,13 @@ const FSCK: &[(&str, &str)] = &[
                 where t.instance_id = i.id and t.wait_kind = 'incident')",
     ),
     (
+        // D8: the freeze's clock, set by every freeze and cleared by the
+        // step that leaves it.
+        "an instance's frozen_at disagrees with its status",
+        "select id::text from rbpmn_instance \
+         where (status = 'failed') <> (frozen_at is not null)",
+    ),
+    (
         "an instance holds more than one incident token",
         "select instance_id::text from rbpmn_token where wait_kind = 'incident' \
          group by instance_id having count(*) > 1",

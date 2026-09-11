@@ -2314,6 +2314,161 @@ async fn abandoning_a_frozen_instance_hands_it_to_retention() {
     db.drop().await;
 }
 
+/// A review whose timers a frozen instance keeps: a duration, a date and a
+/// cycle on the host, while a note's side path is what freezes it.
+const CLOCK_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m_note" name="NOTE"/>
+  <bpmn:process id="clock" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:userTask id="review"/>
+    <bpmn:boundaryEvent id="sla" attachedToRef="review">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="deadline" attachedToRef="review">
+      <bpmn:timerEventDefinition><bpmn:timeDate>2099-01-01T00:00:00Z</bpmn:timeDate></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="remind" cancelActivity="false" attachedToRef="review">
+      <bpmn:timerEventDefinition><bpmn:timeCycle>R/P7D</bpmn:timeCycle></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="note" cancelActivity="false" attachedToRef="review">
+      <bpmn:messageEventDefinition messageRef="m_note"/>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="file_note"/>
+    <bpmn:endEvent id="done"/>
+    <bpmn:endEvent id="escalated"/>
+    <bpmn:endEvent id="expired"/>
+    <bpmn:endEvent id="reminded"/>
+    <bpmn:endEvent id="filed"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="review"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="review" targetRef="done"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="sla" targetRef="escalated"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="deadline" targetRef="expired"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="remind" targetRef="reminded"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="note" targetRef="file_note"/>
+    <bpmn:sequenceFlow id="f7" sourceRef="file_note" targetRef="filed"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+async fn due_of(pool: &PgPool, instance: uuid::Uuid, element: &str) -> f64 {
+    sqlx::query_scalar(
+        "select extract(epoch from due_at)::float8 from rbpmn_timer \
+         where instance_id = $1 and element_id = $2",
+    )
+    .bind(instance)
+    .bind(element)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A frozen instance's clock stops (docs/design/incident-scope.md, D8): the
+/// repair that lands re-arms every timer the freeze kept. A duration moves by
+/// the outage, keeping the time it had left; a cycle whose occurrence passed
+/// while frozen steps along its own grid to the first occurrence at or after
+/// the resume, skipping the missed ones; a date keeps its instant.
+#[tokio::test]
+async fn a_repair_stops_the_clock_for_the_time_frozen() {
+    const DAY: f64 = 86_400.0;
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("file_note").await.unwrap();
+    engine
+        .deploy(
+            CLOCK_XML,
+            &Bindings::new()
+                .correlation("note", "case.id")
+                .retries("file_note", rbpmn_core::RetryPolicy::new().attempts(1)),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({"case": {"id": "c-1"}});
+    let started = engine.start("clock", None, initial.clone()).await.unwrap();
+    let id = started.id;
+    engine
+        .correlate("NOTE", "c-1", serde_json::json!({}))
+        .await
+        .unwrap();
+    let (note, _) = open_items(&db.pool, id)
+        .await
+        .into_iter()
+        .find(|(_, element)| element == "file_note")
+        .unwrap();
+    assert_eq!(
+        engine
+            .fail_work_item(note, &FailOptions::default())
+            .await
+            .unwrap(),
+        FailOutcome::IncidentRaised
+    );
+
+    // Twenty-two days frozen, and the reminder's occurrence missed in them.
+    sqlx::query(
+        "update rbpmn_instance set frozen_at = frozen_at - interval '22 days' where id = $1",
+    )
+    .bind(id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "update rbpmn_timer set due_at = due_at - interval '22 days' \
+         where instance_id = $1 and element_id = 'remind'",
+    )
+    .bind(id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let (sla, remind, deadline) = (
+        due_of(&db.pool, id, "sla").await,
+        due_of(&db.pool, id, "remind").await,
+        due_of(&db.pool, id, "deadline").await,
+    );
+
+    let repaired = engine
+        .repair(id, 0, Disposition::Abandon, "filed by hand")
+        .await
+        .unwrap();
+    assert_eq!(repaired.status, InstanceStatus::Active);
+    let now: f64 = sqlx::query_scalar("select extract(epoch from clock_timestamp())::float8")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let moved = due_of(&db.pool, id, "sla").await - sla;
+    assert!(
+        (22.0 * DAY..22.0 * DAY + 60.0).contains(&moved),
+        "the duration moved {moved} s, not the 22 days frozen"
+    );
+    let rearmed = due_of(&db.pool, id, "remind").await;
+    let steps = (rearmed - remind) / (7.0 * DAY);
+    assert!(
+        (steps - steps.round()).abs() < 1e-6 && steps.round() >= 1.0,
+        "the cycle moved {steps} periods, not a whole number of them"
+    );
+    assert!(
+        rearmed >= now - 1.0 && rearmed < now + 7.0 * DAY,
+        "the cycle's next occurrence is not the first at or after now"
+    );
+    assert_eq!(due_of(&db.pool, id, "deadline").await, deadline);
+    let frozen_at: Option<f64> = sqlx::query_scalar(
+        "select extract(epoch from frozen_at)::float8 from rbpmn_instance where id = $1",
+    )
+    .bind(id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        frozen_at, None,
+        "the step that left the freeze keeps its clock"
+    );
+    harness::replay_verify(&db.pool, id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
 /// Terminate tears everything down in one transaction — including armed
 /// timers (fixture-12 shape with a timer in the surviving branch).
 #[tokio::test]

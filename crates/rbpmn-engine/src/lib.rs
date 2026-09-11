@@ -172,6 +172,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         include_str!("../migrations/0019_retry_policy.sql"),
     ),
     (20, "repair", include_str!("../migrations/0020_repair.sql")),
+    (
+        21,
+        "frozen_at",
+        include_str!("../migrations/0021_frozen_at.sql"),
+    ),
 ];
 
 /// The retry budget an item gets when its manifest says nothing: the same

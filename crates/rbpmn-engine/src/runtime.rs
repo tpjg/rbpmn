@@ -1293,10 +1293,18 @@ pub(crate) async fn persist_step(
 ) -> Result<(), EngineError> {
     let status = status_to_db(state.status);
     let counters = state.counters();
+    // A repair re-arms what the freeze kept (docs/design/incident-scope.md,
+    // D8): the instance's clock stopped while it was frozen. Before the row
+    // below moves `frozen_at` on, and before this step's own timers are
+    // written — those are armed now and owe nothing to the outage.
+    if matches!(events.first(), Some(Event::IncidentRepaired { .. })) {
+        rearm_after_freeze(tx, instance_id).await?;
+    }
     sqlx::query(
         "update rbpmn_instance set status = $2, variables = $3, next_token = $4, \
          next_work_item = $5, next_timer = $6, next_subscription = $7, \
          next_scope = $8, next_incident = $9, \
+         frozen_at = case when $2 = 'failed' then clock_timestamp() end, \
          completed_at = case when $2 in ('completed', 'terminated') \
          then now() else completed_at end where id = $1",
     )
@@ -1642,6 +1650,58 @@ pub(crate) async fn persist_step(
         .bind(&event_kinds)
         .bind(&event_elements)
         .bind(&event_payloads)
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// D8's re-arm: every timer a frozen instance kept, moved as though the
+/// instance's clock had stopped at `frozen_at`. A duration moves by the
+/// outage, keeping exactly the time it had left. A cycle steps along its own
+/// grid to the first occurrence at or after now — missed occurrences are
+/// skipped, never replayed, the rule every cycle re-arm follows, and a bounded
+/// `R<n>` spends nothing on them because it counts fires. A date keeps its
+/// instant, and fires once if it passed.
+async fn rearm_after_freeze(tx: &mut PgConnection, instance_id: Uuid) -> Result<(), EngineError> {
+    sqlx::query(
+        "update rbpmn_timer t set due_at = t.due_at + (clock_timestamp() - i.frozen_at) \
+         from rbpmn_instance i \
+         where i.id = $1 and t.instance_id = $1 and t.due_kind = 'duration' \
+           and i.frozen_at is not null",
+    )
+    .bind(instance_id)
+    .execute(&mut *tx)
+    .await?;
+    // The period is fixed-length (lint), so epoch arithmetic is exact here,
+    // as in `insert_timer`; it comes from the spec, which only Rust can split.
+    let mut numbers: Vec<i64> = Vec::new();
+    let mut periods: Vec<f64> = Vec::new();
+    for row in sqlx::query(
+        "select timer_no, due_spec from rbpmn_timer \
+         where instance_id = $1 and due_kind = 'cycle'",
+    )
+    .bind(instance_id)
+    .fetch_all(&mut *tx)
+    .await?
+    {
+        let spec: String = row.get("due_spec");
+        let parts = rbpmn_model::iso8601::split_cycle(&spec)
+            .map_err(|e| internal(format!("armed cycle '{spec}' is not valid: {e}")))?;
+        numbers.push(row.get("timer_no"));
+        periods.push(parts.period_seconds);
+    }
+    if !numbers.is_empty() {
+        sqlx::query(
+            "update rbpmn_timer t set due_at = to_timestamp(extract(epoch from t.due_at) \
+               + c.period * greatest(0, ceil((extract(epoch from clock_timestamp()) \
+                                              - extract(epoch from t.due_at)) / c.period))) \
+             from unnest($2::bigint[], $3::float8[]) as c(no, period) \
+             where t.instance_id = $1 and t.timer_no = c.no",
+        )
+        .bind(instance_id)
+        .bind(&numbers)
+        .bind(&periods)
         .execute(&mut *tx)
         .await?;
     }
