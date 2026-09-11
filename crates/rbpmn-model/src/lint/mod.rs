@@ -683,7 +683,7 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
                     rule::BOUNDARY_ON_SUPPORTED_HOST,
                     id,
                     "error boundary events attach to service tasks or subprocesses — \
-                     v1 errors are raised by service-task failures past their retry budget",
+                     a user task's failure is caught by one on an embedded subprocess around it",
                 ));
             }
             match error_ref.as_deref() {
@@ -879,6 +879,15 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
             }
         }
 
+        // The side token has to be consumed somewhere: a terminate end takes
+        // the whole scope with it, so only a plain end ends the side path.
+        // Decided before the failure warning, which speaks only for a
+        // well-formed side path; the error for a missing end comes last.
+        let plain_end = (0..g.scope.nodes.len()).any(|v| {
+            in_path[v]
+                && matches!(&g.node(v).kind, NodeKind::End(k) if !matches!(k, EndKind::Terminate))
+        });
+
         // A failure on the side path has to stop on the side path. An error
         // walks outward through enclosing scopes and never sideways, so the
         // host's own boundaries do not reach it: only a catch-all on the
@@ -895,7 +904,7 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
         // incidents no boundary can catch, so a warning here could name no
         // remedy — `side-path-message-arm` and `timer-expression` already
         // speak for the two of them a model can see.
-        for v in (0..g.scope.nodes.len()).filter(|&v| in_path[v] && v != b) {
+        for v in (0..g.scope.nodes.len()).filter(|&v| plain_end && in_path[v] && v != b) {
             if has_catch_all(g, v) {
                 continue;
             }
@@ -941,12 +950,6 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
             ));
         }
 
-        // The side token has to be consumed somewhere: a terminate end takes
-        // the whole scope with it, so only a plain end ends the side path.
-        let plain_end = (0..g.scope.nodes.len()).any(|v| {
-            in_path[v]
-                && matches!(&g.node(v).kind, NodeKind::End(k) if !matches!(k, EndKind::Terminate))
-        });
         if !plain_end {
             out.push(Diagnostic::error(
                 rule::BOUNDARY_SIDE_PATH,

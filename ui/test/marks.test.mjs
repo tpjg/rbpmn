@@ -119,3 +119,40 @@ test('an unknown status is inert with the status named, never silently live', ()
   assert.equal(mark.inert, true);
   assert.match(mark.payload.title, /inert: the instance is quarantined/);
 });
+
+test('a failure a boundary caught is drawn as handled, not as the reason', () => {
+  const marks = marksFor(
+    inspection({
+      status: 'completed',
+      workItems: [
+        {
+          elementId: 'notify',
+          state: 'failed',
+          kind: 'service',
+          topic: 'notices',
+          retries: 0,
+          lastFailure: 'dependency unavailable',
+        },
+      ],
+    })
+  );
+  assert.equal(marks.length, 1);
+  assert.equal(marks[0].kind, 'handled');
+  assert.equal(marks[0].inert, false);
+  assert.match(marks[0].payload.title, /dependency unavailable — handled by a boundary/);
+});
+
+test('on a frozen instance, a failure caught elsewhere stays handled', () => {
+  const data = frozen();
+  data.workItems.push({
+    elementId: 'earlier',
+    state: 'failed',
+    kind: 'service',
+    topic: 'x',
+    retries: 0,
+    lastFailure: 'caught earlier',
+  });
+  const mark = marksFor(data).find((m) => m.elementId === 'earlier');
+  assert.equal(mark.kind, 'handled');
+  assert.equal(mark.inert, false);
+});

@@ -6,7 +6,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import * as mod from 'bpmn-moddle';
-import { droppedErrorRefDiagnostic, droppedErrorRefs } from '../src/editor/dropped-refs.js';
+import {
+  carryDroppedErrorRefs,
+  droppedErrorRefDiagnostic,
+  droppedErrorRefs,
+  triageDroppedErrorRefs,
+} from '../src/editor/dropped-refs.js';
 
 const BpmnModdle = mod.default ?? mod.BpmnModdle;
 
@@ -64,4 +69,47 @@ test('the diagnostic is an error on the boundary and names the consequence', () 
   assert.equal(d.element, 'be');
   assert.match(d.message, /err_missing/);
   assert.match(d.message, /catch-all/);
+});
+
+// The editor re-imports its own serialization — every XML-box edit, every
+// theme change — and moddle wrote that text, so the reference is already gone
+// from it. This is the case the carry exists for, run through the real thing.
+test('a re-import of the serialized model finds nothing, so the finding is carried', async () => {
+  const m = moddle();
+  const original = model('<bpmn:errorEventDefinition errorRef="err_missing" />');
+  const first = droppedErrorRefs((await m.fromXML(original)).warnings);
+  const { rootElement } = await m.fromXML(original);
+  const { xml: serialized } = await m.toXML(rootElement);
+  const again = droppedErrorRefs((await moddle().fromXML(serialized)).warnings);
+  assert.deepEqual(again, [], 'the round trip already lost it');
+  assert.deepEqual(carryDroppedErrorRefs(first, again), first);
+});
+
+test('a fresh finding for the same boundary replaces the carried one', () => {
+  assert.deepEqual(
+    carryDroppedErrorRefs(
+      [{ boundaryId: 'be', ref: 'old' }],
+      [
+        { boundaryId: 'be', ref: 'new' },
+        { boundaryId: 'b2', ref: 'x' },
+      ]
+    ),
+    [
+      { boundaryId: 'be', ref: 'new' },
+      { boundaryId: 'b2', ref: 'x' },
+    ]
+  );
+});
+
+test('a code retires an entry; a missing boundary keeps it, unreported', () => {
+  const entries = ['coded', 'codeless', 'missing'].map((boundaryId) => ({ boundaryId, ref: 'r' }));
+  const { keep, report } = triageDroppedErrorRefs(entries, (id) => id);
+  assert.deepEqual(
+    keep.map((d) => d.boundaryId),
+    ['codeless', 'missing']
+  );
+  assert.deepEqual(
+    report.map((d) => d.boundaryId),
+    ['codeless']
+  );
 });

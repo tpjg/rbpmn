@@ -36,3 +36,33 @@ export function droppedErrorRefDiagnostic({ boundaryId, ref }) {
       `boundary a catch-all that catches every error. Give it an error code, or remove it`,
   };
 }
+
+/// Carry what an earlier import found across a re-import of the editor's own
+/// serialization. That text was written by moddle, so the dangling reference
+/// is already gone from it and a fresh look finds nothing: without carrying,
+/// the first XML-box edit or theme change would retire every warning and
+/// leave the boundaries indistinguishable from deliberate catch-alls. A fresh
+/// finding for the same boundary wins. (Pasting an unrelated model into the
+/// XML box with a codeless boundary of the same id inherits the entry — loud
+/// rather than silent, the direction to err in.)
+export function carryDroppedErrorRefs(previous, found) {
+  const byBoundary = new Map((previous ?? []).map((d) => [d.boundaryId, d]));
+  for (const d of found ?? []) byBoundary.set(d.boundaryId, d);
+  return [...byBoundary.values()];
+}
+
+/// Sort the entries by what the model now says about each boundary. `coded`
+/// retires the entry for good — the modeller has answered it. `codeless` is
+/// reported, and kept. `missing` is kept but not reported, so an undo that
+/// brings the boundary back brings its warning back with it.
+export function triageDroppedErrorRefs(entries, statusOf) {
+  const keep = [];
+  const report = [];
+  for (const d of entries ?? []) {
+    const status = statusOf(d.boundaryId);
+    if (status === 'coded') continue;
+    keep.push(d);
+    if (status === 'codeless') report.push(d);
+  }
+  return { keep, report };
+}

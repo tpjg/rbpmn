@@ -127,8 +127,10 @@ Five things it must get right:
   nothing in the XML is left to say it was a typo. The linter cannot see what
   is no longer there, so the tools that round-trip must: `just fixtures-di`
   refuses anything moddle warns about, and the editor reports a dropped
-  `errorRef` as an error on its boundary until the boundary has a code again
-  (`ui/src/editor/dropped-refs.js`). bpmnlint shares the blind spot — its
+  `errorRef` as an error on its boundary until the boundary has a code again — carried
+  across the editor's re-imports of its own serialization (the XML box, a
+  theme change), which moddle wrote and which no longer hold the reference to
+  find (`ui/src/editor/dropped-refs.js`). bpmnlint shares the blind spot — its
   rules see only the tree moddle built — so the plugin lists that fixture
   beside `duplicate-id` as something only deploy can catch. What no tool here
   can reach is a third-party modeler that saves after importing: that has
@@ -397,11 +399,13 @@ status in `ui/src/inspector/marks.js`, because there is no column for it: a
 frozen instance's rows are real and nothing will act on them, and a diagram
 that draws them like live ones claims the failure is one element wide when it
 is the whole instance. The marks that record the failure — the incident token
-and the failed work item — are never muted; they are the reason, not an arm.
+and the failed work item it is parked at — are never muted; they are the
+reason, not an arm. A failed item with no incident token at its element was
+caught, and is drawn as handled.
 
-**With one (D1).** The catch-all on `notify` takes the side path to its own
-end, `notified` records that it did not run, `REPLY` correlates, and the
-instance completes.
+**With one (D1).** The catch-all on `notify` takes the side path to an end of
+its own, `REPLY` correlates, and the instance completes; `notify` shows as a
+failure the model handled, not as an incident.
 
 ## Slices
 

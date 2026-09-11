@@ -418,6 +418,17 @@ body {
   stroke-width: 3px !important;
 }
 
+/* A failure a boundary caught: it happened, and the model handled it. Neither
+   the red of an incident nor the dashes of an arm that will not fire. */
+.rbpmn-badge-handled {
+  background: #4a5568;
+}
+
+.rbpmn-mark-handled .djs-visual > :nth-child(1) {
+  stroke: #4a5568 !important;
+  stroke-width: 2px !important;
+}
+
 /* Present but inert: the row is still there — a frozen instance keeps its
    arms, they are what a repair resumes from — and nothing will act on it,
    because every gate that would is closed by instance status. Dashes and a

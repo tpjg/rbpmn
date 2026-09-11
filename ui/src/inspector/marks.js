@@ -12,10 +12,14 @@
 // exactly like a live one makes the picture claim a blast radius one element
 // wide when it is the whole instance.
 //
-// What is never inert: the marks that record the failure itself. An incident
-// token and a failed work item are not arms waiting on something, they are
-// the reason nothing else will happen, and muting them would hide the one
-// thing an operator came for.
+// What is never inert: the marks that record a failure. An incident token,
+// and the failed work item it is parked at, are not arms waiting on
+// something — they are the reason nothing else will happen, and muting them
+// would hide the one thing an operator came for. A failed item with no
+// incident token at its element was *caught*: a boundary took it, and it is
+// drawn as handled — history, not a reason. (Matched by element, because the
+// inspection carries no token on a work item: a task that failed twice in a
+// loop, once caught and once not, draws both as the incident.)
 
 /// Why the arms on this instance cannot fire, or null while they can.
 function inertReason(status) {
@@ -37,6 +41,9 @@ function inertReason(status) {
 
 export function marksFor(data) {
   const inert = inertReason(data.status);
+  const incidentAt = new Set(
+    data.tokens.filter((t) => t.waitKind === 'incident').map((t) => t.elementId)
+  );
   const marks = [];
 
   /// An arm or a live wait: true now, and only while the instance is active.
@@ -69,10 +76,17 @@ export function marksFor(data) {
         `work item ${item.state} (${item.kind} / ${item.topic})`
       );
     } else if (item.state === 'failed') {
-      failure(
-        item.elementId,
-        `work item failed: ${item.lastFailure ?? 'no detail recorded'}`
-      );
+      const detail = item.lastFailure ?? 'no detail recorded';
+      if (incidentAt.has(item.elementId)) {
+        failure(item.elementId, `work item failed: ${detail}`);
+      } else {
+        marks.push({
+          elementId: item.elementId,
+          kind: 'handled',
+          inert: false,
+          payload: { title: `work item failed: ${detail} — handled by a boundary` },
+        });
+      }
     }
   }
   for (const timer of data.timers) {

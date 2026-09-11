@@ -18,7 +18,12 @@ import { annotate, focus } from '../shared/annotations.js';
 import { ensureDi } from '../shared/layout.js';
 import { el } from '../shared/dom.js';
 import { renderProperties } from './properties.js';
-import { droppedErrorRefDiagnostic, droppedErrorRefs } from './dropped-refs.js';
+import {
+  carryDroppedErrorRefs,
+  droppedErrorRefDiagnostic,
+  droppedErrorRefs,
+  triageDroppedErrorRefs,
+} from './dropped-refs.js';
 import {
   binding,
   emptyManifest,
@@ -136,7 +141,9 @@ const state = {
   manifest: emptyManifest(),
   /// errorRefs the last import could not resolve, which the round trip has
   /// since dropped — each one silently turned its boundary into a catch-all
-  /// (`dropped-refs.js`). Reset by every import.
+  /// (`dropped-refs.js`). Replaced by a fresh import, carried across a
+  /// re-import of the editor's own serialization, retired once the boundary
+  /// has a code.
   droppedErrorRefs: [],
   /// The DMN artifacts this deployment carries: `[{ name, xml }]`. They
   /// travel *inside* the deployment, which is why the editor can validate
@@ -311,7 +318,7 @@ async function remountForTheme() {
   mountDecisionEditor();
   setMode('process');
   renderDecisions();
-  await importXml(xml);
+  await importXml(xml, { carry: true });
 }
 
 // ---------------------------------------------------------------- validation
@@ -371,13 +378,15 @@ async function runCheck({ syncXmlBox = true } = {}) {
     });
   }
 
-  // Until the boundary has a code again (or is gone), the catch-all it
-  // became on import is not something the modeller chose.
-  for (const dropped of state.droppedErrorRefs) {
-    const element = modeler.get('elementRegistry').get(dropped.boundaryId);
-    const definition = element?.businessObject.eventDefinitions?.[0];
-    if (definition && !definition.errorRef) diagnostics.push(droppedErrorRefDiagnostic(dropped));
-  }
+  // Until the boundary is given a code, the catch-all it became on import is
+  // not something the modeller chose.
+  const { keep, report } = triageDroppedErrorRefs(state.droppedErrorRefs, (id) => {
+    const definition = modeler.get('elementRegistry').get(id)?.businessObject.eventDefinitions?.[0];
+    if (!definition) return 'missing';
+    return definition.errorRef ? 'coded' : 'codeless';
+  });
+  state.droppedErrorRefs = keep;
+  diagnostics.push(...report.map(droppedErrorRefDiagnostic));
 
   renderDiagnostics(diagnostics);
   const errors = diagnostics.filter((d) => d.severity === 'error');
@@ -992,16 +1001,21 @@ function fitClearOfPalette() {
   });
 }
 
-async function importXml(xml) {
+async function importXml(xml, { carry = false } = {}) {
   try {
     // Read the text as given, before anything round-trips it: once moddle
     // has exported it, a dangling errorRef is gone and cannot be found.
     const { warnings } = await modeler.get('moddle').fromXML(xml);
-    state.droppedErrorRefs = droppedErrorRefs(warnings);
+    const found = droppedErrorRefs(warnings);
     // Hand-written models carry no diagram; laying one out beats rendering an
     // empty canvas.
     const renderable = await ensureDi(xml);
     await modeler.importXML(renderable);
+    // Only once the import took: a failed one leaves the old model on the
+    // canvas, and what was found about it stays with it. A re-import of the
+    // editor's own serialization (`carry`) cannot find what the first import
+    // already lost, so it keeps what that one found.
+    state.droppedErrorRefs = carry ? carryDroppedErrorRefs(state.droppedErrorRefs, found) : found;
     fitClearOfPalette();
   } catch (e) {
     setVerdict('error', 'cannot import');
@@ -1334,7 +1348,7 @@ async function main() {
   let xmlTimer;
   ui.xmlText.addEventListener('input', () => {
     clearTimeout(xmlTimer);
-    xmlTimer = setTimeout(() => importXml(ui.xmlText.value), 400);
+    xmlTimer = setTimeout(() => importXml(ui.xmlText.value, { carry: true }), 400);
   });
 
   onThemeChange(remountForTheme);
