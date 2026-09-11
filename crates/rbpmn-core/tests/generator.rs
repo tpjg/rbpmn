@@ -153,6 +153,22 @@ fn report(context: &str, block: &Block, xml: &str, detail: &str) -> String {
     format!("{context}\n  block: {block:?}\n  detail: {detail}\n--- model ---\n{xml}")
 }
 
+/// What a generated model must not produce: every diagnostic, bar one rule.
+///
+/// "A warning on a textbook model means the rule fires on something it
+/// should not" holds for every structural rule, and `side-path-failure-escapes`
+/// is not one. It is advisory about failure containment and fires on textbook
+/// models by design — on any side path running a task with no catch-all,
+/// which this generator's side paths do whenever they run a task
+/// (`docs/design/incident-scope.md`, D2). Where it lands, and where it must
+/// not, is pinned by the fixture corpus instead.
+fn unexpected(diagnostics: &[rbpmn_model::Diagnostic]) -> Vec<&rbpmn_model::Diagnostic> {
+    diagnostics
+        .iter()
+        .filter(|d| d.rule != rbpmn_model::rule::SIDE_PATH_FAILURE_ESCAPES)
+        .collect()
+}
+
 /// proptest reads `PROPTEST_CASES` only into `ProptestConfig::default()`; a
 /// struct literal with `cases:` silently overrides it, which is how the
 /// documented `PROPTEST_CASES=20000 cargo test -- --ignored` ran 128 cases
@@ -178,7 +194,7 @@ proptest! {
             .map_err(|e| report("generated XML did not parse", &block, &g.xml, &e.to_string()))
             .unwrap();
         prop_assert!(
-            checked.diagnostics.is_empty(),
+            unexpected(&checked.diagnostics).is_empty(),
             "{}",
             report(
                 "generated model is not lint-clean",
@@ -468,7 +484,7 @@ fn known_shapes_lint_clean_and_match_the_oracle() {
         let g = build(&block);
         let checked = rbpmn_model::check(&g.xml).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
         assert!(
-            checked.diagnostics.is_empty(),
+            unexpected(&checked.diagnostics).is_empty(),
             "{}",
             report(
                 &format!("{name}: not lint-clean"),
@@ -704,7 +720,7 @@ fn sweep(models: usize, rounds: u64) -> Sweep {
         let checked =
             rbpmn_model::check(&g.xml).unwrap_or_else(|e| panic!("model {i}: parse: {e}"));
         assert!(
-            checked.diagnostics.is_empty(),
+            unexpected(&checked.diagnostics).is_empty(),
             "{}",
             report(
                 &format!("model {i}: not lint-clean"),
@@ -872,7 +888,7 @@ proptest! {
             .map_err(|e| report("generated XML did not parse", &block, &g.xml, &e.to_string()))
             .unwrap();
         prop_assert!(
-            checked.diagnostics.is_empty(),
+            unexpected(&checked.diagnostics).is_empty(),
             "{}",
             report(
                 "wide model is not lint-clean",
