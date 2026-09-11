@@ -596,6 +596,9 @@ impl Engine {
         {
             reject_nul(answer)?;
         }
+        if let Disposition::Divert { code: Some(code) } = &disposition {
+            reject_nul_text(code, "divert code")?;
+        }
         reject_nul_text(reason, "repair reason")?;
         let (definition, proc, bindings, mut state) =
             match load_instance(self, &mut *tx, instance_id).await {
@@ -1298,7 +1301,7 @@ pub(crate) async fn persist_step(
     // below moves `frozen_at` on, and before this step's own timers are
     // written — those are armed now and owe nothing to the outage.
     if matches!(events.first(), Some(Event::IncidentRepaired { .. })) {
-        rearm_after_freeze(tx, instance_id).await?;
+        resume_after_freeze(tx, instance_id).await?;
     }
     sqlx::query(
         "update rbpmn_instance set status = $2, variables = $3, next_token = $4, \
@@ -1656,16 +1659,26 @@ pub(crate) async fn persist_step(
     Ok(())
 }
 
-/// D8's re-arm: every timer a frozen instance kept, moved as though the
-/// instance's clock had stopped at `frozen_at`. A duration moves by the
-/// outage, keeping exactly the time it had left. A cycle steps along its own
-/// grid to the first occurrence at or after now — missed occurrences are
-/// skipped, never replayed, the rule every cycle re-arm follows, and a bounded
-/// `R<n>` spends nothing on them because it counts fires. A date keeps its
-/// instant, and fires once if it passed.
-async fn rearm_after_freeze(tx: &mut PgConnection, instance_id: Uuid) -> Result<(), EngineError> {
+/// D8's resume: every timer a frozen instance kept, moved as though the
+/// instance's clock had stopped at `frozen_at`, and the scheduler and workers
+/// woken for what the repair made due or claimable.
+///
+/// A duration moves by the outage and keeps exactly the time it had left. A
+/// cycle occurrence that came due while the instance was frozen steps along
+/// its own grid to the first occurrence at or after now — missed occurrences
+/// are skipped, never replayed, the rule every cycle re-arm follows, and a
+/// bounded `R<n>` spends nothing on them because it counts fires. One already
+/// due when the instance froze was owed before the freeze and fires on
+/// resume, as a duration overdue then does. A date keeps its instant, and
+/// fires once if it passed.
+///
+/// All of it is epoch arithmetic: `timestamptz - timestamptz` is a
+/// days-and-hours interval, and adding it back adds calendar days in the
+/// session's time zone — an hour wrong across a daylight-saving change.
+async fn resume_after_freeze(tx: &mut PgConnection, instance_id: Uuid) -> Result<(), EngineError> {
     sqlx::query(
-        "update rbpmn_timer t set due_at = t.due_at + (clock_timestamp() - i.frozen_at) \
+        "update rbpmn_timer t set due_at = to_timestamp(extract(epoch from t.due_at) \
+           + extract(epoch from clock_timestamp()) - extract(epoch from i.frozen_at)) \
          from rbpmn_instance i \
          where i.id = $1 and t.instance_id = $1 and t.due_kind = 'duration' \
            and i.frozen_at is not null",
@@ -1673,8 +1686,8 @@ async fn rearm_after_freeze(tx: &mut PgConnection, instance_id: Uuid) -> Result<
     .bind(instance_id)
     .execute(&mut *tx)
     .await?;
-    // The period is fixed-length (lint), so epoch arithmetic is exact here,
-    // as in `insert_timer`; it comes from the spec, which only Rust can split.
+    // The period is fixed-length (lint) and comes from the spec, which only
+    // Rust can split.
     let mut numbers: Vec<i64> = Vec::new();
     let mut periods: Vec<f64> = Vec::new();
     for row in sqlx::query(
@@ -1696,14 +1709,32 @@ async fn rearm_after_freeze(tx: &mut PgConnection, instance_id: Uuid) -> Result<
             "update rbpmn_timer t set due_at = to_timestamp(extract(epoch from t.due_at) \
                + c.period * greatest(0, ceil((extract(epoch from clock_timestamp()) \
                                               - extract(epoch from t.due_at)) / c.period))) \
-             from unnest($2::bigint[], $3::float8[]) as c(no, period) \
-             where t.instance_id = $1 and t.timer_no = c.no",
+             from unnest($2::bigint[], $3::float8[]) as c(no, period), rbpmn_instance i \
+             where t.instance_id = $1 and t.timer_no = c.no and i.id = $1 \
+               and i.frozen_at is not null and t.due_at >= i.frozen_at",
         )
         .bind(instance_id)
         .bind(&numbers)
         .bind(&periods)
         .execute(&mut *tx)
         .await?;
+    }
+    // Wake whoever the freeze put to sleep: a timer the moves made due, and a
+    // service item that became claimable again, would otherwise wait out a
+    // poll interval — their own NOTIFY was spent while the instance was
+    // frozen. Items this step creates notify for themselves.
+    sqlx::query("select pg_notify('rbpmn_timer', '')")
+        .execute(&mut *tx)
+        .await?;
+    let topics: Vec<String> = sqlx::query_scalar(
+        "select distinct topic from rbpmn_work_item \
+         where instance_id = $1 and state = 'available' and kind = 'service'",
+    )
+    .bind(instance_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    for topic in topics {
+        notify_work(tx, &topic).await?;
     }
     Ok(())
 }

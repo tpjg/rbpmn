@@ -2332,6 +2332,9 @@ const CLOCK_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:boundaryEvent id="remind" cancelActivity="false" attachedToRef="review">
       <bpmn:timerEventDefinition><bpmn:timeCycle>R/P7D</bpmn:timeCycle></bpmn:timerEventDefinition>
     </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="chase" cancelActivity="false" attachedToRef="review">
+      <bpmn:timerEventDefinition><bpmn:timeCycle>R/P3D</bpmn:timeCycle></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
     <bpmn:boundaryEvent id="note" cancelActivity="false" attachedToRef="review">
       <bpmn:messageEventDefinition messageRef="m_note"/>
     </bpmn:boundaryEvent>
@@ -2340,12 +2343,14 @@ const CLOCK_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:endEvent id="escalated"/>
     <bpmn:endEvent id="expired"/>
     <bpmn:endEvent id="reminded"/>
+    <bpmn:endEvent id="chased"/>
     <bpmn:endEvent id="filed"/>
     <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="review"/>
     <bpmn:sequenceFlow id="f2" sourceRef="review" targetRef="done"/>
     <bpmn:sequenceFlow id="f3" sourceRef="sla" targetRef="escalated"/>
     <bpmn:sequenceFlow id="f4" sourceRef="deadline" targetRef="expired"/>
     <bpmn:sequenceFlow id="f5" sourceRef="remind" targetRef="reminded"/>
+    <bpmn:sequenceFlow id="f8" sourceRef="chase" targetRef="chased"/>
     <bpmn:sequenceFlow id="f6" sourceRef="note" targetRef="file_note"/>
     <bpmn:sequenceFlow id="f7" sourceRef="file_note" targetRef="filed"/>
   </bpmn:process>
@@ -2365,9 +2370,10 @@ async fn due_of(pool: &PgPool, instance: uuid::Uuid, element: &str) -> f64 {
 
 /// A frozen instance's clock stops (docs/design/incident-scope.md, D8): the
 /// repair that lands re-arms every timer the freeze kept. A duration moves by
-/// the outage, keeping the time it had left; a cycle whose occurrence passed
+/// the outage, keeping the time it had left; a cycle whose occurrence came due
 /// while frozen steps along its own grid to the first occurrence at or after
-/// the resume, skipping the missed ones; a date keeps its instant.
+/// the resume, skipping the missed ones, while one owed before the freeze
+/// fires on resume; a date keeps its instant.
 #[tokio::test]
 async fn a_repair_stops_the_clock_for_the_time_frozen() {
     const DAY: f64 = 86_400.0;
@@ -2403,22 +2409,31 @@ async fn a_repair_stops_the_clock_for_the_time_frozen() {
         FailOutcome::IncidentRaised
     );
 
-    // Twenty-two days frozen, and the reminder's occurrence missed in them.
+    // Twenty-two days frozen: the reminder's occurrence came due in them, the
+    // chaser's was due before the freeze began. Backdated in epoch seconds —
+    // `interval '22 days'` is calendar days, an hour off across a DST change.
     sqlx::query(
-        "update rbpmn_instance set frozen_at = frozen_at - interval '22 days' where id = $1",
+        "update rbpmn_instance set frozen_at = to_timestamp(extract(epoch from frozen_at) - $2) \
+         where id = $1",
     )
     .bind(id)
+    .bind(22.0 * DAY)
     .execute(&db.pool)
     .await
     .unwrap();
-    sqlx::query(
-        "update rbpmn_timer set due_at = due_at - interval '22 days' \
-         where instance_id = $1 and element_id = 'remind'",
-    )
-    .bind(id)
-    .execute(&db.pool)
-    .await
-    .unwrap();
+    for (element, days) in [("remind", 22.0), ("chase", 30.0)] {
+        sqlx::query(
+            "update rbpmn_timer set due_at = to_timestamp(extract(epoch from due_at) - $3) \
+             where instance_id = $1 and element_id = $2",
+        )
+        .bind(id)
+        .bind(element)
+        .bind(days * DAY)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let chase = due_of(&db.pool, id, "chase").await;
     let (sla, remind, deadline) = (
         due_of(&db.pool, id, "sla").await,
         due_of(&db.pool, id, "remind").await,
@@ -2451,6 +2466,11 @@ async fn a_repair_stops_the_clock_for_the_time_frozen() {
         "the cycle's next occurrence is not the first at or after now"
     );
     assert_eq!(due_of(&db.pool, id, "deadline").await, deadline);
+    assert_eq!(
+        due_of(&db.pool, id, "chase").await,
+        chase,
+        "an occurrence owed before the freeze fires on resume, not a period later"
+    );
     let frozen_at: Option<f64> = sqlx::query_scalar(
         "select extract(epoch from frozen_at)::float8 from rbpmn_instance where id = $1",
     )

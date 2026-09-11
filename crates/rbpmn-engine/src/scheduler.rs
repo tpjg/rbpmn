@@ -262,8 +262,11 @@ impl Engine {
         if state.status != InstanceStatus::Active {
             return Ok(Attempt::Resolved); // resolved between pick and lock
         }
-        // Re-check under the instance lock: a concurrent step may have
-        // fired or cancelled it; due_at cannot move (timers never reschedule).
+        // Re-check under the instance lock: a concurrent step may have fired
+        // or cancelled it, or — the instance frozen and repaired between the
+        // pick and this lock — a repair's re-arm moved it later
+        // (docs/design/incident-scope.md, D8). `due_at <= now()` is what
+        // keeps a moved timer from firing early.
         let still_armed = sqlx::query(
             "select 1 from rbpmn_timer where instance_id = $1 and timer_no = $2 \
              and due_at <= now()",

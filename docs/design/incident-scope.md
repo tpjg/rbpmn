@@ -337,10 +337,12 @@ times in succession, each re-arm landing in the past.
 So the instance's clock stops while it is frozen:
 
 - a **duration** moves by the outage, keeping exactly the time it had left;
-- a **cycle** steps along its own grid to the first occurrence at or after
-  the resume — the re-arm rule the cycle design already states, missed
-  occurrences skipped rather than replayed, which costs a bounded `R<n>`
-  nothing because it counts fires;
+- a **cycle** occurrence that came due while frozen steps along its own grid
+  to the first occurrence at or after the resume — the re-arm rule the cycle
+  design already states, missed occurrences skipped rather than replayed,
+  which costs a bounded `R<n>` nothing because it counts fires; one already
+  due when the instance froze was owed before the freeze, and fires on
+  resume like a duration overdue then;
 - a **`timeDate`** keeps its instant and fires once if it passed, because
   that deadline genuinely did.
 
@@ -354,7 +356,11 @@ outage after. The core's timer state never changes, so replay needs nothing.
 
 Work items keep their columns: a retry backoff running when the instance
 froze has usually elapsed by the resume, and a lease still held is completed
-or extended as before.
+or extended as before. The repair wakes the scheduler and the workers, whose
+notifications were spent while the instance was frozen. The instants are
+moved in epoch seconds: adding a timestamp difference back as an interval
+adds calendar days in the session's time zone, an hour wrong across a
+daylight-saving change.
 
 ### D9 — every incident has a number
 
