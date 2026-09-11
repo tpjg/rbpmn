@@ -1,0 +1,53 @@
+{
+  "fixture": "accept/10-error-boundary.bpmn",
+  "variables": {},
+  "actions": [
+    {
+      "fail": "st",
+      "code": "UNKNOWN_CODE"
+    },
+    {
+      "repair": 0,
+      "disposition": "advance",
+      "answer": 1,
+      "refused": "RepairRefused"
+    },
+    {
+      "repair": 0,
+      "disposition": "advance",
+      "reason": " ",
+      "refused": "RepairRefused"
+    },
+    {
+      "repair": 0,
+      "disposition": "advance",
+      "patch": {
+        "charged": "by hand"
+      },
+      "reason": "charged at the till"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {
+      "charged": "by hand"
+    },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started st",
+      "work-item-created st service st",
+      "work-item-failed st UNKNOWN_CODE",
+      "incident-raised st UNKNOWN_CODE",
+      "incident-repaired st advance",
+      "variables-patched",
+      "element-completed st",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

@@ -59,6 +59,30 @@ struct DeliverAction {
     deliver: String,
     #[serde(default)]
     patch: Option<Value>,
+    #[serde(default)]
+    refused: Option<String>,
+}
+
+/// Repair the instance's open incident (`docs/design/incident-scope.md`,
+/// D4–D5). `repair` is the incident number the request names (D9), and
+/// `refused`, as on a delivery, is the `StepError` variant the step must
+/// answer with — typed, before any mutation.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // read once the core takes `Command::Repair`
+struct RepairAction {
+    repair: u64,
+    disposition: String,
+    #[serde(default)]
+    patch: Option<Value>,
+    #[serde(default)]
+    answer: Option<Value>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    refused: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +93,7 @@ enum Action {
     Fail(FailAction),
     Fire(FireAction),
     Deliver(DeliverAction),
+    Repair(RepairAction),
 }
 
 /// Answer the decision a business-rule task is waiting on.
@@ -119,6 +144,11 @@ fn run_scenario(path: &Path, failures: &mut String) {
     trace.extend(events.iter().map(|e| e.to_string()));
 
     for action in &scenario.actions {
+        let refused = match action {
+            Action::Deliver(d) => d.refused.as_deref(),
+            Action::Repair(r) => r.refused.as_deref(),
+            _ => None,
+        };
         let (element, command) = match action {
             Action::Complete(CompleteAction { complete, patch }) => {
                 let node = proc
@@ -175,7 +205,7 @@ fn run_scenario(path: &Path, failures: &mut String) {
                     .unwrap_or_else(|| panic!("{name}: no armed timer at '{fire}'"));
                 (fire, Command::FireTimer { id })
             }
-            Action::Deliver(DeliverAction { deliver, patch }) => {
+            Action::Deliver(DeliverAction { deliver, patch, .. }) => {
                 let node = proc
                     .node_by_id(deliver)
                     .unwrap_or_else(|| panic!("{name}: no element '{deliver}'"));
@@ -185,10 +215,49 @@ fn run_scenario(path: &Path, failures: &mut String) {
                 let patch = patch.clone().unwrap_or_else(|| serde_json::json!({}));
                 (deliver, Command::DeliverMessage { id, patch })
             }
+            Action::Repair(_) => {
+                writeln!(
+                    failures,
+                    "{name}: a repair action needs `Command::Repair`, which the core does not have"
+                )
+                .unwrap();
+                return;
+            }
         };
-        let events = step(&proc, &mut state, command)
-            .unwrap_or_else(|e| panic!("{name}: action on '{element}' failed: {e}"));
-        trace.extend(events.iter().map(|e| e.to_string()));
+        let before = state.clone();
+        match (step(&proc, &mut state, command), refused) {
+            (Ok(events), None) => trace.extend(events.iter().map(|e| e.to_string())),
+            // A refusal is typed and comes before any mutation, so the state
+            // it leaves is the state it found.
+            (Err(e), Some(variant)) if format!("{e:?}").starts_with(variant) => {
+                if state != before {
+                    writeln!(
+                        failures,
+                        "{name}: the refusal at '{element}' changed the state"
+                    )
+                    .unwrap();
+                    return;
+                }
+            }
+            (Err(e), Some(variant)) => {
+                writeln!(
+                    failures,
+                    "{name}: '{element}' was refused with {e:?}, not {variant}"
+                )
+                .unwrap();
+                return;
+            }
+            (Ok(events), Some(variant)) => {
+                let stepped: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+                writeln!(
+                    failures,
+                    "{name}: '{element}' should have been refused with {variant}, and stepped: {stepped:?}"
+                )
+                .unwrap();
+                return;
+            }
+            (Err(e), None) => panic!("{name}: action on '{element}' failed: {e}"),
+        }
     }
 
     let status = match state.status {

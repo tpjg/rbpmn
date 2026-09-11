@@ -1,0 +1,50 @@
+{
+  "fixture": "accept/23-timer-from-variable.bpmn",
+  "variables": {},
+  "actions": [
+    {
+      "repair": 0,
+      "disposition": "retry",
+      "patch": {
+        "order": {
+          "slaDuration": "PT4H"
+        }
+      },
+      "reason": "the SLA was missing"
+    },
+    {
+      "complete": "review"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {
+      "order": {
+        "slaDuration": "PT4H"
+      }
+    },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started review",
+      "work-item-created review user review",
+      "timer-resolve-failed sla order.slaDuration",
+      "work-item-cancelled review",
+      "incident-raised sla",
+      "incident-repaired sla retry",
+      "variables-patched",
+      "element-started review",
+      "work-item-created review user review",
+      "timer-armed sla PT4H",
+      "work-item-completed review",
+      "timer-cancelled sla",
+      "element-completed review",
+      "flow-taken f2",
+      "element-started reviewed",
+      "element-completed reviewed",
+      "instance-completed"
+    ]
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "fixture": "accept/53-sibling-in-flight-at-a-freeze.bpmn",
+  "variables": {},
+  "actions": [
+    {
+      "repair": 0,
+      "disposition": "retry",
+      "patch": {
+        "order": {
+          "holdFor": "PT1H"
+        }
+      },
+      "reason": "the hold was missing"
+    },
+    {
+      "fire": "hold"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {
+      "order": {
+        "holdFor": "PT1H"
+      }
+    },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started ps",
+      "element-completed ps",
+      "flow-taken f_hold",
+      "flow-taken f_direct",
+      "element-started hold",
+      "timer-resolve-failed hold order.holdFor",
+      "incident-raised hold",
+      "incident-repaired hold retry",
+      "variables-patched",
+      "element-started hold",
+      "timer-armed hold PT1H",
+      "timer-fired hold",
+      "element-completed hold",
+      "flow-taken f2",
+      "element-started pj",
+      "element-completed pj",
+      "flow-taken f3",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

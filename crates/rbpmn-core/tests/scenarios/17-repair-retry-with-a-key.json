@@ -1,0 +1,51 @@
+{
+  "fixture": "accept/17-message-catch.bpmn",
+  "bindings": {
+    "correlations": {
+      "c": "order.id"
+    }
+  },
+  "variables": {},
+  "actions": [
+    {
+      "repair": 0,
+      "disposition": "retry",
+      "patch": {
+        "order": {
+          "id": "o-17"
+        }
+      },
+      "reason": "the order id was missing"
+    },
+    {
+      "deliver": "c"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {
+      "order": {
+        "id": "o-17"
+      }
+    },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started c",
+      "correlation-failed c order.id",
+      "incident-raised c",
+      "incident-repaired c retry",
+      "variables-patched",
+      "element-started c",
+      "message-subscribed c WarehouseAck o-17",
+      "message-received c WarehouseAck",
+      "element-completed c",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

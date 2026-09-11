@@ -1,0 +1,65 @@
+{
+  "fixture": "accept/25-business-rule-task.bpmn",
+  "bindings": {
+    "decisions": {
+      "decide": {
+        "decision": "Discount",
+        "result": "order.discount"
+      }
+    }
+  },
+  "variables": {
+    "Amount": 250
+  },
+  "actions": [
+    {
+      "decide": "decide",
+      "answer": null
+    },
+    {
+      "repair": 0,
+      "disposition": "advance",
+      "refused": "RepairRefused"
+    },
+    {
+      "repair": 0,
+      "disposition": "advance",
+      "patch": {
+        "order": {
+          "discount": 30
+        }
+      },
+      "refused": "RepairRefused"
+    },
+    {
+      "repair": 0,
+      "disposition": "advance",
+      "answer": 30,
+      "reason": "priced by hand"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {
+      "Amount": 250,
+      "order": {
+        "discount": 30
+      }
+    },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started decide",
+      "decision-requested decide Discount",
+      "incident-raised decide",
+      "incident-repaired decide advance",
+      "element-completed decide",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

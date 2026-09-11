@@ -1,0 +1,55 @@
+{
+  "fixture": "accept/17-message-catch.bpmn",
+  "bindings": {
+    "correlations": {
+      "c": "order.id"
+    }
+  },
+  "variables": {},
+  "actions": [
+    {
+      "repair": 0,
+      "disposition": "retry",
+      "reason": "try again"
+    },
+    {
+      "repair": 0,
+      "disposition": "advance",
+      "refused": "IncidentNotOpen"
+    },
+    {
+      "repair": 1,
+      "disposition": "advance",
+      "patch": {
+        "acked": "by phone"
+      },
+      "reason": "the warehouse confirmed by phone"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {
+      "acked": "by phone"
+    },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started c",
+      "correlation-failed c order.id",
+      "incident-raised c",
+      "incident-repaired c retry",
+      "element-started c",
+      "correlation-failed c order.id",
+      "incident-raised c",
+      "incident-repaired c advance",
+      "variables-patched",
+      "element-completed c",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

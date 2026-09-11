@@ -1,0 +1,52 @@
+{
+  "fixture": "accept/10-error-boundary.bpmn",
+  "variables": {},
+  "actions": [
+    {
+      "repair": 0,
+      "disposition": "retry",
+      "refused": "IncidentNotOpen"
+    },
+    {
+      "fail": "st",
+      "code": "UNKNOWN_CODE"
+    },
+    {
+      "repair": 0,
+      "disposition": "retry",
+      "patch": {
+        "card": "renewed"
+      },
+      "reason": "the card was renewed"
+    },
+    {
+      "complete": "st"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {
+      "card": "renewed"
+    },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started st",
+      "work-item-created st service st",
+      "work-item-failed st UNKNOWN_CODE",
+      "incident-raised st UNKNOWN_CODE",
+      "incident-repaired st retry",
+      "variables-patched",
+      "element-started st",
+      "work-item-created st service st",
+      "work-item-completed st",
+      "element-completed st",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}
