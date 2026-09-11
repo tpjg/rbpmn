@@ -242,6 +242,7 @@ pub fn app(tokens: Tokens, engine: rbpmn_engine::Engine) -> Router {
         .route("/definitions", post(api::deploy))
         .route("/instances", post(api::start))
         .route("/instances/{id}/inspect", get(api::inspect))
+        .route("/instances/{id}/repair", post(api::repair))
         .route("/events", get(api::events))
         .route("/work-items/{id}/complete", post(api::complete))
         .route("/work-items/{id}/fail", post(api::fail))

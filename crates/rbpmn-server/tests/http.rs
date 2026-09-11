@@ -12,6 +12,8 @@ const INCLUSIVE_XML: &str =
 const MINIMAL_XML: &str = include_str!("../../rbpmn-model/tests/fixtures/accept/01-minimal.bpmn");
 const CATCH_ALL_XML: &str =
     include_str!("../../rbpmn-model/tests/fixtures/accept/44-catch-all-error-boundary.bpmn");
+const MESSAGE_CATCH_XML: &str =
+    include_str!("../../rbpmn-model/tests/fixtures/accept/17-message-catch.bpmn");
 /// A user task with an interrupting message boundary: the payment that ends
 /// a contested ticket while a clerk holds the task.
 const BOUNDARY_XML: &str =
@@ -1213,6 +1215,100 @@ async fn deploy_carries_decision_artifacts() {
             .any(|d| d["rule"] == "unresolved-decision"),
         "{body}"
     );
+    db.drop().await;
+}
+
+/// Repair over HTTP (docs/design/incident-scope.md, D10). An instance frozen on
+/// a correlation it could never make is repaired by naming its incident: a
+/// stale number is 409 with the incident to name instead, a field the
+/// disposition does not take is 400, a disposition the incident does not
+/// allow is 422 — and the Retry that fixes the key lands.
+#[tokio::test]
+async fn an_incident_is_repaired_over_http() {
+    let (app, db) = test_app().await;
+    let post = |uri: String, body: serde_json::Value| {
+        let app = app.clone();
+        async move { app.oneshot(authed("POST", &uri, body)).await.unwrap() }
+    };
+    let resp = post(
+        "/v1/definitions".into(),
+        serde_json::json!({
+            "bpmn": MESSAGE_CATCH_XML,
+            "bindings": { "correlations": { "c": "order.id" } }
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = post(
+        "/v1/instances".into(),
+        serde_json::json!({ "definitionKey": "p", "variables": {} }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let instance_id = body_json(resp).await["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let repair = format!("/v1/instances/{instance_id}/repair");
+
+    let resp = post(
+        repair.clone(),
+        serde_json::json!({ "incident": 1, "disposition": "retry", "reason": "resent" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(resp).await["openIncident"], 0);
+
+    let resp = post(
+        repair.clone(),
+        serde_json::json!({
+            "incident": 0, "disposition": "abandon", "code": "X", "reason": "stray field"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = post(
+        repair.clone(),
+        serde_json::json!({
+            "incident": 0, "disposition": "advance", "answer": 1, "reason": "not a decision"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let resp = post(
+        repair.clone(),
+        serde_json::json!({
+            "incident": 0,
+            "disposition": "retry",
+            "patch": { "order": { "id": "o-17" } },
+            "reason": "the order id was missing"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({ "status": "active", "incident": null })
+    );
+
+    let resp = post(
+        "/v1/messages".into(),
+        serde_json::json!({ "name": "WarehouseAck", "correlationKey": "o-17" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/v1/instances/{instance_id}/inspect"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["status"], "completed");
     db.drop().await;
 }
 

@@ -431,6 +431,90 @@ pub async fn message(State(engine): State<Engine>, Json(body): Json<MessageBody>
     }
 }
 
+/// Repair the instance's open incident (docs/design/incident-scope.md, D5,
+/// D9–D10): the fields `Engine::repair` takes, with the disposition's own
+/// beside them. A field the disposition does not take is refused, never
+/// ignored.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairBody {
+    pub incident: u64,
+    /// `retry`, `advance`, `divert`, `abandon` or `abandonInstance`.
+    pub disposition: String,
+    #[serde(default)]
+    pub patch: Option<serde_json::Value>,
+    /// Present means answered — null included, which is an answer.
+    #[serde(default, deserialize_with = "present")]
+    pub answer: Option<serde_json::Value>,
+    #[serde(default)]
+    pub code: Option<String>,
+    pub reason: String,
+}
+
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(d).map(Some)
+}
+
+fn disposition_of(
+    kind: &str,
+    patch: Option<serde_json::Value>,
+    answer: Option<serde_json::Value>,
+    code: Option<String>,
+) -> Result<rbpmn_engine::Disposition, String> {
+    use rbpmn_engine::Disposition;
+    let refuse = |what: &str| Err(format!("a {kind} repair takes no {what}"));
+    let patch_or_empty = |p: Option<serde_json::Value>| p.unwrap_or_else(|| json!({}));
+    match kind {
+        "retry" if answer.is_some() || code.is_some() => refuse("answer or code"),
+        "retry" => Ok(Disposition::Retry {
+            patch: patch_or_empty(patch),
+        }),
+        "advance" if code.is_some() => refuse("code"),
+        "advance" => Ok(Disposition::Advance {
+            patch: patch_or_empty(patch),
+            answer,
+        }),
+        "divert" if patch.is_some() || answer.is_some() => refuse("patch or answer"),
+        "divert" => Ok(Disposition::Divert { code }),
+        "abandon" | "abandonInstance" if patch.is_some() || answer.is_some() || code.is_some() => {
+            refuse("patch, answer or code")
+        }
+        "abandon" => Ok(Disposition::Abandon),
+        "abandonInstance" => Ok(Disposition::AbandonInstance),
+        other => Err(format!(
+            "no disposition '{other}': retry, advance, divert, abandon or abandonInstance"
+        )),
+    }
+}
+
+/// The repair verb. 200 carries the status the instance is in after the
+/// step, and the incident to name next if it froze again; a stale incident
+/// is 409 with the open one as a field; a disposition the incident does not
+/// allow is 422 with its reason.
+pub async fn repair(
+    State(engine): State<Engine>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<RepairBody>,
+) -> Response {
+    let disposition = match disposition_of(&body.disposition, body.patch, body.answer, body.code) {
+        Ok(disposition) => disposition,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
+    match engine
+        .repair(id, body.incident, disposition, &body.reason)
+        .await
+    {
+        Ok(repaired) => Json(json!({
+            "status": repaired.status,
+            "incident": repaired.incident,
+        }))
+        .into_response(),
+        Err(e) => engine_error(e),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct TopicBody {
     pub name: String,
@@ -448,6 +532,16 @@ pub async fn declare_topic(State(engine): State<Engine>, Json(body): Json<TopicB
 
 fn engine_error(e: EngineError) -> Response {
     let (status, message) = match &e {
+        // A repair naming an incident that is not open (D9). The conflict is
+        // the instance's state, and the incident to name instead — when the
+        // instance is frozen at all — is a field, not only prose.
+        EngineError::Step(rbpmn_engine::StepError::IncidentNotOpen { open, .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": e.to_string(), "openIncident": open })),
+            )
+                .into_response();
+        }
         EngineError::UnknownDefinition(_)
         | EngineError::UnknownWorkItem(_)
         | EngineError::UnknownInstance(_)
