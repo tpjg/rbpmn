@@ -117,6 +117,7 @@ pub fn check(proc: &ExecutableProcess, s: &InstanceState) -> Result<(), String> 
             WaitKind::Join { .. }
             | WaitKind::EventGateway
             | WaitKind::Incident
+            | WaitKind::Halted(_)
             | WaitKind::Decision => {}
         }
     }
@@ -168,18 +169,45 @@ pub fn check(proc: &ExecutableProcess, s: &InstanceState) -> Result<(), String> 
         }
     }
 
-    // The uniform incident freeze: at least one token parked where it
-    // failed. NOT exactly one — `Advancer::freeze` deliberately parks every
-    // sibling that was still in flight as `Incident` too, so that a frozen
-    // parallel branch is not silently lost (token conservation survives the
-    // freeze, which is what makes a future repair API possible).
+    // The uniform incident freeze: exactly one token is the cause, parked
+    // where it failed, and whatever else the freeze stopped is halted where
+    // it stood — neither exists on an instance that is not frozen
+    // (docs/design/incident-scope.md, D6–D7). Exactly one is what lets a
+    // repair name the instance rather than a token.
+    let incidents = s
+        .tokens()
+        .filter(|(_, t)| t.wait == WaitKind::Incident)
+        .count();
+    let halted = s
+        .tokens()
+        .filter(|(_, t)| matches!(t.wait, WaitKind::Halted(_)))
+        .count();
     if s.status == InstanceStatus::Failed {
-        let incidents = s
-            .tokens()
-            .filter(|(_, t)| matches!(t.wait, WaitKind::Incident))
-            .count();
-        if incidents == 0 {
-            return Err("failed instance has no incident token".to_string());
+        if incidents != 1 {
+            return Err(format!(
+                "failed instance has {incidents} incident tokens, not one"
+            ));
+        }
+        if s.open_incident().is_none() {
+            return Err("failed instance has no open incident number".to_string());
+        }
+    } else if incidents + halted > 0 {
+        return Err(format!(
+            "{:?} instance holds {incidents} incident and {halted} halted tokens",
+            s.status
+        ));
+    }
+    // A halted move bound for a join must still know the flow it was on: the
+    // join counts arrivals by incoming flow.
+    for (id, t) in s.tokens() {
+        if t.wait == WaitKind::Halted(Halt::InFlight { via: None })
+            && matches!(proc.node(t.node).kind, ExecKind::ParallelGateway)
+            && proc.node(t.node).incoming.len() > 1
+        {
+            return Err(format!(
+                "halted token {id:?} bound for join '{}' lost its flow",
+                proc.node_id(t.node)
+            ));
         }
     }
 
@@ -250,6 +278,11 @@ pub fn canonical(proc: &ExecutableProcess, s: &InstanceState) -> String {
             WaitKind::Message(_) => "message".into(),
             WaitKind::EventGateway => "gateway".into(),
             WaitKind::Incident => "incident".into(),
+            WaitKind::Halted(Halt::InFlight { via }) => format!(
+                "halted@{}",
+                via.map_or_else(|| "-".to_string(), |f| proc.flow(f).id.clone())
+            ),
+            WaitKind::Halted(Halt::AwaitingDecision) => "halted:decision".into(),
             WaitKind::Decision => "decision".into(),
             WaitKind::Scope(_) => "subprocess".into(),
         };

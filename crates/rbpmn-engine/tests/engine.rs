@@ -1946,6 +1946,70 @@ async fn missing_correlation_key_freezes_loudly() {
     db.drop().await;
 }
 
+/// A delivery whose non-interrupting boundary could not re-arm is refused
+/// before anything changes (docs/design/incident-scope.md, D11): `correlate`
+/// answers the typed step refusal, the transaction rolls back, and the host
+/// keeps its work item, the boundary its subscription, the document its key.
+#[tokio::test]
+async fn a_delivery_that_would_break_its_boundary_is_refused() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("file_note").await.unwrap();
+    let bindings = Bindings::new().correlation("note_received", "case.id");
+    engine
+        .deploy(
+            &fixture("accept/33-non-interrupting-message-boundary.bpmn"),
+            &bindings,
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start(
+            "casefile",
+            None,
+            serde_json::json!({"case": {"id": "c-33"}}),
+        )
+        .await
+        .unwrap();
+
+    let refused = engine
+        .correlate("NOTE", "c-33", serde_json::json!({"case": {"id": 1.5}}))
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(rbpmn_engine::EngineError::Step(
+                rbpmn_core::StepError::BoundaryCannotRearm { .. }
+            ))
+        ),
+        "{refused:?}"
+    );
+    let (status, variables): (String, serde_json::Value) =
+        sqlx::query_as("select status, variables from rbpmn_instance where id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "active");
+    assert_eq!(variables, serde_json::json!({"case": {"id": "c-33"}}));
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 1);
+    let open = |items: Vec<(uuid::Uuid, String)>| -> Vec<String> {
+        items.into_iter().map(|(_, element)| element).collect()
+    };
+    assert_eq!(open(open_items(&db.pool, started.id).await), ["review"]);
+
+    // The boundary is still armed: a delivery that keeps the key goes through.
+    engine
+        .correlate("NOTE", "c-33", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        open(open_items(&db.pool, started.id).await),
+        ["review", "file_note"]
+    );
+    db.drop().await;
+}
+
 /// Terminate tears everything down in one transaction — including armed
 /// timers (fixture-12 shape with a timer in the surviving branch).
 #[tokio::test]

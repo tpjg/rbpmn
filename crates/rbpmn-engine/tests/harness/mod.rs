@@ -155,13 +155,25 @@ const FSCK: &[(&str, &str)] = &[
          where t.scope_no <> 0 and s.scope_no is null",
     ),
     (
-        // At least one, not exactly one: the freeze parks every token that
-        // was still in flight (a parallel sibling mid-advance) as an
-        // incident too, so token conservation survives the freeze.
+        // Every freeze parks its cause at an incident, and whatever else it
+        // stopped is halted (docs/design/incident-scope.md, D6–D7). This and
+        // the next two are that sentence, one direction each.
         "a failed instance is not frozen at an incident token",
         "select i.id::text from rbpmn_instance i where i.status = 'failed' \
            and not exists (select 1 from rbpmn_token t \
                 where t.instance_id = i.id and t.wait_kind = 'incident')",
+    ),
+    (
+        "an instance holds more than one incident token",
+        "select instance_id::text from rbpmn_token where wait_kind = 'incident' \
+         group by instance_id having count(*) > 1",
+    ),
+    (
+        "an instance that is not frozen holds an incident or halted token",
+        "select t.instance_id::text from rbpmn_token t \
+         join rbpmn_instance i on i.id = t.instance_id \
+         where t.wait_kind in ('incident', 'halted', 'halted_decision') \
+           and i.status <> 'failed'",
     ),
     (
         "a work item is locked without a live lease or an owner",

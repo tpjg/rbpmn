@@ -19,8 +19,8 @@ use crate::compile::{ExecKind, ExecutableProcess, FlowIx, NodeIx, TimerDue};
 use crate::event::Event;
 use crate::merge_patch::merge_patch;
 use crate::state::{
-    InstanceState, InstanceStatus, ScopeId, ScopeState, SubscriptionId, SubscriptionState, TimerId,
-    TimerState, Token, TokenId, WaitKind, WorkItemId, WorkItemState,
+    Halt, InstanceState, InstanceStatus, ScopeId, ScopeState, SubscriptionId, SubscriptionState,
+    TimerId, TimerState, Token, TokenId, WaitKind, WorkItemId, WorkItemState,
 };
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -97,6 +97,11 @@ pub enum StepError {
     UnknownTimer(TimerId),
     #[error("no open subscription {0:?} in this instance")]
     UnknownSubscription(SubscriptionId),
+    /// A delivery refused before anything changed: the non-interrupting
+    /// boundary it triggers could not re-arm afterwards
+    /// (docs/design/incident-scope.md, D11).
+    #[error("delivery refused: boundary '{element}' could not re-arm — {reason}")]
+    BoundaryCannotRearm { element: String, reason: String },
     #[error("internal invariant violated: {0} — state is poisoned")]
     Invariant(String),
 }
@@ -131,6 +136,72 @@ fn assign(document: &mut Value, path: &[String], value: Value) {
         .as_object_mut()
         .expect("made an object above")
         .insert(last.clone(), value);
+}
+
+/// Why a message arm could not be opened.
+enum ArmFailure {
+    /// The key did not resolve to a string or an exact integer.
+    Unusable { name: String },
+    /// Another open subscription already waits on this `(message, key)`.
+    Duplicate { message: String, key: String },
+}
+
+impl ArmFailure {
+    fn describe(&self) -> String {
+        match self {
+            ArmFailure::Unusable { name } => {
+                format!("its correlation key '{name}' would not be a string or an exact integer")
+            }
+            ArmFailure::Duplicate { message, key } => format!(
+                "a subscription for ({message}, {key}) is already open, and a second would \
+                 make every delivery ambiguous"
+            ),
+        }
+    }
+}
+
+/// The `(message, key)` the message arm at `element` — a catch, a receive
+/// task or a message boundary — opens with against `variables`, or why it
+/// cannot open. Keys must be strings or exact integers (floats have no
+/// canonical spelling across a jsonb round-trip, so the same logical value
+/// would arm two different keys), and a second open subscription for one
+/// `(message, key)` would make every delivery permanently ambiguous.
+/// `excluding` is a subscription about to be consumed, which its own re-arm
+/// cannot collide with.
+fn arm_key(
+    proc: &ExecutableProcess,
+    state: &InstanceState,
+    variables: &Value,
+    element: NodeIx,
+    excluding: Option<SubscriptionId>,
+) -> Result<(String, String), ArmFailure> {
+    let Some((message, key)) = proc.message_arm(element) else {
+        unreachable!("arm_key is only called on message arms");
+    };
+    let key_value = match rbpmn_model::condition::resolve_path(variables, key) {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => n
+            .as_i64()
+            .map(|i| i.to_string())
+            .or_else(|| n.as_u64().map(|u| u.to_string())),
+        _ => None,
+    };
+    let Some(key_value) = key_value else {
+        return Err(ArmFailure::Unusable {
+            name: key.join("."),
+        });
+    };
+    if state
+        .subscriptions
+        .iter()
+        .any(|(id, s)| Some(*id) != excluding && s.message == message && s.key == key_value)
+    {
+        return Err(ArmFailure::Duplicate {
+            message: message.to_string(),
+            key: key_value,
+        });
+    }
+    Ok((message.to_string(), key_value))
 }
 
 pub fn step(
@@ -424,10 +495,11 @@ pub fn step(
                 }
                 // `Decision` cannot be reached: it is resolved inside the
                 // transaction that created it, so no timer can fire against a
-                // token still holding it.
+                // token still holding it. A halted token never armed anything.
                 WaitKind::Timer(_)
                 | WaitKind::Join { .. }
                 | WaitKind::Incident
+                | WaitKind::Halted(_)
                 | WaitKind::Decision => Err(StepError::Invariant(format!(
                     "timer {id:?} fired on a token in an unrelated wait state"
                 ))),
@@ -437,10 +509,33 @@ pub fn step(
             if state.status != InstanceStatus::Active {
                 return Err(StepError::InstanceNotActive(state.status));
             }
-            let sub = state
+            let element = state
                 .subscriptions
-                .remove(&id)
-                .ok_or(StepError::UnknownSubscription(id))?;
+                .get(&id)
+                .ok_or(StepError::UnknownSubscription(id))?
+                .element;
+            // A non-interrupting boundary re-arms on this delivery, its key
+            // read from the document *after* this patch. When that would
+            // fail, the delivery is refused here, before anything changes:
+            // the alternative is a freeze that takes the waiting host's work
+            // with it (docs/design/incident-scope.md, D11).
+            if matches!(
+                proc.node(element).kind,
+                ExecKind::MessageBoundary {
+                    interrupting: false,
+                    ..
+                }
+            ) {
+                let mut patched = state.variables.clone();
+                merge_patch(&mut patched, &patch);
+                if let Err(failure) = arm_key(proc, state, &patched, element, Some(id)) {
+                    return Err(StepError::BoundaryCannotRearm {
+                        element: proc.node_id(element).to_string(),
+                        reason: failure.describe(),
+                    });
+                }
+            }
+            let sub = state.subscriptions.remove(&id).expect("looked up above");
             let mut adv = Advancer::new(proc);
             adv.events.push(Event::MessageReceived {
                 id,
@@ -493,9 +588,8 @@ pub fn step(
                 // is opened immediately: a new id, and the key re-evaluated
                 // against the now-patched document, because this is an arm and
                 // arms evaluate at arm time. The old row is already gone, so
-                // the duplicate check cannot trip on itself; a key that has
-                // become unusable freezes exactly as it would have at the
-                // first arm, and the helper stops before the side token.
+                // the duplicate check cannot trip on itself, and a re-arm that
+                // would fail was refused above, before anything changed.
                 //
                 // The emission order is the one the golden traces pin:
                 // `message-received`, `variables-patched`, **then** the
@@ -512,12 +606,13 @@ pub fn step(
                     adv.run(state)
                 }
                 // A timer catch hosts nothing, a join holds no arm, an
-                // incident advances nothing, and a decision never survives the
-                // transaction that parked it — so none of these can own a
-                // subscription.
+                // incident advances nothing, a halted token never armed
+                // anything, and a decision never survives the transaction
+                // that parked it — so none of these can own a subscription.
                 WaitKind::Timer(_)
                 | WaitKind::Join { .. }
                 | WaitKind::Incident
+                | WaitKind::Halted(_)
                 | WaitKind::Decision => Err(StepError::Invariant(format!(
                     "message {id:?} delivered to a token in an unrelated wait state"
                 ))),
@@ -1179,15 +1274,17 @@ impl<'a> Advancer<'a> {
     /// The order is the whole content of this function, and the golden traces
     /// pin it:
     ///
-    /// 1. the **host's scope**, before anything can freeze in it: a re-arm
-    ///    that cannot resolve its key parks the host as an incident, and an
-    ///    advancer still pointing at the root would file it in the wrong
-    ///    scope;
+    /// 1. the **host's scope**, before anything is armed or spawned in it —
+    ///    an advancer still pointing at the root would file both in the
+    ///    wrong scope;
     /// 2. the **re-arm** — a fresh subscription for a message boundary, the
     ///    next occurrence for a cycle, nothing at all for a single-shot timer
-    ///    (it fired once, which is what a `timeDuration` says). `false` means
-    ///    the re-arm failed and already froze the instance, so there is no
-    ///    side path to run: the caller flushes the events it produced;
+    ///    (it fired once, which is what a `timeDuration` says). `false` would
+    ///    mean the re-arm failed and froze the instance, leaving no side path
+    ///    to run. Neither kind reaches it: a cycle re-arms from a due already
+    ///    resolved, and a message re-arm that would fail was refused as a
+    ///    delivery before anything changed (docs/design/incident-scope.md,
+    ///    D11);
     /// 3. the **side token**. A live host is never observably without its
     ///    boundary, which is what puts the re-arm ahead of this.
     fn side_path_triggered(
@@ -1263,13 +1360,10 @@ impl<'a> Advancer<'a> {
 
     /// Open a subscription for the message arm at `element` — a catch, a
     /// receive task or a message boundary, all three through here —
-    /// evaluating its correlation key from the variables **now** (arm time).
-    /// Keys must be strings or exact integers (floats have no canonical
-    /// spelling across a jsonb round-trip — the same logical value would arm
-    /// two different keys); anything else can never match. Both cases, and a
-    /// duplicate open (message, key) in this instance (which would make
-    /// every delivery permanently ambiguous), freeze the instance as an
-    /// incident instead of waiting forever. A boundary's freeze parks its
+    /// evaluating its correlation key from the variables **now** (arm time),
+    /// through [`arm_key`]. When the arm cannot open — an unusable key, or a
+    /// duplicate `(message, key)` in this instance — the instance freezes as
+    /// an incident instead of waiting forever. A boundary's freeze parks its
     /// host's token **at the boundary element**, exactly as `arm_timer`'s
     /// does, so inspection names the arm that could not be made.
     fn subscribe(
@@ -1278,64 +1372,48 @@ impl<'a> Advancer<'a> {
         token: TokenId,
         element: NodeIx,
     ) -> Option<SubscriptionId> {
-        let Some((message, key)) = self.proc.message_arm(element) else {
-            unreachable!("subscribe is only called on message arms");
+        let (message, key) = match arm_key(self.proc, state, &state.variables, element, None) {
+            Ok(arm) => arm,
+            Err(failure) => {
+                let at = self.proc.node_id(element).to_string();
+                self.events.push(match failure {
+                    ArmFailure::Unusable { name } => Event::CorrelationFailed { element: at, name },
+                    ArmFailure::Duplicate { message, key } => Event::DuplicateSubscription {
+                        element: at,
+                        message,
+                        key,
+                    },
+                });
+                self.freeze(state, token, element, None, None);
+                return None;
+            }
         };
-        let value = rbpmn_model::condition::resolve_path(&state.variables, key);
-        let key_value = match value {
-            Value::String(s) => Some(s.clone()),
-            Value::Number(n) => n
-                .as_i64()
-                .map(|i| i.to_string())
-                .or_else(|| n.as_u64().map(|u| u.to_string())),
-            _ => None,
-        };
-        let Some(key_value) = key_value else {
-            self.events.push(Event::CorrelationFailed {
-                element: self.proc.node_id(element).to_string(),
-                name: key.join("."),
-            });
-            self.freeze(state, token, element, None, None);
-            return None;
-        };
-        if state
-            .subscriptions
-            .values()
-            .any(|s| s.message == message && s.key == key_value)
-        {
-            self.events.push(Event::DuplicateSubscription {
-                element: self.proc.node_id(element).to_string(),
-                message: message.to_string(),
-                key: key_value,
-            });
-            self.freeze(state, token, element, None, None);
-            return None;
-        }
         let id = state.alloc_subscription(SubscriptionState {
             element,
             token,
-            message: message.to_string(),
-            key: key_value.clone(),
+            message: message.clone(),
+            key: key.clone(),
         });
         self.events.push(Event::MessageSubscribed {
             id,
             element: self.proc.node_id(element).to_string(),
-            message: message.to_string(),
-            key: key_value,
+            message,
+            key,
             token,
         });
         Some(id)
     }
 
     /// Every incident converges here: withdraw the token's in-flight arms,
-    /// park it at the failing element (`WaitKind::Incident` — inspection
-    /// shows *where*, and a future repair API has one shape to resume), and
-    /// freeze the instance. Tokens still queued in this advancement (a
-    /// parallel sibling mid-transit) park at their target elements the same
-    /// way — frozen means *nothing advances and nothing vanishes*; token
-    /// conservation must survive the freeze or no repair can ever resume.
-    /// The cause event is pushed by the caller first; `incident-raised`
-    /// closes the sequence.
+    /// park it at the failing element as the cause (`WaitKind::Incident` —
+    /// inspection shows *where*, and a repair has one token to resume), and
+    /// freeze the instance under the next incident number. Everything else
+    /// the freeze stops is collateral, halted where it stood — a parallel
+    /// sibling mid-transit at its target, with the flow it was on; a sibling
+    /// parked on a decision, awaiting it. Frozen means *nothing advances and
+    /// nothing vanishes*: token conservation must survive the freeze or no
+    /// repair can resume (docs/design/incident-scope.md, D7). The cause event
+    /// is pushed by the caller first; `incident-raised` closes the sequence.
     fn freeze(
         &mut self,
         state: &mut InstanceState,
@@ -1364,10 +1442,13 @@ impl<'a> Advancer<'a> {
         for id in open {
             self.cancel_work_item(state, id);
         }
-        // A scope this token owns has no members and no owner left once the
-        // freeze parks it as an incident; leaving it behind would project a
-        // `rbpmn_scope` row whose token_no points at a token in another wait
-        // state, which is precisely what a resume would trip on.
+        // A scope this token owns is the empty one its entry had just opened
+        // — the one freeze that could take a waiting host, a non-interrupting
+        // boundary failing to re-arm, is refused as a delivery instead (D11).
+        // It has no owner left once the freeze parks the token as an
+        // incident; leaving it behind would project a `rbpmn_scope` row whose
+        // token_no points at a token in another wait state, which is
+        // precisely what a resume would trip on.
         let owned_scope = match state.tokens.get(&token).map(|t| &t.wait) {
             Some(WaitKind::Scope(child)) => Some(*child),
             _ => None,
@@ -1401,8 +1482,9 @@ impl<'a> Advancer<'a> {
         // instance was never created, the incident never recorded, and every
         // retry did the same thing.
         //
-        // They park at their own node, like the queue below, so inspection
-        // still shows where each branch stood.
+        // They are halted at their own node, like the queue below, so
+        // inspection still shows where each branch stood — and a repair asks
+        // their question again rather than starting the element twice.
         let pending: Vec<TokenId> = state
             .tokens
             .iter()
@@ -1411,7 +1493,7 @@ impl<'a> Advancer<'a> {
             .collect();
         for id in pending {
             if let Some(t) = state.tokens.get_mut(&id) {
-                t.wait = WaitKind::Incident;
+                t.wait = WaitKind::Halted(Halt::AwaitingDecision);
             }
         }
         for mv in std::mem::take(&mut self.queue) {
@@ -1420,15 +1502,17 @@ impl<'a> Advancer<'a> {
                 Token {
                     node: mv.node,
                     scope: mv.scope,
-                    wait: WaitKind::Incident,
+                    wait: WaitKind::Halted(Halt::InFlight { via: mv.via }),
                 },
             );
         }
         state.status = InstanceStatus::Failed;
+        let incident = state.alloc_incident();
         self.events.push(Event::IncidentRaised {
             element: self.proc.node_id(element).to_string(),
             code,
             detail,
+            incident,
         });
     }
 

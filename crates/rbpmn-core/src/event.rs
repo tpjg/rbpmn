@@ -103,6 +103,13 @@ pub enum Event {
         /// none to give. Same split as above: payload, not `Display`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// The incident's number on its instance: each freeze mints the
+        /// next, and a repair names the one it repairs
+        /// (docs/design/incident-scope.md, D9). Payload, not `Display`. An
+        /// event written before the number existed reads as 0, the number
+        /// the migration gives the one incident such an instance can hold.
+        #[serde(default)]
+        incident: u64,
     },
     VariablesPatched {
         patch: Value,

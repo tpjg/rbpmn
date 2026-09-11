@@ -574,13 +574,14 @@ incident); collateral resuming — an in-flight sibling completing a join, a
 pending decision asked again; a repair that re-freezes; and D11's refused
 delivery. Then the core: `WaitKind::Halted`, the incident counter,
 `Command::Repair`, `incident-repaired` (a new stable `Display` line),
-side-path membership in compile, D11's check in `DeliverMessage`. The
-explorer takes every repair as a stimulus on every failed state and asserts
+side-path membership in compile, D11's check in `DeliverMessage`. The core's
+new states reach persistence at once, so the migration that holds them — two
+wait kinds and the incident counter — lands here too, with D11's refusal
+through `correlate`. The explorer takes every repair as a stimulus on every failed state and asserts
 D6 over the whole space. No lint change: repair is not a model capability.
 
-**Slice 4 — through the engine.** The migration (two wait kinds, the incident
-counter, `frozen_at`), persistence, `Engine::repair`, D8 in `persist_step`,
-the typed errors and D11's refusal on `correlate`, the HTTP route, and
+**Slice 4 — through the engine.** `frozen_at`, `Engine::repair`, D8 in
+`persist_step`, the typed errors, the HTTP route, and
 `commands_from` rebuilding the command so replay covers it. Engine tests: a
 sibling's lease completing after a repair, the timer move, a resent repair.
 Storm and chaos repair some of what they freeze. The README's upgrade note

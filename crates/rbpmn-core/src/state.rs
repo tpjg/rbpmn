@@ -39,9 +39,9 @@ pub enum InstanceStatus {
     Active,
     Completed,
     Terminated,
-    /// Incident: a raised error matched no boundary. The instance is frozen
-    /// as-is (tokens and closed items stay put) for later repair — nothing
-    /// is torn down, unlike terminate.
+    /// Frozen on an incident: exactly one token is its cause, at
+    /// [`WaitKind::Incident`], and nothing advances until a repair. Tokens and
+    /// closed items stay put — nothing is torn down, unlike terminate.
     Failed,
 }
 
@@ -68,11 +68,17 @@ pub enum WaitKind {
     /// Parked at an event-based gateway; the armed timers/subscriptions
     /// point back at this token and race — first to fire wins.
     EventGateway,
-    /// Frozen by an incident at this element. Every incident converges on
-    /// this shape — token parked where it failed, in-flight arms withdrawn —
-    /// so inspection always shows *where*, and a future repair API has one
-    /// state to resume from.
+    /// The cause of an incident, parked at the element that failed. Every
+    /// incident converges on this shape — token parked where it failed,
+    /// in-flight arms withdrawn — so inspection always shows *where*, and a
+    /// repair has exactly one token to resume from: a frozen instance holds
+    /// one of these, and nothing else does (docs/design/incident-scope.md,
+    /// D6).
     Incident,
+    /// Collateral of an incident: a token the freeze stopped where it stood,
+    /// not where anything failed. It resumes with the cause, from the point
+    /// it carries (D7).
+    Halted(Halt),
     /// Parked at a subprocess, waiting for the child scope it opened to
     /// empty. Resumed when the last token inside that scope is consumed.
     Scope(ScopeId),
@@ -84,6 +90,18 @@ pub enum WaitKind {
     /// must be able to say "waiting for an answer" without being able to
     /// compute one (`docs/dmn.md`, D3).
     Decision,
+}
+
+/// Where a halted token resumes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Halt {
+    /// A move that had not entered its node when the instance froze. It
+    /// resumes by entering, on the flow it was on: a parallel join counts
+    /// arrivals by incoming flow, so the flow is part of the token.
+    InFlight { via: Option<FlowIx> },
+    /// A decision that was pending when the instance froze. Its element has
+    /// started, so it resumes by asking the question again.
+    AwaitingDecision,
 }
 
 /// An open subprocess scope instance.
@@ -154,6 +172,7 @@ pub struct InstanceState {
     next_timer: u64,
     next_subscription: u64,
     next_scope: u64,
+    next_incident: u64,
 }
 
 impl InstanceState {
@@ -171,6 +190,7 @@ impl InstanceState {
             next_timer: 0,
             next_subscription: 0,
             next_scope: 1, // 0 is the implicit root
+            next_incident: 0,
         }
     }
 
@@ -277,6 +297,7 @@ impl InstanceState {
             next_timer: counters.next_timer,
             next_subscription: counters.next_subscription,
             next_scope: counters.next_scope.max(1),
+            next_incident: counters.next_incident,
         }
     }
 
@@ -287,7 +308,24 @@ impl InstanceState {
             next_timer: self.next_timer,
             next_subscription: self.next_subscription,
             next_scope: self.next_scope,
+            next_incident: self.next_incident,
         }
+    }
+
+    /// The incident this instance is frozen on, if it is: each freeze mints
+    /// the next number, so the open incident is the last one minted
+    /// (docs/design/incident-scope.md, D9).
+    pub fn open_incident(&self) -> Option<u64> {
+        match self.status {
+            InstanceStatus::Failed => self.next_incident.checked_sub(1),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn alloc_incident(&mut self) -> u64 {
+        let incident = self.next_incident;
+        self.next_incident += 1;
+        incident
     }
 
     pub(crate) fn alloc_work_item(&mut self, item: WorkItemState) -> WorkItemId {
@@ -328,6 +366,9 @@ pub struct Counters {
     pub next_timer: u64,
     pub next_subscription: u64,
     pub next_scope: u64,
+    /// Incidents raised so far: each freeze mints the next number, so the
+    /// open one, if any, is the last (docs/design/incident-scope.md, D9).
+    pub next_incident: u64,
 }
 
 impl Default for InstanceState {

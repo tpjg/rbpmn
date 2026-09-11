@@ -15,9 +15,9 @@
 
 use crate::{Completion, Correlation, Engine, EngineError, FailOutcome, StartedInstance};
 use rbpmn_core::{
-    Bindings, Command, Counters, Event, ExecutableProcess, InstanceState, InstanceStatus, ScopeId,
-    ScopeState, SubscriptionId, SubscriptionState, TimerDue, TimerId, TimerState, Token, TokenId,
-    WaitKind, WorkItemId, WorkItemState, WorkKind, step,
+    Bindings, Command, Counters, Event, ExecutableProcess, Halt, InstanceState, InstanceStatus,
+    ScopeId, ScopeState, SubscriptionId, SubscriptionState, TimerDue, TimerId, TimerState, Token,
+    TokenId, WaitKind, WorkItemId, WorkItemState, WorkKind, step,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
@@ -879,7 +879,7 @@ pub(crate) async fn load_instance_nowait(
         "select i.definition_id, i.definition_key, i.definition_version, \
                 i.status, i.variables, \
                 i.next_token, i.next_work_item, i.next_timer, i.next_subscription, \
-                i.next_scope \
+                i.next_scope, i.next_incident \
          from rbpmn_instance i where i.id = $1 for update{}",
         if nowait { " nowait" } else { "" }
     );
@@ -1060,6 +1060,18 @@ pub(crate) async fn load_instance_nowait(
             ),
             "event_gateway" => WaitKind::EventGateway,
             "incident" => WaitKind::Incident,
+            // Collateral of an incident: a move in flight keeps the flow it
+            // was on (nullable — a scope's first move has none), a pending
+            // decision is asked again.
+            "halted" => WaitKind::Halted(Halt::InFlight {
+                via: match row.get::<Option<String>, _>("arrived_via") {
+                    Some(flow_id) => Some(proc.flow_by_id(&flow_id).ok_or_else(|| {
+                        internal(format!("token references unknown flow '{flow_id}'"))
+                    })?),
+                    None => None,
+                },
+            }),
+            "halted_decision" => WaitKind::Halted(Halt::AwaitingDecision),
             // A token parked at a subprocess waits on the scope it opened —
             // the one whose parked token is this one.
             "scope" => WaitKind::Scope(
@@ -1123,6 +1135,7 @@ pub(crate) async fn load_instance_nowait(
             next_timer: inst.get::<i64, _>("next_timer") as u64,
             next_subscription: inst.get::<i64, _>("next_subscription") as u64,
             next_scope: inst.get::<i64, _>("next_scope") as u64,
+            next_incident: inst.get::<i64, _>("next_incident") as u64,
         },
     );
     Ok(Some((definition, proc, bindings, state)))
@@ -1191,7 +1204,7 @@ pub(crate) async fn persist_step(
     sqlx::query(
         "update rbpmn_instance set status = $2, variables = $3, next_token = $4, \
          next_work_item = $5, next_timer = $6, next_subscription = $7, \
-         next_scope = $8, \
+         next_scope = $8, next_incident = $9, \
          completed_at = case when $2 in ('completed', 'terminated') \
          then now() else completed_at end where id = $1",
     )
@@ -1203,6 +1216,7 @@ pub(crate) async fn persist_step(
     .bind(counters.next_timer as i64)
     .bind(counters.next_subscription as i64)
     .bind(counters.next_scope as i64)
+    .bind(counters.next_incident as i64)
     .execute(&mut *tx)
     .await?;
 
@@ -1266,6 +1280,10 @@ pub(crate) async fn persist_step(
             WaitKind::Message(_) => ("message", None, None),
             WaitKind::EventGateway => ("event_gateway", None, None),
             WaitKind::Incident => ("incident", None, None),
+            WaitKind::Halted(Halt::InFlight { via }) => {
+                ("halted", via.map(|f| proc.flow(f).id.clone()), None)
+            }
+            WaitKind::Halted(Halt::AwaitingDecision) => ("halted_decision", None, None),
             WaitKind::Scope(_) => ("scope", None, None),
             // A decision is answered inside the transaction that asks for
             // it, so no token should reach persistence still holding one.
