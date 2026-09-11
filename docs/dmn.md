@@ -505,6 +505,13 @@ DMN has no error codes. Catching one would mean inventing a reserved code and
 teaching modelers to write it in their BPMN, which is a designed contract, and
 a feature is never the reason one ships early. So the token parks at the
 element with the uniform incident shape and inspection shows *where*.
+The catch-all ([design/incident-scope.md](design/incident-scope.md), D1) takes
+away the first leg of that: a boundary with no `errorRef` needs no code. The
+ruling stands on the other — a failed decision raises no error at all; it has
+no work item to fail, and is an incident of the same kind as a deadline that
+will not resolve — so a catch-all does not reach it either. Whether one
+*should* is a question the catch-all reopened, recorded there rather than
+answered here.
 
 *A null answer continues.* Freezing on null would turn every incomplete
 decision table into an incident, and P1 measured that dsntk cannot tell a legal

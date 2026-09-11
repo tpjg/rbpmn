@@ -303,7 +303,12 @@ pub fn reachable_conditions(proc: &ExecutableProcess, codes: &[String]) -> Vec<E
         for &b in proc.boundaries(n) {
             queue.push_back(b);
         }
-        for code in codes {
+        // Error boundaries are matched, never armed, so they are reached
+        // per failure the exploration can raise: every declared code, and
+        // the codeless failure — which only a catch-all takes, and which a
+        // model declaring no codes at all can still raise.
+        let failures = codes.iter().map(|c| Some(c.as_str())).chain([None]);
+        for code in failures {
             if let Some(b) = proc.error_boundary(n, code) {
                 queue.push_back(b);
             }
@@ -458,7 +463,7 @@ pub struct Report {
 pub fn explore(proc: &ExecutableProcess, initial: Value, codes: &[String]) -> Report {
     let patches = patch_alphabet(proc, codes);
     let mut codes_opt: Vec<Option<String>> = codes.iter().cloned().map(Some).collect();
-    codes_opt.push(None); // an unmatched failure: the incident path
+    codes_opt.push(None); // a codeless failure: the incident path, unless a catch-all takes it
 
     let mut state = InstanceState::new();
     step(proc, &mut state, Command::Start { variables: initial }).expect("start");

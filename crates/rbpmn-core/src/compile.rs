@@ -693,9 +693,11 @@ pub enum ExecKind {
     },
     ParallelGateway,
     /// Interrupting error boundary: entered only when its host's work item
-    /// raises a matching error code — never via a sequence flow.
+    /// fails with a matching error — never via a sequence flow. `None` is the
+    /// catch-all (no `errorRef`): it matches any error, coded or not, when no
+    /// boundary for the exact code on the same host does.
     ErrorBoundary {
-        code: String,
+        code: Option<String>,
     },
     /// Timer intermediate catch: parks its token behind an armed timer.
     TimerCatch {
@@ -791,14 +793,15 @@ pub struct ExecutableProcess {
     nodes: Vec<ExecNode>,
     flows: Vec<ExecFlow>,
     ids: BTreeMap<String, NodeIx>,
-    /// host node -> (error code, boundary node)
-    error_boundaries: BTreeMap<NodeIx, Vec<(String, NodeIx)>>,
+    /// host node -> (error code, or `None` for the catch-all; boundary node)
+    error_boundaries: BTreeMap<NodeIx, Vec<(Option<String>, NodeIx)>>,
     /// host node -> the boundary nodes armed on the host's token whenever it
     /// starts waiting — timer *and* message, in **XML declaration order**.
     /// One list rather than one per kind because arming allocates timer and
     /// subscription ids and the golden traces pin them: two lists would make
     /// the trace depend on which kind the code happened to walk first.
-    /// `error_boundaries` stays separate — it is matched by code, never armed.
+    /// `error_boundaries` stays separate — it is matched by code (or taken by
+    /// the catch-all), never armed.
     boundaries: BTreeMap<NodeIx, Vec<NodeIx>>,
     /// Each static scope's start event; index 0 is the process root. The
     /// rest of the scope tree (parents, owners) is only needed while
@@ -1150,19 +1153,28 @@ impl ExecutableProcess {
                     // pass below is the one place that validates it.
                     boundary_hosts.push((ix, b.attached_to.clone().unwrap_or_default()));
                     match &b.trigger {
-                        BoundaryTrigger::Error { error_ref } => {
-                            let code = error_ref
-                                .as_deref()
-                                .and_then(|r| defs.errors.iter().find(|e| e.id == r))
-                                .and_then(|e| e.code.clone())
-                                .ok_or_else(|| {
-                                    CompileError::Internal(format!(
-                                        "error boundary '{}' without a coded error survived lint",
-                                        node.id
-                                    ))
-                                })?;
-                            ExecKind::ErrorBoundary { code }
-                        }
+                        // No errorRef is the catch-all. A *present* one must
+                        // resolve to a coded error: lint refuses a dangling
+                        // or codeless reference, so reaching here without one
+                        // is a gate that failed — never a catch-all by default.
+                        BoundaryTrigger::Error { error_ref } => match error_ref.as_deref() {
+                            None => ExecKind::ErrorBoundary { code: None },
+                            Some(r) => {
+                                let code = defs
+                                    .errors
+                                    .iter()
+                                    .find(|e| e.id == r)
+                                    .and_then(|e| e.code.clone())
+                                    .ok_or_else(|| {
+                                        CompileError::Internal(format!(
+                                            "error boundary '{}' with an unresolvable or \
+                                             codeless errorRef survived lint",
+                                            node.id
+                                        ))
+                                    })?;
+                                ExecKind::ErrorBoundary { code: Some(code) }
+                            }
+                        },
                         // `cancelActivity` for both kinds, and lint is what
                         // makes reading it safe: only a timer or a message
                         // boundary may be non-interrupting, an error boundary
@@ -1257,7 +1269,7 @@ impl ExecutableProcess {
             }
         }
 
-        let mut error_boundaries: BTreeMap<NodeIx, Vec<(String, NodeIx)>> = BTreeMap::new();
+        let mut error_boundaries: BTreeMap<NodeIx, Vec<(Option<String>, NodeIx)>> = BTreeMap::new();
         let mut boundaries: BTreeMap<NodeIx, Vec<NodeIx>> = BTreeMap::new();
         for (boundary_ix, host_id) in boundary_hosts {
             let host = *node_ix.get(host_id.as_str()).ok_or_else(|| {
@@ -1265,10 +1277,11 @@ impl ExecutableProcess {
             })?;
             match &nodes[boundary_ix].kind {
                 ExecKind::ErrorBoundary { code } => {
-                    // Errors originate from failing service tasks, and
-                    // propagate outward to the nearest enclosing scope whose
-                    // subprocess carries a matching boundary — the scoped
-                    // error handler embedded subprocesses exist for.
+                    // Errors originate from failing work items — a service
+                    // task's handler, or any task failed through the task
+                    // API — and propagate outward to the nearest enclosing
+                    // scope whose subprocess carries a matching boundary: the
+                    // scoped error handler embedded subprocesses exist for.
                     if !matches!(
                         nodes[host].kind,
                         ExecKind::Task {
@@ -1372,12 +1385,15 @@ impl ExecutableProcess {
         self.ids.get(id).copied()
     }
 
-    /// The error boundary on `host` matching `code` exactly, if any.
-    pub fn error_boundary(&self, host: NodeIx, code: &str) -> Option<NodeIx> {
-        self.error_boundaries
-            .get(&host)?
-            .iter()
-            .find(|(c, _)| c == code)
+    /// The error boundary on `host` that catches a failure carrying `code`:
+    /// the one declared for that exact code, else the catch-all. Per host,
+    /// never across the chain — `step` asks each host of the outward walk in
+    /// turn, which is what makes a nearer catch-all beat a farther exact
+    /// code. A codeless failure can only ever meet the catch-all.
+    pub fn error_boundary(&self, host: NodeIx, code: Option<&str>) -> Option<NodeIx> {
+        let candidates = self.error_boundaries.get(&host)?;
+        code.and_then(|c| candidates.iter().find(|(k, _)| k.as_deref() == Some(c)))
+            .or_else(|| candidates.iter().find(|(k, _)| k.is_none()))
             .map(|(_, b)| *b)
     }
 
@@ -1394,7 +1410,8 @@ impl ExecutableProcess {
 
     /// The boundaries armed whenever `host` starts waiting — timer and
     /// message alike, in XML declaration order. Error boundaries are not
-    /// here: they are matched by code when the host fails, never armed.
+    /// here: they are matched when the host fails — by code, or by the
+    /// catch-all — and never armed.
     pub fn boundaries(&self, host: NodeIx) -> &[NodeIx] {
         self.boundaries.get(&host).map(Vec::as_slice).unwrap_or(&[])
     }

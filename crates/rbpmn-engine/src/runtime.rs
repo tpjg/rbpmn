@@ -61,6 +61,8 @@ pub(crate) mod item_state {
 #[derive(Debug, Clone, Default)]
 pub struct FailOptions {
     /// Error code for boundary matching once the retry budget is exhausted.
+    /// `None` is still catchable, but only by a catch-all (an error boundary
+    /// with no `errorRef`) on the host or an enclosing subprocess.
     pub error_code: Option<String>,
     /// Human-readable failure reason, recorded on the work item
     /// (`last_failure`) and in the retry events — what makes an incident

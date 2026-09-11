@@ -293,9 +293,11 @@ no rbpmn-specific syntax anywhere.
   join's parked tokens / `SELECT FOR UPDATE` on instance-scope advance).
 - Terminate end event: delete all tokens/scopes/work items/timers/subscriptions of the
   instance in one transaction; write terminal event.
-- Error boundary: service-task failure past retry budget raises a named error; matched
-  by error code on the boundary event of the task or nearest enclosing scope; no match
-  → instance goes to a `failed`/incident state (do NOT silently swallow).
+- Error boundary: a work item failing past its retry budget raises an error, coded or
+  not. At each host from the failing task outward through enclosing scopes, a boundary
+  for the exact code is tried, then a catch-all (no `errorRef`); no match → instance
+  goes to a `failed`/incident state (do NOT silently swallow — a catch-all is the
+  author's handling, drawn and recorded, never the engine's).
 - At-least-once handler delivery is the contract; the engine guarantees exactly-once
   *state transition* (completion of an already-completed work item is a no-op returning
   a distinct result). Handlers must be idempotent; say so loudly in docs.

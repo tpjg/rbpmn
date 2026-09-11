@@ -32,9 +32,11 @@ pub enum Command {
     /// Complete an open work item, applying an RFC 7386 merge patch to the
     /// variables in the same step that advances the token.
     CompleteWorkItem { id: WorkItemId, patch: Value },
-    /// A work item's retry budget is exhausted: raise the named error. A
-    /// matching error boundary on the host interrupts the task and takes the
-    /// boundary path; no match freezes the instance in the incident state.
+    /// A work item's retry budget is exhausted: raise the error, with its
+    /// code if it has one. The nearest matching error boundary — on the host,
+    /// else on an enclosing subprocess, an exact code before a catch-all at
+    /// each — interrupts and takes the boundary path; no match freezes the
+    /// instance in the incident state.
     RaiseError {
         id: WorkItemId,
         code: Option<String>,
@@ -233,12 +235,13 @@ pub fn step(
                 // and the instance freezes — so inspection shows *where*, and
                 // a repair API has one state to resume from.
                 //
-                // Deliberately not caught by an error boundary. Boundaries
-                // match an error *code*, and a failed decision has none to
-                // give: DMN has no error codes, so catching one would mean
-                // inventing a reserved code and teaching modelers to write it
-                // in their BPMN. That is a designed contract, and a feature is
-                // never the reason one ships early.
+                // Deliberately not caught by an error boundary, a catch-all
+                // included. A failed decision raises no error: it has no work
+                // item to fail, and is an incident of the same kind as a
+                // deadline that will not resolve. Whether a catch-all *should*
+                // reach it is open (`docs/design/incident-scope.md`) — that is
+                // a designed contract, and a feature is never the reason one
+                // ships early.
                 adv.freeze(state, token, element, None, reason);
                 return adv.run(state);
             };
@@ -305,27 +308,32 @@ pub fn step(
             // failing that — by one on the nearest enclosing subprocess:
             // the scoped error handler. Each step outward interrupts that
             // subprocess's token, tearing its whole scope down.
+            //
+            // At each host the exact code is tried before the catch-all, and
+            // the walk moves outward only when neither is there — so a nearer
+            // catch-all beats a farther exact code. A failure with no code
+            // can only ever meet a catch-all, and the walk runs for it too:
+            // it is the shape of the failure nobody anticipated, which is
+            // what a catch-all exists for.
             let mut caught = None;
-            if let Some(c) = code.as_deref() {
-                let mut host = element;
-                let mut target = token_id;
-                let mut scope = state
-                    .tokens
-                    .get(&token_id)
-                    .map(|t| t.scope)
-                    .unwrap_or(ScopeId::ROOT);
-                loop {
-                    if let Some(boundary) = proc.error_boundary(host, c) {
-                        caught = Some((target, boundary));
-                        break;
-                    }
-                    let Some(enclosing) = state.scopes.get(&scope) else {
-                        break; // reached the instance root uncaught
-                    };
-                    host = enclosing.element;
-                    target = enclosing.token;
-                    scope = enclosing.parent;
+            let mut host = element;
+            let mut target = token_id;
+            let mut scope = state
+                .tokens
+                .get(&token_id)
+                .map(|t| t.scope)
+                .unwrap_or(ScopeId::ROOT);
+            loop {
+                if let Some(boundary) = proc.error_boundary(host, code.as_deref()) {
+                    caught = Some((target, boundary));
+                    break;
                 }
+                let Some(enclosing) = state.scopes.get(&scope) else {
+                    break; // reached the instance root uncaught
+                };
+                host = enclosing.element;
+                target = enclosing.token;
+                scope = enclosing.parent;
             }
             match caught {
                 Some((target, boundary_ix)) => {

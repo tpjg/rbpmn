@@ -1,9 +1,8 @@
 # Incident scope — design round
 
-**Status: decided and in progress.** D1 — the catch-all error boundary —
-and D2, the warning that ships with it, are decided and owed as a slice. The
-freeze stays instance-wide, and the way out of an incident is a repair API
-rather than a narrower freeze (D3); everything from D4 down is the shape
+**Status: D1 and D2 shipped.** The catch-all error boundary and the warning
+that ships with it are in. The freeze stays instance-wide, and the way out of
+an incident is a repair API rather than a narrower freeze (D3); everything from D4 down is the shape
 that round will start from, not a commitment to build it now. The
 alternatives that were weighed and refused are at the bottom, briefly,
 because the reasoning for not taking them is the part worth keeping.
@@ -406,7 +405,7 @@ instance completes.
 
 ## Slices
 
-**Slice 1 — the catch-all (D1 + D2).** Fixtures first, both directions: an
+**Slice 1 — the catch-all (D1 + D2): shipped.** Fixtures first, both directions: an
 absent `errorRef` accepted and matched, a present-but-unresolvable one still
 refused, two catch-alls on one host refused, a codeless failure caught, an
 exact code preferred over the catch-all at the same host, and the outward
@@ -441,6 +440,11 @@ cheap.
 
 ## Known warts, stated up front
 
+- **The catch-all reopens one DMN ruling.** `docs/dmn.md` refused catchable
+  decision failures partly because a boundary needs a code and DMN has none.
+  A catch-all needs none, so that leg is gone; the ruling stands on its other
+  one — a failed decision raises no error — and a catch-all does not reach it.
+  Whether it should is open, and deliberately not answered by this slice.
 - **D2 warns on nearly every side path.** Ten of the eleven side-path
   fixtures that predate it carry it, because a side path exists to run a task
   and the task is what fails. None of them is a false positive. It ships as
