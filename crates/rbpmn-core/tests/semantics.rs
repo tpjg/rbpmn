@@ -1502,3 +1502,99 @@ fn the_read_names_where_a_diverts_code_lands_and_what_it_tears_down() {
         "the one code that lands, where it lands, and the scope it costs"
     );
 }
+
+/// A catch-all takes any code, and no list can enumerate that — so the read
+/// says it with the codeless entry rather than by guessing an alphabet
+/// (docs/design/incident-scope.md, D10). The freeze here fails no work item
+/// at all (a correlation key that will not resolve), which is what puts a
+/// catch-all on the walk in the first place: an error raised at `c` would
+/// have been caught by it and never frozen.
+#[test]
+fn a_catch_all_on_the_walk_is_the_codeless_entry_and_takes_any_code() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m" name="Go"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:subProcess id="sp">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:startEvent id="s2"><bpmn:outgoing>fi1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:intermediateCatchEvent id="c">
+        <bpmn:incoming>fi1</bpmn:incoming>
+        <bpmn:outgoing>fi2</bpmn:outgoing>
+        <bpmn:messageEventDefinition messageRef="m"/>
+      </bpmn:intermediateCatchEvent>
+      <bpmn:endEvent id="e2"><bpmn:incoming>fi2</bpmn:incoming></bpmn:endEvent>
+      <bpmn:sequenceFlow id="fi1" sourceRef="s2" targetRef="c"/>
+      <bpmn:sequenceFlow id="fi2" sourceRef="c" targetRef="e2"/>
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="sp_any" attachedToRef="sp">
+      <bpmn:outgoing>f3</bpmn:outgoing>
+      <bpmn:errorEventDefinition/>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="e_fail"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="end"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sp"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="sp" targetRef="end"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="sp_any" targetRef="e_fail"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let defs = rbpmn_model::parse(xml).unwrap();
+    let bindings = Bindings::new().correlation("c", "order.id");
+    let proc = ExecutableProcess::compile(&defs, "p", &bindings).unwrap();
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({}), // no order.id, so `c` cannot arm
+        },
+    )
+    .unwrap();
+    assert_eq!(state.status, InstanceStatus::Failed);
+
+    let read = rbpmn_core::open_incident(&proc, &state).expect("a frozen instance has one");
+    assert_eq!(&*read.element, "c");
+    let divert = read
+        .options
+        .iter()
+        .find(|o| o.disposition == rbpmn_core::RepairKind::Divert)
+        .expect("divert is an option");
+    assert!(divert.refused.is_none());
+    assert_eq!(
+        divert
+            .codes
+            .iter()
+            .map(|c| {
+                (
+                    c.code.as_deref(),
+                    c.caught_at.as_str(),
+                    c.tears_down.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [(None, "sp_any", Some("sp"))],
+        "the catch-all is one entry, not an alphabet"
+    );
+
+    // And what that entry means: a code the read never named lands there too.
+    let mut diverted = state.clone();
+    step(
+        &proc,
+        &mut diverted,
+        Command::Repair {
+            incident: read.incident,
+            disposition: Disposition::Divert {
+                code: Some("A_CODE_NOBODY_DECLARED".to_string()),
+            },
+            reason: "the warehouse will never ack this one".to_string(),
+        },
+    )
+    .expect("a catch-all takes any code");
+    // ...and what it costs: `sp` comes down with the token still inside it,
+    // the boundary's path runs, and `e_fail` is the last token there is.
+    assert_eq!(diverted.status, InstanceStatus::Completed);
+    assert_eq!(diverted.tokens().count(), 0);
+}

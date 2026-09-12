@@ -150,9 +150,10 @@ pub struct RepairOption {
     pub disposition: RepairKind,
     /// What the caller supplies with it.
     pub takes: Takes,
-    /// For a Divert, every code that reaches a boundary from the resume
-    /// point and where each one lands. Empty for every other disposition,
-    /// and for a Divert nothing catches — `refused` then says so.
+    /// For a Divert that would land, where each code it can send is caught.
+    /// Every declared code on the walk appears; a catch-all does not expand
+    /// into the codes it would take, it says so through the codeless entry.
+    /// Empty for every other disposition, and whenever `refused` is set.
     pub codes: Vec<CaughtCode>,
     /// Why it would be refused, or `None` when it lands.
     pub refused: Option<RefusedBecause>,
@@ -538,17 +539,24 @@ pub fn open_incident(proc: &ExecutableProcess, state: &InstanceState) -> Option<
             RepairKind::AbandonInstance,
         ]
         .into_iter()
-        .map(|disposition| RepairOption {
-            disposition,
-            takes: takes(disposition),
-            codes: match disposition {
-                RepairKind::Divert => divert_codes.clone(),
-                _ => Vec::new(),
-            },
-            refused: refusal(disposition).map(|cause| RefusedBecause {
-                reason: cause.to_string(),
-                cause,
-            }),
+        .map(|disposition| {
+            let refused = refusal(disposition);
+            RepairOption {
+                disposition,
+                takes: takes(disposition),
+                // Nothing is offered under a refusal. `CauseUnknown` is the
+                // one that does not already empty this, and a list of codes
+                // printed beneath "which token failed is unknown" reads as
+                // an offer of something that cannot be sent.
+                codes: match (disposition, &refused) {
+                    (RepairKind::Divert, None) => divert_codes.clone(),
+                    _ => Vec::new(),
+                },
+                refused: refused.map(|cause| RefusedBecause {
+                    reason: cause.to_string(),
+                    cause,
+                }),
+            }
         })
         .collect(),
     })

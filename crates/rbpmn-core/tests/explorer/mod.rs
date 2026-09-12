@@ -524,11 +524,22 @@ pub fn read_agrees(
                         ));
                     }
                 }
+                // A catch-all takes any code at all, which no list can
+                // enumerate — the read says it with the codeless entry
+                // instead. So the omission half asks the opposite question
+                // there: with that entry every code must land, and without
+                // it every code the read leaves out must be refused. Exact
+                // either way.
                 let named: Vec<&Option<String>> = option.codes.iter().map(|c| &c.code).collect();
+                let catch_all = option.codes.iter().any(|c| c.code.is_none());
                 for code in codes {
-                    if !named.contains(&code)
-                        && structural(Disposition::Divert { code: code.clone() }).is_none()
-                    {
+                    let lands = structural(Disposition::Divert { code: code.clone() }).is_none();
+                    if catch_all && !lands {
+                        return Err(format!(
+                            "the read names a catch-all, and a divert with {code:?} is refused"
+                        ));
+                    }
+                    if !catch_all && !named.contains(&code) && lands {
                         return Err(format!(
                             "a divert with {code:?} lands, and the read does not name it"
                         ));

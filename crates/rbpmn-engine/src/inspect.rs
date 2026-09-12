@@ -157,11 +157,13 @@ impl Engine {
         let status: String = inst.get("status");
         let incident = if status == "failed" {
             // Best effort, and deliberately so: this is the view an operator
-            // opens *because* something is wrong, and rehydrating state is
-            // the one part of it that can fail on its own — a stored
-            // definition that no longer compiles, say, which is an instance
-            // nobody can repair anyway. The incident is then omitted and the
-            // rest of the inspection stands.
+            // opens *because* something is wrong. What it buys is the errors
+            // raised in Rust — a stored definition that no longer compiles,
+            // a row the core will not rehydrate — where the rest of the
+            // inspection still stands and the instance is unrepairable
+            // anyway, `repair` failing on the same load. A database error
+            // aborts this transaction and fails the read whatever happens
+            // here; there is nothing to swallow.
             match load_instance_snapshot(self, tx, id).await {
                 Ok((_, proc, _, state)) => rbpmn_core::open_incident(&proc, &state),
                 Err(e) => {
