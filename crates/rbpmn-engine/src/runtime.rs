@@ -1339,7 +1339,10 @@ pub(crate) async fn persist_step(
     // D8): the instance's clock stopped while it was frozen. Before the row
     // below moves `frozen_at` on, and before this step's own timers are
     // written — those are armed now and owe nothing to the outage.
-    if matches!(events.first(), Some(Event::IncidentRepaired { .. })) {
+    if events
+        .iter()
+        .any(|e| matches!(e, Event::IncidentRepaired { .. }))
+    {
         resume_after_freeze(tx, instance_id).await?;
     }
     sqlx::query(

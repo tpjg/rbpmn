@@ -393,6 +393,20 @@ body {
   background: #c0392b;
 }
 
+/* The history strokes come first, deliberately: a mark for something already
+   over must not paint over an element's live arm, and at equal specificity
+   the later rule wins. A retried task carries both — the failure that was
+   repaired, and the new item now waiting for a worker. */
+.rbpmn-mark-handled .djs-visual > :nth-child(1) {
+  stroke: #4a5568 !important;
+  stroke-width: 2px !important;
+}
+
+.rbpmn-mark-repaired .djs-visual > :nth-child(1) {
+  stroke: #2f855a !important;
+  stroke-width: 2px !important;
+}
+
 .rbpmn-mark-token .djs-visual > :nth-child(1) {
   stroke: #2b6cb0 !important;
   stroke-width: 3px !important;
@@ -437,20 +451,10 @@ body {
   background: #2f855a;
 }
 
-.rbpmn-mark-repaired .djs-visual > :nth-child(1) {
-  stroke: #2f855a !important;
-  stroke-width: 2px !important;
-}
-
 /* A failure a boundary caught: it happened, and the model handled it. Neither
    the red of an incident nor the dashes of an arm that will not fire. */
 .rbpmn-badge-handled {
   background: #4a5568;
-}
-
-.rbpmn-mark-handled .djs-visual > :nth-child(1) {
-  stroke: #4a5568 !important;
-  stroke-width: 2px !important;
 }
 
 /* Present but inert: the row is still there — a frozen instance keeps its

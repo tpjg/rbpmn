@@ -285,6 +285,13 @@ fn run_scenario(path: &Path, failures: &mut String) {
             (Ok(events), None) => trace.extend(events.iter().map(|e| e.to_string())),
             // A refusal is typed and comes before any mutation, so the state
             // it leaves is the state it found.
+            //
+            // The expectation is a Debug *prefix*, deliberately: a scenario
+            // pins as much of a refusal as is stable — the numbers
+            // `IncidentNotOpen` carries, which are what D9 turns on, or the
+            // element `BoundaryCannotRearm` names — and stops before prose
+            // that may be reworded. A bare variant name pins the variant
+            // alone, which for a refusal with fields is rarely enough.
             (Err(e), Some(variant)) if format!("{e:?}").starts_with(variant) => {
                 if state != before {
                     writeln!(

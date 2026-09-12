@@ -6,7 +6,7 @@
       "repair": 0,
       "disposition": "retry",
       "reason": "the card was renewed",
-      "refused": "IncidentNotOpen"
+      "refused": "IncidentNotOpen { named: 0, open: None }"
     },
     {
       "fail": "st",

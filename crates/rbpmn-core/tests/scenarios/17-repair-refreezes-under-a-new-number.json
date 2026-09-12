@@ -16,7 +16,7 @@
       "repair": 0,
       "disposition": "advance",
       "reason": "acked by phone",
-      "refused": "IncidentNotOpen"
+      "refused": "IncidentNotOpen { named: 0, open: Some(1) }"
     },
     {
       "repair": 1,

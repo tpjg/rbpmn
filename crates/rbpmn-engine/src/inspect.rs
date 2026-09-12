@@ -156,8 +156,19 @@ impl Engine {
         // pays for the rehydration this needs.
         let status: String = inst.get("status");
         let incident = if status == "failed" {
-            let (_, proc, _, state) = load_instance_snapshot(self, tx, id).await?;
-            rbpmn_core::open_incident(&proc, &state)
+            // Best effort, and deliberately so: this is the view an operator
+            // opens *because* something is wrong, and rehydrating state is
+            // the one part of it that can fail on its own — a stored
+            // definition that no longer compiles, say, which is an instance
+            // nobody can repair anyway. The incident is then omitted and the
+            // rest of the inspection stands.
+            match load_instance_snapshot(self, tx, id).await {
+                Ok((_, proc, _, state)) => rbpmn_core::open_incident(&proc, &state),
+                Err(e) => {
+                    tracing::warn!(instance = %id, error = %e, "cannot read the open incident");
+                    None
+                }
+            }
         } else {
             None
         };

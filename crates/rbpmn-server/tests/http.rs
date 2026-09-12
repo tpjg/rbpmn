@@ -1368,6 +1368,10 @@ async fn an_incident_is_repaired_over_http() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // Which refusal, not merely 422: every Step error maps to this status, so
+    // an assertion on the status alone passes for the wrong reason too.
+    let body = body_json(resp).await;
+    assert!(body.to_string().contains("takes an answer"), "{body}");
 
     let resp = post(
         repair.clone(),

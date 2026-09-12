@@ -2388,6 +2388,177 @@ async fn the_inspection_says_what_a_repair_would_do() {
     db.drop().await;
 }
 
+/// A freeze halts what was in flight, and the row has to carry the flow it
+/// was on (D7): a token halted on its way to a join is written `halted` with
+/// `arrived_via`, and a repair puts it back on that flow. Lose it and the
+/// join waits forever for an arrival it can no longer count — which is why
+/// this goes through the database rather than the core alone.
+#[tokio::test]
+async fn a_halted_token_keeps_the_flow_it_was_on() {
+    // Branch f2 fails its correlation while branch f3's token is still
+    // queued behind it in the same advancement, so the freeze finds one
+    // token in flight and parks it where it stood.
+    const XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m" name="Go"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:intermediateCatchEvent id="c">
+      <bpmn:messageEventDefinition messageRef="m"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:userTask id="ut"/>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="c"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ps" targetRef="ut"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="c" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="ut" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="pj" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(XML, &Bindings::new().correlation("c", "order.id"))
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    assert_eq!(status_of(&db.pool, started.id).await, "failed");
+
+    let halted: Vec<(String, String, Option<String>)> = sqlx::query(
+        "select element_id, wait_kind, arrived_via from rbpmn_token \
+         where instance_id = $1 and wait_kind like 'halted%' order by token_no",
+    )
+    .bind(started.id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| {
+        (
+            r.get("element_id"),
+            r.get("wait_kind"),
+            r.get("arrived_via"),
+        )
+    })
+    .collect();
+    assert_eq!(
+        halted,
+        vec![(
+            "ut".to_string(),
+            "halted".to_string(),
+            Some("f3".to_string())
+        )],
+        "the halted token carries the flow it arrived on"
+    );
+    let inspection = engine.inspect_instance(started.id).await.unwrap();
+    assert_eq!(inspection.incident.expect("frozen").halted, 1);
+
+    engine
+        .repair(
+            started.id,
+            0,
+            Disposition::Retry {
+                patch: serde_json::json!({"order": {"id": "o-1"}}),
+            },
+            "the order id was missing",
+        )
+        .await
+        .unwrap();
+    // Both branches now arrive at the join by their own flow. A halted token
+    // that lost `arrived_via` would leave this instance waiting forever.
+    let held = engine
+        .get_task("ut", &GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .expect("the halted branch entered its task");
+    engine
+        .complete_task(held.id, "clerk", serde_json::json!({}))
+        .await
+        .unwrap();
+    engine
+        .correlate("Go", "o-1", serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// A Divert lands on a boundary the failure never reached (D5): the incident
+/// is thrown as the code the operator names, the boundary that matches takes
+/// it, and the recovery path runs. The failed work item stays failed — a
+/// repair never reopens a closed item.
+#[tokio::test]
+async fn a_diverted_incident_takes_the_boundary_the_code_names() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("st").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/10-error-boundary.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    let (failed, _) = open_items(&db.pool, started.id).await[0].clone();
+    freeze_on(&engine, failed).await;
+
+    let repaired = engine
+        .repair(
+            started.id,
+            0,
+            Disposition::Divert {
+                code: Some("PAYMENT_FAILED".to_string()),
+            },
+            "the acquirer will not settle this one; hand it to the clerk",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (repaired.status, repaired.incident),
+        (InstanceStatus::Active, None)
+    );
+    let open: Vec<String> = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .map(|(_, element)| element)
+        .collect();
+    assert_eq!(open, ["t_fix"], "the boundary's recovery path is what runs");
+    let state: String = sqlx::query("select state from rbpmn_work_item where id = $1")
+        .bind(failed)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .get("state");
+    assert_eq!(state, "failed", "a repair never reopens a closed item");
+
+    let held = engine
+        .get_task("t_fix", &GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .expect("t_fix is on offer");
+    engine
+        .complete_task(held.id, "clerk", serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
 /// Abandoning a frozen instance ends it as `Terminated` (D5): the sibling's
 /// open item is cancelled with everything else, and the instance becomes
 /// retention's to retire, which a `failed` one never is.

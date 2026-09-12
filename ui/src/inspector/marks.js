@@ -27,7 +27,14 @@
 // inspection carries no token on a work item: a task that failed twice in a
 // loop, once caught and once not, draws both as the incident.) A failure an
 // operator repaired is neither: no boundary took it, a person did, and the
-// reason they gave is on the mark.
+// reason they gave is on the mark. That match is by element too, and a Retry
+// re-enters the element it repaired — so where an element holds both a
+// repaired failure and one a boundary later caught, the mark speaks for the
+// element rather than claiming which failure was which.
+//
+// Both are history: they record something already over, so they never carry
+// the dashes of an arm that will not fire, and they do not stop the element's
+// real arms from carrying them.
 
 /// Why the arms on this instance cannot fire, or null while they can.
 function inertReason(status) {
@@ -54,7 +61,8 @@ export function marksFor(data) {
   );
   /// Element -> the reason the operator gave, when a repair landed there.
   /// `detail` carries it because `display` is the golden-trace format and
-  /// cannot hold prose that may be reworded.
+  /// cannot hold prose that may be reworded. Last repair wins: the map is
+  /// keyed by element, which is all the payload can tell us.
   const repairedAt = new Map(
     data.events
       .filter((e) => e.kind === 'incident-repaired' && e.elementId)
@@ -105,9 +113,11 @@ export function marksFor(data) {
           elementId: item.elementId,
           kind: 'repaired',
           inert: false,
+          history: true,
           payload: {
             title:
-              `work item failed: ${detail} — repaired` + (reason ? `: ${reason}` : ''),
+              `work item failed: ${detail} — an incident here was repaired` +
+              (reason ? `: ${reason}` : ''),
           },
         });
       } else {
@@ -115,6 +125,7 @@ export function marksFor(data) {
           elementId: item.elementId,
           kind: 'handled',
           inert: false,
+          history: true,
           payload: { title: `work item failed: ${detail} — handled by a boundary` },
         });
       }

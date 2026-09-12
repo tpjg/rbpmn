@@ -1455,11 +1455,21 @@ fn freeze_and_check(
             }
         }
     }
+    // The hazard D9 exists for is the number *below* the open one: an
+    // operator's resend landing on an incident somebody already repaired,
+    // which is `release_task`'s epoch bug in another shape. A number never
+    // minted is the easy half, so it is only used where there is no lower
+    // one to name.
+    let stale = if incident > 0 {
+        incident - 1
+    } else {
+        incident + 1
+    };
     match step(
         proc,
         state,
         Command::Repair {
-            incident: incident + 1,
+            incident: stale,
             disposition: Disposition::Retry { patch: json!({}) },
             reason: "stale".to_string(),
         },
@@ -1467,9 +1477,8 @@ fn freeze_and_check(
         Err(StepError::IncidentNotOpen { .. }) if *state == frozen => tally.stale_refused += 1,
         other => {
             return Err(format!(
-                "a repair of incident {} on an instance frozen at incident {incident} \
-                 answered {other:?}",
-                incident + 1
+                "a repair of incident {stale} on an instance frozen at incident {incident} \
+                 answered {other:?}"
             ));
         }
     }

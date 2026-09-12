@@ -43,7 +43,12 @@ export function annotate(viewer, annotations) {
     // applies only when everything on the element is inert — one live mark
     // among inert ones is the one that matters, and dashing the element would
     // mute it.
-    const allInert = items.every((a) => a.inert);
+    // A mark that records something already over does not vote: `history`
+    // marks are never inert because they are never live, and counting them
+    // undashes an element whose real arms cannot fire — which is the
+    // mispaint the dashes exist to prevent.
+    const pending = items.filter((a) => !a.history);
+    const allInert = pending.length > 0 && pending.every((a) => a.inert);
     if (allInert) {
       canvas.addMarker(elementId, 'rbpmn-mark-inert');
       marks.push([elementId, 'inert']);

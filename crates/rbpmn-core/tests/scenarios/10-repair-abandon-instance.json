@@ -15,7 +15,7 @@
       "repair": 0,
       "disposition": "retry",
       "reason": "too late",
-      "refused": "IncidentNotOpen"
+      "refused": "IncidentNotOpen { named: 0, open: None }"
     }
   ],
   "expect": {

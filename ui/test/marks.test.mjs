@@ -62,6 +62,9 @@ test('on an active instance every mark is live', () => {
   assert.ok(marks.length > 0);
   assert.ok(marks.every((m) => m.inert === false));
   assert.ok(marks.every((m) => !m.payload.title.includes('inert')));
+  // Nothing live is history: only a history mark is exempt from the inert
+  // vote, and exempting a live arm would undash a whole frozen element.
+  assert.ok(marks.every((m) => !m.history));
 });
 
 test('a frozen instance draws its arms as inert, and says why', () => {
@@ -139,6 +142,7 @@ test('a failure a boundary caught is drawn as handled, not as the reason', () =>
   assert.equal(marks.length, 1);
   assert.equal(marks[0].kind, 'handled');
   assert.equal(marks[0].inert, false);
+  assert.equal(marks[0].history, true);
   assert.match(marks[0].payload.title, /dependency unavailable — handled by a boundary/);
 });
 
@@ -203,7 +207,13 @@ test('a failure an operator repaired is repaired, not handled by a boundary', ()
   assert.equal(marks.length, 1);
   assert.equal(marks[0].kind, 'repaired');
   assert.equal(marks[0].inert, false);
-  assert.match(marks[0].payload.title, /handler answered 502 — repaired: the acquirer was down/);
+  assert.match(
+    marks[0].payload.title,
+    /handler answered 502 — an incident here was repaired: the acquirer was down/
+  );
+  // History: it records something already over, so it does not vote on
+  // whether the element is drawn inert (`annotations.js`).
+  assert.equal(marks[0].history, true);
 });
 
 test('a repair at one element does not repaint a failure caught at another', () => {
