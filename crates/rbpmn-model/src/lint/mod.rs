@@ -777,20 +777,17 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
     // what run them: each warning below fires once per node, not once per
     // enclosing side path.
     let side_paths: Vec<_> = (0..g.scope.nodes.len())
-        .filter(|&b| {
-            matches!(&g.node(b).kind, NodeKind::Boundary(d) if !d.cancel_activity)
-                && g.host_of[b].is_some()
-        })
+        .filter(|&b| starts_a_side_path(&g.node(b).kind) && g.host_of[b].is_some())
         .map(|b| (b, reach(g.scope.nodes.len(), &[b], |v| g.succs(v))))
         .collect();
 
     for b in 0..g.scope.nodes.len() {
-        let NodeKind::Boundary(data) = &g.node(b).kind else {
+        if !starts_a_side_path(&g.node(b).kind) {
             continue;
-        };
+        }
         // An unresolvable `attachedToRef` is `bpmn-structure`'s to report;
         // without a host there is no "beside the host" to describe.
-        let (false, Some(host)) = (data.cancel_activity, g.host_of[b]) else {
+        let Some(host) = g.host_of[b] else {
             continue;
         };
         let boundary_id = &g.node(b).id;
@@ -903,12 +900,17 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
             }
         }
 
-        // The side token has to be consumed somewhere: a terminate end takes
-        // the whole scope with it, so only a plain end ends the side path.
-        // Decided before the failure warning, which speaks only for a
-        // well-formed side path; the error for a missing end comes last.
+        // The side token has to be consumed somewhere, and only a plain end
+        // of its own does it: a terminate end takes the whole scope instead.
+        // Asked over where the token can be *carried* rather than over
+        // everything the path owns — an error handler's end belongs to a
+        // failure that may never happen, and a nested non-interrupting
+        // boundary's path answers for its own sibling, so neither discharges
+        // this one. Decided before the failure warning, which speaks only for
+        // a well-formed side path; the error for a missing end comes last.
+        let carried = reach(g.scope.nodes.len(), &[b], |v| g.side_token_succs(v));
         let plain_end = (0..g.scope.nodes.len()).any(|v| {
-            in_path[v]
+            carried[v]
                 && matches!(&g.node(v).kind, NodeKind::End(k) if !matches!(k, EndKind::Terminate))
         });
 
@@ -982,12 +984,23 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
                     "non-interrupting boundary '{boundary_id}' starts a side path with no \
                      plain end event: the sibling token it spawns beside '{host_id}' has \
                      nowhere to be consumed, and the instance can never complete. End the \
-                     path at its own end event (a terminate end is allowed, and cancels \
-                     the whole scope)"
+                     path at its own plain end event: a terminate end cancels the whole \
+                     scope rather than consuming the token, and an error boundary's \
+                     handler runs only if the activity fails"
                 ),
             ));
         }
     }
+}
+
+/// A boundary that spawns a sibling token, which is what a side path is.
+/// Error boundaries are excluded whatever `cancelActivity` says: one is
+/// interrupting by definition and `bpmn-structure` refuses a non-interrupting
+/// one, so reading it as a side path describes a path that does not exist
+/// and recommends a remedy for it.
+fn starts_a_side_path(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::Boundary(d)
+        if !d.cancel_activity && !matches!(d.trigger, BoundaryTrigger::Error { .. }))
 }
 
 /// An error boundary with no errorRef: it catches any error, coded or not.

@@ -128,6 +128,26 @@ impl<'a> Graph<'a> {
         out
     }
 
+    /// Successors the side token can be *carried* along: sequence flows,
+    /// plus interrupting boundaries that are not error boundaries.
+    ///
+    /// What separates them is what a boundary does to the token running the
+    /// activity. An interrupting timer or message boundary moves that token,
+    /// so where it leads is somewhere the token can still be consumed. An
+    /// error boundary moves it only if the activity *fails*, which no model
+    /// guarantees — so its handler's end cannot be the only end a side path
+    /// has. A non-interrupting boundary spawns a sibling and leaves the
+    /// token where it was, so its path answers for that sibling instead.
+    pub fn side_token_succs(&self, v: usize) -> Vec<usize> {
+        let mut out: Vec<usize> = self.flow_out[v].iter().map(|&fi| self.tgt(fi)).collect();
+        out.extend(
+            self.interrupting_boundaries[v]
+                .iter()
+                .filter(|&&b| !is_error_boundary(&self.node(b).kind)),
+        );
+        out
+    }
+
     /// Successors over sequence flows plus **interrupting** host->boundary
     /// pseudo-edges only — what the region analysis walks.
     ///
@@ -323,6 +343,12 @@ pub fn check(g: &Graph, owner: &str, out: &mut Vec<Diagnostic>) {
             }
         }
     }
+}
+
+/// An error boundary is entered by a failure, never by the token arriving:
+/// interrupting, but not a way *on* that the model promises to take.
+fn is_error_boundary(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::Boundary(d) if matches!(d.trigger, BoundaryTrigger::Error { .. }))
 }
 
 /// Set of nodes reachable from `seeds` under `neighbors` (mark-before-push,
