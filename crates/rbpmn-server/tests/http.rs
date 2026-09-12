@@ -1300,6 +1300,8 @@ async fn an_incident_is_repaired_over_http() {
         option("divert")["refused"]["reason"].is_string(),
         "{incident}"
     );
+    // Nothing catches here, so there is no code to offer either.
+    assert_eq!(option("divert")["codes"], serde_json::json!([]));
 
     // Every disposition the read hands out is one this route takes. Each is
     // named against an incident that is not open, so each is answered 409 —

@@ -10,8 +10,8 @@
 //! and the manifest pane.
 
 use rbpmn_engine::{
-    Bindings, EventView, InstanceInspection, OpenIncident, RepairKind, RepairOption, Takes,
-    TokenView, WorkItemView,
+    Bindings, CaughtCode, EventView, InstanceInspection, OpenIncident, RepairKind, RepairOption,
+    Takes, TokenView, WorkItemView,
 };
 use std::path::PathBuf;
 
@@ -77,16 +77,28 @@ fn sample() -> InstanceInspection {
             resume: "st".to_string(),
             halted: 0,
             options: [
-                (RepairKind::Retry, Takes::Patch),
-                (RepairKind::Advance, Takes::Patch),
-                (RepairKind::Divert, Takes::Code),
-                (RepairKind::Abandon, Takes::Nothing),
-                (RepairKind::AbandonInstance, Takes::Nothing),
+                (RepairKind::Retry, Takes::Patch, Vec::new()),
+                (RepairKind::Advance, Takes::Patch, Vec::new()),
+                // `be` catches PAYMENT_FAILED on `st` itself, so a Divert
+                // naming it stays inside the instance: nothing is torn down,
+                // and the recovery path picks the token up.
+                (
+                    RepairKind::Divert,
+                    Takes::Code,
+                    vec![CaughtCode {
+                        code: Some("PAYMENT_FAILED".to_string()),
+                        caught_at: "be".to_string(),
+                        tears_down: None,
+                    }],
+                ),
+                (RepairKind::Abandon, Takes::Nothing, Vec::new()),
+                (RepairKind::AbandonInstance, Takes::Nothing, Vec::new()),
             ]
             .into_iter()
-            .map(|(disposition, takes)| RepairOption {
+            .map(|(disposition, takes, codes)| RepairOption {
                 disposition,
                 takes,
+                codes,
                 refused: None,
             })
             .collect(),

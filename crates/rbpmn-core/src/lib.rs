@@ -43,6 +43,6 @@ pub use state::{
     SubscriptionState, TimerId, TimerState, Token, TokenId, WaitKind, WorkItemId, WorkItemState,
 };
 pub use step::{
-    Command, Disposition, OpenIncident, Refusal, RefusedBecause, RepairOption, StepError, Takes,
-    open_incident, step,
+    CaughtCode, Command, Disposition, OpenIncident, Refusal, RefusedBecause, RepairOption,
+    StepError, Takes, open_incident, step,
 };

@@ -2513,6 +2513,36 @@ async fn a_diverted_incident_takes_the_boundary_the_code_names() {
     let (failed, _) = open_items(&db.pool, started.id).await[0].clone();
     freeze_on(&engine, failed).await;
 
+    // What the read offers before anything is sent: the one code that
+    // reaches a boundary from here, where it lands, and — `be` being on the
+    // failing activity itself — nothing torn down to get there (D10).
+    let incident = engine
+        .inspect_instance(started.id)
+        .await
+        .unwrap()
+        .incident
+        .expect("a frozen instance has one");
+    let divert = incident
+        .options
+        .iter()
+        .find(|o| o.disposition == RepairKind::Divert)
+        .expect("divert is an option");
+    assert!(divert.refused.is_none());
+    assert_eq!(
+        divert
+            .codes
+            .iter()
+            .map(|c| {
+                (
+                    c.code.as_deref(),
+                    c.caught_at.as_str(),
+                    c.tears_down.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [(Some("PAYMENT_FAILED"), "be", None)]
+    );
+
     let repaired = engine
         .repair(
             started.id,

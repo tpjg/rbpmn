@@ -133,6 +133,19 @@ export function describeRepair(data) {
       option.disposition,
       option.refused ? `refused — ${option.refused.reason}` : `would land, ${takes}`,
     ]);
+    // A Divert's code decides which boundary takes the error, and a boundary
+    // further out costs the scope in between — so the read names both, and
+    // the operator picks with the price in front of them.
+    for (const landing of option.codes ?? []) {
+      const code = landing.code ?? null;
+      const cost = landing.tearsDown
+        ? `caught at ${landing.caughtAt}, tearing down ${landing.tearsDown}`
+        : `caught at ${landing.caughtAt}`;
+      lines.push([
+        code === null ? 'with no code' : `with code ${code}`,
+        code === null ? `${cost} — a catch-all, so any code lands` : cost,
+      ]);
+    }
   }
   return lines;
 }

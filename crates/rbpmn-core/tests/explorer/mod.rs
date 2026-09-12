@@ -508,16 +508,38 @@ pub fn read_agrees(
                 patch: json!({}),
                 answer: (option.takes == Takes::Answer).then(|| json!(1)),
             }),
-            // The read says whether *something* catches, never which code
-            // does, so what has to agree with it is the best any code
-            // manages: `and` folds to None as soon as one lands. The
-            // alphabet is every code the model declares plus the codeless
-            // failure, so a boundary that exists is offered its code here.
-            RepairKind::Divert => codes
-                .iter()
-                .map(|code| structural(Disposition::Divert { code: code.clone() }))
-                .reduce(|a, b| a.and(b))
-                .flatten(),
+            // The read names the codes, so this is exact in both
+            // directions: every code it names lands, and every code in the
+            // model's alphabet it leaves out is refused. The alphabet is
+            // every code the model declares plus the codeless failure, so a
+            // boundary that exists is offered its own code here.
+            RepairKind::Divert => {
+                for landing in &option.codes {
+                    if let Some(cause) = structural(Disposition::Divert {
+                        code: landing.code.clone(),
+                    }) {
+                        return Err(format!(
+                            "the read says a divert with {:?} lands at {}, the command says {cause:?}",
+                            landing.code, landing.caught_at
+                        ));
+                    }
+                }
+                let named: Vec<&Option<String>> = option.codes.iter().map(|c| &c.code).collect();
+                for code in codes {
+                    if !named.contains(&code)
+                        && structural(Disposition::Divert { code: code.clone() }).is_none()
+                    {
+                        return Err(format!(
+                            "a divert with {code:?} lands, and the read does not name it"
+                        ));
+                    }
+                }
+                if option.codes.is_empty() {
+                    structural(Disposition::Divert { code: None })
+                } else {
+                    None
+                }
+            }
             RepairKind::Abandon => structural(Disposition::Abandon),
             RepairKind::AbandonInstance => structural(Disposition::AbandonInstance),
         };

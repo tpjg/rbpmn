@@ -192,6 +192,26 @@ const openIncident = {
       disposition: 'divert',
       takes: 'code',
       refused: { cause: 'nothing-catches', reason: 'no boundary catches an error raised here' },
+      codes: [],
+    },
+  ],
+};
+
+/// The same incident in a model that does catch something: one code caught on
+/// the failing activity itself, one caught further out at the cost of the
+/// subprocess in between, and the codeless divert a catch-all takes.
+const divertible = {
+  ...openIncident,
+  options: [
+    {
+      disposition: 'divert',
+      takes: 'code',
+      refused: null,
+      codes: [
+        { code: null, caughtAt: 'any_error', tearsDown: null },
+        { code: 'PAYMENT_FAILED', caughtAt: 'be', tearsDown: null },
+        { code: 'ESCALATE', caughtAt: 'sub_be', tearsDown: 'sub' },
+      ],
     },
   ],
 };
@@ -231,6 +251,24 @@ test('a repair that re-enters elsewhere says where', () => {
   const value = (label) => lines.find(([l]) => l === label)?.[1];
   assert.equal(value('a repair resumes at'), 'review');
   assert.equal(value('also stopped'), undefined, 'no collateral, nothing to say');
+});
+
+test('a divert names its codes, where each lands, and what it costs', () => {
+  const lines = describeRepair(inspection({ status: 'failed', incident: divertible }));
+  const value = (label) => lines.find(([l]) => l === label)?.[1];
+
+  assert.match(value('with code PAYMENT_FAILED'), /^caught at be$/);
+  assert.match(value('with code ESCALATE'), /caught at sub_be, tearing down sub/);
+  assert.match(value('with no code'), /caught at any_error — a catch-all, so any code lands/);
+});
+
+test('a disposition that takes no code lists none', () => {
+  const lines = describeRepair(inspection({ status: 'failed', incident: openIncident }));
+  assert.equal(
+    lines.filter(([label]) => label.startsWith('with ')).length,
+    0,
+    'nothing catches here, so there is no code to name'
+  );
 });
 
 test('nothing frozen, nothing to describe', () => {

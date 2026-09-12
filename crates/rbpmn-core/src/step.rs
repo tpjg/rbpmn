@@ -150,16 +150,35 @@ pub struct RepairOption {
     pub disposition: RepairKind,
     /// What the caller supplies with it.
     pub takes: Takes,
-    /// Why it would be refused, or `None` when it lands. For a Divert that
-    /// reads "some code reaches a boundary from here": which codes do is the
-    /// model's own, and one nothing catches is refused when it is sent.
+    /// For a Divert, every code that reaches a boundary from the resume
+    /// point and where each one lands. Empty for every other disposition,
+    /// and for a Divert nothing catches — `refused` then says so.
+    pub codes: Vec<CaughtCode>,
+    /// Why it would be refused, or `None` when it lands.
     pub refused: Option<RefusedBecause>,
+}
+
+/// A code a Divert can send, and what sending it does
+/// (docs/design/incident-scope.md, D10).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaughtCode {
+    /// The code to send. `None` is the codeless Divert, which only a
+    /// catch-all takes — and a catch-all takes *any* code, so a `None` entry
+    /// means every code lands, each wherever this list says it is caught.
+    pub code: Option<String>,
+    /// The boundary that takes it.
+    pub caught_at: String,
+    /// The subprocess torn down on the way, when the boundary that catches
+    /// is not on the failing activity itself: an error walks outward, and
+    /// the scope it leaves goes with everything still running in it.
+    pub tears_down: Option<String>,
 }
 
 /// What a disposition takes beside its reason. A patch is optional — the
 /// repair of a world that fixed itself carries none — an answer is required
-/// where it is taken, and a code may be left out only where a catch-all
-/// boundary takes it.
+/// where it is taken, and which codes a Divert may send is
+/// [`RepairOption::codes`], the codeless one included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Takes {
@@ -387,18 +406,50 @@ fn catcher(
         .find_map(|(target, host)| proc.error_boundary(host, code).map(|b| (target, b)))
 }
 
-/// Would a Divert land anywhere at all — with some code, or none? The read's
-/// question, answered off the same walk the command takes.
-fn anything_catches(
+/// The codes a Divert can send from `host`, and where each one lands — every
+/// answer from `catcher`, the walk the command itself takes, asked once per
+/// candidate. A code no boundary declares is left out: nothing but a
+/// catch-all could take it, and the catch-all is the `None` entry.
+fn landing_codes(
     proc: &ExecutableProcess,
     state: &InstanceState,
     host: NodeIx,
     token: TokenId,
     scope: ScopeId,
-) -> bool {
-    outward(state, host, token, scope)
+) -> Vec<CaughtCode> {
+    let walk = outward(state, host, token, scope);
+    // The codeless divert first, then every code a boundary on the walk
+    // declares, innermost host first and without repeats.
+    let mut candidates: Vec<Option<String>> = vec![None];
+    for (_, h) in &walk {
+        for b in proc.error_boundaries(*h) {
+            if let ExecKind::ErrorBoundary { code: Some(c) } = &proc.node(b).kind
+                && !candidates.iter().any(|x| x.as_deref() == Some(c.as_str()))
+            {
+                candidates.push(Some(c.clone()));
+            }
+        }
+    }
+    candidates
         .into_iter()
-        .any(|(_, host)| proc.error_boundaries(host).next().is_some())
+        .filter_map(|code| {
+            let (target, boundary) = catcher(proc, state, host, token, scope, code.as_deref())?;
+            // Which level caught it is told by the token it interrupts: the
+            // cause's own means the failing activity's boundary took it,
+            // anything else is an enclosing subprocess — and that scope is
+            // torn down with everything still running inside it.
+            let tears_down = walk
+                .iter()
+                .position(|(t, _)| *t == target)
+                .filter(|&i| i > 0)
+                .map(|i| proc.node_id(walk[i].1).to_string());
+            Some(CaughtCode {
+                code,
+                caught_at: proc.node_id(boundary).to_string(),
+                tears_down,
+            })
+        })
+        .collect()
 }
 
 /// Abandon's rule (D5): consuming the token must leave no join waiting for
@@ -439,6 +490,7 @@ pub fn open_incident(proc: &ExecutableProcess, state: &InstanceState) -> Option<
     // An instance frozen before repair existed can hold several: only
     // abandoning it, which needs no cause, is left (D7).
     let unknown_cause = (causes.len() > 1).then_some(Refusal::CauseUnknown);
+    let divert_codes = landing_codes(proc, state, resume, cause, parked.scope);
     let refusal = |disposition: RepairKind| -> Option<Refusal> {
         if disposition == RepairKind::AbandonInstance {
             return None;
@@ -452,9 +504,7 @@ pub fn open_incident(proc: &ExecutableProcess, state: &InstanceState) -> Option<
             {
                 Some(Refusal::GatewayHasNoSingleWayOn)
             }
-            RepairKind::Divert if !anything_catches(proc, state, resume, cause, parked.scope) => {
-                Some(Refusal::NothingCatches)
-            }
+            RepairKind::Divert if divert_codes.is_empty() => Some(Refusal::NothingCatches),
             RepairKind::Abandon
                 if abandon_would_strand_a_join(proc, state, cause, parked.scope, resume) =>
             {
@@ -491,6 +541,10 @@ pub fn open_incident(proc: &ExecutableProcess, state: &InstanceState) -> Option<
         .map(|disposition| RepairOption {
             disposition,
             takes: takes(disposition),
+            codes: match disposition {
+                RepairKind::Divert => divert_codes.clone(),
+                _ => Vec::new(),
+            },
             refused: refusal(disposition).map(|cause| RefusedBecause {
                 reason: cause.to_string(),
                 cause,

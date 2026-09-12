@@ -388,8 +388,10 @@ frozen before the migration holds incident 0.
 - **What a repair would do is a read.** `rbpmn_core::open_incident` answers,
   for the open incident, its number, *R*, and each disposition allowed or
   refused with the reason — from the functions `Command::Repair` itself asks,
-  so the read cannot say one thing and the verb do another. For a Divert it
-  reads *something catches from here*; which code does is the model's own.
+  so the read cannot say one thing and the verb do another. A Divert's codes
+  are named one by one — each with the boundary that takes it and, when that
+  boundary is further out, the subprocess torn down to reach it — because a
+  code is the one thing a Divert needs and only the model knows it.
   `inspect_instance` carries it, on a load that takes no row lock, and the
   inspector shows it as text. Offering the button is not a read (D13).
 

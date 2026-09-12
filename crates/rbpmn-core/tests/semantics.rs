@@ -1449,3 +1449,56 @@ fn a_repair_event_keeps_a_null_answer_apart_from_none() {
     }
     assert_eq!(with(None).to_string(), "incident-repaired decide advance");
 }
+
+/// A Divert names the codes that reach a boundary, where each one lands, and
+/// what it costs to get there (docs/design/incident-scope.md, D10). Here the
+/// failing task is inside a subprocess and only the subprocess's own boundary
+/// catches: naming its code reaches `be`, and `sp` goes down on the way with
+/// everything still running in it. A codeless Divert is not offered at all —
+/// nothing here is a catch-all.
+#[test]
+fn the_read_names_where_a_diverts_code_lands_and_what_it_tears_down() {
+    let xml =
+        include_str!("../../rbpmn-model/tests/fixtures/accept/20-subprocess-error-boundary.bpmn");
+    let defs = rbpmn_model::parse(xml).unwrap();
+    let proc = ExecutableProcess::compile(&defs, "p", &Bindings::default()).unwrap();
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({}),
+        },
+    )
+    .unwrap();
+
+    // A codeless failure at `reserve`: its own boundary is a timer, and the
+    // subprocess's wants OUT_OF_STOCK, so nothing catches it.
+    let (id, _) = state.open_work_items().next().expect("reserve is open");
+    step(&proc, &mut state, Command::RaiseError { id, code: None }).unwrap();
+    assert_eq!(state.status, InstanceStatus::Failed);
+
+    let read = rbpmn_core::open_incident(&proc, &state).expect("a frozen instance has one");
+    assert_eq!((&*read.element, &*read.resume), ("reserve", "reserve"));
+    let divert = read
+        .options
+        .iter()
+        .find(|o| o.disposition == rbpmn_core::RepairKind::Divert)
+        .expect("divert is an option");
+    assert!(divert.refused.is_none());
+    assert_eq!(
+        divert
+            .codes
+            .iter()
+            .map(|c| {
+                (
+                    c.code.as_deref(),
+                    c.caught_at.as_str(),
+                    c.tears_down.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [(Some("OUT_OF_STOCK"), "be", Some("sp"))],
+        "the one code that lands, where it lands, and the scope it costs"
+    );
+}
