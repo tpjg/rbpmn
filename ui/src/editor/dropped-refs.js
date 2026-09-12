@@ -51,6 +51,22 @@ export function carryDroppedErrorRefs(previous, found) {
   return [...byBoundary.values()];
 }
 
+/// What the model now says about a boundary whose errorRef was dropped, read
+/// off its business object: `coded` once it has been given an error code,
+/// `codeless` while it is still the catch-all the import made of it, and
+/// `missing` when there is no error boundary there at all — deleted, or
+/// turned into another kind of boundary through the XML box.
+///
+/// The type check is the whole point. Any first event definition without an
+/// `errorRef` used to read as `codeless`, so a boundary edited into a timer
+/// stayed on the list and went on reporting an error about a code it can no
+/// longer carry — for the rest of the session, with no way to clear it.
+export function droppedErrorRefStatus(businessObject) {
+  const definition = businessObject?.eventDefinitions?.[0];
+  if (definition?.$type !== 'bpmn:ErrorEventDefinition') return 'missing';
+  return definition.errorRef ? 'coded' : 'codeless';
+}
+
 /// Sort the entries by what the model now says about each boundary. `coded`
 /// retires the entry for good — the modeller has answered it. `codeless` is
 /// reported, and kept. `missing` is kept but not reported, so an undo that

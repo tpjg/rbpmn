@@ -675,10 +675,7 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
         }
 
         if let BoundaryTrigger::Error { error_ref } = &b.trigger {
-            if !matches!(
-                host_kind,
-                NodeKind::ServiceTask { .. } | NodeKind::SubProcess(_)
-            ) {
+            if !may_catch_errors(host_kind) {
                 out.push(Diagnostic::error(
                     rule::BOUNDARY_ON_SUPPORTED_HOST,
                     id,
@@ -1003,16 +1000,29 @@ fn starts_a_side_path(kind: &NodeKind) -> bool {
         if !d.cancel_activity && !matches!(d.trigger, BoundaryTrigger::Error { .. }))
 }
 
+/// What an error boundary may attach to. A user task fails through the task
+/// API rather than by raising an error, so its failure is caught by a
+/// boundary on an embedded subprocess around it — which is what
+/// `boundary-on-supported-host` says, and what this keeps to one answer.
+fn may_catch_errors(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::ServiceTask { .. } | NodeKind::SubProcess(_))
+}
+
 /// An error boundary with no errorRef: it catches any error, coded or not.
 fn is_catch_all(kind: &NodeKind) -> bool {
     matches!(kind, NodeKind::Boundary(b)
         if matches!(b.trigger, BoundaryTrigger::Error { error_ref: None }))
 }
 
+/// Does this activity have a catch-all that actually catches? A boundary on
+/// a host that may not carry one is refused, and reading it as "handled"
+/// swallows the advice for what to do instead — for a user task, the one
+/// place that names the subprocess wrapper.
 fn has_catch_all(g: &Graph, host: usize) -> bool {
-    g.boundaries[host]
-        .iter()
-        .any(|&bi| is_catch_all(&g.node(bi).kind))
+    may_catch_errors(&g.node(host).kind)
+        && g.boundaries[host]
+            .iter()
+            .any(|&bi| is_catch_all(&g.node(bi).kind))
 }
 
 /// The first activity inside a scope, at any depth, whose failure nothing in

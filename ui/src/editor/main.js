@@ -21,6 +21,7 @@ import { renderProperties } from './properties.js';
 import {
   carryDroppedErrorRefs,
   droppedErrorRefDiagnostic,
+  droppedErrorRefStatus,
   droppedErrorRefs,
   triageDroppedErrorRefs,
 } from './dropped-refs.js';
@@ -380,11 +381,9 @@ async function runCheck({ syncXmlBox = true } = {}) {
 
   // Until the boundary is given a code, the catch-all it became on import is
   // not something the modeller chose.
-  const { keep, report } = triageDroppedErrorRefs(state.droppedErrorRefs, (id) => {
-    const definition = modeler.get('elementRegistry').get(id)?.businessObject.eventDefinitions?.[0];
-    if (!definition) return 'missing';
-    return definition.errorRef ? 'coded' : 'codeless';
-  });
+  const { keep, report } = triageDroppedErrorRefs(state.droppedErrorRefs, (id) =>
+    droppedErrorRefStatus(modeler.get('elementRegistry').get(id)?.businessObject)
+  );
   state.droppedErrorRefs = keep;
   diagnostics.push(...report.map(droppedErrorRefDiagnostic));
 

@@ -9,6 +9,7 @@ import * as mod from 'bpmn-moddle';
 import {
   carryDroppedErrorRefs,
   droppedErrorRefDiagnostic,
+  droppedErrorRefStatus,
   droppedErrorRefs,
   triageDroppedErrorRefs,
 } from '../src/editor/dropped-refs.js';
@@ -112,4 +113,38 @@ test('a code retires an entry; a missing boundary keeps it, unreported', () => {
     report.map((d) => d.boundaryId),
     ['codeless']
   );
+});
+
+/// The boundary as moddle builds it — the same shape the editor reads from
+/// `elementRegistry`, rather than a hand-made stand-in for it.
+async function boundaryOf(definition) {
+  const { rootElement } = await moddle().fromXML(model(definition));
+  const process = rootElement.rootElements.find((e) => e.$type === 'bpmn:Process');
+  return process.flowElements.find((e) => e.id === 'be');
+}
+
+test('the status of a dropped errorRef follows what the boundary now is', async () => {
+  assert.equal(
+    droppedErrorRefStatus(
+      await boundaryOf('<bpmn:errorEventDefinition errorRef="err_declined" />')
+    ),
+    'coded'
+  );
+  assert.equal(droppedErrorRefStatus(await boundaryOf('<bpmn:errorEventDefinition />')), 'codeless');
+});
+
+// Through the XML box a boundary can stop being an error boundary at all. A
+// timer has no errorRef to answer with, and reading that as `codeless` kept
+// the entry reporting an error about a code the element can no longer carry.
+test('a boundary that is no longer an error boundary is missing, not codeless', async () => {
+  assert.equal(
+    droppedErrorRefStatus(
+      await boundaryOf(
+        '<bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition>'
+      )
+    ),
+    'missing'
+  );
+  assert.equal(droppedErrorRefStatus(await boundaryOf('')), 'missing', 'no definition at all');
+  assert.equal(droppedErrorRefStatus(undefined), 'missing', 'the element is gone');
 });
