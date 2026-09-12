@@ -439,7 +439,9 @@ pub async fn message(State(engine): State<Engine>, Json(body): Json<MessageBody>
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RepairBody {
     pub incident: u64,
-    /// `retry`, `advance`, `divert`, `abandon` or `abandonInstance`.
+    /// `retry`, `advance`, `divert`, `abandon` or `abandon-instance` — the
+    /// word the inspection hands out and the `incident-repaired` event
+    /// records, which is why it is parsed through `RepairKind` below.
     pub disposition: String,
     #[serde(default)]
     pub patch: Option<serde_json::Value>,
@@ -461,29 +463,38 @@ fn disposition_of(
     answer: Option<serde_json::Value>,
     code: Option<String>,
 ) -> Result<rbpmn_engine::Disposition, String> {
-    use rbpmn_engine::Disposition;
+    use rbpmn_engine::{Disposition, RepairKind};
     let refuse = |what: &str| Err(format!("a {kind} repair takes no {what}"));
     let patch_or_empty = |p: Option<serde_json::Value>| p.unwrap_or_else(|| json!({}));
+    // Through `RepairKind`'s own serde, never a second table of spellings:
+    // the word a caller sends is the word the inspection offers and the
+    // event records (docs/design/incident-scope.md, D9–D10). Spelling this
+    // out by hand is what let `abandonInstance` here diverge from the
+    // `abandon-instance` every other surface writes.
+    let Ok(kind) = serde_json::from_value::<RepairKind>(json!(kind)) else {
+        return Err(format!(
+            "no disposition '{kind}': retry, advance, divert, abandon or abandon-instance"
+        ));
+    };
     match kind {
-        "retry" if answer.is_some() || code.is_some() => refuse("answer or code"),
-        "retry" => Ok(Disposition::Retry {
+        RepairKind::Retry if answer.is_some() || code.is_some() => refuse("answer or code"),
+        RepairKind::Retry => Ok(Disposition::Retry {
             patch: patch_or_empty(patch),
         }),
-        "advance" if code.is_some() => refuse("code"),
-        "advance" => Ok(Disposition::Advance {
+        RepairKind::Advance if code.is_some() => refuse("code"),
+        RepairKind::Advance => Ok(Disposition::Advance {
             patch: patch_or_empty(patch),
             answer,
         }),
-        "divert" if patch.is_some() || answer.is_some() => refuse("patch or answer"),
-        "divert" => Ok(Disposition::Divert { code }),
-        "abandon" | "abandonInstance" if patch.is_some() || answer.is_some() || code.is_some() => {
+        RepairKind::Divert if patch.is_some() || answer.is_some() => refuse("patch or answer"),
+        RepairKind::Divert => Ok(Disposition::Divert { code }),
+        RepairKind::Abandon | RepairKind::AbandonInstance
+            if patch.is_some() || answer.is_some() || code.is_some() =>
+        {
             refuse("patch, answer or code")
         }
-        "abandon" => Ok(Disposition::Abandon),
-        "abandonInstance" => Ok(Disposition::AbandonInstance),
-        other => Err(format!(
-            "no disposition '{other}': retry, advance, divert, abandon or abandonInstance"
-        )),
+        RepairKind::Abandon => Ok(Disposition::Abandon),
+        RepairKind::AbandonInstance => Ok(Disposition::AbandonInstance),
     }
 }
 

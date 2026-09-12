@@ -1301,6 +1301,22 @@ async fn an_incident_is_repaired_over_http() {
         "{incident}"
     );
 
+    // Every disposition the read hands out is one this route takes. Each is
+    // named against an incident that is not open, so each is answered 409 —
+    // the 400 of a word the route does not know is what this catches, and
+    // nothing is stepped either way.
+    for option in incident["options"].as_array().expect("options") {
+        let disposition = option["disposition"].as_str().expect("a name");
+        let resp = post(
+            repair.clone(),
+            serde_json::json!({
+                "incident": 7, "disposition": disposition, "reason": "the spellings agree"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{disposition}");
+    }
+
     let resp = post(
         repair.clone(),
         serde_json::json!({ "incident": 1, "disposition": "retry", "reason": "resent" }),

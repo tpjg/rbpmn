@@ -150,13 +150,16 @@ pub struct RepairOption {
     pub disposition: RepairKind,
     /// What the caller supplies with it.
     pub takes: Takes,
-    /// Why it would be refused, or `None` when it lands.
+    /// Why it would be refused, or `None` when it lands. For a Divert that
+    /// reads "some code reaches a boundary from here": which codes do is the
+    /// model's own, and one nothing catches is refused when it is sent.
     pub refused: Option<RefusedBecause>,
 }
 
 /// What a disposition takes beside its reason. A patch is optional — the
 /// repair of a world that fixed itself carries none — an answer is required
-/// where it is taken, and a code may be left out to mean the catch-all.
+/// where it is taken, and a code may be left out only where a catch-all
+/// boundary takes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Takes {
@@ -416,9 +419,13 @@ fn abandon_would_strand_a_join(
 
 /// What a repair would do at the instance's open incident, for a reader —
 /// the inspector's, and anyone else's (docs/design/incident-scope.md, D10).
-/// `None` when the instance is not frozen. Every verdict here is the one the
-/// command reaches, from the same functions: a read that could disagree with
-/// the verb would be worse than no read.
+/// `None` when the instance is not frozen — and for a frozen instance that
+/// holds no token at an incident at all, which is corruption rather than a
+/// state a step can produce: `fsck` reports it ("a failed instance is not
+/// frozen at an incident token") and the command answers the same state with
+/// `StepError::Invariant`. Every verdict here is the one the command
+/// reaches, from the same functions: a read that could disagree with the
+/// verb would be worse than no read.
 pub fn open_incident(proc: &ExecutableProcess, state: &InstanceState) -> Option<OpenIncident> {
     let incident = state.open_incident()?;
     let causes: Vec<TokenId> = state
