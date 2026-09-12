@@ -366,9 +366,18 @@ attached to activities in `P`). Every node in `P \ {B}` must have **all** its
 predecessors (sequence flows and host pseudo-edges) inside `P ∪ {B}`. In words:
 the side path is **disjoint from everything else in the scope**. It ends at
 its own end event(s) — a plain end is *required*, because that is where the
-side token is consumed; a terminate end is *allowed*, because "on the fifth
-reminder, cancel the whole thing" is a legitimate escape and scope-local
-terminate already exists. It may contain subprocesses, loops, exclusive
+side token is consumed; a terminate end is *allowed* beside one, because "on
+the fifth reminder, cancel the whole thing" is a legitimate escape and
+scope-local terminate already exists, but it does not stand in for the plain
+end: it cancels the scope rather than consuming the token.
+
+The plain end must be one the side token can be *carried* to, which is a
+smaller set than `P`. `P` exists to answer disjointness and ownership, and it
+crosses every boundary pseudo-edge — including an error boundary's, whose
+handler runs only if the activity fails. A catch-all's end is therefore not
+the side path's end, and adding the catch-all that `side-path-failure-escapes`
+recommends must not retire `boundary-side-path`
+(`reject/side-path-catch-all-is-not-an-end`). It may contain subprocesses, loops, exclusive
 gateways and boundaries of its own — but **not a parallel block directly on
 the path**, and that is the correction building it forced (see the log at
 the top): a side path is a *multi-token* region, because the boundary can

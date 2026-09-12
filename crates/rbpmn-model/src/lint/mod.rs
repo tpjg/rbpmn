@@ -757,9 +757,12 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
 /// nodes reachable from the boundary `B` over sequence flows, plus the
 /// pseudo-edges of boundaries attached to activities already in `P`. Every
 /// node in `P \ {B}` must have **all** its predecessors (flows and host
-/// pseudo-edges) inside `P`. A plain end event in `P` is required — that is
-/// where the side token is consumed — and a terminate end is allowed, because
-/// "on the fifth reminder, cancel the whole thing" is a legitimate escape.
+/// pseudo-edges) inside `P` — that is disjointness, and `P` is its question.
+/// The plain end where the side token is consumed is asked over a smaller
+/// set: the nodes it can be *carried* to ([`Graph::side_token_succs`]), which
+/// leaves out an error handler's, since that runs only if the activity fails.
+/// A terminate end is allowed beside a plain one — "on the fifth reminder,
+/// cancel the whole thing" is a legitimate escape — but never instead of it.
 ///
 /// One diagnostic per boundary, on the boundary: the offending node is named
 /// in the message, and a merge reported at every node downstream of it would
@@ -1032,11 +1035,22 @@ fn has_catch_all(g: &Graph, host: usize) -> bool {
 /// scope down from the path it walks, so it is reached from here, exactly as
 /// [`message_arms_within`] is.
 fn uncaught_failure_within(scope: &FlowScope) -> Option<&FlowNode> {
+    // The same question `has_catch_all` asks, one scope down, and it has to
+    // be asked the same way: a catch-all on a host that may not carry one is
+    // refused, so it catches nothing and cannot mask the failure under it.
+    // Missing that here hid the warning for the very shape the warning
+    // recommends — a user task wrapped in a subprocess, with the catch-all
+    // put on the task instead of the wrapper.
     let caught = |id: &str| {
-        scope.nodes.iter().any(|n| {
-            is_catch_all(&n.kind)
-                && matches!(&n.kind, NodeKind::Boundary(b) if b.attached_to.as_deref() == Some(id))
-        })
+        scope
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .is_some_and(|host| may_catch_errors(&host.kind))
+            && scope.nodes.iter().any(|n| {
+                is_catch_all(&n.kind)
+                    && matches!(&n.kind, NodeKind::Boundary(b) if b.attached_to.as_deref() == Some(id))
+            })
     };
     for node in &scope.nodes {
         if caught(&node.id) {

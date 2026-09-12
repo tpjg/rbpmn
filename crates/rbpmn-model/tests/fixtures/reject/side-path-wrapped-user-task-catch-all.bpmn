@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error boundary-on-supported-host @ chase_any
+  warn side-path-failure-escapes @ wrap
+-->
+<!-- The shape side-path-failure-escapes itself recommends — wrap the user
+     task in an embedded subprocess — with the catch-all put on the user task
+     inside rather than on the subprocess. That boundary is refused, so it
+     catches nothing, and the advice has to arrive with the refusal: a
+     catch-all on `wrap` is what contains the failure. Reading a boundary its
+     host may not carry as "handled" swallowed the warning one scope down,
+     where the nested walk asks the same question. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:userTask id="review" name="Review">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:boundaryEvent id="remind" cancelActivity="false" attachedToRef="review">
+      <bpmn:outgoing>f3</bpmn:outgoing>
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration>PT1H</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:subProcess id="wrap" name="Chase">
+      <bpmn:incoming>f3</bpmn:incoming>
+      <bpmn:outgoing>f4</bpmn:outgoing>
+      <bpmn:startEvent id="w_start">
+        <bpmn:outgoing>wi1</bpmn:outgoing>
+      </bpmn:startEvent>
+      <bpmn:userTask id="chase" name="Chase by phone">
+        <bpmn:incoming>wi1</bpmn:incoming>
+        <bpmn:outgoing>wi2</bpmn:outgoing>
+      </bpmn:userTask>
+      <bpmn:boundaryEvent id="chase_any" name="Could not chase" attachedToRef="chase">
+        <bpmn:outgoing>wi3</bpmn:outgoing>
+        <bpmn:errorEventDefinition />
+      </bpmn:boundaryEvent>
+      <bpmn:endEvent id="w_end">
+        <bpmn:incoming>wi2</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:endEvent id="w_failed">
+        <bpmn:incoming>wi3</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="wi1" sourceRef="w_start" targetRef="chase" />
+      <bpmn:sequenceFlow id="wi2" sourceRef="chase" targetRef="w_end" />
+      <bpmn:sequenceFlow id="wi3" sourceRef="chase_any" targetRef="w_failed" />
+    </bpmn:subProcess>
+    <bpmn:endEvent id="reviewed">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="chased">
+      <bpmn:incoming>f4</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="review" />
+    <bpmn:sequenceFlow id="f2" sourceRef="review" targetRef="reviewed" />
+    <bpmn:sequenceFlow id="f3" sourceRef="remind" targetRef="wrap" />
+    <bpmn:sequenceFlow id="f4" sourceRef="wrap" targetRef="chased" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_p">
+    <bpmndi:BPMNPlane id="BPMNPlane_p" bpmnElement="p">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="review_di" bpmnElement="review">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="remind_di" bpmnElement="remind">
+        <dc:Bounds x="207" y="92" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="reviewed_di" bpmnElement="reviewed">
+        <dc:Bounds x="357" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="wrap_di" bpmnElement="wrap">
+        <dc:Bounds x="325" y="170" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="chased_di" bpmnElement="chased">
+        <dc:Bounds x="507" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="357" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
+        <di:waypoint x="225" y="128" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="325" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4">
+        <di:waypoint x="425" y="210" />
+        <di:waypoint x="507" y="210" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_wrap">
+    <bpmndi:BPMNPlane id="BPMNPlane_wrap" bpmnElement="wrap">
+      <bpmndi:BPMNShape id="w_start_di" bpmnElement="w_start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="chase_di" bpmnElement="chase">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="chase_any_di" bpmnElement="chase_any">
+        <dc:Bounds x="207" y="92" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="w_end_di" bpmnElement="w_end">
+        <dc:Bounds x="357" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="w_failed_di" bpmnElement="w_failed">
+        <dc:Bounds x="357" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="wi1_di" bpmnElement="wi1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="wi2_di" bpmnElement="wi2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="357" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="wi3_di" bpmnElement="wi3">
+        <di:waypoint x="225" y="128" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="357" y="210" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
