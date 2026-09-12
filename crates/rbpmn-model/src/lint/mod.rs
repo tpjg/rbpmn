@@ -759,8 +759,10 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
 /// node in `P \ {B}` must have **all** its predecessors (flows and host
 /// pseudo-edges) inside `P` — that is disjointness, and `P` is its question.
 /// The plain end where the side token is consumed is asked over a smaller
-/// set: the nodes it can be *carried* to ([`Graph::side_token_succs`]), which
-/// leaves out an error handler's, since that runs only if the activity fails.
+/// set: the nodes the path's own sequence flows reach ([`Graph::flow_succs`]).
+/// Every boundary is optional — a timer fires only if it fires, an error
+/// handler only if the activity fails — so an end behind one is an end the
+/// token may never reach.
 /// A terminate end is allowed beside a plain one — "on the fifth reminder,
 /// cancel the whole thing" is a legitimate escape — but never instead of it.
 ///
@@ -902,15 +904,15 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
 
         // The side token has to be consumed somewhere, and only a plain end
         // of its own does it: a terminate end takes the whole scope instead.
-        // Asked over where the token can be *carried* rather than over
-        // everything the path owns — an error handler's end belongs to a
-        // failure that may never happen, and a nested non-interrupting
-        // boundary's path answers for its own sibling, so neither discharges
-        // this one. Decided before the failure warning, which speaks only for
-        // a well-formed side path; the error for a missing end comes last.
-        let carried = reach(g.scope.nodes.len(), &[b], |v| g.side_token_succs(v));
+        // Asked over the path's own sequence flows, not over everything it
+        // owns, because every boundary is optional — a timer fires only if it
+        // fires, an error handler only if the activity fails — so an end
+        // behind one is an end this token may never reach. Decided before the
+        // failure warning, which speaks only for a well-formed side path; the
+        // error for a missing end comes last.
+        let by_flow = reach(g.scope.nodes.len(), &[b], |v| g.flow_succs(v));
         let plain_end = (0..g.scope.nodes.len()).any(|v| {
-            carried[v]
+            by_flow[v]
                 && matches!(&g.node(v).kind, NodeKind::End(k) if !matches!(k, EndKind::Terminate))
         });
 

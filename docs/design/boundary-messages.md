@@ -371,13 +371,15 @@ the fifth reminder, cancel the whole thing" is a legitimate escape and
 scope-local terminate already exists, but it does not stand in for the plain
 end: it cancels the scope rather than consuming the token.
 
-The plain end must be one the side token can be *carried* to, which is a
-smaller set than `P`. `P` exists to answer disjointness and ownership, and it
-crosses every boundary pseudo-edge — including an error boundary's, whose
-handler runs only if the activity fails. A catch-all's end is therefore not
-the side path's end, and adding the catch-all that `side-path-failure-escapes`
-recommends must not retire `boundary-side-path`
-(`reject/side-path-catch-all-is-not-an-end`). It may contain subprocesses, loops, exclusive
+The plain end must be one the path's own **sequence flows** reach, which is a
+smaller set than `P`. `P` answers disjointness and ownership, and for that it
+crosses every boundary pseudo-edge; but every boundary is optional — a timer
+fires only if it fires, an error handler runs only if the activity fails — so
+an end behind one is an end the side token may never reach. Adding the
+catch-all that `side-path-failure-escapes` recommends therefore does not
+retire `boundary-side-path` (`reject/side-path-catch-all-is-not-an-end`), and
+neither does a timer handler (`reject/side-path-timer-handler-is-not-an-end`);
+`accept/54` is a path that carries both and still ends on its own flows. It may contain subprocesses, loops, exclusive
 gateways and boundaries of its own — but **not a parallel block directly on
 the path**, and that is the correction building it forced (see the log at
 the top): a side path is a *multi-token* region, because the boundary can
