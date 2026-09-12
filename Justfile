@@ -238,7 +238,7 @@ tla:
     # because a frozen instance is terminal here — the model has no repair.
     # The failing config is not a bug: it prices the instance-wide freeze
     # (docs/design/incident-scope.md, D3).
-    check "lease siblings: stranded only by a sibling's freeze" LeaseSiblings.cfg          LeaseSiblings.tla hold "" -deadlock
+    check "lease siblings: stranded only while frozen" LeaseSiblings.cfg          LeaseSiblings.tla hold "" -deadlock
     check "lease siblings: the freeze strands a sibling"        LeaseSiblings_Stranded.cfg LeaseSiblings.tla fail "Invariant SiblingNeverStranded is violated" -deadlock
     check "lease siblings: a caught failure is reached"         LeaseSiblings_CaughtIsReachable.cfg LeaseSiblings.tla fail "Invariant NoFailureWasCaught is violated" -deadlock
     # Repair, the one transition out of a frozen instance. -deadlock for the

@@ -24,6 +24,11 @@
 (* of its own guarantees on the way: `active` has never gone from FALSE to  *)
 (* TRUE in any model before this one.                                       *)
 (*                                                                          *)
+(* A repair lands as one of three shapes: it resumes the instance, it        *)
+(* abandons it, or it diverts — and a Divert can tear down an enclosing      *)
+(* scope, cancelling the sibling's open item on the way out. That last one   *)
+(* is the only landing repair that ends a live foreign lease.                *)
+(*                                                                          *)
 (* The sibling is `Lease` itself, instantiated as `LeaseSiblings` does it,  *)
 (* so the lease checked here is the transcription the engine runs. The      *)
 (* failing work is not modelled beyond its effect: its item closes as       *)
@@ -47,7 +52,7 @@ ASSUME MaxIncidents \in Nat /\ MaxIncidents > 0
 ASSUME NoIncident \notin 0..MaxIncidents
 ASSUME UncheckedIncident \in BOOLEAN
 
-Kinds == {"repair", "abandon"}
+Kinds == {"repair", "abandon", "divert"}
 Requests == [op : Operators, incident : 0..(MaxIncidents - 1), kind : Kinds]
 
 VARIABLES
@@ -152,6 +157,24 @@ AbandonLands(r) ==
     /\ UNCHANGED <<active, now, sowner, suntil, sretryAt, sretries, sbelieves,
                    scompletions, sleaseNo, sissued, minted, sent, openAtThaw>>
 
+\* A Divert lands: the instance goes active, and the boundary it diverts to
+\* may be on an enclosing subprocess — `interrupt_to_boundary` then tears
+\* that scope down and cancels every open item inside it, the sibling's
+\* included. It is the one landing repair that ends a live foreign lease, so
+\* the lease's guarantees are checked across it and not only across an
+\* abandon (D5).
+DivertLands(r) ==
+    /\ r.kind = "divert"
+    /\ Lands(r)
+    /\ active' = TRUE
+    /\ sstate' = IF S!Open THEN "cancelled" ELSE sstate
+    /\ slastActor' = Process
+    /\ snamed' = NoLease
+    /\ landed' = r.incident
+    /\ UNCHANGED <<now, sowner, suntil, sretryAt, sretries, sbelieves,
+                   scompletions, sleaseNo, sissued, closed, minted, sent,
+                   openAtThaw>>
+
 \* Every other arrival — a stale number, an instance no longer frozen, a
 \* resend of one that landed — is answered IncidentNotOpen and steps nothing.
 Refused(r) ==
@@ -176,7 +199,8 @@ Next ==
     \/ Freeze
     \/ \E w \in Workers : SiblingFreezes(w)
     \/ \E o \in Operators, k \in Kinds : Send(o, k)
-    \/ \E r \in sent : RepairLands(r) \/ AbandonLands(r) \/ Refused(r)
+    \/ \E r \in sent : RepairLands(r) \/ AbandonLands(r) \/ DivertLands(r)
+                        \/ Refused(r)
     \/ SiblingStep
 
 Spec == Init /\ [][Next]_vars

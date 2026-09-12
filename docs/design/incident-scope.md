@@ -483,11 +483,16 @@ stranded items — a sibling branch's open task on an instance this item froze
 database clock, so the transcription checked is the one the engine runs.
 
 - `LeaseSiblings_Stranded.cfg` fails, and is meant to. It is `NeverStranded`
-  asked of both items, and its trace is the motivating case: one item fails
-  past its budget, and the other — open, perhaps leased mid-handler — can be
-  neither claimed nor completed. The price of D3, checked instead of argued.
-- `StrandedOnlyByASiblingsFreeze` holds: a stranded item is always its
-  sibling's freeze, never its own doing.
+  asked of both items: the instance freezes — an item failing past its
+  budget, or one of the causes that fails no item at all — and the other,
+  open and perhaps leased mid-handler, can be neither claimed nor completed.
+  The price of D3, checked instead of argued.
+- `StrandedOnlyWhileFrozen` holds: a stranded item is always the freeze,
+  never the lease's own doing. It deliberately does not say a *sibling*
+  failed: three of the four freeze sites fail no work item at all, and
+  `InstanceFreezes` is the action that reaches them. Without it the property
+  was a claim about work-item failures alone, true only because no other
+  actor existed in the model — the drift this file's own warning predicts.
 - `FreezeAdvancesNothing` holds: on a frozen instance nothing is claimed,
   completed, failed or cancelled, and the one change an item can still take
   is its holder handing it back. Composing it is what showed `Lease`'s `Fail`

@@ -477,7 +477,7 @@ NoLiveForeignCompletion ==
 (* branch's open task on an instance this item froze — and a one-item model *)
 (* cannot express that: its only freeze is its own final failure, which     *)
 (* closes it. LeaseSiblings.tla composes two of these items on one          *)
-(* instance: `StrandedOnlyByASiblingsFreeze` holds there, and               *)
+(* instance: `StrandedOnlyWhileFrozen` holds there, and                     *)
 (* LeaseSiblings_Stranded.cfg fails on exactly that stranding.              *)
 (***************************************************************************)
 Open == state \in {"available", "locked"}

@@ -19,7 +19,7 @@
 (* lock, so interleaving is the whole of the concurrency there is.          *)
 (*                                                                          *)
 (* The properties come in a pair, and the pair is the point:               *)
-(*   - `StrandedOnlyByASiblingsFreeze` holds: when an item is stranded, the *)
+(*   - `StrandedOnlyWhileFrozen` holds: when an item is stranded, the *)
 (*     instance is frozen and the OTHER item is the one that failed. The    *)
 (*     freeze is the only cause, and it is never the stranded item's own.  *)
 (*   - `SiblingNeverStranded` fails (LeaseSiblings_Stranded.cfg). It is the *)
@@ -73,9 +73,22 @@ I2 == INSTANCE Lease WITH
 
 Init == I1!Init /\ I2!Init
 
+\* The instance freezes with nothing of its own failing: a decision with no
+\* answer, a deadline or a correlation key that will not resolve — three of
+\* `step.rs`'s four freeze sites, none of which fails a work item. The freeze
+\* is instance-wide whatever raised it and strands a sibling the same way, so
+\* the model has to reach one; without this action the property below would
+\* be a claim about work-item failures alone, true only because no other
+\* actor exists here.
+InstanceFreezes ==
+    /\ active
+    /\ active' = FALSE
+    /\ UNCHANGED <<now, item1, item2>>
+
 Next ==
     \/ I1!Next /\ UNCHANGED item2
     \/ I2!Next /\ UNCHANGED item1
+    \/ InstanceFreezes
 
 Spec == Init /\ [][Next]_vars
 
@@ -88,9 +101,14 @@ EachItemSafe ==
     /\ I1!NoLiveForeignCompletion /\ I2!NoLiveForeignCompletion
     /\ I1!CancelledIsNeverCompleted /\ I2!CancelledIsNeverCompleted
 
-StrandedOnlyByASiblingsFreeze ==
-    /\ ~I1!NeverStranded => (~active /\ state2 = "failed")
-    /\ ~I2!NeverStranded => (~active /\ state1 = "failed")
+\* A stranding is always the freeze, never the lease: an open item that can
+\* be neither claimed nor completed is what the instance-wide freeze costs
+\* (D3), and nothing in the lease itself produces one. It deliberately does
+\* *not* say a sibling failed — `InstanceFreezes` is exactly the case where
+\* none did, and the engine has three of those.
+StrandedOnlyWhileFrozen ==
+    /\ ~I1!NeverStranded => ~active
+    /\ ~I2!NeverStranded => ~active
 
 \* Deliberately FALSE — LeaseSiblings_Stranded.cfg expects the violation.
 SiblingNeverStranded == I1!NeverStranded /\ I2!NeverStranded

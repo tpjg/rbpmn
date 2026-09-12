@@ -149,4 +149,12 @@ Spec == Init /\ [][Next]_vars
 \* A timer fires at or after its due, a moved one included.
 NeverFiresEarly == ~early
 
+\* D8's move is a move *forward*. The claim's re-check is what stops a moved
+\* timer from firing early — and with it in place `early` cannot be set at
+\* all, so `NeverFiresEarly` says nothing about the arithmetic that moved the
+\* row. This does: an occurrence re-armed into the past would fire at once on
+\* resume, and both configs would still reach their expected verdicts.
+RepairNeverMovesATimerEarlier ==
+    [][ (phase = "frozen" /\ phase' = "active") => due' >= due ]_vars
+
 =============================================================================
