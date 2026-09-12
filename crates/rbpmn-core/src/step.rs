@@ -125,8 +125,58 @@ impl Disposition {
     }
 }
 
+/// The instance's open incident, and what a repair could do with it
+/// (docs/design/incident-scope.md, D10). A read: diagnosing which
+/// dispositions are legal is one, offering the button is not.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenIncident {
+    /// The number a repair must name (D9).
+    pub incident: u64,
+    /// Where it failed — what `incident-raised` names.
+    pub element: String,
+    /// Where a repair re-enters, which for a boundary that could not arm is
+    /// its host, and for an event-gateway alternative the gateway.
+    pub resume: String,
+    /// Tokens the freeze halted beside the cause; they resume with it (D7).
+    pub halted: usize,
+    pub options: Vec<RepairOption>,
+}
+
+/// One disposition, and whether it would land here.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairOption {
+    pub disposition: RepairKind,
+    /// What the caller supplies with it.
+    pub takes: Takes,
+    /// Why it would be refused, or `None` when it lands.
+    pub refused: Option<RefusedBecause>,
+}
+
+/// What a disposition takes beside its reason. A patch is optional — the
+/// repair of a world that fixed itself carries none — an answer is required
+/// where it is taken, and a code may be left out to mean the catch-all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Takes {
+    Nothing,
+    Patch,
+    Answer,
+    Code,
+}
+
+/// A refusal as a reader needs it: the cause to match on, the prose to show.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefusedBecause {
+    pub cause: Refusal,
+    pub reason: String,
+}
+
 /// Why a repair was refused, before anything changed (D5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Refusal {
     #[error("a repair needs a reason: it is what makes the history an audit trail")]
     NoReason,
@@ -297,10 +347,30 @@ fn arm_key(
     Ok((message.to_string(), key_value))
 }
 
+/// Where an error raised at `host` is offered, outward: the host itself,
+/// then each enclosing subprocess, with the token each step would interrupt
+/// — `token` at the host, an enclosing subprocess's parked token further
+/// out, whose whole scope is torn down with it.
+fn outward(
+    state: &InstanceState,
+    host: NodeIx,
+    token: TokenId,
+    scope: ScopeId,
+) -> Vec<(TokenId, NodeIx)> {
+    let (mut host, mut target, mut scope) = (host, token, scope);
+    let mut hosts = vec![(target, host)];
+    while let Some(enclosing) = state.scopes.get(&scope) {
+        host = enclosing.element;
+        target = enclosing.token;
+        scope = enclosing.parent;
+        hosts.push((target, host));
+    }
+    hosts
+}
+
 /// The error boundary that catches `code` raised at `host`, and the token it
 /// interrupts: on `host` itself, else on the nearest enclosing subprocess —
-/// an exact code before a catch-all at each — whose parked token is then the
-/// one interrupted, its whole scope torn down with it. `None` is uncaught.
+/// an exact code before a catch-all at each. `None` is uncaught.
 fn catcher(
     proc: &ExecutableProcess,
     state: &InstanceState,
@@ -309,16 +379,118 @@ fn catcher(
     scope: ScopeId,
     code: Option<&str>,
 ) -> Option<(TokenId, NodeIx)> {
-    let (mut host, mut target, mut scope) = (host, token, scope);
-    loop {
-        if let Some(boundary) = proc.error_boundary(host, code) {
-            return Some((target, boundary));
+    outward(state, host, token, scope)
+        .into_iter()
+        .find_map(|(target, host)| proc.error_boundary(host, code).map(|b| (target, b)))
+}
+
+/// Would a Divert land anywhere at all — with some code, or none? The read's
+/// question, answered off the same walk the command takes.
+fn anything_catches(
+    proc: &ExecutableProcess,
+    state: &InstanceState,
+    host: NodeIx,
+    token: TokenId,
+    scope: ScopeId,
+) -> bool {
+    outward(state, host, token, scope)
+        .into_iter()
+        .any(|(_, host)| proc.error_boundaries(host).next().is_some())
+}
+
+/// Abandon's rule (D5): consuming the token must leave no join waiting for
+/// it — it is on a side path, where nothing joins, or it is the last token
+/// of its scope. The command and the read ask this one function.
+fn abandon_would_strand_a_join(
+    proc: &ExecutableProcess,
+    state: &InstanceState,
+    cause: TokenId,
+    scope: ScopeId,
+    resume: NodeIx,
+) -> bool {
+    let last_of_its_scope = !state
+        .tokens()
+        .any(|(id, t)| id != cause && t.scope == scope);
+    !proc.on_side_path(resume) && !last_of_its_scope
+}
+
+/// What a repair would do at the instance's open incident, for a reader —
+/// the inspector's, and anyone else's (docs/design/incident-scope.md, D10).
+/// `None` when the instance is not frozen. Every verdict here is the one the
+/// command reaches, from the same functions: a read that could disagree with
+/// the verb would be worse than no read.
+pub fn open_incident(proc: &ExecutableProcess, state: &InstanceState) -> Option<OpenIncident> {
+    let incident = state.open_incident()?;
+    let causes: Vec<TokenId> = state
+        .tokens()
+        .filter(|(_, t)| t.wait == WaitKind::Incident)
+        .map(|(id, _)| id)
+        .collect();
+    let &cause = causes.first()?;
+    let parked = state.tokens.get(&cause)?.clone();
+    let resume = proc.resume_point(parked.node);
+    // An instance frozen before repair existed can hold several: only
+    // abandoning it, which needs no cause, is left (D7).
+    let unknown_cause = (causes.len() > 1).then_some(Refusal::CauseUnknown);
+    let refusal = |disposition: RepairKind| -> Option<Refusal> {
+        if disposition == RepairKind::AbandonInstance {
+            return None;
         }
-        let enclosing = state.scopes.get(&scope)?;
-        host = enclosing.element;
-        target = enclosing.token;
-        scope = enclosing.parent;
-    }
+        if unknown_cause.is_some() {
+            return unknown_cause;
+        }
+        match disposition {
+            RepairKind::Advance
+                if matches!(proc.node(resume).kind, ExecKind::EventBasedGateway) =>
+            {
+                Some(Refusal::GatewayHasNoSingleWayOn)
+            }
+            RepairKind::Divert if !anything_catches(proc, state, resume, cause, parked.scope) => {
+                Some(Refusal::NothingCatches)
+            }
+            RepairKind::Abandon
+                if abandon_would_strand_a_join(proc, state, cause, parked.scope, resume) =>
+            {
+                Some(Refusal::AJoinWouldWait)
+            }
+            _ => None,
+        }
+    };
+    let takes = |disposition: RepairKind| match disposition {
+        RepairKind::Retry => Takes::Patch,
+        RepairKind::Advance if matches!(proc.node(resume).kind, ExecKind::BusinessRule { .. }) => {
+            Takes::Answer
+        }
+        RepairKind::Advance => Takes::Patch,
+        RepairKind::Divert => Takes::Code,
+        RepairKind::Abandon | RepairKind::AbandonInstance => Takes::Nothing,
+    };
+    Some(OpenIncident {
+        incident,
+        element: proc.node_id(parked.node).to_string(),
+        resume: proc.node_id(resume).to_string(),
+        halted: state
+            .tokens()
+            .filter(|(_, t)| matches!(t.wait, WaitKind::Halted(_)))
+            .count(),
+        options: [
+            RepairKind::Retry,
+            RepairKind::Advance,
+            RepairKind::Divert,
+            RepairKind::Abandon,
+            RepairKind::AbandonInstance,
+        ]
+        .into_iter()
+        .map(|disposition| RepairOption {
+            disposition,
+            takes: takes(disposition),
+            refused: refusal(disposition).map(|cause| RefusedBecause {
+                reason: cause.to_string(),
+                cause,
+            }),
+        })
+        .collect(),
+    })
 }
 
 fn is_empty(patch: &Value) -> bool {
@@ -594,10 +766,7 @@ pub fn step(
                     }
                 }
                 Disposition::Abandon => {
-                    let last_of_its_scope = !state
-                        .tokens()
-                        .any(|(id, t)| id != cause && t.scope == parked.scope);
-                    if !proc.on_side_path(resume) && !last_of_its_scope {
+                    if abandon_would_strand_a_join(proc, state, cause, parked.scope, resume) {
                         return Err(StepError::RepairRefused(Refusal::AJoinWouldWait));
                     }
                 }

@@ -1,8 +1,9 @@
 //! Instance inspection: the read model behind the playground's token-overlay
 //! debug view (phase-2 exit criterion) and any dashboard. Read-only.
 
+use crate::runtime::load_instance_snapshot;
 use crate::{Engine, EngineError};
-use rbpmn_core::Bindings;
+use rbpmn_core::{Bindings, OpenIncident};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -20,6 +21,11 @@ pub struct InstanceInspection {
     /// and since the manifest is deliberately absent from the XML, there is
     /// nowhere else a reader could recover it from.
     pub bindings: Bindings,
+    /// The open incident and what a repair would do with it, on a frozen
+    /// instance and nowhere else (`docs/design/incident-scope.md`, D10).
+    /// Every verdict in it comes from the core functions the repair command
+    /// itself asks, so what this says would happen is what happens.
+    pub incident: Option<OpenIncident>,
     pub tokens: Vec<TokenView>,
     pub scopes: Vec<ScopeView>,
     pub work_items: Vec<WorkItemView>,
@@ -146,6 +152,16 @@ impl Engine {
             }
         })?;
 
+        // Only a frozen instance has an incident, and only a frozen one
+        // pays for the rehydration this needs.
+        let status: String = inst.get("status");
+        let incident = if status == "failed" {
+            let (_, proc, _, state) = load_instance_snapshot(self, tx, id).await?;
+            rbpmn_core::open_incident(&proc, &state)
+        } else {
+            None
+        };
+
         let tokens = sqlx::query(
             "select element_id, wait_kind, scope_no from rbpmn_token \
              where instance_id = $1 order by token_no",
@@ -265,10 +281,11 @@ impl Engine {
         Ok(InstanceInspection {
             id,
             definition_key,
-            status: inst.get("status"),
+            status,
             variables: inst.get("variables"),
             bpmn_xml: inst.get("bpmn_xml"),
             bindings,
+            incident,
             tokens,
             scopes,
             work_items,

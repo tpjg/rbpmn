@@ -49,7 +49,8 @@ pub use inspect::{
 };
 pub use instances::{INSTANCE_VIEW, InstanceMatch, MAX_FIND_LIMIT};
 pub use rbpmn_core::{
-    Bindings, Disposition, Event, IndexDeclaration, IndexScope, InstanceStatus, Refusal, StepError,
+    Bindings, Disposition, Event, IndexDeclaration, IndexScope, InstanceStatus, OpenIncident,
+    Refusal, RefusedBecause, RepairKind, RepairOption, StepError, Takes,
 };
 pub use retention::{
     ArchiveBatch, ArchiveError, InstanceRecord, PrunableDefinition, RetentionArchive,

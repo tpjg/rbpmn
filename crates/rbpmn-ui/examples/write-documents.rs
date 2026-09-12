@@ -9,7 +9,10 @@
 //! one needs a database. It is enough to see the layout, the diagnosis line
 //! and the manifest pane.
 
-use rbpmn_engine::{Bindings, EventView, InstanceInspection, TokenView, WorkItemView};
+use rbpmn_engine::{
+    Bindings, EventView, InstanceInspection, OpenIncident, RepairKind, RepairOption, Takes,
+    TokenView, WorkItemView,
+};
 use std::path::PathBuf;
 
 fn main() -> std::io::Result<()> {
@@ -68,6 +71,26 @@ fn sample() -> InstanceInspection {
                 "st",
                 serde_json::json!({ "gateway": "acquirer-a", "capture": "auto" }),
             ),
+        incident: Some(OpenIncident {
+            incident: 0,
+            element: "st".to_string(),
+            resume: "st".to_string(),
+            halted: 0,
+            options: [
+                (RepairKind::Retry, Takes::Patch),
+                (RepairKind::Advance, Takes::Patch),
+                (RepairKind::Divert, Takes::Code),
+                (RepairKind::Abandon, Takes::Nothing),
+                (RepairKind::AbandonInstance, Takes::Nothing),
+            ]
+            .into_iter()
+            .map(|(disposition, takes)| RepairOption {
+                disposition,
+                takes,
+                refused: None,
+            })
+            .collect(),
+        }),
         tokens: vec![TokenView {
             element_id: "st".to_string(),
             wait_kind: "incident".to_string(),

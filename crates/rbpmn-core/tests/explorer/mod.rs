@@ -197,6 +197,12 @@ pub fn check(proc: &ExecutableProcess, s: &InstanceState) -> Result<(), String> 
             s.status
         ));
     }
+    if open_incident(proc, s).is_some() != (s.status == InstanceStatus::Failed) {
+        return Err(format!(
+            "{:?} instance and the incident read disagree about being frozen",
+            s.status
+        ));
+    }
     // A halted move bound for a join must still know the flow it was on: the
     // join counts arrivals by incoming flow.
     for (id, t) in s.tokens() {
@@ -443,6 +449,127 @@ fn side_path_saturated(proc: &ExecutableProcess, s: &InstanceState, element: Nod
     s.tokens().filter(|(_, t)| path.contains(&t.node)).count() >= MAX_SIDE_TOKENS
 }
 
+/// The read of an open incident says the same as the command that repairs
+/// it (docs/design/incident-scope.md, D10). `open_incident` exists so an
+/// operator can be told what a repair would do before sending one; it
+/// answers off the functions the command itself asks, and this is what
+/// holds the two together — every disposition, at every frozen state the
+/// exploration reaches.
+pub fn read_agrees(
+    proc: &ExecutableProcess,
+    s: &InstanceState,
+    codes: &[Option<String>],
+) -> Result<(), String> {
+    let Some(read) = open_incident(proc, s) else {
+        return Ok(());
+    };
+    let halted = s
+        .tokens()
+        .filter(|(_, t)| matches!(t.wait, WaitKind::Halted(_)))
+        .count();
+    if read.halted != halted {
+        return Err(format!(
+            "the read counts {} halted tokens, the state holds {halted}",
+            read.halted
+        ));
+    }
+    // What the command refuses on the shape of the state, which is all the
+    // read claims to know. Whether a payload is legal for a disposition is
+    // `takes`, checked below.
+    let structural = |disposition| {
+        let mut next = s.clone();
+        match step(
+            proc,
+            &mut next,
+            Command::Repair {
+                incident: read.incident,
+                disposition,
+                reason: "read".to_string(),
+            },
+        ) {
+            Err(StepError::RepairRefused(c))
+                if matches!(
+                    c,
+                    Refusal::CauseUnknown
+                        | Refusal::GatewayHasNoSingleWayOn
+                        | Refusal::NothingCatches
+                        | Refusal::AJoinWouldWait
+                ) =>
+            {
+                Some(c)
+            }
+            _ => None,
+        }
+    };
+    for option in &read.options {
+        let verdict = match option.disposition {
+            RepairKind::Retry => structural(Disposition::Retry { patch: json!({}) }),
+            RepairKind::Advance => structural(Disposition::Advance {
+                patch: json!({}),
+                answer: (option.takes == Takes::Answer).then(|| json!(1)),
+            }),
+            // The read says whether *something* catches, never which code
+            // does, so what has to agree with it is the best any code
+            // manages: `and` folds to None as soon as one lands. The
+            // alphabet is every code the model declares plus the codeless
+            // failure, so a boundary that exists is offered its code here.
+            RepairKind::Divert => codes
+                .iter()
+                .map(|code| structural(Disposition::Divert { code: code.clone() }))
+                .reduce(|a, b| a.and(b))
+                .flatten(),
+            RepairKind::Abandon => structural(Disposition::Abandon),
+            RepairKind::AbandonInstance => structural(Disposition::AbandonInstance),
+        };
+        if option.refused.as_ref().map(|r| r.cause) != verdict {
+            return Err(format!(
+                "the read says {} is {:?}, the command says {verdict:?}",
+                option.disposition,
+                option.refused.as_ref().map(|r| r.cause)
+            ));
+        }
+        if let Some(refused) = &option.refused
+            && refused.reason != refused.cause.to_string()
+        {
+            return Err(format!(
+                "the read's prose for {} is not its own cause",
+                option.disposition
+            ));
+        }
+        // `takes` is the other half of the read: what a caller supplies.
+        // An answer where none is taken and none where one is are both
+        // refusals, so the claim is checkable in both directions.
+        if option.disposition == RepairKind::Advance && option.refused.is_none() {
+            let answer = (option.takes != Takes::Answer).then(|| json!(1));
+            let expected = if option.takes == Takes::Answer {
+                Refusal::DecisionNeedsAnAnswer
+            } else {
+                Refusal::AnswerOnlyForADecision
+            };
+            let mut next = s.clone();
+            let refusal = step(
+                proc,
+                &mut next,
+                Command::Repair {
+                    incident: read.incident,
+                    disposition: Disposition::Advance {
+                        patch: json!({}),
+                        answer,
+                    },
+                    reason: "read".to_string(),
+                },
+            );
+            if !matches!(refusal, Err(StepError::RepairRefused(c)) if c == expected) {
+                return Err(format!(
+                    "the read says Advance takes {:?}, the command disagrees",
+                    option.takes
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Every command the outside world could issue against this state.
 pub fn stimuli(
     proc: &ExecutableProcess,
@@ -568,7 +695,11 @@ pub fn explore(proc: &ExecutableProcess, initial: Value, codes: &[String]) -> Re
     };
 
     while let Some(s) = frontier.pop_front() {
-        if let Err(v) = check(proc, &s) {
+        for v in check(proc, &s)
+            .err()
+            .into_iter()
+            .chain(read_agrees(proc, &s, &codes_opt).err())
+        {
             r.violations.push(v);
             if r.violations.len() > 20 {
                 return r;

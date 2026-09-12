@@ -29,7 +29,7 @@
 //! query alike (one shared map), so the two cannot disagree by construction.
 
 use crate::listen::Wakeup;
-use crate::runtime::{DefinitionRef, insert_engine_event, load_instance_nowait, persist_step};
+use crate::runtime::{DefinitionRef, Lock, insert_engine_event, load_instance_under, persist_step};
 use crate::{Engine, EngineError, MAX_RECORDED_TIMER_FAILURES};
 use rbpmn_core::{Command, InstanceStatus, TimerId};
 use sqlx::Row;
@@ -255,7 +255,7 @@ impl Engine {
         // instance's row lock for a while — the sequential drain loop must
         // move on to other instances' timers, not park behind it.
         let Some((definition, proc, bindings, mut state)) =
-            load_instance_nowait(self, &mut tx, instance_id, true).await?
+            load_instance_under(self, &mut tx, instance_id, Lock::NoWait).await?
         else {
             return Ok(Attempt::Busy); // a caller holds the instance row
         };

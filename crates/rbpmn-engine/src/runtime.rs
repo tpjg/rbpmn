@@ -945,7 +945,7 @@ pub(crate) async fn load_instance(
     ),
     EngineError,
 > {
-    load_instance_nowait(engine, tx, instance_id, false)
+    load_instance_under(engine, tx, instance_id, Lock::Wait)
         .await?
         // Only the NOWAIT variant can report lock-busy; a blocking load
         // waits instead. Surfaced as an error rather than a panic: this is
@@ -953,15 +953,49 @@ pub(crate) async fn load_instance(
         .ok_or_else(|| internal("blocking instance load reported lock-busy".to_string()))
 }
 
-/// [`load_instance`] with an optional `FOR UPDATE NOWAIT`: `Ok(None)` when
-/// someone else holds the instance row lock — for callers with other work
-/// to do (the scheduler must not park its whole drain loop behind one
-/// long-running caller transaction).
-pub(crate) async fn load_instance_nowait(
+/// Rebuilds the same state without taking the row lock — a reader's load,
+/// for a caller that will not step. The inspector's: it reads inside one
+/// repeatable-read transaction, so its snapshot is consistent without a
+/// lock, and a read must never make a step queue behind it.
+pub(crate) async fn load_instance_snapshot(
     engine: &Engine,
     tx: &mut PgConnection,
     instance_id: Uuid,
-    nowait: bool,
+) -> Result<
+    (
+        DefinitionRef,
+        std::sync::Arc<ExecutableProcess>,
+        std::sync::Arc<Bindings>,
+        InstanceState,
+    ),
+    EngineError,
+> {
+    load_instance_under(engine, tx, instance_id, Lock::Snapshot)
+        .await?
+        .ok_or_else(|| internal("snapshot instance load reported lock-busy".to_string()))
+}
+
+/// How a load takes the instance row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lock {
+    /// A step waits for it.
+    Wait,
+    /// The scheduler gives up rather than queue behind a held one.
+    NoWait,
+    /// A read takes nothing.
+    Snapshot,
+}
+
+/// [`load_instance`] under a chosen lock: `Lock::NoWait` yields `Ok(None)`
+/// when someone else holds the instance row — for callers with other work
+/// to do (the scheduler must not park its whole drain loop behind one
+/// long-running caller transaction) — and `Lock::Snapshot` takes no lock at
+/// all, which only a caller that will not step may ask for.
+pub(crate) async fn load_instance_under(
+    engine: &Engine,
+    tx: &mut PgConnection,
+    instance_id: Uuid,
+    lock: Lock,
 ) -> Result<
     Option<(
         DefinitionRef,
@@ -976,8 +1010,12 @@ pub(crate) async fn load_instance_nowait(
                 i.status, i.variables, \
                 i.next_token, i.next_work_item, i.next_timer, i.next_subscription, \
                 i.next_scope, i.next_incident \
-         from rbpmn_instance i where i.id = $1 for update{}",
-        if nowait { " nowait" } else { "" }
+         from rbpmn_instance i where i.id = $1{}",
+        match lock {
+            Lock::Wait => " for update",
+            Lock::NoWait => " for update nowait",
+            Lock::Snapshot => "",
+        }
     );
     let inst = match sqlx::query(&sql)
         .bind(instance_id)

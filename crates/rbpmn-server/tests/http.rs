@@ -1251,6 +1251,56 @@ async fn an_incident_is_repaired_over_http() {
         .to_string();
     let repair = format!("/v1/instances/{instance_id}/repair");
 
+    // What the inspection says a repair would do, before one is sent (D10):
+    // the number to name, where it failed and would re-enter, and per
+    // disposition what it takes — with the two this model cannot offer
+    // refused, in the prose an operator reads.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/v1/instances/{instance_id}/inspect"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let incident = body_json(resp).await["incident"].clone();
+    assert_eq!(
+        (
+            &incident["incident"],
+            &incident["element"],
+            &incident["resume"],
+            &incident["halted"]
+        ),
+        (
+            &serde_json::json!(0),
+            &serde_json::json!("c"),
+            &serde_json::json!("c"),
+            &serde_json::json!(0)
+        ),
+        "{incident}"
+    );
+    let option = |disposition: &str| {
+        incident["options"]
+            .as_array()
+            .expect("options")
+            .iter()
+            .find(|o| o["disposition"] == disposition)
+            .unwrap_or_else(|| panic!("{disposition} is an option: {incident}"))
+            .clone()
+    };
+    assert_eq!(option("retry")["takes"], "patch");
+    assert_eq!(option("retry")["refused"], serde_json::Value::Null);
+    assert_eq!(option("advance")["takes"], "patch");
+    assert_eq!(option("abandon")["takes"], "nothing");
+    // Nothing in this model catches an error.
+    assert_eq!(option("divert")["takes"], "code");
+    assert_eq!(option("divert")["refused"]["cause"], "nothing-catches");
+    assert!(
+        option("divert")["refused"]["reason"].is_string(),
+        "{incident}"
+    );
+
     let resp = post(
         repair.clone(),
         serde_json::json!({ "incident": 1, "disposition": "retry", "reason": "resent" }),
@@ -1318,6 +1368,18 @@ async fn an_incident_is_repaired_over_http() {
         body_json(resp).await,
         serde_json::json!({ "status": "active", "incident": null })
     );
+
+    // Repaired: there is nothing left to tell an operator about.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/v1/instances/{instance_id}/inspect"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["incident"], serde_json::Value::Null);
 
     let resp = post(
         "/v1/messages".into(),

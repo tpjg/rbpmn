@@ -8,8 +8,8 @@ use rbpmn_core::Bindings;
 use rbpmn_engine::testing::TestDb;
 use rbpmn_engine::{
     Completion, DeployError, Disposition, Engine, EngineError, FailOptions, FailOutcome,
-    HandlerFailure, HttpPostHandler, InstanceStatus, ServiceTaskHandler, StepError, WorkItem,
-    WorkerOptions,
+    HandlerFailure, HttpPostHandler, InstanceStatus, Refusal, RepairKind, ServiceTaskHandler,
+    StepError, Takes, WorkItem, WorkerOptions,
 };
 use sqlx::{PgPool, Row};
 use std::fs;
@@ -2258,6 +2258,129 @@ async fn a_repair_names_its_incident() {
             open: None
         }))
     ));
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// What the inspection says a repair would do is what a repair does (D10).
+/// It names the open incident, where a repair re-enters, and per disposition
+/// what the caller supplies and why it would be refused — and each verdict is
+/// the one `Engine::repair` reaches, because both come from the same core
+/// functions. An instance that is not frozen carries none.
+#[tokio::test]
+async fn the_inspection_says_what_a_repair_would_do() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/03-parallel-gateway.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    assert!(
+        engine
+            .inspect_instance(started.id)
+            .await
+            .unwrap()
+            .incident
+            .is_none()
+    );
+    let (ta, _) = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .find(|(_, element)| element == "ta")
+        .unwrap();
+    freeze_on(&engine, ta).await;
+
+    let incident = engine
+        .inspect_instance(started.id)
+        .await
+        .unwrap()
+        .incident
+        .expect("a frozen instance has one");
+    assert_eq!(
+        (
+            incident.incident,
+            &*incident.element,
+            &*incident.resume,
+            incident.halted
+        ),
+        (0, "ta", "ta", 0)
+    );
+    let option = |kind: RepairKind| {
+        incident
+            .options
+            .iter()
+            .find(|o| o.disposition == kind)
+            .unwrap_or_else(|| panic!("{kind} is an option"))
+    };
+    assert_eq!(option(RepairKind::Retry).takes, Takes::Patch);
+    assert!(option(RepairKind::Retry).refused.is_none());
+    assert_eq!(option(RepairKind::Advance).takes, Takes::Patch);
+    assert!(option(RepairKind::Advance).refused.is_none());
+    assert_eq!(option(RepairKind::AbandonInstance).takes, Takes::Nothing);
+    assert!(option(RepairKind::AbandonInstance).refused.is_none());
+    // Nothing in this model catches an error, and `tb` is still open in the
+    // same scope: the two dispositions that cannot land say so, in the prose
+    // an operator reads.
+    let divert = option(RepairKind::Divert);
+    assert_eq!(divert.takes, Takes::Code);
+    assert_eq!(
+        divert.refused.as_ref().map(|r| (r.cause, r.reason.clone())),
+        Some((Refusal::NothingCatches, Refusal::NothingCatches.to_string()))
+    );
+    assert_eq!(
+        option(RepairKind::Abandon)
+            .refused
+            .as_ref()
+            .map(|r| r.cause),
+        Some(Refusal::AJoinWouldWait)
+    );
+
+    // Refusal for refusal, the command says the same.
+    assert!(matches!(
+        engine
+            .repair(started.id, 0, Disposition::Divert { code: None }, "divert")
+            .await,
+        Err(EngineError::Step(StepError::RepairRefused(
+            Refusal::NothingCatches
+        )))
+    ));
+    assert!(matches!(
+        engine
+            .repair(started.id, 0, Disposition::Abandon, "drop it")
+            .await,
+        Err(EngineError::Step(StepError::RepairRefused(
+            Refusal::AJoinWouldWait
+        )))
+    ));
+    let repaired = engine
+        .repair(
+            started.id,
+            0,
+            Disposition::Advance {
+                patch: serde_json::json!({}),
+                answer: None,
+            },
+            "filed by hand",
+        )
+        .await
+        .unwrap();
+    assert_eq!(repaired.status, InstanceStatus::Active);
+    assert!(
+        engine
+            .inspect_instance(started.id)
+            .await
+            .unwrap()
+            .incident
+            .is_none()
+    );
     harness::replay_verify(&db.pool, started.id, &initial)
         .await
         .unwrap();

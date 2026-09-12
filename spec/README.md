@@ -228,13 +228,16 @@ paths. Every shape that takes a lock:
 | `delete_definition` | definition row → policy row | blocking |
 | deploy (`deploy.rs`) | advisory(key) → definition rows | blocking |
 | declared index build (`tasks.rs`) | [try-advisory(instance indexes)] → **no row locks at all** | try only |
+| instance inspection (`inspect.rs`) | one repeatable-read snapshot, **no locks at all** | none |
 
 `retire` and `deploy` were outside the model until the third audit. Three
 things are deliberately *not* modelled and are argued instead: the
 scheduler's `pg_try_advisory_xact_lock`, the migration advisory, and the
 declared index build's slot. All are excluded for the same reason — a
 try-lock never waits, so it cannot be an edge in a wait-for cycle; the
-migration one also runs only at startup.
+migration one also runs only at startup. The inspector is in the table for
+the opposite reason: it takes nothing at all, so there is no edge to place —
+its consistency comes from the snapshot, not from a lock.
 
 The index-build slot earns a paragraph, because it is the one place where
 "use a blocking lock, it is simpler" is not merely worse but **wrong**, and
@@ -489,6 +492,10 @@ cannot be moved past now.
 a step — the instance row `FOR UPDATE`, then its per-instance rows, the timer
 moves among them. `TimerTeardown` stands: a repair's teardown (a Divert into
 an enclosing scope) reaps a token's arms with it through the same
-`tear_down_scope`, and a moved row is still armed on a live token. Bounds:
+`tear_down_scope`, and a moved row is still armed on a live token. The read
+of an open incident (D10) adds no shape either: `load_instance_snapshot`
+rebuilds the same state without the `FOR UPDATE` every stepping loader takes,
+inside the inspector's repeatable-read transaction, so it neither waits for a
+step nor makes one wait for it. Bounds:
 one operator (a resend is what matters, not a second sender), two incidents
 (what a Retry that fails again needs), and `LeaseSiblings`' lease bounds.
