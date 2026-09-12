@@ -1,7 +1,7 @@
 # Incident scope — design round
 
 **Status: D1 and D2 shipped, and the price of D3 is checked. D4–D13, repair,
-are decided, and slices 3–6 build them.** The catch-all error boundary
+are decided and shipped, in slices 3–6.** The catch-all error boundary
 and the warning that ships with it are in. The freeze stays instance-wide, and
 the way out of an incident is a repair API rather than a narrower freeze (D3).
 The alternatives that were weighed and refused are at the bottom, briefly,
@@ -385,10 +385,13 @@ frozen before the migration holds incident 0.
   `_in_tx` twin, returning what the step did: landed, completed, terminated,
   or frozen again under a new number.
 - **`POST /v1/instances/{id}/repair`**, the same four fields as JSON.
-- **What a repair would do is a read.** `rbpmn_core` answers, for the open
-  incident, its number, *R*, and each disposition allowed or refused with the
-  reason; `inspect_instance` carries it and the inspector shows it as text.
-  Offering the button is not a read (D13).
+- **What a repair would do is a read.** `rbpmn_core::open_incident` answers,
+  for the open incident, its number, *R*, and each disposition allowed or
+  refused with the reason — from the functions `Command::Repair` itself asks,
+  so the read cannot say one thing and the verb do another. For a Divert it
+  reads *something catches from here*; which code does is the model's own.
+  `inspect_instance` carries it, on a load that takes no row lock, and the
+  inspector shows it as text. Offering the button is not a read (D13).
 
 ### D11 — a delivery that would leave its boundary unable to re-arm is refused
 
@@ -580,7 +583,7 @@ half of what it does, and the round trip is worth a test. Owes `just ui`,
 
 **Slice 2 — the failing `Lease` config: shipped** as `spec/LeaseSiblings.tla`.
 
-**Slice 3 — repair in the core.** Scenarios first, red by design: a
+**Slice 3 — repair in the core: shipped.** Scenarios first, red by design: a
 `repair` action in the scenario runner, and golden traces for each
 disposition at each row of finding 2's table; the refusals (Advance at a
 gateway, Divert into nothing, Abandon on a main-flow branch, a stale
@@ -594,21 +597,24 @@ wait kinds and the incident counter — lands here too, with D11's refusal
 through `correlate`. The explorer takes every repair as a stimulus on every failed state and asserts
 D6 over the whole space. No lint change: repair is not a model capability.
 
-**Slice 4 — through the engine.** `frozen_at`, `Engine::repair`, D8 in
+**Slice 4 — through the engine: shipped.** `frozen_at`, `Engine::repair`, D8 in
 `persist_step`, the typed errors, the HTTP route, and
 `commands_from` rebuilding the command so replay covers it. Engine tests: a
 sibling's lease completing after a repair, the timer move, a resent repair.
 Storm and chaos repair some of what they freeze. The README's upgrade note
 gains the new wait kinds, which an older engine cannot load.
 
-**Slice 5 — `spec/Repair.tla`**, its counterexample config, `spec/README`,
-and `LockOrder` re-read.
+**Slice 5 — `spec/Repair.tla`: shipped**, with `spec/RepairClock.tla` for the
+timers a repair moves, their counterexample configs, `spec/README`, and
+`LockOrder` re-read.
 
-**Slice 6 — what the operator sees.** The inspection carries the open
+**Slice 6 — what the operator sees: shipped.** The inspection carries the open
 incident and what each disposition would do (D10); the inspector shows it as
 text, draws halted tokens as frozen collateral, and a repaired failure as
-repaired rather than "handled by a boundary". `bpmn-engine-design.md`'s
-incident-freeze paragraph and `docs/dmn.md`'s pointer follow.
+repaired rather than "handled by a boundary". The explorer checks the read
+against the command at every frozen state it reaches, disposition by
+disposition, so the two cannot drift. `bpmn-engine-design.md`'s
+incident-freeze paragraph and `docs/dmn.md`'s pointer say the same.
 
 ## Test plan
 

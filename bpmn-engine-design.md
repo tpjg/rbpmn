@@ -711,8 +711,9 @@ Incident freeze (uniform, decided in the post-phase-3 review round): every
 incident converges on one shape — the token parks at the failing element
 with the `incident` wait kind, that token's in-flight arms (boundary
 timers, partial event-gateway arms) are withdrawn, and the instance
-freezes. Inspection always shows *where* it failed, and a future repair API
-has exactly one state to resume from. Anything the freeze deliberately
+freezes. Inspection always shows *where* it failed and what a repair would do
+about it (`docs/design/incident-scope.md`, D10), and a repair has exactly one
+state to resume from. Anything the freeze deliberately
 keeps (a sibling branch's subscription, say) is excluded from scheduler and
 correlation queries by instance status, never left to trip them.
 

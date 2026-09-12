@@ -418,6 +418,30 @@ body {
   stroke-width: 3px !important;
 }
 
+/* Collateral: a move in flight or a pending decision the freeze stopped where
+   it stood. Not the failure, and not an arm the world can still satisfy — it
+   waits on the repair, and resumes with it. Inert like every other row on a
+   frozen instance, so it carries the dashes too. */
+.rbpmn-badge-halted {
+  background: #5a67d8;
+}
+
+.rbpmn-mark-halted .djs-visual > :nth-child(1) {
+  stroke: #5a67d8 !important;
+  stroke-width: 3px !important;
+}
+
+/* A failure an operator repaired: no boundary took this one, a person did,
+   and the reason they gave is on the mark. */
+.rbpmn-badge-repaired {
+  background: #2f855a;
+}
+
+.rbpmn-mark-repaired .djs-visual > :nth-child(1) {
+  stroke: #2f855a !important;
+  stroke-width: 2px !important;
+}
+
 /* A failure a boundary caught: it happened, and the model handled it. Neither
    the red of an incident nor the dashes of an arm that will not fire. */
 .rbpmn-badge-handled {

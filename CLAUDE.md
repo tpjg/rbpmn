@@ -241,7 +241,11 @@ inclusive gateway, block structure, messages-only interaction, build order).
 - The inspector is **read-only, forever**. No retry, no cancel, no variable
   edit, no migration, no lists, no search. Every one of those is a designed
   API first; a UI is never the reason one ships early. The pressure to add a
-  button will come from the element pane — that is the spot to hold.
+  button will come from the element pane — that is the spot to hold. An open
+  incident is the live test of it: the inspection carries what each
+  disposition of a repair would do (`docs/design/incident-scope.md`, D10) and
+  the inspector prints it as text. Diagnosing is a read; offering the button
+  is not (D13).
 - **Benchmarks are a separate track and never gate on absolute numbers**
   (`benchmarks/`). Two rules with teeth. (a) A feature must not land because a
   benchmark axis wanted it: the three-history-level matrix is *wired and

@@ -156,3 +156,78 @@ test('on a frozen instance, a failure caught elsewhere stays handled', () => {
   assert.equal(mark.kind, 'handled');
   assert.equal(mark.inert, false);
 });
+
+// A freeze stops more than the token that failed (D7): a move in flight and a
+// decision waiting for its answer are halted where they stood. They are not
+// arms — nothing the world does will satisfy one — so they are their own kind.
+test('the freeze draws what it halted as collateral, not as an ordinary arm', () => {
+  const data = frozen();
+  data.tokens.push(
+    { elementId: 'notify', waitKind: 'halted', scopeNo: 0 },
+    { elementId: 'price', waitKind: 'halted_decision', scopeNo: 0 }
+  );
+  const marks = marksFor(data);
+
+  const inFlight = find(marks, 'notify', 'halted');
+  const decision = find(marks, 'price', 'halted');
+  assert.match(inFlight.payload.title, /halted in flight by the freeze/);
+  assert.match(decision.payload.title, /a decision pending/);
+  assert.equal(inFlight.inert, true, 'collateral on a frozen instance is inert');
+  assert.match(inFlight.payload.title, /inert: the instance is frozen on an incident/);
+  assert.equal(find(marks, 'notify', 'token'), undefined, 'not also a plain arm');
+});
+
+test('a failure an operator repaired is repaired, not handled by a boundary', () => {
+  const marks = marksFor(
+    inspection({
+      workItems: [
+        {
+          elementId: 'charge',
+          state: 'failed',
+          kind: 'service',
+          topic: 'payments',
+          retries: 0,
+          lastFailure: 'handler answered 502',
+        },
+      ],
+      events: [
+        {
+          kind: 'incident-repaired',
+          elementId: 'charge',
+          display: 'incident-repaired charge retry',
+          detail: 'the acquirer was down all morning',
+        },
+      ],
+    })
+  );
+  assert.equal(marks.length, 1);
+  assert.equal(marks[0].kind, 'repaired');
+  assert.equal(marks[0].inert, false);
+  assert.match(marks[0].payload.title, /handler answered 502 — repaired: the acquirer was down/);
+});
+
+test('a repair at one element does not repaint a failure caught at another', () => {
+  const marks = marksFor(
+    inspection({
+      workItems: [
+        {
+          elementId: 'notify',
+          state: 'failed',
+          kind: 'service',
+          topic: 'notices',
+          retries: 0,
+          lastFailure: 'dependency unavailable',
+        },
+      ],
+      events: [
+        {
+          kind: 'incident-repaired',
+          elementId: 'charge',
+          display: 'incident-repaired charge retry',
+          detail: 'unrelated',
+        },
+      ],
+    })
+  );
+  assert.equal(marks[0].kind, 'handled');
+});

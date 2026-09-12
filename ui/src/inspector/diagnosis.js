@@ -33,7 +33,11 @@ export function diagnose(data) {
     }
     return {
       severity: 'error',
-      headline: `Incident at ${incidentToken.elementId}`,
+      // The number is what a repair must name, so it belongs in the line an
+      // operator reads. Only a payload that carries the read has one.
+      headline: data.incident
+        ? `Incident ${data.incident.incident} at ${incidentToken.elementId}`
+        : `Incident at ${incidentToken.elementId}`,
       detail: parts.join(' — '),
       elementId: incidentToken.elementId,
     };
@@ -94,4 +98,41 @@ function describeWait(token, data) {
   );
   if (item) return `${where} on ${item.kind} work item (${item.state}, topic ${item.topic})`;
   return `${where} (${token.waitKind})`;
+}
+
+/// The open incident as text: the number a repair names, where it failed and
+/// re-enters, what else the freeze stopped, and per disposition what it takes
+/// or why it would be refused (docs/design/incident-scope.md, D10). Label and
+/// value pairs, for the caller to render.
+///
+/// Every verdict here is the engine's own — the core answers it from the
+/// functions the repair command asks, so this reports rather than re-derives.
+/// It says what a repair *would* do; it never offers to do one (D13).
+///
+/// @returns {[string, string][] | null} null when nothing is frozen.
+export function describeRepair(data) {
+  const incident = data.incident;
+  if (!incident) return null;
+  const lines = [
+    ['incident', String(incident.incident)],
+    ['failed at', incident.element],
+  ];
+  if (incident.resume !== incident.element) {
+    lines.push(['a repair resumes at', incident.resume]);
+  }
+  if (incident.halted) {
+    lines.push([
+      'also stopped',
+      `${incident.halted} token(s), resumed by the same repair`,
+    ]);
+  }
+  for (const option of incident.options ?? []) {
+    const takes =
+      option.takes === 'nothing' ? 'takes nothing else' : `takes a ${option.takes}`;
+    lines.push([
+      option.disposition,
+      option.refused ? `refused — ${option.refused.reason}` : `would land, ${takes}`,
+    ]);
+  }
+  return lines;
 }

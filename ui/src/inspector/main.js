@@ -17,7 +17,7 @@ import { annotate, focus } from '../shared/annotations.js';
 import { ensureDi } from '../shared/layout.js';
 import { clear, el, field, jsonTree, section } from '../shared/dom.js';
 import { describeElement } from '../shared/model-facts.js';
-import { diagnose } from './diagnosis.js';
+import { describeRepair, diagnose } from './diagnosis.js';
 import { marksFor } from './marks.js';
 import { onThemeChange, rendererColors } from '../shared/theme.js';
 
@@ -236,7 +236,18 @@ async function main() {
   const varsSection = el('section', 'pane');
   const { wrap: varsWrap, body: varsBody } = section('Variables');
   varsBody.append(jsonTree(data.variables));
-  varsSection.append(el('h2', null, 'Instance'), varsWrap);
+  varsSection.append(el('h2', null, 'Instance'));
+
+  // What a repair would do, when one is open. Text, and only text: the
+  // inspector is read-only, and a repair is an API call with a reason
+  // attached (docs/design/incident-scope.md, D13).
+  const repairLines = describeRepair(data);
+  if (repairLines) {
+    const { wrap, body } = section('Open incident');
+    for (const [label, value] of repairLines) body.append(field(label, value));
+    varsSection.append(wrap);
+  }
+  varsSection.append(varsWrap);
 
   const { wrap: bindWrap, body: bindBody } = section('Deployed manifest', { open: false });
   bindBody.append(jsonTree(data.bindings ?? {}));

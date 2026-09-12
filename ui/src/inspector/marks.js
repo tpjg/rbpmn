@@ -12,6 +12,12 @@
 // exactly like a live one makes the picture claim a blast radius one element
 // wide when it is the whole instance.
 //
+// A freeze stops more than the token that failed: a move in flight and a
+// decision waiting for its answer are halted where they stood, and a repair
+// resumes them with the cause (D7). They are drawn as their own kind, not as
+// ordinary arms — an arm is something the world can still satisfy, and these
+// are waiting on an operator.
+//
 // What is never inert: the marks that record a failure. An incident token,
 // and the failed work item it is parked at, are not arms waiting on
 // something — they are the reason nothing else will happen, and muting them
@@ -19,7 +25,9 @@
 // incident token at its element was *caught*: a boundary took it, and it is
 // drawn as handled — history, not a reason. (Matched by element, because the
 // inspection carries no token on a work item: a task that failed twice in a
-// loop, once caught and once not, draws both as the incident.)
+// loop, once caught and once not, draws both as the incident.) A failure an
+// operator repaired is neither: no boundary took it, a person did, and the
+// reason they gave is on the mark.
 
 /// Why the arms on this instance cannot fire, or null while they can.
 function inertReason(status) {
@@ -44,6 +52,14 @@ export function marksFor(data) {
   const incidentAt = new Set(
     data.tokens.filter((t) => t.waitKind === 'incident').map((t) => t.elementId)
   );
+  /// Element -> the reason the operator gave, when a repair landed there.
+  /// `detail` carries it because `display` is the golden-trace format and
+  /// cannot hold prose that may be reworded.
+  const repairedAt = new Map(
+    data.events
+      .filter((e) => e.kind === 'incident-repaired' && e.elementId)
+      .map((e) => [e.elementId, e.detail])
+  );
   const marks = [];
 
   /// An arm or a live wait: true now, and only while the instance is active.
@@ -64,6 +80,10 @@ export function marksFor(data) {
   for (const token of data.tokens) {
     if (token.waitKind === 'incident') {
       failure(token.elementId, 'token — incident');
+    } else if (token.waitKind === 'halted') {
+      arm(token.elementId, 'halted', 'token — halted in flight by the freeze');
+    } else if (token.waitKind === 'halted_decision') {
+      arm(token.elementId, 'halted', 'token — halted by the freeze, a decision pending');
     } else {
       arm(token.elementId, 'token', `token — ${token.waitKind}`);
     }
@@ -79,6 +99,17 @@ export function marksFor(data) {
       const detail = item.lastFailure ?? 'no detail recorded';
       if (incidentAt.has(item.elementId)) {
         failure(item.elementId, `work item failed: ${detail}`);
+      } else if (repairedAt.has(item.elementId)) {
+        const reason = repairedAt.get(item.elementId);
+        marks.push({
+          elementId: item.elementId,
+          kind: 'repaired',
+          inert: false,
+          payload: {
+            title:
+              `work item failed: ${detail} — repaired` + (reason ? `: ${reason}` : ''),
+          },
+        });
       } else {
         marks.push({
           elementId: item.elementId,

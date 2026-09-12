@@ -76,9 +76,9 @@ how a process transition and a business write become one commit.
 
 Everything through embedded subprocesses, boundary events (interrupting,
 non-interrupting, cyclic timers), DMN decisions, message correlation, timers,
-incidents and retention is implemented and covered by the corpus. The known
-gaps, each with its status in the design brief's
-[open-items table](bpmn-engine-design.md#everything-still-open--one-visible-list):
+incidents and the repair that resolves them, and retention is implemented and
+covered by the corpus. The known gaps, each with its status in the design
+brief's [open-items table](bpmn-engine-design.md#everything-still-open--one-visible-list):
 cross-definition messaging (message start/throw between definitions lint clean
 but refuse to compile) and the instance migration API.
 

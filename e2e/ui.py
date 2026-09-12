@@ -115,8 +115,21 @@ def check_inspector(browser):
 
     # The sample instance is frozen at 'st'; that is the headline.
     diagnosis = page.inner_text(".diagnosis")
-    check("Incident at st" in diagnosis, f"diagnosis names the incident ({diagnosis!r})")
+    check(
+        "Incident 0 at st" in diagnosis,
+        f"diagnosis names the incident and its number ({diagnosis!r})",
+    )
     check("handler answered 502" in diagnosis, "diagnosis carries the failure detail")
+    # What a repair would do, as text (D10). The number is what a repair has
+    # to name and the dispositions are what it may ask for; the inspector
+    # prints them and offers no button (D13).
+    side = page.inner_text(".side")
+    check("Open incident" in side, "the side pane carries the open incident")
+    check("would land" in side, f"the dispositions say what they would do ({side[:80]!r})")
+    check(
+        page.locator("button:has-text('Repair')").count() == 0,
+        "the inspector offers no repair button",
+    )
 
     # Runtime markers landed on the diagram.
     badges = page.locator(".rbpmn-badge").count()
@@ -1147,8 +1160,16 @@ def check_served(browser):
         # `accept/28-demo-order.bpmn`. This half shares `e2e/demo.py`'s stack
         # deliberately, so the model the demo shows off is the model this
         # asserts on, and a change to one cannot quietly diverge from the other.
+        side = page.inner_text(".side")
+        # The read reaches the browser from a real engine: the number to name
+        # and the word a repair is sent with — `abandon-instance`, the same
+        # spelling `POST /v1/instances/{id}/repair` takes.
         check(
-            "Incident at charge" in diagnosis,
+            "Open incident" in side and "abandon-instance" in side,
+            f"the open incident is described from the engine ({side[:80]!r})",
+        )
+        check(
+            "Incident 0 at charge" in diagnosis,
             f"a real frozen instance diagnoses itself ({diagnosis[:60]!r})",
         )
         # Opens on the problem rather than an empty pane.

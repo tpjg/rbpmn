@@ -504,7 +504,8 @@ Boundaries match an error **code**, and a failed decision has none to give —
 DMN has no error codes. Catching one would mean inventing a reserved code and
 teaching modelers to write it in their BPMN, which is a designed contract, and
 a feature is never the reason one ships early. So the token parks at the
-element with the uniform incident shape and inspection shows *where*.
+element with the uniform incident shape, and inspection shows *where* — and
+what each disposition of a repair would do about it.
 The catch-all ([design/incident-scope.md](design/incident-scope.md), D1) takes
 away the first leg of that: a boundary with no `errorRef` needs no code. The
 ruling stands on the other — a failed decision raises no error at all; it has
