@@ -84,6 +84,20 @@ pub struct GetTaskOptions {
     pub ttl: Duration,
     pub order: TaskOrder,
     pub filter: Option<TaskFilter>,
+    /// Items this caller does not want offered — "skip this one", kept by
+    /// the caller and sent with the next claim.
+    ///
+    /// It is not a lock and not a deferral: nothing is written, the items
+    /// stay exactly as claimable as they were, and every other caller still
+    /// sees them at the head of the queue. That is the whole point — the
+    /// alternative an application reaches for otherwise is to claim, look,
+    /// and hold or hand back, which locks the very items it did not want.
+    ///
+    /// Ordering is untouched: the next item in `order` that is not in this
+    /// list is the one claimed. Cost is a walk past each excluded row, so a
+    /// claim is linear in the length of the list — fine for the handful a
+    /// person skips, which is why it is capped rather than unbounded.
+    pub exclude: Vec<Uuid>,
 }
 
 impl GetTaskOptions {
@@ -93,6 +107,7 @@ impl GetTaskOptions {
             ttl: Duration::from_secs(600),
             order: TaskOrder::Fifo,
             filter: None,
+            exclude: Vec::new(),
         }
     }
 }
@@ -219,6 +234,21 @@ async fn current_item_state(engine: &Engine, task: Uuid) -> Result<String, Engin
 /// A lease must be plausible: zero would mint a lock expired at birth (two
 /// owners on one task moments later), and an absurd TTL turns into a
 /// Postgres interval error surfaced as a 500. Reject both at the boundary.
+/// How many items one claim may be told to skip. A person skips a handful;
+/// the cap is `MAX_FIND_LIMIT`'s, because a bound a caller can hit should be
+/// one number in this engine rather than a new convention per call.
+pub const MAX_EXCLUDE: usize = crate::MAX_FIND_LIMIT as usize;
+
+fn validate_exclude(exclude: &[Uuid]) -> Result<(), EngineError> {
+    if exclude.len() > MAX_EXCLUDE {
+        return Err(EngineError::InvalidVariables(format!(
+            "exclude takes at most {MAX_EXCLUDE} items, got {}",
+            exclude.len()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_ttl(ttl: Duration) -> Result<(), EngineError> {
     const MIN_TTL: Duration = Duration::from_millis(10);
     const MAX_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
@@ -349,13 +379,23 @@ impl Engine {
         crate::runtime::reject_nul_text(topic, "topic")?;
         crate::runtime::reject_nul_text(&options.owner, "owner")?;
         validate_ttl(options.ttl)?;
+        validate_exclude(&options.exclude)?;
         let direction = match options.order {
             TaskOrder::Fifo => "asc",
             TaskOrder::Lifo => "desc",
         };
+        // Emitted only when there is something to exclude, so a claim with
+        // no exclusions is the statement it has always been — same text,
+        // same plan. The seek on `rbpmn_work_item_pull (topic, created_at,
+        // item_no)` is untouched either way: this filters what the scan
+        // walks over, it does not change what it seeks to.
+        let (exclude_sql, first_arg) = match options.exclude.is_empty() {
+            true => ("", 4),
+            false => (" and w.id <> all($4::uuid[])", 5),
+        };
         let mut args: Vec<String> = Vec::new();
         let filter_sql = match &options.filter {
-            Some(filter) => compile_filter(filter, &mut args, 4)?,
+            Some(filter) => compile_filter(filter, &mut args, first_arg)?,
             None => String::new(),
         };
         let sql = format!(
@@ -364,7 +404,7 @@ impl Engine {
              lease_no = lease_no + 1 \
              where id = (select w.id from rbpmn_work_item w \
                 join rbpmn_instance i on i.id = w.instance_id \
-                where w.topic = $1 and {claimable}{filter_sql} \
+                where w.topic = $1 and {claimable}{exclude_sql}{filter_sql} \
                 order by w.created_at {direction}, w.item_no {direction} \
                 limit 1 for update of w skip locked) \
              returning id, instance_id, definition_key, definition_id, \
@@ -379,6 +419,9 @@ impl Engine {
             .bind(topic)
             .bind(&options.owner)
             .bind(options.ttl.as_secs_f64());
+        if !options.exclude.is_empty() {
+            query = query.bind(options.exclude.clone());
+        }
         for value in &args {
             query = query.bind(value);
         }
@@ -427,25 +470,36 @@ impl Engine {
     }
 
     /// How many tasks on `topic` are claimable right now (dashboard
-    /// indications). Same predicates and filter shape as [`Engine::get_task`].
+    /// indications). Same predicates, filter and `exclude` as
+    /// [`Engine::get_task`], so "how many would I be offered" and "offer me
+    /// one" answer the same question rather than two nearly-alike ones.
     pub async fn count_tasks(
         &self,
         topic: &str,
         filter: Option<&TaskFilter>,
+        exclude: &[Uuid],
     ) -> Result<u64, EngineError> {
         crate::runtime::reject_nul_text(topic, "topic")?;
+        validate_exclude(exclude)?;
+        let (exclude_sql, first_arg) = match exclude.is_empty() {
+            true => ("", 2),
+            false => (" and w.id <> all($2::uuid[])", 3),
+        };
         let mut args: Vec<String> = Vec::new();
         let filter_sql = match filter {
-            Some(filter) => compile_filter(filter, &mut args, 2)?,
+            Some(filter) => compile_filter(filter, &mut args, first_arg)?,
             None => String::new(),
         };
         let sql = format!(
             "select count(*) from rbpmn_work_item w \
              join rbpmn_instance i on i.id = w.instance_id \
-             where w.topic = $1 and {claimable}{filter_sql}",
+             where w.topic = $1 and {claimable}{exclude_sql}{filter_sql}",
             claimable = crate::CLAIMABLE,
         );
         let mut query = sqlx::query(&sql).bind(topic);
+        if !exclude.is_empty() {
+            query = query.bind(exclude.to_vec());
+        }
         for value in &args {
             query = query.bind(value);
         }

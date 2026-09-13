@@ -104,6 +104,11 @@ pub struct GetTaskBody {
     pub order: Option<String>,
     #[serde(default)]
     pub filter: Option<FilterBody>,
+    /// Items this caller does not want offered — the ids behind a "skip this
+    /// one" button, kept by the client and sent with the next claim. Nothing
+    /// is written and nothing is locked: they stay claimable, for everyone.
+    #[serde(default)]
+    pub exclude: Vec<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -137,6 +142,7 @@ pub async fn get_task(State(engine): State<Engine>, Json(body): Json<GetTaskBody
     }
     options.order = order;
     options.filter = body.filter.map(FilterBody::into_filter);
+    options.exclude = body.exclude;
     match engine.get_task(&body.topic, &options).await {
         Ok(Some(task)) => Json(serde_json::json!({ "task": task })).into_response(),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
@@ -150,6 +156,10 @@ pub struct CountTasksBody {
     pub topic: String,
     #[serde(default)]
     pub filter: Option<FilterBody>,
+    /// The same skip list [`GetTaskBody`] takes, so a depth and a claim
+    /// answer one question.
+    #[serde(default)]
+    pub exclude: Vec<Uuid>,
 }
 
 pub async fn count_tasks(
@@ -157,7 +167,10 @@ pub async fn count_tasks(
     Json(body): Json<CountTasksBody>,
 ) -> Response {
     let filter = body.filter.map(FilterBody::into_filter);
-    match engine.count_tasks(&body.topic, filter.as_ref()).await {
+    match engine
+        .count_tasks(&body.topic, filter.as_ref(), &body.exclude)
+        .await
+    {
         Ok(count) => Json(serde_json::json!({ "count": count })).into_response(),
         Err(e) => engine_error(e),
     }

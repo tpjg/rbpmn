@@ -1218,6 +1218,99 @@ async fn deploy_carries_decision_artifacts() {
     db.drop().await;
 }
 
+/// "Skip this one" over the wire (design brief, Task API): the client keeps
+/// the ids it does not want and sends them with the next claim. It is a
+/// read-side filter and nothing else — the skipped item is written to in no
+/// way, and the very next caller is still offered it.
+#[tokio::test]
+async fn a_claim_can_skip_items_over_http() {
+    let (app, db) = test_app().await;
+    let post = |uri: String, body: serde_json::Value| {
+        let app = app.clone();
+        async move { app.oneshot(authed("POST", &uri, body)).await.unwrap() }
+    };
+    let resp = post(
+        "/v1/definitions".into(),
+        serde_json::json!({ "bpmn": MINIMAL_XML, "bindings": {} }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let mut items = Vec::new();
+    for n in 0..2 {
+        let resp = post(
+            "/v1/instances".into(),
+            serde_json::json!({ "definitionKey": "p", "variables": { "n": n } }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let instance = body_json(resp).await["instanceId"]
+            .as_str()
+            .expect("an instance id")
+            .to_string();
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "GET",
+                &format!("/v1/instances/{instance}/inspect"),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        items.push(
+            body_json(resp).await["workItems"][0]["id"]
+                .as_str()
+                .expect("a work item id")
+                .to_string(),
+        );
+    }
+
+    // The depth answers the same question the claim does.
+    let count = |exclude: serde_json::Value| {
+        post(
+            "/v1/tasks/count".into(),
+            serde_json::json!({ "topic": "review", "exclude": exclude }),
+        )
+    };
+    assert_eq!(
+        body_json(count(serde_json::json!([])).await).await["count"],
+        2
+    );
+    assert_eq!(
+        body_json(count(serde_json::json!([items[0]])).await).await["count"],
+        1
+    );
+
+    // Skip the head: the next one in FIFO order that was not skipped.
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({ "topic": "review", "owner": "alice", "exclude": [items[0]] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["task"]["id"], items[1]);
+
+    // ...and the skipped one is untouched: the next caller is offered it.
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({ "topic": "review", "owner": "bob" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["task"]["id"], items[0]);
+
+    // Skipping everything claimable is 204, not an error.
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({
+            "topic": "review", "owner": "carol", "exclude": [items[0], items[1]]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    db.drop().await;
+}
+
 /// Repair over HTTP (docs/design/incident-scope.md, D10). An instance frozen on
 /// a correlation it could never make is repaired by naming its incident: a
 /// stale number is 409 with the incident to name instead, a malformed body or

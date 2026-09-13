@@ -538,7 +538,7 @@ async fn probe_all(
         "count_tasks".to_string(),
         timed(samples, |_| async {
             engine
-                .count_tasks(topic, None)
+                .count_tasks(topic, None, &[])
                 .await
                 .map(|_| ())
                 .map_err(|e| format!("count probe: {e}"))

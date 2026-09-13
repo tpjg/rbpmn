@@ -961,7 +961,11 @@ async fn inbox_worker(
     loop {
         if count_first {
             counters.inbox_queries.fetch_add(1, Ordering::Relaxed);
-            if engine.count_tasks(&topic, filter.as_ref()).await.is_err() {
+            if engine
+                .count_tasks(&topic, filter.as_ref(), &[])
+                .await
+                .is_err()
+            {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 continue;
             }

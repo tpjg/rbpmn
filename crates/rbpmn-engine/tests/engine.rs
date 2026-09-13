@@ -3494,6 +3494,115 @@ async fn tasks_are_fifo_by_default_lifo_on_request() {
     db.drop().await;
 }
 
+/// "Skip this one": the caller keeps the ids it does not want and sends them
+/// with the next claim. Nothing is written and nothing is locked — the
+/// skipped item stays exactly where it was in the queue, for this caller and
+/// every other, which is what claiming-then-releasing to skip cannot say.
+#[tokio::test]
+async fn a_claim_can_be_told_which_items_to_skip() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let ids = three_review_instances(&engine).await;
+    let mut items = Vec::new();
+    for id in &ids {
+        items.push(open_items(&db.pool, *id).await[0].0);
+    }
+
+    // FIFO, skipping the head: the next one in order, not the one after the
+    // caller's last claim.
+    let mut skip_head = GetTaskOptions::new("w1");
+    skip_head.exclude = vec![items[0]];
+    let task = engine
+        .get_task("review", &skip_head)
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(
+        task.id, items[1],
+        "the next claimable one that was not skipped"
+    );
+
+    // And the skipped one is untouched: another caller is still offered it,
+    // still at the head.
+    let other = engine
+        .get_task("review", &GetTaskOptions::new("w2"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(
+        other.id, items[0],
+        "skipping locks nothing, defers nothing, and is this caller's alone"
+    );
+
+    // LIFO reads the same list from the other end.
+    let mut skip_tail = GetTaskOptions::new("w3");
+    skip_tail.order = TaskOrder::Lifo;
+    skip_tail.exclude = vec![items[2]];
+    assert!(
+        engine
+            .get_task("review", &skip_tail)
+            .await
+            .unwrap()
+            .is_none(),
+        "the other two are claimed; the only one left is the skipped one"
+    );
+    db.drop().await;
+}
+
+/// Skipping everything offers nothing, and the count says the same — the two
+/// answer one question, so a queue depth cannot promise what a claim refuses.
+#[tokio::test]
+async fn skipping_every_item_offers_nothing_and_counts_none() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let ids = three_review_instances(&engine).await;
+    let mut items = Vec::new();
+    for id in &ids {
+        items.push(open_items(&db.pool, *id).await[0].0);
+    }
+
+    assert_eq!(engine.count_tasks("review", None, &[]).await.unwrap(), 3);
+    assert_eq!(engine.count_tasks("review", None, &items).await.unwrap(), 0);
+    let mut skip_all = GetTaskOptions::new("w1");
+    skip_all.exclude = items.clone();
+    assert!(
+        engine
+            .get_task("review", &skip_all)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // One fewer skipped, one left to offer.
+    assert_eq!(
+        engine
+            .count_tasks("review", None, &items[1..])
+            .await
+            .unwrap(),
+        1
+    );
+    db.drop().await;
+}
+
+/// A person skips a handful, so the list is bounded rather than unbounded —
+/// and refused loudly at the edge, like every other bound this engine takes.
+#[tokio::test]
+async fn a_skip_list_is_capped() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let mut options = GetTaskOptions::new("w1");
+    options.exclude = (0..1001).map(|_| uuid::Uuid::new_v4()).collect();
+    assert!(matches!(
+        engine.get_task("review", &options).await,
+        Err(EngineError::InvalidVariables(_))
+    ));
+    assert!(matches!(
+        engine.count_tasks("review", None, &options.exclude).await,
+        Err(EngineError::InvalidVariables(_))
+    ));
+    db.drop().await;
+}
+
 #[tokio::test]
 async fn a_claimed_task_names_the_pinned_definition_not_the_latest() {
     let db = TestDb::create().await;
@@ -3949,10 +4058,13 @@ async fn filters_match_live_instance_variables() {
         .await
         .unwrap();
 
-    assert_eq!(engine.count_tasks("review", None).await.unwrap(), 2);
+    assert_eq!(engine.count_tasks("review", None, &[]).await.unwrap(), 2);
     let filter = TaskFilter::new("p").field("region", "north");
     assert_eq!(
-        engine.count_tasks("review", Some(&filter)).await.unwrap(),
+        engine
+            .count_tasks("review", Some(&filter), &[])
+            .await
+            .unwrap(),
         1
     );
 
@@ -4008,7 +4120,7 @@ async fn declared_indexes_serve_the_filter_queries() {
     let undeclared = TaskFilter::new("p").field("shade", "s7");
     assert_eq!(
         engine
-            .count_tasks("review", Some(&undeclared))
+            .count_tasks("review", Some(&undeclared), &[])
             .await
             .unwrap(),
         1
@@ -4017,7 +4129,10 @@ async fn declared_indexes_serve_the_filter_queries() {
     // Declared field: correct AND index-served.
     let declared = TaskFilter::new("p").field("region", "r250");
     assert_eq!(
-        engine.count_tasks("review", Some(&declared)).await.unwrap(),
+        engine
+            .count_tasks("review", Some(&declared), &[])
+            .await
+            .unwrap(),
         1
     );
     let mut options = GetTaskOptions::new("w1");

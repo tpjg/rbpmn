@@ -442,7 +442,20 @@ current registration state** and fails loudly with the same rule id
   consumers FIFO is fair-but-not-strict — `SKIP LOCKED` skips rows a peer is
   claiming; strict global FIFO would serialize all consumers, the wrong trade
   for a work queue. The same `order` parameter applies to
-  `get_task_filtered`. **Lease model, not long locks:** base TTL is
+  `get_task_filtered`. `exclude` takes the ids this caller does not want
+  offered — the "skip this one" button of a task UI — and is a read-side
+  filter and nothing more: no row is written, the skipped items stay exactly
+  as claimable as they were for every other consumer, and the order is
+  untouched, so the item claimed is simply the next one in `order` that was
+  not skipped. It is what a client would otherwise fake by claiming, looking
+  and handing back, which locks the very items it did not want. Cost is a
+  walk past each skipped row, so the list is capped rather than unbounded.
+  An engine older than the release that added it *ignores* the field rather
+  than refusing it — the task bodies are not `deny_unknown_fields` — so a
+  client skipping against an old engine is offered the same item again and
+  the button appears not to work. Deliberate: the field is additive, and the
+  cost of strictness there is every other caller's stray field becoming a
+  400. **Lease model, not long locks:** base TTL is
   short (~10 min), and holders renew it while actively working. Expired locks make
   the item available again (no reaper needed — availability predicate is
   `state='available' OR lock_until < now()`).
@@ -558,7 +571,9 @@ current registration state** and fails loudly with the same rule id
   the indexed expression shape (`variables->>'field'` + literal definition_id) so
   declared indexes are actually used. EXPLAIN-based integration test: index usage
   for a declared field, correct results (via seq scan) for an undeclared one.
-- `count_tasks(topic, filter) -> u64` — dashboard indications; same index discipline.
+- `count_tasks(topic, filter, exclude) -> u64` — dashboard indications; same
+  index discipline, and the same skip list `get_task` takes, so "how many
+  would I be offered" and "offer me one" answer one question.
 - `complete_task(id, owner, merge_patch)` / `fail_task(id, owner, error_code?)` —
   owner checked; completing advances the token in the same transaction.
 
