@@ -103,6 +103,7 @@ fn sample() -> InstanceInspection {
             })
             .collect(),
         }),
+        incident_unreadable: None,
         tokens: vec![TokenView {
             element_id: "st".to_string(),
             wait_kind: "incident".to_string(),

@@ -238,7 +238,8 @@ async function main() {
   varsBody.append(jsonTree(data.variables));
   varsSection.append(el('h2', null, 'Instance'));
 
-  // What a repair would do, when one is open. Text, and only text: the
+  // What a repair would do, when one is open, or why the engine could not
+  // read the incident. Text, and only text: the
   // inspector is read-only, and a repair is an API call with a reason
   // attached (docs/design/incident-scope.md, D13).
   const repairLines = describeRepair(data);

@@ -393,7 +393,10 @@ frozen before the migration holds incident 0.
   boundary is further out, the subprocess torn down to reach it — because a
   code is the one thing a Divert needs and only the model knows it.
   `inspect_instance` carries it, on a load that takes no row lock, and the
-  inspector shows it as text. Offering the button is not a read (D13).
+  inspector shows it as text. A frozen instance whose incident cannot be read
+  — a load that fails in Rust, or rows holding no open incident — carries
+  `incident_unreadable`, the reason, in its place; a database error fails the
+  inspection instead. Offering the button is not a read (D13).
 
 ### D11 — a delivery that would leave its boundary unable to re-arm is refused
 

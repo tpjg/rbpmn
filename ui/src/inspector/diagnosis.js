@@ -109,10 +109,16 @@ function describeWait(token, data) {
 /// functions the repair command asks, so this reports rather than re-derives.
 /// It says what a repair *would* do; it never offers to do one (D13).
 ///
+/// A frozen instance whose incident the engine could not read carries the
+/// reason instead, and that reason is the whole description: a repair refuses
+/// such an instance, so there are no dispositions to list.
+///
 /// @returns {[string, string][] | null} null when nothing is frozen.
 export function describeRepair(data) {
   const incident = data.incident;
-  if (!incident) return null;
+  if (!incident) {
+    return data.incidentUnreadable ? [['unreadable', data.incidentUnreadable]] : null;
+  }
   const lines = [
     ['incident', String(incident.incident)],
     ['failed at', incident.element],

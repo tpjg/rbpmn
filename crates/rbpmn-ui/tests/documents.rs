@@ -219,6 +219,10 @@ fn hostile_data_cannot_escape_the_data_block() {
                 },
             ],
         });
+        // The reason an incident could not be read carries element ids and
+        // error text out of the rows. Never set beside an `incident` in a
+        // real inspection; set here only to reach the document.
+        inspection.incident_unreadable = Some((*hostile).to_string());
 
         let html = render_inspection(&inspection);
 
@@ -248,6 +252,7 @@ fn hostile_data_cannot_escape_the_data_block() {
         assert_eq!(parsed["variables"][*hostile]["nested"][0], *hostile);
         assert_eq!(parsed["workItems"][0]["lastFailure"], *hostile);
         assert_eq!(parsed["events"][0]["display"], *hostile);
+        assert_eq!(parsed["incidentUnreadable"], *hostile);
         assert_eq!(parsed["bpmnXml"], inspection.bpmn_xml);
         // The manifest too, and at depth. Without this the escaping check
         // above passes when the payload is simply *gone* — a raw-character

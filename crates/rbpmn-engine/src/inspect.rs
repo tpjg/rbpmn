@@ -26,6 +26,13 @@ pub struct InstanceInspection {
     /// Every verdict in it comes from the core functions the repair command
     /// itself asks, so what this says would happen is what happens.
     pub incident: Option<OpenIncident>,
+    /// Why a frozen instance carries no `incident`: set exactly when the
+    /// status is `failed` and `incident` is `None`. Either the load failed in
+    /// Rust — a stored definition that no longer compiles, a row the core
+    /// will not rehydrate — or the rows hold no open incident, which no step
+    /// produces. `repair` refuses both. Without it the incident vanishes from
+    /// the view and its reason reaches only the server's log.
+    pub incident_unreadable: Option<String>,
     pub tokens: Vec<TokenView>,
     pub scopes: Vec<ScopeView>,
     pub work_items: Vec<WorkItemView>,
@@ -155,7 +162,7 @@ impl Engine {
         // Only a frozen instance has an incident, and only a frozen one
         // pays for the rehydration this needs.
         let status: String = inst.get("status");
-        let incident = if status == "failed" {
+        let (incident, incident_unreadable) = if status == "failed" {
             // Best effort for errors raised in Rust, and only those: this is
             // the view an operator opens *because* something is wrong. A
             // stored definition that no longer compiles, or a row the core
@@ -166,15 +173,25 @@ impl Engine {
             // read with "current transaction is aborted" and leave the cause
             // in a log line.
             match load_instance_snapshot(self, tx, id).await {
-                Ok((_, proc, _, state)) => rbpmn_core::open_incident(&proc, &state),
+                Ok((_, proc, _, state)) => match rbpmn_core::open_incident(&proc, &state) {
+                    Some(incident) => (Some(incident), None),
+                    None => (
+                        None,
+                        Some(
+                            "the instance is failed, but its rows hold no open incident \
+                             (no incident number, or no token at an incident)"
+                                .to_string(),
+                        ),
+                    ),
+                },
                 Err(e @ EngineError::Db(_)) => return Err(e),
                 Err(e) => {
                     tracing::warn!(instance = %id, error = %e, "cannot read the open incident");
-                    None
+                    (None, Some(e.to_string()))
                 }
             }
         } else {
-            None
+            (None, None)
         };
 
         let tokens = sqlx::query(
@@ -301,6 +318,7 @@ impl Engine {
             bpmn_xml: inst.get("bpmn_xml"),
             bindings,
             incident,
+            incident_unreadable,
             tokens,
             scopes,
             work_items,

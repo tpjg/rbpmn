@@ -2105,13 +2105,16 @@ async fn inspection_returns_a_database_error_and_carries_on_past_a_rust_one() {
         .unwrap();
     freeze_on(&engine, ta).await;
 
-    // A row the core will not rehydrate: no incident, the rest still stands.
+    // A row the core will not rehydrate: no incident, the reason in its
+    // place, and the rest still stands.
     sqlx::query("update rbpmn_token set element_id = 'nowhere' where element_id = 'ta'")
         .execute(&db.pool)
         .await
         .unwrap();
     let inspection = engine.inspect_instance(started.id).await.unwrap();
     assert!(inspection.incident.is_none());
+    let reason = inspection.incident_unreadable.expect("the reason travels");
+    assert!(reason.contains("'nowhere'"), "{reason}");
     assert!(inspection.tokens.iter().any(|t| t.element_id == "nowhere"));
 
     // A schema behind this build: the missing column itself, 42703.
@@ -2125,6 +2128,49 @@ async fn inspection_returns_a_database_error_and_carries_on_past_a_rust_one() {
         }
         other => panic!("expected the undefined-column error, got {other:?}"),
     }
+    db.drop().await;
+}
+
+/// `incident_unreadable` is set exactly when a failed instance carries no
+/// `incident` — including when the rows load cleanly but hold no open
+/// incident, a state no step produces and `repair` refuses.
+#[tokio::test]
+async fn a_frozen_instance_with_no_open_incident_says_so() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/03-parallel-gateway.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let active = engine.inspect_instance(started.id).await.unwrap();
+    assert!(active.incident.is_none() && active.incident_unreadable.is_none());
+
+    let (ta, _) = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .find(|(_, element)| element == "ta")
+        .unwrap();
+    freeze_on(&engine, ta).await;
+    let frozen = engine.inspect_instance(started.id).await.unwrap();
+    assert!(frozen.incident.is_some() && frozen.incident_unreadable.is_none());
+
+    // No incident number was ever minted.
+    sqlx::query("update rbpmn_instance set next_incident = 0 where id = $1")
+        .bind(started.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let inspection = engine.inspect_instance(started.id).await.unwrap();
+    assert!(inspection.incident.is_none());
+    let reason = inspection.incident_unreadable.expect("the reason travels");
+    assert!(reason.contains("no open incident"), "{reason}");
     db.drop().await;
 }
 

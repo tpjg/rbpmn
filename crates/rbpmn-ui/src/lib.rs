@@ -166,6 +166,7 @@ pub mod testing {
             bpmn_xml: "<definitions/>".to_string(),
             bindings: Bindings::default(),
             incident: None,
+            incident_unreadable: None,
             tokens: Vec::new(),
             scopes: Vec::new(),
             work_items: Vec::new(),

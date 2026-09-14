@@ -271,6 +271,16 @@ test('a disposition that takes no code lists none', () => {
   );
 });
 
+// The engine could not read the incident; the reason takes its place rather
+// than the section vanishing as if nothing were frozen.
+test('an unreadable incident is described by why', () => {
+  const reason = "definition no longer compiles: token references unknown element 'nowhere'";
+  assert.deepEqual(
+    describeRepair(inspection({ status: 'failed', incident: null, incidentUnreadable: reason })),
+    [['unreadable', reason]]
+  );
+});
+
 test('nothing frozen, nothing to describe', () => {
   assert.equal(describeRepair(inspection()), null);
   assert.equal(describeRepair(inspection({ status: 'completed' })), null);
