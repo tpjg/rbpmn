@@ -462,11 +462,18 @@ current registration state** and fails loudly with the same rule id
   *n* heap fetches, *n* join probes and up to *n* comparisons — and a session
   that adds one skip at a time pays that sum, quadratic in the skips rather
   than linear. Hence a cap on either list rather than an unbounded one.
-  An engine older than the release that added it *ignores* the field rather
-  than refusing it — the task bodies are not `deny_unknown_fields` — so a
-  client skipping against an old engine is offered the same item again and
-  the button appears not to work. Deliberate: the field is additive, and the
-  cost of strictness there is every other caller's stray field becoming a
+  An engine older than the release that added them *ignores* these fields
+  rather than refusing them — the task bodies are not `deny_unknown_fields` —
+  and what that costs differs sharply by form, which is worth saying out
+  loud. Skipping degrades benignly: the same item is offered again and the
+  button appears not to work. Including does not. The claim succeeds, the
+  caller is handed an arbitrary task it said it would not accept, and that
+  task is *locked to it* for the full lease — a task UI will open it. A
+  client that names ids must therefore check the id it got back against the
+  list it sent and `release_task` on a miss; that check costs nothing against
+  a current engine and is the whole defence against an old one. The
+  alternative is strictness, which cannot be given to one field — it is
+  per-body — so it would turn every other caller's stray field into a
   400. **Lease model, not long locks:** base TTL is
   short (~10 min), and holders renew it while actively working. Expired locks make
   the item available again (no reaper needed — availability predicate is

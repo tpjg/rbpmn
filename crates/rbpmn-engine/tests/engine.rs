@@ -3851,6 +3851,48 @@ async fn an_include_list_and_a_filter_hold_their_own_parameters() {
     db.drop().await;
 }
 
+/// An included item is reached however far down the queue it sits. Which
+/// plan Postgres picks for `w.id = any(...)` is its own affair — the primary
+/// key or the queue seek — so this asserts what is true either way rather
+/// than which index was used: the named item comes back, from behind three
+/// hundred older ones that a plain claim would have taken first.
+#[tokio::test]
+async fn an_include_list_reaches_an_item_deep_in_the_queue() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    let mut last = None;
+    for n in 0..300 {
+        let started = engine
+            .start("p", None, serde_json::json!({ "n": n }))
+            .await
+            .unwrap();
+        last = Some(open_items(&db.pool, started.id).await[0].0);
+    }
+    let tail = last.expect("three hundred of them");
+
+    let mut only_tail = GetTaskOptions::new("w1");
+    only_tail.ids = Some(TaskIds::Include(vec![tail]));
+    let task = engine
+        .get_task("review", &only_tail)
+        .await
+        .unwrap()
+        .expect("the named item, wherever it sits");
+    assert_eq!(task.id, tail);
+
+    // And it really was deep: FIFO hands a plain claim something else.
+    let head = engine
+        .get_task("review", &GetTaskOptions::new("w2"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_ne!(head.id, tail, "the named item was not simply the head");
+    db.drop().await;
+}
+
 /// A person skips a handful, so the list is bounded rather than unbounded —
 /// and refused loudly at the edge, like every other bound this engine takes.
 #[tokio::test]

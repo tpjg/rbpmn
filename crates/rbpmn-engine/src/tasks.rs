@@ -116,9 +116,11 @@ pub struct GetTaskOptions {
 /// claim, so a claim with *n* skipped costs *n* heap fetches, *n*
 /// instance-join probes and up to *n* comparisons — and a session that skips
 /// one more each time pays that sum, quadratic in the skips rather than
-/// linear. An included list is bounded work of its own, and which plan it
-/// gets is the planner's; the ordering and the `limit 1` are unchanged
-/// either way.
+/// linear. An included list is bounded work of its own and which plan it gets
+/// is the planner's, but it has a cost of its own worth knowing: should the
+/// planner keep the queue seek rather than take the primary key, naming only
+/// items far down the queue walks everything ahead of them to reach one. The
+/// ordering and the `limit 1` are unchanged either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskIds {
     /// Offer anything but these — "skip this one", kept by the caller and
@@ -436,11 +438,14 @@ impl Engine {
             TaskOrder::Fifo => "asc",
             TaskOrder::Lifo => "desc",
         };
-        // The seek on `rbpmn_work_item_pull (topic, created_at, item_no)`
-        // is untouched whichever form this takes: an id filter says which
-        // rows the scan may accept, not what it seeks to. A claim that names
-        // no ids — and one that excludes none, which is the same thing — is
-        // the statement it has always been, text and plan.
+        // A claim that names no ids — and one that excludes none, which is
+        // the same thing — is the statement it has always been, text and
+        // plan. For `Exclude` the seek on `rbpmn_work_item_pull (topic,
+        // created_at, item_no)` survives the added conjunct, which
+        // `a_skip_list_does_not_cost_the_claim_its_index` measures rather
+        // than assumes. For `Include` the plan is the planner's to pick —
+        // `w.id = any(...)` gives it a pkey path it may well prefer — and
+        // nothing here measures which it takes, so nothing here claims it.
         let ids_sql = options
             .ids
             .as_ref()
