@@ -3584,6 +3584,135 @@ async fn skipping_every_item_offers_nothing_and_counts_none() {
     db.drop().await;
 }
 
+/// A skip list and a filter in one claim. This is the only shape in which
+/// the exclude conjunct shifts the filter's parameter numbers along — `$5`
+/// in the claim, `$3` in the count — and an off-by-one there would bind a
+/// filter's text value to the uuid array, which every test that passes one
+/// without the other would still call green.
+#[tokio::test]
+async fn a_skip_list_and_a_filter_hold_their_own_parameters() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    let mut north = Vec::new();
+    for n in 0..3 {
+        let started = engine
+            .start("p", None, serde_json::json!({ "region": "north", "n": n }))
+            .await
+            .unwrap();
+        north.push(open_items(&db.pool, started.id).await[0].0);
+    }
+    engine
+        .start("p", None, serde_json::json!({ "region": "south" }))
+        .await
+        .unwrap();
+
+    let filter = || TaskFilter::new("p").field("region", "north");
+    assert_eq!(
+        engine
+            .count_tasks("review", Some(&filter()), &[])
+            .await
+            .unwrap(),
+        3,
+        "the filter alone"
+    );
+    assert_eq!(
+        engine
+            .count_tasks("review", Some(&filter()), &north[..1])
+            .await
+            .unwrap(),
+        2,
+        "the filter and the skip list together"
+    );
+
+    let mut options = GetTaskOptions::new("w1");
+    options.filter = Some(filter());
+    options.exclude = vec![north[0]];
+    let task = engine
+        .get_task("review", &options)
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(
+        task.id, north[1],
+        "the filter still filters and the skip list still skips"
+    );
+    assert_eq!(task.variables["region"], "north");
+    db.drop().await;
+}
+
+/// The claim's seek survives the skip list. `rbpmn_work_item_pull (topic,
+/// created_at, item_no)` is what orders the queue, and the exclusion is a
+/// filter over what that scan walks — not part of what it seeks to. Asserted
+/// the way the declared-index test asserts its own: against
+/// `pg_stat_user_indexes` for the real query, on enough rows for the planner
+/// to have a choice. It says the seek still used the index, which is the
+/// measurable claim; it does not say the plan is unchanged byte for byte.
+#[tokio::test]
+async fn a_skip_list_does_not_cost_the_claim_its_index() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    let mut items = Vec::new();
+    for n in 0..300 {
+        let started = engine
+            .start("p", None, serde_json::json!({ "n": n }))
+            .await
+            .unwrap();
+        if n < 5 {
+            items.push(open_items(&db.pool, started.id).await[0].0);
+        }
+    }
+    sqlx::query("analyze rbpmn_work_item")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("analyze rbpmn_instance")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let scans = || async {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "select idx_scan::bigint from pg_stat_user_indexes \
+             where indexrelname = 'rbpmn_work_item_pull'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .unwrap_or(0)
+    };
+    let before = scans().await;
+
+    let mut options = GetTaskOptions::new("w1");
+    options.exclude = items.clone();
+    let task = engine
+        .get_task("review", &options)
+        .await
+        .unwrap()
+        .expect("a task");
+    assert!(!items.contains(&task.id), "it skipped what it was given");
+
+    let mut after = before;
+    for _ in 0..20 {
+        after = scans().await;
+        if after > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await; // stats lag
+    }
+    assert!(
+        after > before,
+        "a claim carrying a skip list no longer used rbpmn_work_item_pull"
+    );
+    db.drop().await;
+}
+
 /// A person skips a handful, so the list is bounded rather than unbounded —
 /// and refused loudly at the edge, like every other bound this engine takes.
 #[tokio::test]

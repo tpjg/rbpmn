@@ -96,7 +96,7 @@ serve both "this exact version" and "the latest of this key".
 ## `rbpmn_v_work_item`
 
 The question is a triage screen's first paint: *for every queue this user can
-work, how many items are waiting right now?* `count_tasks(topic, filter)`
+work, how many items are waiting right now?* `count_tasks(topic, filter, exclude)`
 answers it one queue at a time, so a dashboard covering T topics across D
 definitions cost T×D round trips. Here it is one statement.
 

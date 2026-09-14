@@ -94,9 +94,16 @@ pub struct GetTaskOptions {
     /// and hold or hand back, which locks the very items it did not want.
     ///
     /// Ordering is untouched: the next item in `order` that is not in this
-    /// list is the one claimed. Cost is a walk past each excluded row, so a
-    /// claim is linear in the length of the list — fine for the handful a
-    /// person skips, which is why it is capped rather than unbounded.
+    /// list is the one claimed.
+    ///
+    /// The cost is worth stating in the shape it is actually paid. The
+    /// skipped items are precisely the rows the scan must walk before it
+    /// reaches one to claim, so a claim with *n* skipped costs *n* heap
+    /// fetches, *n* instance-join probes and up to *n* uuid comparisons —
+    /// and a session that skips one more each time pays that sum, which is
+    /// quadratic in the number of skips, not linear. At the handful a person
+    /// clicks through it is nothing; at the cap it is a million comparisons,
+    /// still fast but no longer free. That is why the list is capped.
     pub exclude: Vec<Uuid>,
 }
 
@@ -234,6 +241,17 @@ async fn current_item_state(engine: &Engine, task: Uuid) -> Result<String, Engin
 /// A lease must be plausible: zero would mint a lock expired at birth (two
 /// owners on one task moments later), and an absurd TTL turns into a
 /// Postgres interval error surfaced as a 500. Reject both at the boundary.
+fn validate_ttl(ttl: Duration) -> Result<(), EngineError> {
+    const MIN_TTL: Duration = Duration::from_millis(10);
+    const MAX_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
+    if ttl < MIN_TTL || ttl > MAX_TTL {
+        return Err(EngineError::InvalidVariables(format!(
+            "lease ttl must be between 10ms and 30 days, got {ttl:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// How many items one claim may be told to skip. A person skips a handful;
 /// the cap is `MAX_FIND_LIMIT`'s, because a bound a caller can hit should be
 /// one number in this engine rather than a new convention per call.
@@ -244,17 +262,6 @@ fn validate_exclude(exclude: &[Uuid]) -> Result<(), EngineError> {
         return Err(EngineError::InvalidVariables(format!(
             "exclude takes at most {MAX_EXCLUDE} items, got {}",
             exclude.len()
-        )));
-    }
-    Ok(())
-}
-
-fn validate_ttl(ttl: Duration) -> Result<(), EngineError> {
-    const MIN_TTL: Duration = Duration::from_millis(10);
-    const MAX_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
-    if ttl < MIN_TTL || ttl > MAX_TTL {
-        return Err(EngineError::InvalidVariables(format!(
-            "lease ttl must be between 10ms and 30 days, got {ttl:?}"
         )));
     }
     Ok(())

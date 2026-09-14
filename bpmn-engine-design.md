@@ -448,8 +448,12 @@ current registration state** and fails loudly with the same rule id
   as claimable as they were for every other consumer, and the order is
   untouched, so the item claimed is simply the next one in `order` that was
   not skipped. It is what a client would otherwise fake by claiming, looking
-  and handing back, which locks the very items it did not want. Cost is a
-  walk past each skipped row, so the list is capped rather than unbounded.
+  and handing back, which locks the very items it did not want. The skipped
+  rows are exactly what the scan walks before it reaches a claimable one, so
+  a claim with *n* skipped costs *n* heap fetches, *n* join probes and up to
+  *n* comparisons — and a session that adds one skip at a time pays that sum,
+  quadratic in the skips rather than linear. Nothing at the handful a person
+  clicks through; hence a cap rather than an unbounded list.
   An engine older than the release that added it *ignores* the field rather
   than refusing it — the task bodies are not `deny_unknown_fields` — so a
   client skipping against an old engine is offered the same item again and
