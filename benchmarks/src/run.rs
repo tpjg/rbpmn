@@ -962,7 +962,7 @@ async fn inbox_worker(
         if count_first {
             counters.inbox_queries.fetch_add(1, Ordering::Relaxed);
             if engine
-                .count_tasks(&topic, filter.as_ref(), &[])
+                .count_tasks(&topic, filter.as_ref(), None)
                 .await
                 .is_err()
             {

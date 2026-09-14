@@ -442,18 +442,26 @@ current registration state** and fails loudly with the same rule id
   consumers FIFO is fair-but-not-strict — `SKIP LOCKED` skips rows a peer is
   claiming; strict global FIFO would serialize all consumers, the wrong trade
   for a work queue. The same `order` parameter applies to
-  `get_task_filtered`. `exclude` takes the ids this caller does not want
-  offered — the "skip this one" button of a task UI — and is a read-side
-  filter and nothing more: no row is written, the skipped items stay exactly
-  as claimable as they were for every other consumer, and the order is
-  untouched, so the item claimed is simply the next one in `order` that was
-  not skipped. It is what a client would otherwise fake by claiming, looking
-  and handing back, which locks the very items it did not want. The skipped
-  rows are exactly what the scan walks before it reaches a claimable one, so
-  a claim with *n* skipped costs *n* heap fetches, *n* join probes and up to
-  *n* comparisons — and a session that adds one skip at a time pays that sum,
-  quadratic in the skips rather than linear. Nothing at the handful a person
-  clicks through; hence a cap rather than an unbounded list.
+  `get_task_filtered`. `ids` names, by id, which items this claim will
+  accept: `Exclude` for the "skip this one" button of a task UI, `Include`
+  for "offer me one of these". An enum rather than two lists because they are
+  alternatives — naming what you will take *and* what you will not is a
+  contradiction, so it is unrepresentable rather than refused at runtime —
+  and because it settles what an empty list means. `Include([])` is "nothing
+  here is acceptable", so nothing is offered; a bare list would have read
+  that as "no filter" and handed back an unrelated task, which is precisely
+  wrong for the caller whose candidate list came back empty. `Exclude([])` is
+  the identity, so it adds no SQL at all and the claim is the statement it
+  has always been. Either way it is a read-side filter and nothing more: no
+  row is written, the items keep the state they had, every other consumer
+  still sees them, and the order is untouched — the item claimed is the first
+  one in `order` that the filter admits. It is what a client would otherwise
+  fake by claiming, looking and handing back, which locks the very items it
+  did not want. Cost differs by form: excluded rows are exactly what the scan
+  walks before reaching a claimable one, so a claim with *n* skipped costs
+  *n* heap fetches, *n* join probes and up to *n* comparisons — and a session
+  that adds one skip at a time pays that sum, quadratic in the skips rather
+  than linear. Hence a cap on either list rather than an unbounded one.
   An engine older than the release that added it *ignores* the field rather
   than refusing it — the task bodies are not `deny_unknown_fields` — so a
   client skipping against an old engine is offered the same item again and
@@ -575,8 +583,8 @@ current registration state** and fails loudly with the same rule id
   the indexed expression shape (`variables->>'field'` + literal definition_id) so
   declared indexes are actually used. EXPLAIN-based integration test: index usage
   for a declared field, correct results (via seq scan) for an undeclared one.
-- `count_tasks(topic, filter, exclude) -> u64` — dashboard indications; same
-  index discipline, and the same skip list `get_task` takes, so "how many
+- `count_tasks(topic, filter, ids) -> u64` — dashboard indications; same
+  index discipline, and the same `TaskIds` `get_task` takes, so "how many
   would I be offered" and "offer me one" answer one question.
 - `complete_task(id, owner, merge_patch)` / `fail_task(id, owner, error_code?)` —
   owner checked; completing advances the token in the same transaction.

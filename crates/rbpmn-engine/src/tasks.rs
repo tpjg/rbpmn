@@ -75,7 +75,11 @@ impl TaskFilter {
     }
 }
 
+/// `#[non_exhaustive]`: built with [`GetTaskOptions::new`] and then adjusted,
+/// never by struct literal, so a field added later is not a breaking change
+/// for everyone who names one.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GetTaskOptions {
     /// Lease holder identity, recorded in `lock_owner`; completion and
     /// failure of a live-leased task require it.
@@ -84,27 +88,67 @@ pub struct GetTaskOptions {
     pub ttl: Duration,
     pub order: TaskOrder,
     pub filter: Option<TaskFilter>,
-    /// Items this caller does not want offered — "skip this one", kept by
-    /// the caller and sent with the next claim.
-    ///
-    /// It is not a lock and not a deferral: nothing is written, the items
-    /// stay exactly as claimable as they were, and every other caller still
-    /// sees them at the head of the queue. That is the whole point — the
-    /// alternative an application reaches for otherwise is to claim, look,
-    /// and hold or hand back, which locks the very items it did not want.
-    ///
-    /// Ordering is untouched: the next item in `order` that is not in this
-    /// list is the one claimed.
-    ///
-    /// The cost is worth stating in the shape it is actually paid. The
-    /// skipped items are precisely the rows the scan must walk before it
-    /// reaches one to claim, so a claim with *n* skipped costs *n* heap
-    /// fetches, *n* instance-join probes and up to *n* uuid comparisons —
-    /// and a session that skips one more each time pays that sum, which is
-    /// quadratic in the number of skips, not linear. At the handful a person
-    /// clicks through it is nothing; at the cap it is a million comparisons,
-    /// still fast but no longer free. That is why the list is capped.
-    pub exclude: Vec<Uuid>,
+    /// Which items this caller will accept, by id. `None` is every claimable
+    /// one; see [`TaskIds`].
+    pub ids: Option<TaskIds>,
+}
+
+/// Naming items a claim may or may not have, by id — the two halves of "give
+/// me the next one, but…".
+///
+/// An enum rather than two lists because the states are alternatives: naming
+/// what you will take *and* what you will not is either a contradiction or a
+/// redundancy, and the type says so rather than a runtime refusal. It also
+/// settles what an empty list means, which two bare `Vec`s could not: an
+/// empty `Include` is "nothing here is acceptable", so nothing is offered.
+/// A bare `include: Vec<Uuid>` would read that as "no filter" and hand back
+/// an unrelated task — the caller whose candidate list came back empty is
+/// exactly the caller who must not be given one.
+///
+/// Neither form writes anything or holds anything. The items keep the state
+/// they had, and every other caller still sees them: this is a filter over
+/// what *this* claim will accept, not a lock, a deferral or a reservation.
+/// Ordering is untouched — the item claimed is the first one in `order` that
+/// the filter admits.
+///
+/// Both are capped at [`MAX_TASK_IDS`], for reasons that differ. Excluded
+/// items are precisely the rows the scan must walk before reaching one to
+/// claim, so a claim with *n* skipped costs *n* heap fetches, *n*
+/// instance-join probes and up to *n* comparisons — and a session that skips
+/// one more each time pays that sum, quadratic in the skips rather than
+/// linear. An included list is bounded work of its own, and which plan it
+/// gets is the planner's; the ordering and the `limit 1` are unchanged
+/// either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskIds {
+    /// Offer anything but these — "skip this one", kept by the caller and
+    /// sent with the next claim. Empty is the identity: nothing is skipped,
+    /// and the statement is the one a claim has always made.
+    Exclude(Vec<Uuid>),
+    /// Offer only these. Empty means nothing is acceptable, so nothing is
+    /// offered — never "no filter".
+    Include(Vec<Uuid>),
+}
+
+impl TaskIds {
+    fn ids(&self) -> &[Uuid] {
+        match self {
+            TaskIds::Exclude(ids) | TaskIds::Include(ids) => ids,
+        }
+    }
+
+    /// The conjunct this filter adds, or `None` when it adds nothing.
+    /// `Exclude([])` is the only form that adds nothing: excluding nothing
+    /// is what the claim already does, so the SQL and its plan stay exactly
+    /// as they were. `Include([])` very much adds one — it is what makes
+    /// "nothing is acceptable" true rather than ignored.
+    fn conjunct(&self, param: usize) -> Option<String> {
+        match self {
+            TaskIds::Exclude(ids) if ids.is_empty() => None,
+            TaskIds::Exclude(_) => Some(format!(" and w.id <> all(${param}::uuid[])")),
+            TaskIds::Include(_) => Some(format!(" and w.id = any(${param}::uuid[])")),
+        }
+    }
 }
 
 impl GetTaskOptions {
@@ -114,7 +158,7 @@ impl GetTaskOptions {
             ttl: Duration::from_secs(600),
             order: TaskOrder::Fifo,
             filter: None,
-            exclude: Vec::new(),
+            ids: None,
         }
     }
 }
@@ -252,16 +296,17 @@ fn validate_ttl(ttl: Duration) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// How many items one claim may be told to skip. A person skips a handful;
-/// the cap is `MAX_FIND_LIMIT`'s, because a bound a caller can hit should be
-/// one number in this engine rather than a new convention per call.
-pub const MAX_EXCLUDE: usize = crate::MAX_FIND_LIMIT as usize;
+/// How many items one claim may name, either way. A person skips or picks a
+/// handful; the cap is `MAX_FIND_LIMIT`'s, because a bound a caller can hit
+/// should be one number in this engine rather than a convention per call.
+pub const MAX_TASK_IDS: usize = crate::MAX_FIND_LIMIT as usize;
 
-fn validate_exclude(exclude: &[Uuid]) -> Result<(), EngineError> {
-    if exclude.len() > MAX_EXCLUDE {
+fn validate_ids(ids: Option<&TaskIds>) -> Result<(), EngineError> {
+    let Some(ids) = ids else { return Ok(()) };
+    if ids.ids().len() > MAX_TASK_IDS {
         return Err(EngineError::InvalidVariables(format!(
-            "exclude takes at most {MAX_EXCLUDE} items, got {}",
-            exclude.len()
+            "a claim may name at most {MAX_TASK_IDS} items, got {}",
+            ids.ids().len()
         )));
     }
     Ok(())
@@ -386,20 +431,22 @@ impl Engine {
         crate::runtime::reject_nul_text(topic, "topic")?;
         crate::runtime::reject_nul_text(&options.owner, "owner")?;
         validate_ttl(options.ttl)?;
-        validate_exclude(&options.exclude)?;
+        validate_ids(options.ids.as_ref())?;
         let direction = match options.order {
             TaskOrder::Fifo => "asc",
             TaskOrder::Lifo => "desc",
         };
-        // Emitted only when there is something to exclude, so a claim with
-        // no exclusions is the statement it has always been — same text,
-        // same plan. The seek on `rbpmn_work_item_pull (topic, created_at,
-        // item_no)` is untouched either way: this filters what the scan
-        // walks over, it does not change what it seeks to.
-        let (exclude_sql, first_arg) = match options.exclude.is_empty() {
-            true => ("", 4),
-            false => (" and w.id <> all($4::uuid[])", 5),
-        };
+        // The seek on `rbpmn_work_item_pull (topic, created_at, item_no)`
+        // is untouched whichever form this takes: an id filter says which
+        // rows the scan may accept, not what it seeks to. A claim that names
+        // no ids — and one that excludes none, which is the same thing — is
+        // the statement it has always been, text and plan.
+        let ids_sql = options
+            .ids
+            .as_ref()
+            .and_then(|ids| ids.conjunct(4))
+            .unwrap_or_default();
+        let first_arg = if ids_sql.is_empty() { 4 } else { 5 };
         let mut args: Vec<String> = Vec::new();
         let filter_sql = match &options.filter {
             Some(filter) => compile_filter(filter, &mut args, first_arg)?,
@@ -411,7 +458,7 @@ impl Engine {
              lease_no = lease_no + 1 \
              where id = (select w.id from rbpmn_work_item w \
                 join rbpmn_instance i on i.id = w.instance_id \
-                where w.topic = $1 and {claimable}{exclude_sql}{filter_sql} \
+                where w.topic = $1 and {claimable}{ids_sql}{filter_sql} \
                 order by w.created_at {direction}, w.item_no {direction} \
                 limit 1 for update of w skip locked) \
              returning id, instance_id, definition_key, definition_id, \
@@ -426,8 +473,15 @@ impl Engine {
             .bind(topic)
             .bind(&options.owner)
             .bind(options.ttl.as_secs_f64());
-        if !options.exclude.is_empty() {
-            query = query.bind(options.exclude.clone());
+        if !ids_sql.is_empty() {
+            query = query.bind(
+                options
+                    .ids
+                    .as_ref()
+                    .expect("a conjunct has ids")
+                    .ids()
+                    .to_vec(),
+            );
         }
         for value in &args {
             query = query.bind(value);
@@ -477,21 +531,19 @@ impl Engine {
     }
 
     /// How many tasks on `topic` are claimable right now (dashboard
-    /// indications). Same predicates, filter and `exclude` as
+    /// indications). Same predicates, filter and [`TaskIds`] as
     /// [`Engine::get_task`], so "how many would I be offered" and "offer me
     /// one" answer the same question rather than two nearly-alike ones.
     pub async fn count_tasks(
         &self,
         topic: &str,
         filter: Option<&TaskFilter>,
-        exclude: &[Uuid],
+        ids: Option<&TaskIds>,
     ) -> Result<u64, EngineError> {
         crate::runtime::reject_nul_text(topic, "topic")?;
-        validate_exclude(exclude)?;
-        let (exclude_sql, first_arg) = match exclude.is_empty() {
-            true => ("", 2),
-            false => (" and w.id <> all($2::uuid[])", 3),
-        };
+        validate_ids(ids)?;
+        let ids_sql = ids.and_then(|ids| ids.conjunct(2)).unwrap_or_default();
+        let first_arg = if ids_sql.is_empty() { 2 } else { 3 };
         let mut args: Vec<String> = Vec::new();
         let filter_sql = match filter {
             Some(filter) => compile_filter(filter, &mut args, first_arg)?,
@@ -500,12 +552,12 @@ impl Engine {
         let sql = format!(
             "select count(*) from rbpmn_work_item w \
              join rbpmn_instance i on i.id = w.instance_id \
-             where w.topic = $1 and {claimable}{exclude_sql}{filter_sql}",
+             where w.topic = $1 and {claimable}{ids_sql}{filter_sql}",
             claimable = crate::CLAIMABLE,
         );
         let mut query = sqlx::query(&sql).bind(topic);
-        if !exclude.is_empty() {
-            query = query.bind(exclude.to_vec());
+        if !ids_sql.is_empty() {
+            query = query.bind(ids.expect("a conjunct has ids").ids().to_vec());
         }
         for value in &args {
             query = query.bind(value);

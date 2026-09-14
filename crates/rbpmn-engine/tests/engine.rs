@@ -9,7 +9,7 @@ use rbpmn_engine::testing::TestDb;
 use rbpmn_engine::{
     Completion, DeployError, Disposition, Engine, EngineError, FailOptions, FailOutcome,
     HandlerFailure, HttpPostHandler, InstanceStatus, Refusal, RepairKind, ServiceTaskHandler,
-    StepError, Takes, WorkItem, WorkerOptions,
+    StepError, Takes, TaskIds, WorkItem, WorkerOptions,
 };
 use sqlx::{PgPool, Row};
 use std::fs;
@@ -3511,7 +3511,7 @@ async fn a_claim_can_be_told_which_items_to_skip() {
     // FIFO, skipping the head: the next one in order, not the one after the
     // caller's last claim.
     let mut skip_head = GetTaskOptions::new("w1");
-    skip_head.exclude = vec![items[0]];
+    skip_head.ids = Some(TaskIds::Exclude(vec![items[0]]));
     let task = engine
         .get_task("review", &skip_head)
         .await
@@ -3537,7 +3537,7 @@ async fn a_claim_can_be_told_which_items_to_skip() {
     // LIFO reads the same list from the other end.
     let mut skip_tail = GetTaskOptions::new("w3");
     skip_tail.order = TaskOrder::Lifo;
-    skip_tail.exclude = vec![items[2]];
+    skip_tail.ids = Some(TaskIds::Exclude(vec![items[2]]));
     assert!(
         engine
             .get_task("review", &skip_tail)
@@ -3561,10 +3561,16 @@ async fn skipping_every_item_offers_nothing_and_counts_none() {
         items.push(open_items(&db.pool, *id).await[0].0);
     }
 
-    assert_eq!(engine.count_tasks("review", None, &[]).await.unwrap(), 3);
-    assert_eq!(engine.count_tasks("review", None, &items).await.unwrap(), 0);
+    assert_eq!(engine.count_tasks("review", None, None).await.unwrap(), 3);
+    assert_eq!(
+        engine
+            .count_tasks("review", None, Some(&TaskIds::Exclude(items.clone())))
+            .await
+            .unwrap(),
+        0
+    );
     let mut skip_all = GetTaskOptions::new("w1");
-    skip_all.exclude = items.clone();
+    skip_all.ids = Some(TaskIds::Exclude(items.clone()));
     assert!(
         engine
             .get_task("review", &skip_all)
@@ -3576,7 +3582,7 @@ async fn skipping_every_item_offers_nothing_and_counts_none() {
     // One fewer skipped, one left to offer.
     assert_eq!(
         engine
-            .count_tasks("review", None, &items[1..])
+            .count_tasks("review", None, Some(&TaskIds::Exclude(items[1..].to_vec())))
             .await
             .unwrap(),
         1
@@ -3613,7 +3619,7 @@ async fn a_skip_list_and_a_filter_hold_their_own_parameters() {
     let filter = || TaskFilter::new("p").field("region", "north");
     assert_eq!(
         engine
-            .count_tasks("review", Some(&filter()), &[])
+            .count_tasks("review", Some(&filter()), None)
             .await
             .unwrap(),
         3,
@@ -3621,7 +3627,11 @@ async fn a_skip_list_and_a_filter_hold_their_own_parameters() {
     );
     assert_eq!(
         engine
-            .count_tasks("review", Some(&filter()), &north[..1])
+            .count_tasks(
+                "review",
+                Some(&filter()),
+                Some(&TaskIds::Exclude(north[..1].to_vec()))
+            )
             .await
             .unwrap(),
         2,
@@ -3630,7 +3640,7 @@ async fn a_skip_list_and_a_filter_hold_their_own_parameters() {
 
     let mut options = GetTaskOptions::new("w1");
     options.filter = Some(filter());
-    options.exclude = vec![north[0]];
+    options.ids = Some(TaskIds::Exclude(vec![north[0]]));
     let task = engine
         .get_task("review", &options)
         .await
@@ -3690,7 +3700,7 @@ async fn a_skip_list_does_not_cost_the_claim_its_index() {
     let before = scans().await;
 
     let mut options = GetTaskOptions::new("w1");
-    options.exclude = items.clone();
+    options.ids = Some(TaskIds::Exclude(items.clone()));
     let task = engine
         .get_task("review", &options)
         .await
@@ -3713,6 +3723,134 @@ async fn a_skip_list_does_not_cost_the_claim_its_index() {
     db.drop().await;
 }
 
+/// The other way round: name what you will take. Everything the skip list
+/// says about not locking and not deferring holds here too — this decides
+/// what *this* claim accepts, and leaves the queue as it was for everyone.
+#[tokio::test]
+async fn a_claim_can_be_told_which_items_it_will_take() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let ids = three_review_instances(&engine).await;
+    let mut items = Vec::new();
+    for id in &ids {
+        items.push(open_items(&db.pool, *id).await[0].0);
+    }
+
+    // Only the last one is acceptable, so FIFO order notwithstanding, that
+    // is the one claimed.
+    let mut only_last = GetTaskOptions::new("w1");
+    only_last.ids = Some(TaskIds::Include(vec![items[2]]));
+    let task = engine
+        .get_task("review", &only_last)
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(task.id, items[2]);
+
+    // The two it did not name are untouched, and still first in line.
+    let next = engine
+        .get_task("review", &GetTaskOptions::new("w2"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(next.id, items[0]);
+
+    assert_eq!(
+        engine
+            .count_tasks("review", None, Some(&TaskIds::Include(items[..2].to_vec())))
+            .await
+            .unwrap(),
+        1,
+        "one of the two named is still claimable; the other is now held"
+    );
+    db.drop().await;
+}
+
+/// Naming nothing acceptable offers nothing — the reading a bare list could
+/// not express, and the reason `TaskIds` is an enum. A caller whose candidate
+/// list came back empty is exactly the caller who must not be handed an
+/// unrelated task.
+#[tokio::test]
+async fn an_empty_include_is_nothing_acceptable_not_no_filter() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    three_review_instances(&engine).await;
+
+    let mut nothing = GetTaskOptions::new("w1");
+    nothing.ids = Some(TaskIds::Include(Vec::new()));
+    assert!(engine.get_task("review", &nothing).await.unwrap().is_none());
+    assert_eq!(
+        engine
+            .count_tasks("review", None, Some(&TaskIds::Include(Vec::new())))
+            .await
+            .unwrap(),
+        0
+    );
+    // ...while naming none at all is every claimable one, as it always was.
+    assert_eq!(engine.count_tasks("review", None, None).await.unwrap(), 3);
+    assert!(
+        engine
+            .get_task("review", &GetTaskOptions::new("w2"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    db.drop().await;
+}
+
+/// The include form renumbers the filter's parameters exactly as the exclude
+/// form does — `$5` in the claim, `$3` in the count — so it needs the same
+/// proof: an off-by-one would bind a filter's text value to the uuid array,
+/// and a suite that never pairs them would stay green.
+#[tokio::test]
+async fn an_include_list_and_a_filter_hold_their_own_parameters() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    let mut north = Vec::new();
+    for n in 0..2 {
+        let started = engine
+            .start("p", None, serde_json::json!({ "region": "north", "n": n }))
+            .await
+            .unwrap();
+        north.push(open_items(&db.pool, started.id).await[0].0);
+    }
+    let south = engine
+        .start("p", None, serde_json::json!({ "region": "south" }))
+        .await
+        .unwrap();
+    let south_item = open_items(&db.pool, south.id).await[0].0;
+
+    // Naming the southern item and filtering for northern ones is an empty
+    // intersection, and both halves have to be applied to see that.
+    assert_eq!(
+        engine
+            .count_tasks(
+                "review",
+                Some(&TaskFilter::new("p").field("region", "north")),
+                Some(&TaskIds::Include(vec![south_item])),
+            )
+            .await
+            .unwrap(),
+        0,
+        "the filter and the named list are both applied, not one or the other"
+    );
+    let mut options = GetTaskOptions::new("w1");
+    options.filter = Some(TaskFilter::new("p").field("region", "north"));
+    options.ids = Some(TaskIds::Include(vec![south_item, north[1]]));
+    let task = engine
+        .get_task("review", &options)
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(task.id, north[1], "the named one that the filter admits");
+    assert_eq!(task.variables["region"], "north");
+    db.drop().await;
+}
+
 /// A person skips a handful, so the list is bounded rather than unbounded —
 /// and refused loudly at the edge, like every other bound this engine takes.
 #[tokio::test]
@@ -3720,13 +3858,17 @@ async fn a_skip_list_is_capped() {
     let db = TestDb::create().await;
     let engine = engine(&db).await;
     let mut options = GetTaskOptions::new("w1");
-    options.exclude = (0..1001).map(|_| uuid::Uuid::new_v4()).collect();
+    options.ids = Some(TaskIds::Exclude(
+        (0..1001).map(|_| uuid::Uuid::new_v4()).collect(),
+    ));
     assert!(matches!(
         engine.get_task("review", &options).await,
         Err(EngineError::InvalidVariables(_))
     ));
     assert!(matches!(
-        engine.count_tasks("review", None, &options.exclude).await,
+        engine
+            .count_tasks("review", None, options.ids.as_ref())
+            .await,
         Err(EngineError::InvalidVariables(_))
     ));
     db.drop().await;
@@ -4187,11 +4329,11 @@ async fn filters_match_live_instance_variables() {
         .await
         .unwrap();
 
-    assert_eq!(engine.count_tasks("review", None, &[]).await.unwrap(), 2);
+    assert_eq!(engine.count_tasks("review", None, None).await.unwrap(), 2);
     let filter = TaskFilter::new("p").field("region", "north");
     assert_eq!(
         engine
-            .count_tasks("review", Some(&filter), &[])
+            .count_tasks("review", Some(&filter), None)
             .await
             .unwrap(),
         1
@@ -4249,7 +4391,7 @@ async fn declared_indexes_serve_the_filter_queries() {
     let undeclared = TaskFilter::new("p").field("shade", "s7");
     assert_eq!(
         engine
-            .count_tasks("review", Some(&undeclared), &[])
+            .count_tasks("review", Some(&undeclared), None)
             .await
             .unwrap(),
         1
@@ -4259,7 +4401,7 @@ async fn declared_indexes_serve_the_filter_queries() {
     let declared = TaskFilter::new("p").field("region", "r250");
     assert_eq!(
         engine
-            .count_tasks("review", Some(&declared), &[])
+            .count_tasks("review", Some(&declared), None)
             .await
             .unwrap(),
         1

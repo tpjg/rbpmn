@@ -109,6 +109,30 @@ pub struct GetTaskBody {
     /// is written and nothing is locked: they stay claimable, for everyone.
     #[serde(default)]
     pub exclude: Vec<Uuid>,
+    /// The other way round: offer only these. Present and empty means
+    /// nothing is acceptable, so nothing is offered — never "no filter",
+    /// which is what omitting the field says. Sending both is refused.
+    #[serde(default)]
+    pub include: Option<Vec<Uuid>>,
+}
+
+/// The flat pair a client sends, as the one thing the engine takes. Both at
+/// once is a contradiction rather than a combination, so it is refused here
+/// and unrepresentable past here.
+fn task_ids(
+    exclude: Vec<Uuid>,
+    include: Option<Vec<Uuid>>,
+) -> Result<Option<rbpmn_engine::TaskIds>, String> {
+    match (exclude.is_empty(), include) {
+        (false, Some(_)) => Err(
+            "exclude and include are alternatives: name what you will not take, \
+             or what you will, not both"
+                .to_string(),
+        ),
+        (_, Some(include)) => Ok(Some(rbpmn_engine::TaskIds::Include(include))),
+        (false, None) => Ok(Some(rbpmn_engine::TaskIds::Exclude(exclude))),
+        (true, None) => Ok(None),
+    }
 }
 
 #[derive(Deserialize)]
@@ -142,7 +166,10 @@ pub async fn get_task(State(engine): State<Engine>, Json(body): Json<GetTaskBody
     }
     options.order = order;
     options.filter = body.filter.map(FilterBody::into_filter);
-    options.exclude = body.exclude;
+    options.ids = match task_ids(body.exclude, body.include) {
+        Ok(ids) => ids,
+        Err(why) => return bad_request(why),
+    };
     match engine.get_task(&body.topic, &options).await {
         Ok(Some(task)) => Json(serde_json::json!({ "task": task })).into_response(),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
@@ -156,10 +183,12 @@ pub struct CountTasksBody {
     pub topic: String,
     #[serde(default)]
     pub filter: Option<FilterBody>,
-    /// The same skip list [`GetTaskBody`] takes, so a depth and a claim
+    /// The same id filter [`GetTaskBody`] takes, so a depth and a claim
     /// answer one question.
     #[serde(default)]
     pub exclude: Vec<Uuid>,
+    #[serde(default)]
+    pub include: Option<Vec<Uuid>>,
 }
 
 pub async fn count_tasks(
@@ -167,8 +196,12 @@ pub async fn count_tasks(
     Json(body): Json<CountTasksBody>,
 ) -> Response {
     let filter = body.filter.map(FilterBody::into_filter);
+    let ids = match task_ids(body.exclude, body.include) {
+        Ok(ids) => ids,
+        Err(why) => return bad_request(why),
+    };
     match engine
-        .count_tasks(&body.topic, filter.as_ref(), &body.exclude)
+        .count_tasks(&body.topic, filter.as_ref(), ids.as_ref())
         .await
     {
         Ok(count) => Json(serde_json::json!({ "count": count })).into_response(),

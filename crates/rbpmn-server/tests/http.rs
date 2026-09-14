@@ -1311,6 +1311,100 @@ async fn a_claim_can_skip_items_over_http() {
     db.drop().await;
 }
 
+/// The include half over the wire, and the one combination that is a
+/// contradiction rather than a combination.
+#[tokio::test]
+async fn a_claim_can_name_what_it_will_take_over_http() {
+    let (app, db) = test_app().await;
+    let post = |uri: String, body: serde_json::Value| {
+        let app = app.clone();
+        async move { app.oneshot(authed("POST", &uri, body)).await.unwrap() }
+    };
+    let resp = post(
+        "/v1/definitions".into(),
+        serde_json::json!({ "bpmn": MINIMAL_XML, "bindings": {} }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let mut items = Vec::new();
+    for n in 0..2 {
+        let resp = post(
+            "/v1/instances".into(),
+            serde_json::json!({ "definitionKey": "p", "variables": { "n": n } }),
+        )
+        .await;
+        let instance = body_json(resp).await["instanceId"]
+            .as_str()
+            .expect("an instance id")
+            .to_string();
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "GET",
+                &format!("/v1/instances/{instance}/inspect"),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        items.push(
+            body_json(resp).await["workItems"][0]["id"]
+                .as_str()
+                .expect("a work item id")
+                .to_string(),
+        );
+    }
+
+    // Name the second one: FIFO order notwithstanding, that is what comes.
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({ "topic": "review", "owner": "alice", "include": [items[1]] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["task"]["id"], items[1]);
+
+    // Present and empty is "nothing acceptable", not "no filter" — 204,
+    // while the first item is still sitting there claimable.
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({ "topic": "review", "owner": "bob", "include": [] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = post(
+        "/v1/tasks/count".into(),
+        serde_json::json!({ "topic": "review", "include": [] }),
+    )
+    .await;
+    assert_eq!(body_json(resp).await["count"], 0);
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({ "topic": "review", "owner": "bob" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["task"]["id"], items[0]);
+
+    // Saying both is refused rather than silently resolved one way.
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({
+            "topic": "review", "owner": "carol",
+            "exclude": [items[0]], "include": [items[1]]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(resp).await["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("alternatives")),
+        "the 400 says why"
+    );
+    db.drop().await;
+}
+
 /// Repair over HTTP (docs/design/incident-scope.md, D10). An instance frozen on
 /// a correlation it could never make is repaired by naming its incident: a
 /// stale number is 409 with the incident to name instead, a malformed body or

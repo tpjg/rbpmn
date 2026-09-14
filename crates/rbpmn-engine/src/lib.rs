@@ -61,8 +61,8 @@ pub use scheduler::SchedulerOptions;
 pub use sqlx::PgPool;
 pub use subscriptions::SUBSCRIPTION_VIEW;
 pub use tasks::{
-    DeclaredIndex, GetTaskOptions, LockExtension, LockedTask, Released, TaskFilter, TaskOrder,
-    declared_index_name, shared_index_name,
+    DeclaredIndex, GetTaskOptions, LockExtension, LockedTask, MAX_TASK_IDS, Released, TaskFilter,
+    TaskIds, TaskOrder, declared_index_name, shared_index_name,
 };
 pub use timers::TIMER_VIEW;
 pub use work_items::{QueueDepth, WORK_ITEM_VIEW};
