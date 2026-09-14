@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
+  warn side-path-failure-escapes @ remind
   warn timer-expression @ remind_due
 -->
 <!-- The cycle read from the variable document — "remind every N days, where

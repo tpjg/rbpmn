@@ -155,3 +155,15 @@ pub enum FailOutcome {
     /// the instance is frozen in the incident state.
     IncidentRaised,
 }
+
+/// What a repair did (docs/design/incident-scope.md, D4–D6): the status the
+/// instance is in after the step — active, completed or terminated, or failed
+/// again — and the events the step produced.
+#[derive(Debug)]
+pub struct Repaired {
+    pub status: rbpmn_core::InstanceStatus,
+    /// The incident open after the step when the repair froze the instance
+    /// again: the number the next repair must name (D9).
+    pub incident: Option<u64>,
+    pub events: Vec<rbpmn_core::Event>,
+}

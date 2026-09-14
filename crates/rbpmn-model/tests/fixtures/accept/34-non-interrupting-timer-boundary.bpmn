@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
+  warn side-path-failure-escapes @ t_ping
 -->
 <!-- The reminder shape, and the smallest non-interrupting boundary there is:
      while the approval is open a timer fires once, spawns a *sibling* token

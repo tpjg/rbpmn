@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
+  warn side-path-failure-escapes @ add_late_fee
 -->
 <!-- "Every 7 days while waiting for payment, add a late fee." The cycle is
      armed when await_payment is entered; each occurrence spawns a side token

@@ -615,6 +615,10 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
     // (host, error code) -> first boundary claiming it; a second boundary
     // with the same code could never fire — ambiguity we reject loudly.
     let mut error_claims: BTreeMap<(usize, String), String> = BTreeMap::new();
+    // host -> its catch-all, the boundary with no errorRef. Same reasoning:
+    // there is no order to break a tie between two with, so the second is
+    // refused rather than one of them picked.
+    let mut catch_alls: BTreeMap<usize, String> = BTreeMap::new();
     for v in 0..g.scope.nodes.len() {
         let NodeKind::Boundary(b) = &g.node(v).kind else {
             continue;
@@ -671,23 +675,31 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
         }
 
         if let BoundaryTrigger::Error { error_ref } = &b.trigger {
-            if !matches!(
-                host_kind,
-                NodeKind::ServiceTask { .. } | NodeKind::SubProcess(_)
-            ) {
+            if !may_catch_errors(host_kind) {
                 out.push(Diagnostic::error(
                     rule::BOUNDARY_ON_SUPPORTED_HOST,
                     id,
                     "error boundary events attach to service tasks or subprocesses — \
-                     v1 errors are raised by service-task failures past their retry budget",
+                     a user task's failure is caught by one on an embedded subprocess around it",
                 ));
             }
             match error_ref.as_deref() {
-                None => out.push(Diagnostic::error(
-                    rule::BPMN_STRUCTURE,
-                    id,
-                    "error boundary event must reference an error definition (errorRef)",
-                )),
+                // No errorRef is a catch-all: standard BPMN, and the only way
+                // to catch a failure that carries no code. A *present*
+                // errorRef that resolves to nothing stays an error below — a
+                // typo must never read as "catch everything".
+                None => {
+                    if let Some(first) = catch_alls.insert(host, id.clone()) {
+                        out.push(Diagnostic::error(
+                            rule::BPMN_STRUCTURE,
+                            id,
+                            format!(
+                                "'{first}' already catches every error on this activity — \
+                                 a second catch-all can never fire"
+                            ),
+                        ));
+                    }
+                }
                 Some(eref) => match defs.errors.iter().find(|e| e.id == eref) {
                     None => out.push(Diagnostic::error(
                         rule::BPMN_STRUCTURE,
@@ -745,30 +757,56 @@ fn boundary_rules(defs: &Definitions, g: &Graph, out: &mut Vec<Diagnostic>) {
 /// nodes reachable from the boundary `B` over sequence flows, plus the
 /// pseudo-edges of boundaries attached to activities already in `P`. Every
 /// node in `P \ {B}` must have **all** its predecessors (flows and host
-/// pseudo-edges) inside `P`. A plain end event in `P` is required — that is
-/// where the side token is consumed — and a terminate end is allowed, because
-/// "on the fifth reminder, cancel the whole thing" is a legitimate escape.
+/// pseudo-edges) inside `P` — that is disjointness, and `P` is its question.
+/// The plain end where the side token is consumed is asked over a smaller
+/// set: the nodes the path's own sequence flows reach ([`Graph::flow_succs`]).
+/// Every boundary is optional — a timer fires only if it fires, an error
+/// handler only if the activity fails — so an end behind one is an end the
+/// token may never reach.
+/// A terminate end is allowed beside a plain one — "on the fifth reminder,
+/// cancel the whole thing" is a legitimate escape — but never instead of it.
 ///
 /// One diagnostic per boundary, on the boundary: the offending node is named
 /// in the message, and a merge reported at every node downstream of it would
 /// be the same fix repeated.
 fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
+    // Every side path in the scope, up front. P is the forward closure from
+    // B over flows and every boundary pseudo-edge (a boundary on an activity
+    // of the side path belongs to it too) — the traversal connectivity uses,
+    // so the two cannot disagree. That same closure means a side path started
+    // on an activity of another one lies wholly inside it, so its nodes are
+    // on both. They belong to the innermost, whose boundary's activations are
+    // what run them: each warning below fires once per node, not once per
+    // enclosing side path.
+    let side_paths: Vec<_> = (0..g.scope.nodes.len())
+        .filter(|&b| starts_a_side_path(&g.node(b).kind) && g.host_of[b].is_some())
+        .map(|b| (b, reach(g.scope.nodes.len(), &[b], |v| g.succs(v))))
+        .collect();
+
     for b in 0..g.scope.nodes.len() {
-        let NodeKind::Boundary(data) = &g.node(b).kind else {
+        if !starts_a_side_path(&g.node(b).kind) {
             continue;
-        };
+        }
         // An unresolvable `attachedToRef` is `bpmn-structure`'s to report;
         // without a host there is no "beside the host" to describe.
-        let (false, Some(host)) = (data.cancel_activity, g.host_of[b]) else {
+        let Some(host) = g.host_of[b] else {
             continue;
         };
         let boundary_id = &g.node(b).id;
         let host_id = &g.node(host).id;
 
-        // P: forward closure from B over flows and every boundary pseudo-edge
-        // (a boundary on an activity of the side path belongs to it too) —
-        // the same traversal connectivity uses, so the two cannot disagree.
-        let in_path = reach(g.scope.nodes.len(), &[b], |v| g.succs(v));
+        let Some((_, in_path)) = side_paths.iter().find(|(s, _)| *s == b) else {
+            continue;
+        };
+        // What this path's warnings speak for: its own nodes, minus those
+        // strictly inside a side path nested in it. The nested *boundary*
+        // stays — it is armed once per activation of this one, which is this
+        // path's to say.
+        let nested: Vec<_> = side_paths
+            .iter()
+            .filter(|(s, _)| *s != b && in_path[*s])
+            .collect();
+        let owned = |v: usize| in_path[v] && v != b && !nested.iter().any(|(s, p)| v != *s && p[v]);
 
         // Disjointness: nothing outside the side path may reach into it. `B`
         // itself is exempt and is the only exemption — its one predecessor is
@@ -841,7 +879,7 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
         // the whole instance, so a scope of its own buys an arm nothing.
         // `lint_scope` reaches that body on its own, with no idea it sits on
         // a side path, which is why the walk happens from here.
-        for v in (0..g.scope.nodes.len()).filter(|&v| in_path[v] && v != b) {
+        for v in (0..g.scope.nodes.len()).filter(|&v| owned(v)) {
             let mut arms: Vec<&FlowNode> = Vec::new();
             if g.node(v).kind.is_message_arm() {
                 arms.push(g.node(v));
@@ -864,12 +902,82 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
             }
         }
 
-        // The side token has to be consumed somewhere: a terminate end takes
-        // the whole scope with it, so only a plain end ends the side path.
+        // The side token has to be consumed somewhere, and only a plain end
+        // of its own does it: a terminate end takes the whole scope instead.
+        // Asked over the path's own sequence flows, not over everything it
+        // owns, because every boundary is optional — a timer fires only if it
+        // fires, an error handler only if the activity fails — so an end
+        // behind one is an end this token may never reach. Decided before the
+        // failure warning, which speaks only for a well-formed side path; the
+        // error for a missing end comes last.
+        let by_flow = reach(g.scope.nodes.len(), &[b], |v| g.flow_succs(v));
         let plain_end = (0..g.scope.nodes.len()).any(|v| {
-            in_path[v]
+            by_flow[v]
                 && matches!(&g.node(v).kind, NodeKind::End(k) if !matches!(k, EndKind::Terminate))
         });
+
+        // A failure on the side path has to stop on the side path. An error
+        // walks outward through enclosing scopes and never sideways, so the
+        // host's own boundaries do not reach it: only a catch-all on the
+        // failing activity, or on a subprocess of the path around it, keeps
+        // it here. Past that it freezes the instance or — with a catch-all
+        // further out — tears down the scope around the host, which is the
+        // flow the side path exists to leave alone. Legal and sometimes
+        // meant, so a warning. One per activity of the path: a subprocess
+        // reports once, naming what escapes it, because a catch-all on the
+        // subprocess is the one fix for all of it.
+        //
+        // Only the error class. A decision with no answer, a deadline or key
+        // that will not resolve, a duplicate subscription: those are
+        // incidents no boundary can catch, so a warning here could name no
+        // remedy — `side-path-message-arm` and `timer-expression` already
+        // speak for the two of them a model can see.
+        for v in (0..g.scope.nodes.len()).filter(|&v| plain_end && owned(v)) {
+            if has_catch_all(g, v) {
+                continue;
+            }
+            let id = &g.node(v).id;
+            let escapes = format!(
+                "Uncaught, a failure there escapes the side path: it freezes the whole \
+                 instance or, if a catch-all further out catches it, tears down the scope \
+                 around '{host_id}' — stopping the flow the side path exists to leave alone"
+            );
+            let message = match &g.node(v).kind {
+                NodeKind::ServiceTask { .. } => format!(
+                    "'{id}' runs on the side path started by non-interrupting boundary \
+                     '{boundary_id}', and nothing on that path catches its failure. \
+                     {escapes}. Give '{id}' an error boundary with no errorRef (a \
+                     catch-all) whose path ends on the side path"
+                ),
+                NodeKind::UserTask => format!(
+                    "'{id}' runs on the side path started by non-interrupting boundary \
+                     '{boundary_id}', and nothing on that path catches it failing through \
+                     the task API. {escapes}. A user task cannot carry an error boundary — \
+                     wrap '{id}' in an embedded subprocess on the side path and give that \
+                     a catch-all"
+                ),
+                NodeKind::SubProcess(sp) if !sp.triggered_by_event => {
+                    let Some(inner) = uncaught_failure_within(&sp.body) else {
+                        continue;
+                    };
+                    format!(
+                        "'{id}' runs on the side path started by non-interrupting \
+                         boundary '{boundary_id}', and '{}' inside it can fail with \
+                         nothing in between to catch it. {escapes}. Give '{id}' an error \
+                         boundary with no errorRef (a catch-all), which contains every \
+                         failure inside it",
+                        inner.id
+                    )
+                }
+                _ => continue,
+            };
+            out.push(Diagnostic::warn(
+                rule::SIDE_PATH_FAILURE_ESCAPES,
+                id,
+                message,
+            ));
+        }
+
         if !plain_end {
             out.push(Diagnostic::error(
                 rule::BOUNDARY_SIDE_PATH,
@@ -878,12 +986,89 @@ fn side_path_rules(g: &Graph, out: &mut Vec<Diagnostic>) {
                     "non-interrupting boundary '{boundary_id}' starts a side path with no \
                      plain end event: the sibling token it spawns beside '{host_id}' has \
                      nowhere to be consumed, and the instance can never complete. End the \
-                     path at its own end event (a terminate end is allowed, and cancels \
-                     the whole scope)"
+                     path at its own plain end event: a terminate end cancels the whole \
+                     scope rather than consuming the token, and an error boundary's \
+                     handler runs only if the activity fails"
                 ),
             ));
         }
     }
+}
+
+/// A boundary that spawns a sibling token, which is what a side path is.
+/// Error boundaries are excluded whatever `cancelActivity` says: one is
+/// interrupting by definition and `bpmn-structure` refuses a non-interrupting
+/// one, so reading it as a side path describes a path that does not exist
+/// and recommends a remedy for it.
+fn starts_a_side_path(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::Boundary(d)
+        if !d.cancel_activity && !matches!(d.trigger, BoundaryTrigger::Error { .. }))
+}
+
+/// What an error boundary may attach to. A user task fails through the task
+/// API rather than by raising an error, so its failure is caught by a
+/// boundary on an embedded subprocess around it — which is what
+/// `boundary-on-supported-host` says, and what this keeps to one answer.
+fn may_catch_errors(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::ServiceTask { .. } | NodeKind::SubProcess(_))
+}
+
+/// An error boundary with no errorRef: it catches any error, coded or not.
+fn is_catch_all(kind: &NodeKind) -> bool {
+    matches!(kind, NodeKind::Boundary(b)
+        if matches!(b.trigger, BoundaryTrigger::Error { error_ref: None }))
+}
+
+/// Does this activity have a catch-all that actually catches? A boundary on
+/// a host that may not carry one is refused, and reading it as "handled"
+/// swallows the advice for what to do instead — for a user task, the one
+/// place that names the subprocess wrapper.
+fn has_catch_all(g: &Graph, host: usize) -> bool {
+    may_catch_errors(&g.node(host).kind)
+        && g.boundaries[host]
+            .iter()
+            .any(|&bi| is_catch_all(&g.node(bi).kind))
+}
+
+/// The first activity inside a scope, at any depth, whose failure nothing in
+/// between catches — a service or user task with no catch-all of its own, or
+/// one inside a subprocess that has none either. What `side_path_rules`
+/// names when a subprocess on a side path lets a failure escape: it lives one
+/// scope down from the path it walks, so it is reached from here, exactly as
+/// [`message_arms_within`] is.
+fn uncaught_failure_within(scope: &FlowScope) -> Option<&FlowNode> {
+    // The same question `has_catch_all` asks, one scope down, and it has to
+    // be asked the same way: a catch-all on a host that may not carry one is
+    // refused, so it catches nothing and cannot mask the failure under it.
+    // Missing that here hid the warning for the very shape the warning
+    // recommends — a user task wrapped in a subprocess, with the catch-all
+    // put on the task instead of the wrapper.
+    let caught = |id: &str| {
+        scope
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .is_some_and(|host| may_catch_errors(&host.kind))
+            && scope.nodes.iter().any(|n| {
+                is_catch_all(&n.kind)
+                    && matches!(&n.kind, NodeKind::Boundary(b) if b.attached_to.as_deref() == Some(id))
+            })
+    };
+    for node in &scope.nodes {
+        if caught(&node.id) {
+            continue;
+        }
+        match &node.kind {
+            NodeKind::ServiceTask { .. } | NodeKind::UserTask => return Some(node),
+            NodeKind::SubProcess(sp) if !sp.triggered_by_event => {
+                if let Some(inner) = uncaught_failure_within(&sp.body) {
+                    return Some(inner);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Every message arm inside a scope's bodies, at any depth — the arms

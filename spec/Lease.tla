@@ -344,10 +344,16 @@ CompleteAlreadyClosed(w) ==
                    completions, leaseNo, issued>>
 
 \* fail_work_item_in_tx: back to available behind a backoff, budget spent.
-\* Exhausting it raises an incident, which freezes the instance.
+\* Exhausting it raises an incident, which freezes the instance. Like
+\* completion, it is refused on a frozen instance (`IncidentOpen`) — the
+\* `active` conjunct. A one-item model cannot tell it is there: its only
+\* freeze is this item's own FailFinally, which closes the item. With a
+\* sibling it matters, and LeaseSiblings.tla's FreezeAdvancesNothing fails
+\* without it.
 Fail(w) ==
     /\ state = "locked"
     /\ GuardAllows(w)
+    /\ active          \* refused on a frozen instance: IncidentOpen
     /\ retries > 0
     /\ state' = "available"
     /\ owner' = NoOne
@@ -367,6 +373,7 @@ Fail(w) ==
 FailFinally(w) ==
     /\ state = "locked"
     /\ GuardAllows(w)
+    /\ active          \* refused on a frozen instance: IncidentOpen
     /\ retries = 0
     /\ state' = "failed"
     /\ active' = FALSE          \* incident: the instance freezes for repair
@@ -374,6 +381,24 @@ FailFinally(w) ==
     /\ lastActor' = w
     /\ named' = NoLease
     /\ UNCHANGED <<owner, until, retryAt, retries, now, completions, leaseNo, issued>>
+
+\* RaiseError that a boundary catches: the item closes as `failed` exactly as
+\* above, and the instance stays active — the boundary's path runs instead of
+\* the freeze. Which of the two a final failure becomes depends on the model's
+\* boundaries, which this spec does not see, so both are enabled wherever a
+\* final failure is: FailFinally is the uncaught branch, FailCaught the caught
+\* one (docs/design/incident-scope.md, D1).
+FailCaught(w) ==
+    /\ state = "locked"
+    /\ GuardAllows(w)
+    /\ active          \* refused on a frozen instance: IncidentOpen
+    /\ retries = 0
+    /\ state' = "failed"
+    /\ believes' = [believes EXCEPT ![w] = FALSE]
+    /\ lastActor' = w
+    /\ named' = NoLease
+    /\ UNCHANGED <<owner, until, retryAt, retries, active, now, completions,
+                   leaseNo, issued>>
 
 \* The process withdraws the item: an interrupting boundary on the host, a
 \* terminate end, the teardown of an enclosing scope. Transcribed from
@@ -404,7 +429,7 @@ Next ==
         \/ Acquire(w) \/ Extend(w) \/ ExtendLost(w)
         \/ ReleaseWith(w, leaseNo) \/ ReleaseReplay(w) \/ ReleaseLost(w)
         \/ Complete(w) \/ CompleteRefused(w) \/ CompleteAlreadyClosed(w)
-        \/ Fail(w) \/ FailFinally(w)
+        \/ Fail(w) \/ FailFinally(w) \/ FailCaught(w)
 
 Spec == Init /\ [][Next]_vars
 
@@ -450,8 +475,10 @@ NoLiveForeignCompletion ==
 (*                                                                          *)
 (* What it does not say: the engine does have stranded items — a SIBLING    *)
 (* branch's open task on an instance this item froze — and a one-item model *)
-(* cannot express that. It would need a second item and a property about    *)
-(* `~active` on it; until then this is the one-item truth, not the whole.   *)
+(* cannot express that: its only freeze is its own final failure, which     *)
+(* closes it. LeaseSiblings.tla composes two of these items on one          *)
+(* instance: `StrandedOnlyWhileFrozen` holds there, and                     *)
+(* LeaseSiblings_Stranded.cfg fails on exactly that stranding.              *)
 (***************************************************************************)
 Open == state \in {"available", "locked"}
 

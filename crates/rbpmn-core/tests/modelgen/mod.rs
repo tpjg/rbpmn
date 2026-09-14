@@ -87,6 +87,36 @@ pub enum Block {
     /// sharp oracle test: any scope bookkeeping that leaks into execution
     /// shows up as a task count that no longer matches the plain block.
     Sub(Box<Block>),
+    /// A **service task** carrying interrupting *error* boundaries, whose path
+    /// runs the wrapped block and merges back as `MsgBoundary`'s does. `catch`
+    /// says which boundaries: one for the host's own code, a catch-all (no
+    /// `errorRef`), or both — where the exact code must win. `scoped` puts
+    /// them on a one-task subprocess around the host instead, so the failure
+    /// walks outward one scope and tears it down before a boundary takes it
+    /// (docs/design/incident-scope.md, D1).
+    ///
+    /// The scope holds the host alone, deliberately: a failure in a scope with
+    /// concurrent work cancels that work, and how much of it had already run
+    /// is the interleaving's to decide — no count-based oracle can predict
+    /// it. That case is the explorer's (`tests/explore.rs`), which sees every
+    /// interleaving and every failure code.
+    ErrBoundary {
+        catch: Catch,
+        scoped: bool,
+        body: Box<Block>,
+    },
+}
+
+/// Which error boundaries an `ErrBoundary` host carries.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Catch {
+    /// One boundary, for the host's own error code.
+    Coded,
+    /// One boundary with no `errorRef`: it takes any failure, coded or not.
+    All,
+    /// Both on one host. A failure with the host's code must take the coded
+    /// one and anything else the catch-all — precedence within one activity.
+    Both,
 }
 
 /// The same tree with element ids and decision variables assigned. The XML
@@ -154,6 +184,24 @@ pub enum Node {
         end: String,
         body: Box<Node>,
     },
+    /// Host service task, its error boundaries, and the path they share.
+    ErrBoundary {
+        /// The service task that fails — or completes.
+        task: String,
+        /// `(subProcess, start, end)` when the boundaries sit one scope out.
+        scope: Option<(String, String, String)>,
+        /// The boundary whose path runs `body`: the coded one for `Coded` and
+        /// `Both`, the catch-all for `All`.
+        boundary: String,
+        /// The catch-all beside a coded boundary (`Both` only). Its path is
+        /// empty and goes straight to the merge.
+        any: Option<String>,
+        catch: Catch,
+        /// The host's own error code — declared as a `bpmn:error` unless the
+        /// host carries only a catch-all.
+        code: String,
+        body: Box<Node>,
+    },
 }
 
 #[derive(Default)]
@@ -204,6 +252,34 @@ fn number(block: &Block, ids: &mut Ids) -> Node {
                 end: format!("b{n}_end"),
             }
         }
+        Block::ErrBoundary {
+            catch,
+            scoped,
+            body,
+        } => {
+            ids.boundaries += 1;
+            ids.task += 1;
+            let n = ids.boundaries;
+            let task = format!("t{}", ids.task);
+            let scope = (*scoped).then(|| {
+                ids.subs += 1;
+                let s = ids.subs;
+                (
+                    format!("sp{s}"),
+                    format!("sp{s}_start"),
+                    format!("sp{s}_end"),
+                )
+            });
+            Node::ErrBoundary {
+                task,
+                scope,
+                boundary: format!("b{n}"),
+                any: (*catch == Catch::Both).then(|| format!("b{n}_any")),
+                catch: *catch,
+                code: format!("E{n}"),
+                body: Box::new(number(body, ids)),
+            }
+        }
         Block::Sub(body) => {
             ids.subs += 1;
             let n = ids.subs;
@@ -247,6 +323,12 @@ pub enum Kind {
     /// in place, and it has no business turning a boundary's host into a
     /// second message id.
     MessageBoundary,
+    /// The host of an `ErrBoundary`: error boundaries attach only to service
+    /// tasks and subprocesses, and every other generated task is a user task.
+    ServiceTask,
+    /// Error boundary; see `Element::boundary` for its host and
+    /// `BoundaryRefs::error_ref` for what it catches.
+    ErrorBoundary,
 }
 
 /// The host, message and `cancelActivity` of a `Kind::MessageBoundary`.
@@ -260,6 +342,9 @@ pub struct BoundaryRefs {
     /// attribute entirely, which is what every accepted interrupting fixture
     /// does and what the default already means.
     pub interrupting: bool,
+    /// `Kind::ErrorBoundary` only: the `bpmn:error` it references, or `None`
+    /// for a catch-all. (`message` is empty on an error boundary.)
+    pub error_ref: Option<String>,
 }
 
 /// A `bpmn:message` root element. Its **name** is what `correlate()` addresses
@@ -268,6 +353,14 @@ pub struct BoundaryRefs {
 pub struct Message {
     pub id: String,
     pub name: String,
+}
+
+/// A `bpmn:error` root element: what a coded error boundary's `errorRef`
+/// points at, and the code a failure must carry to match it.
+#[derive(Clone, Debug)]
+pub struct ErrorDef {
+    pub id: String,
+    pub code: String,
 }
 
 #[derive(Clone, Debug)]
@@ -301,6 +394,8 @@ pub struct Builder {
     /// `bpmn:message` root elements — one per message boundary, so no two
     /// concurrent arms can ever share a `(message, key)` pair.
     pub messages: Vec<Message>,
+    /// `bpmn:error` root elements, one per coded error boundary.
+    pub errors: Vec<ErrorDef>,
     /// Scope currently being emitted into.
     container: Option<String>,
 }
@@ -326,6 +421,24 @@ impl Builder {
                 attached_to: attached_to.to_string(),
                 message: message.to_string(),
                 interrupting,
+                error_ref: None,
+            }),
+        });
+    }
+
+    /// An error boundary: interrupting by definition, reached through its
+    /// host's failure rather than through the graph, and catching the error
+    /// `error_ref` names — or, with none, anything.
+    fn error_boundary_element(&mut self, id: &str, attached_to: &str, error_ref: Option<&str>) {
+        self.elements.push(Element {
+            id: id.to_string(),
+            kind: Kind::ErrorBoundary,
+            container: self.container.clone(),
+            boundary: Some(BoundaryRefs {
+                attached_to: attached_to.to_string(),
+                message: String::new(),
+                interrupting: true,
+                error_ref: error_ref.map(str::to_string),
             }),
         });
     }
@@ -438,6 +551,62 @@ impl Builder {
                 self.flow(&handled, end, None);
                 task.clone()
             }
+            Node::ErrBoundary {
+                task,
+                scope,
+                boundary,
+                any,
+                catch,
+                code,
+                body,
+            } => {
+                // The host: a service task, alone inside a subprocess when the
+                // boundaries sit one scope out — the subprocess is then what
+                // they attach to, and the failure reaches them by walking out.
+                let host = match scope {
+                    None => {
+                        self.element(task, Kind::ServiceTask);
+                        self.flow(from, task, cond);
+                        task.clone()
+                    }
+                    Some((sp, start, end)) => {
+                        self.element(sp, Kind::SubProcess);
+                        self.flow(from, sp, cond);
+                        let outer = self.container.replace(sp.clone());
+                        self.element(start, Kind::Start);
+                        self.element(task, Kind::ServiceTask);
+                        self.flow(start, task, None);
+                        self.element(end, Kind::End);
+                        self.flow(task, end, None);
+                        self.container = outer;
+                        sp.clone()
+                    }
+                };
+                let error_id = format!("err_{boundary}");
+                if *catch != Catch::All {
+                    self.errors.push(ErrorDef {
+                        id: error_id.clone(),
+                        code: code.clone(),
+                    });
+                }
+                let main_ref = (*catch != Catch::All).then_some(error_id.as_str());
+                self.error_boundary_element(boundary, &host, main_ref);
+                // Every exit merges, as `MsgBoundary`'s do and for the same
+                // reason: exactly one is ever taken, and the block must leave
+                // by a single element.
+                let mut exits = vec![host.clone(), self.add(body, boundary, None)];
+                if let Some(any) = any {
+                    self.error_boundary_element(any, &host, None);
+                    exits.push(any.clone());
+                }
+                let n = self.elements.len();
+                let merge = format!("em{n}");
+                self.element(&merge, Kind::Exclusive);
+                for exit in exits {
+                    self.flow(&exit, &merge, None);
+                }
+                merge
+            }
             Node::Sub {
                 id,
                 start,
@@ -498,10 +667,20 @@ impl Builder {
             .iter()
             .map(|m| format!("  <bpmn:message id=\"{}\" name=\"{}\" />\n", m.id, m.name))
             .collect();
+        let errors: String = self
+            .errors
+            .iter()
+            .map(|e| {
+                format!(
+                    "  <bpmn:error id=\"{}\" name=\"{}\" errorCode=\"{}\" />\n",
+                    e.id, e.code, e.code
+                )
+            })
+            .collect();
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" \
-             id=\"defs\" targetNamespace=\"https://rbpmn.dev/generated\">\n{messages}\
+             id=\"defs\" targetNamespace=\"https://rbpmn.dev/generated\">\n{messages}{errors}\
              \x20 <bpmn:process id=\"p\" isExecutable=\"true\">\n{body}  </bpmn:process>\n\
              </bpmn:definitions>\n"
         )
@@ -535,6 +714,19 @@ impl Builder {
                 ));
                 continue;
             }
+            if e.kind == Kind::ErrorBoundary {
+                let b = e.boundary.as_ref().expect("a boundary knows its host");
+                let def = match &b.error_ref {
+                    Some(r) => format!("<bpmn:errorEventDefinition errorRef=\"{r}\" />"),
+                    None => "<bpmn:errorEventDefinition />".to_string(),
+                };
+                out.push_str(&format!(
+                    "    <bpmn:boundaryEvent id=\"{}\" attachedToRef=\"{}\">{inc}{out_tags}{def}\
+                     </bpmn:boundaryEvent>\n",
+                    e.id, b.attached_to
+                ));
+                continue;
+            }
             if e.kind == Kind::MessageBoundary {
                 let b = e.boundary.as_ref().expect("a boundary knows its host");
                 // `{inc}` is always empty by construction; it is emitted so a
@@ -562,9 +754,12 @@ impl Builder {
                 Kind::Start => ("bpmn:startEvent", String::new()),
                 Kind::End => ("bpmn:endEvent", String::new()),
                 Kind::UserTask => ("bpmn:userTask", String::new()),
+                Kind::ServiceTask => ("bpmn:serviceTask", String::new()),
                 Kind::Parallel => ("bpmn:parallelGateway", String::new()),
                 Kind::Inclusive => ("bpmn:inclusiveGateway", String::new()),
-                Kind::SubProcess | Kind::MessageBoundary => unreachable!("handled above"),
+                Kind::SubProcess | Kind::MessageBoundary | Kind::ErrorBoundary => {
+                    unreachable!("handled above")
+                }
                 Kind::Exclusive => {
                     // An exclusive split needs a default flow; by construction
                     // it is always the last outgoing one.
@@ -668,7 +863,7 @@ pub fn boundary_hosts(root: &Node) -> BTreeMap<String, String> {
                 out.insert(task.clone(), boundary.clone());
                 walk(body, out);
             }
-            Node::SideBoundary { body, .. } => walk(body, out),
+            Node::SideBoundary { body, .. } | Node::ErrBoundary { body, .. } => walk(body, out),
         }
     }
     let mut out = BTreeMap::new();
@@ -705,9 +900,10 @@ pub fn side_boundary_hosts(root: &Node) -> BTreeMap<String, SideHost> {
             Node::Task(_) => {}
             Node::Seq(parts) | Node::Par(parts) => parts.iter().for_each(|p| walk(p, out)),
             Node::Xor { branches, .. } => branches.iter().for_each(|b| walk(b, out)),
-            Node::Sub { body, .. } | Node::Loop { body, .. } | Node::MsgBoundary { body, .. } => {
-                walk(body, out)
-            }
+            Node::Sub { body, .. }
+            | Node::Loop { body, .. }
+            | Node::MsgBoundary { body, .. }
+            | Node::ErrBoundary { body, .. } => walk(body, out),
             Node::SideBoundary {
                 task,
                 boundary,
@@ -749,7 +945,9 @@ pub fn work_item_elements(node: &Node) -> BTreeSet<String> {
                 out.insert(ctl.clone());
                 walk(body, out);
             }
-            Node::MsgBoundary { task, body, .. } | Node::SideBoundary { task, body, .. } => {
+            Node::MsgBoundary { task, body, .. }
+            | Node::SideBoundary { task, body, .. }
+            | Node::ErrBoundary { task, body, .. } => {
                 out.insert(task.clone());
                 walk(body, out);
             }
@@ -757,6 +955,54 @@ pub fn work_item_elements(node: &Node) -> BTreeSet<String> {
     }
     let mut out = BTreeSet::new();
     walk(node, &mut out);
+    out
+}
+
+/// Everything the driver needs about one error-boundary host, by host task id.
+#[derive(Debug, Clone)]
+pub struct ErrHost {
+    pub boundary: String,
+    pub any: Option<String>,
+    pub catch: Catch,
+    pub code: String,
+}
+
+/// Host task id -> its error boundaries. The driver's map from "an open work
+/// item turned up" to "its schedule may say to fail it instead".
+pub fn error_hosts(root: &Node) -> BTreeMap<String, ErrHost> {
+    fn walk(node: &Node, out: &mut BTreeMap<String, ErrHost>) {
+        match node {
+            Node::Task(_) => {}
+            Node::Seq(parts) | Node::Par(parts) => parts.iter().for_each(|p| walk(p, out)),
+            Node::Xor { branches, .. } => branches.iter().for_each(|b| walk(b, out)),
+            Node::Sub { body, .. }
+            | Node::Loop { body, .. }
+            | Node::MsgBoundary { body, .. }
+            | Node::SideBoundary { body, .. } => walk(body, out),
+            Node::ErrBoundary {
+                task,
+                boundary,
+                any,
+                catch,
+                code,
+                body,
+                ..
+            } => {
+                out.insert(
+                    task.clone(),
+                    ErrHost {
+                        boundary: boundary.clone(),
+                        any: any.clone(),
+                        catch: *catch,
+                        code: code.clone(),
+                    },
+                );
+                walk(body, out);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, &mut out);
     out
 }
 
@@ -781,6 +1027,12 @@ pub struct Decisions {
     /// boundary re-arms — the host is never observably without it, so there
     /// is no "it fired, that was that" to record.
     pub side: BTreeMap<String, Vec<usize>>,
+    /// Per error boundary, one outcome per activation of its host: complete,
+    /// or fail — with the host's own code, another, or none. A failure is
+    /// scheduled only where a boundary on the host takes it, at once or once
+    /// a repair diverts the host's own code into it ([`Catch::outcomes`]), so
+    /// every run still completes and the oracle has an answer for it.
+    pub fail: BTreeMap<String, Vec<HostOutcome>>,
 }
 
 /// How many deliveries one activation of a non-interrupting boundary may
@@ -816,6 +1068,80 @@ impl Decisions {
             .and_then(|s| s.get(activation))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// What `boundary`'s host does on its `n`-th activation. Past the end of
+    /// the schedule it completes — read through here by both the oracle and
+    /// the driver, like [`Self::delivers`].
+    pub fn host_outcome(&self, boundary: &str, activation: usize) -> HostOutcome {
+        self.fail
+            .get(boundary)
+            .and_then(|s| s.get(activation))
+            .copied()
+            .unwrap_or(HostOutcome::Completes)
+    }
+}
+
+/// What one activation of an error-boundary host does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HostOutcome {
+    Completes,
+    /// Fails with the host's own code — the one its coded boundary declares.
+    FailsWithItsCode,
+    /// Fails with a code no boundary declares.
+    FailsWithAnotherCode,
+    /// Fails with no code at all: the shape only a catch-all can take.
+    FailsWithNoCode,
+    /// Fails with no code on a coded-only host: nothing catches it, the
+    /// instance freezes, and a repair diverts the host's own code into its
+    /// boundary (docs/design/incident-scope.md, D5) — which must land exactly
+    /// where `FailsWithItsCode` would have.
+    FrozenThenDiverted,
+}
+
+/// Which exit of an error-boundary host an outcome takes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Taker {
+    Host,
+    /// `ErrBoundary::boundary`, whose path runs the wrapped block.
+    Boundary,
+    /// A `Both` host's catch-all.
+    CatchAll,
+}
+
+impl Catch {
+    /// The outcomes worth scheduling: a completion, and every failure some
+    /// boundary on this host takes. A coded-only host fails uncaught only as
+    /// `FrozenThenDiverted`: the incident is raised, then repaired by
+    /// diverting the host's own code, so the run still completes.
+    pub fn outcomes(self) -> &'static [HostOutcome] {
+        use HostOutcome::*;
+        match self {
+            Catch::Coded => &[Completes, FailsWithItsCode, FrozenThenDiverted],
+            Catch::All => &[Completes, FailsWithAnotherCode, FailsWithNoCode],
+            Catch::Both => &[
+                Completes,
+                FailsWithItsCode,
+                FailsWithAnotherCode,
+                FailsWithNoCode,
+            ],
+        }
+    }
+
+    /// The oracle's answer to "which boundary takes this": the exact code
+    /// before the catch-all, on one host. The driver never consults it — it
+    /// counts what the engine started — which is what makes it a prediction.
+    pub fn taker(self, outcome: HostOutcome) -> Taker {
+        match (self, outcome) {
+            (_, HostOutcome::Completes) => Taker::Host,
+            (Catch::Coded | Catch::Both, HostOutcome::FailsWithItsCode) => Taker::Boundary,
+            (Catch::Coded, HostOutcome::FrozenThenDiverted) => Taker::Boundary,
+            (Catch::All, _) => Taker::Boundary,
+            (Catch::Both, _) => Taker::CatchAll,
+            (Catch::Coded, other) => {
+                panic!("a coded-only host is never scheduled to fail with {other:?}")
+            }
+        }
     }
 }
 
@@ -857,6 +1183,19 @@ pub fn decide(root: &Node, rng: &mut Rng, max_iterations: usize) -> Decisions {
                 branches.iter().for_each(|b| walk(b, rng, max, reps, out));
             }
             Node::Sub { body, .. } => walk(body, rng, max, reps, out),
+            Node::ErrBoundary {
+                boundary,
+                catch,
+                body,
+                ..
+            } => {
+                let choices = catch.outcomes();
+                let schedule = (0..reps)
+                    .map(|_| choices[rng.below(choices.len())])
+                    .collect();
+                out.fail.insert(boundary.clone(), schedule);
+                walk(body, rng, max, reps, out);
+            }
             Node::MsgBoundary { boundary, body, .. } => {
                 let schedule = (0..reps).map(|_| rng.below(2) == 0).collect();
                 out.deliver.insert(boundary.clone(), schedule);
@@ -971,6 +1310,37 @@ pub fn expected_executions(root: &Node, dec: &Decisions) -> BTreeMap<String, usi
                     walk(body, dec, seen, out);
                 }
             }
+            // `MsgBoundary`'s race with a failure in place of the message: the
+            // host counts when it completes, and otherwise the boundary that
+            // takes the failure counts — the coded one (or a lone catch-all)
+            // with its path, or a `Both` host's catch-all with its empty one.
+            // The driver counts what the engine *started*, so a core that let
+            // the catch-all win over an exact code comes out a multiset apart.
+            Node::ErrBoundary {
+                task,
+                boundary,
+                any,
+                catch,
+                body,
+                ..
+            } => {
+                let activation = seen.entry(boundary.clone()).or_default();
+                let outcome = dec.host_outcome(boundary, *activation);
+                *activation += 1;
+                match catch.taker(outcome) {
+                    Taker::Host => *out.entry(task.clone()).or_default() += 1,
+                    Taker::Boundary => {
+                        *out.entry(boundary.clone()).or_default() += 1;
+                        walk(body, dec, seen, out);
+                    }
+                    Taker::CatchAll => {
+                        let any = any
+                            .as_ref()
+                            .expect("only a Both host has a catch-all beside");
+                        *out.entry(any.clone()).or_default() += 1;
+                    }
+                }
+            }
             Node::Loop { var, ctl, body } => {
                 for _ in 0..dec.loops.get(var).copied().unwrap_or(1) {
                     walk(body, dec, seen, out);
@@ -995,7 +1365,8 @@ fn control_tasks(root: &Node) -> BTreeMap<String, String> {
             Node::Xor { branches, .. } => branches.iter().for_each(|b| walk(b, out)),
             Node::Sub { body, .. }
             | Node::MsgBoundary { body, .. }
-            | Node::SideBoundary { body, .. } => walk(body, out),
+            | Node::SideBoundary { body, .. }
+            | Node::ErrBoundary { body, .. } => walk(body, out),
             Node::Loop { var, ctl, body } => {
                 out.insert(ctl.clone(), var.clone());
                 walk(body, out);
@@ -1005,6 +1376,113 @@ fn control_tasks(root: &Node) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     walk(root, &mut out);
     out
+}
+
+/// What the repair production did, counted from what the engine did — never
+/// from what was scheduled (docs/design/incident-scope.md, D5).
+#[derive(Debug, Default, Clone)]
+pub struct Repairs {
+    pub frozen: usize,
+    pub retried: usize,
+    pub advanced: usize,
+    pub diverted: usize,
+    /// A sibling's completion refused while the instance was frozen, with
+    /// nothing changed: `FreezeAdvancesNothing` at the core.
+    pub siblings_refused: usize,
+    /// A repair naming any incident but the open one, refused (D9).
+    pub stale_refused: usize,
+}
+
+impl Repairs {
+    pub fn add(&mut self, other: &Repairs) {
+        self.frozen += other.frozen;
+        self.retried += other.retried;
+        self.advanced += other.advanced;
+        self.diverted += other.diverted;
+        self.siblings_refused += other.siblings_refused;
+        self.stale_refused += other.stale_refused;
+    }
+}
+
+/// Fail `id` with nothing to catch it, and check the freeze: the incident is
+/// the next number this run minted, a sibling's completion is refused with
+/// nothing changed, and so is a repair naming any other incident. Returns the
+/// open incident, for the repair the caller makes.
+fn freeze_and_check(
+    proc: &ExecutableProcess,
+    state: &mut InstanceState,
+    id: WorkItemId,
+    element: &str,
+    open: &[(WorkItemId, String)],
+    tally: &mut Repairs,
+) -> Result<u64, String> {
+    let events = step(proc, state, Command::RaiseError { id, code: None })
+        .map_err(|e| format!("failing {element}: {e}"))?;
+    let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+    if state.status != InstanceStatus::Failed
+        || trace.last() != Some(&format!("incident-raised {element}"))
+    {
+        return Err(format!(
+            "failing '{element}' with nothing to catch it did not freeze the instance: {}",
+            trace.join(", ")
+        ));
+    }
+    let incident = tally.frozen as u64;
+    tally.frozen += 1;
+    if state.open_incident() != Some(incident) {
+        return Err(format!(
+            "the instance froze on incident {:?}, not {incident} — each freeze mints the next",
+            state.open_incident()
+        ));
+    }
+    let frozen = state.clone();
+    if let Some((sibling, at)) = open.iter().find(|(w, _)| *w != id) {
+        match step(
+            proc,
+            state,
+            Command::CompleteWorkItem {
+                id: *sibling,
+                patch: json!({}),
+            },
+        ) {
+            Err(StepError::InstanceNotActive(InstanceStatus::Failed)) if *state == frozen => {
+                tally.siblings_refused += 1;
+            }
+            other => {
+                return Err(format!(
+                    "completing '{at}' on an instance frozen at '{element}' answered {other:?}"
+                ));
+            }
+        }
+    }
+    // The hazard D9 exists for is the number *below* the open one: an
+    // operator's resend landing on an incident somebody already repaired,
+    // which is `release_task`'s epoch bug in another shape. A number never
+    // minted is the easy half, so it is only used where there is no lower
+    // one to name.
+    let stale = if incident > 0 {
+        incident - 1
+    } else {
+        incident + 1
+    };
+    match step(
+        proc,
+        state,
+        Command::Repair {
+            incident: stale,
+            disposition: Disposition::Retry { patch: json!({}) },
+            reason: "stale".to_string(),
+        },
+    ) {
+        Err(StepError::IncidentNotOpen { .. }) if *state == frozen => tally.stale_refused += 1,
+        other => {
+            return Err(format!(
+                "a repair of incident {stale} on an instance frozen at incident {incident} \
+                 answered {other:?}"
+            ));
+        }
+    }
+    Ok(incident)
 }
 
 pub struct Run {
@@ -1025,6 +1503,16 @@ pub struct Run {
     /// instance stays active until the side work is done, and a run in which
     /// it never happened tested the claim not at all.
     pub hosts_completed_with_side_work: usize,
+    /// Error-boundary hosts: completed, and each way a failure was taken —
+    /// counted from the boundary the engine started, so a sweep can prove
+    /// every exit happened rather than that it was scheduled.
+    pub error_hosts_completed: usize,
+    pub caught_by_code: usize,
+    /// The coded boundary took it on a host that also carried a catch-all.
+    pub exact_beat_catch_all: usize,
+    pub caught_by_catch_all_with_code: usize,
+    pub caught_by_catch_all_without_code: usize,
+    pub repairs: Repairs,
 }
 
 /// Drive the engine to completion under `dec`, acting on whichever open work
@@ -1045,6 +1533,13 @@ pub fn run(
     let controls = control_tasks(root);
     let hosts = boundary_hosts(root);
     let side_hosts = side_boundary_hosts(root);
+    let err_hosts = error_hosts(root);
+    let mut err_activations: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut error_hosts_completed, mut caught_by_code, mut exact_beat_catch_all) =
+        (0usize, 0usize, 0usize);
+    let (mut caught_by_catch_all_with_code, mut caught_by_catch_all_without_code) =
+        (0usize, 0usize);
+    let mut repairs = Repairs::default();
     // Per non-interrupting boundary: which activation of its host we are in,
     // and how many of that activation's deliveries have been made. One
     // delivery per driver step, like every other unit of work, so the
@@ -1234,6 +1729,112 @@ pub fn run(
             *progress = (progress.0 + 1, 0);
         }
 
+        // An error-boundary host: complete it, or fail it the way its schedule
+        // says. The boundary counted is the one the *engine* started — never
+        // the one the oracle expects — so precedence is tested, not assumed.
+        if let Some(host) = err_hosts.get(&element) {
+            let activation = err_activations.entry(host.boundary.clone()).or_default();
+            let outcome = dec.host_outcome(&host.boundary, *activation);
+            *activation += 1;
+            // A coded-only host's codeless failure: nothing catches it, the
+            // instance freezes, and a repair diverts the host's own code —
+            // which must land where `FailsWithItsCode` would have, walking out
+            // to the enclosing subprocess for a scoped host (D5).
+            if outcome == HostOutcome::FrozenThenDiverted {
+                let incident =
+                    freeze_and_check(proc, &mut state, id, &element, &open, &mut repairs)?;
+                let events = step(
+                    proc,
+                    &mut state,
+                    Command::Repair {
+                        incident,
+                        disposition: Disposition::Divert {
+                            code: Some(host.code.clone()),
+                        },
+                        reason: "generated".to_string(),
+                    },
+                )
+                .map_err(|e| format!("diverting {element}: {e}"))?;
+                let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+                if !trace
+                    .iter()
+                    .any(|e| *e == format!("element-started {}", host.boundary))
+                {
+                    return Err(format!(
+                        "diverting '{}' at '{element}' did not take '{}': {}",
+                        host.code,
+                        host.boundary,
+                        trace.join(", ")
+                    ));
+                }
+                repairs.diverted += 1;
+                *executions.entry(host.boundary.clone()).or_default() += 1;
+                continue;
+            }
+            if outcome != HostOutcome::Completes {
+                let code = match outcome {
+                    HostOutcome::FailsWithItsCode => Some(host.code.clone()),
+                    HostOutcome::FailsWithAnotherCode => Some(format!("{}_OTHER", host.code)),
+                    _ => None,
+                };
+                let events = step(
+                    proc,
+                    &mut state,
+                    Command::RaiseError {
+                        id,
+                        code: code.clone(),
+                    },
+                )
+                .map_err(|e| format!("failing {element}: {e}"))?;
+                let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+                if trace.iter().any(|e| e.starts_with("incident-raised")) {
+                    return Err(format!(
+                        "failing '{element}' with {code:?} raised an incident although \
+                         '{}' is on its host: {}",
+                        host.boundary,
+                        trace.join(", ")
+                    ));
+                }
+                let taken = std::iter::once(&host.boundary)
+                    .chain(host.any.iter())
+                    .find(|b| trace.iter().any(|e| *e == format!("element-started {b}")))
+                    .cloned();
+                let Some(taken) = taken else {
+                    return Err(format!(
+                        "failing '{element}' with {code:?} started none of its boundaries: {}",
+                        trace.join(", ")
+                    ));
+                };
+                if state
+                    .work_items()
+                    .find(|(w, _)| *w == id)
+                    .map(|(_, w)| w.open)
+                    != Some(false)
+                {
+                    return Err(format!(
+                        "'{element}' failed into '{taken}' but its work item is not closed"
+                    ));
+                }
+                let catch_all_took_it = match host.catch {
+                    Catch::All => true,
+                    _ => host.any.as_ref() == Some(&taken),
+                };
+                match (catch_all_took_it, code.is_some()) {
+                    (false, _) => {
+                        caught_by_code += 1;
+                        if host.any.is_some() {
+                            exact_beat_catch_all += 1;
+                        }
+                    }
+                    (true, true) => caught_by_catch_all_with_code += 1,
+                    (true, false) => caught_by_catch_all_without_code += 1,
+                }
+                *executions.entry(taken).or_default() += 1;
+                continue;
+            }
+            error_hosts_completed += 1;
+        }
+
         if let Some(boundary) = hosts.get(&element) {
             let activation = activations.entry(boundary.clone()).or_default();
             let deliver = dec.delivers(boundary, *activation);
@@ -1295,6 +1896,45 @@ pub fn run(
             hosts_completed += 1;
         }
 
+        // A plain task: now and then it fails with nothing to catch it, the
+        // instance freezes, and a repair brings it back — Retry or Advance,
+        // the two whose outcome the oracle already predicts (D5). A retried
+        // task is completed later like any other, so this step completes
+        // nothing; an advanced one counts as completed here.
+        let plain = !hosts.contains_key(&element)
+            && !side_hosts.contains_key(&element)
+            && !err_hosts.contains_key(&element);
+        let repair = plain && rng.below(4) == 0;
+        if repair && rng.below(2) == 0 {
+            let incident = freeze_and_check(proc, &mut state, id, &element, &open, &mut repairs)?;
+            let events = step(
+                proc,
+                &mut state,
+                Command::Repair {
+                    incident,
+                    disposition: Disposition::Retry { patch: json!({}) },
+                    reason: "generated".to_string(),
+                },
+            )
+            .map_err(|e| format!("retrying {element}: {e}"))?;
+            let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+            // A new item, not merely another open one at the same element:
+            // two side tokens can both be waiting at one task.
+            let reopened = state.open_work_items().any(|(w, item)| {
+                proc.node_id(item.element) == element && !open.iter().any(|(o, _)| *o == w)
+            });
+            if trace.first() != Some(&format!("incident-repaired {element} retry"))
+                || !reopened
+                || state.status != InstanceStatus::Active
+            {
+                return Err(format!(
+                    "retrying '{element}' did not open it again on an active instance: {}",
+                    trace.join(", ")
+                ));
+            }
+            repairs.retried += 1;
+            continue;
+        }
         let patch = match controls.get(&element) {
             None => json!({}),
             Some(var) => {
@@ -1311,8 +1951,37 @@ pub fn run(
             }
         };
         *executions.entry(element.clone()).or_default() += 1;
-        let events = step(proc, &mut state, Command::CompleteWorkItem { id, patch })
-            .map_err(|e| format!("completing {element}: {e}"))?;
+        let events = if repair {
+            let incident = freeze_and_check(proc, &mut state, id, &element, &open, &mut repairs)?;
+            let events = step(
+                proc,
+                &mut state,
+                Command::Repair {
+                    incident,
+                    disposition: Disposition::Advance {
+                        patch,
+                        answer: None,
+                    },
+                    reason: "generated".to_string(),
+                },
+            )
+            .map_err(|e| format!("advancing {element}: {e}"))?;
+            let trace: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+            if trace.first() != Some(&format!("incident-repaired {element} advance"))
+                || !trace.contains(&format!("element-completed {element}"))
+                || state.status == InstanceStatus::Failed
+            {
+                return Err(format!(
+                    "advancing '{element}' did not complete it: {}",
+                    trace.join(", ")
+                ));
+            }
+            repairs.advanced += 1;
+            events
+        } else {
+            step(proc, &mut state, Command::CompleteWorkItem { id, patch })
+                .map_err(|e| format!("completing {element}: {e}"))?
+        };
 
         if let Some(host) = side_hosts.get(&element) {
             // The arm goes with the host, and only the arm: side tokens
@@ -1358,5 +2027,11 @@ pub fn run(
         hosts_completed,
         side_deliveries,
         hosts_completed_with_side_work,
+        error_hosts_completed,
+        caught_by_code,
+        exact_beat_catch_all,
+        caught_by_catch_all_with_code,
+        caught_by_catch_all_without_code,
+        repairs,
     })
 }

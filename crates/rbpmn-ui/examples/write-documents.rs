@@ -9,7 +9,10 @@
 //! one needs a database. It is enough to see the layout, the diagnosis line
 //! and the manifest pane.
 
-use rbpmn_engine::{Bindings, EventView, InstanceInspection, TokenView, WorkItemView};
+use rbpmn_engine::{
+    Bindings, CaughtCode, EventView, InstanceInspection, OpenIncident, RepairKind, RepairOption,
+    Takes, TokenView, WorkItemView,
+};
 use std::path::PathBuf;
 
 fn main() -> std::io::Result<()> {
@@ -68,6 +71,38 @@ fn sample() -> InstanceInspection {
                 "st",
                 serde_json::json!({ "gateway": "acquirer-a", "capture": "auto" }),
             ),
+        incident: Some(OpenIncident {
+            incident: 0,
+            element: "st".to_string(),
+            resume: "st".to_string(),
+            halted: 0,
+            options: [
+                (RepairKind::Retry, Takes::Patch, Vec::new()),
+                (RepairKind::Advance, Takes::Patch, Vec::new()),
+                // `be` catches PAYMENT_FAILED on `st` itself, so a Divert
+                // naming it stays inside the instance: nothing is torn down,
+                // and the recovery path picks the token up.
+                (
+                    RepairKind::Divert,
+                    Takes::Code,
+                    vec![CaughtCode {
+                        code: Some("PAYMENT_FAILED".to_string()),
+                        caught_at: "be".to_string(),
+                        tears_down: None,
+                    }],
+                ),
+                (RepairKind::Abandon, Takes::Nothing, Vec::new()),
+                (RepairKind::AbandonInstance, Takes::Nothing, Vec::new()),
+            ]
+            .into_iter()
+            .map(|(disposition, takes, codes)| RepairOption {
+                disposition,
+                takes,
+                codes,
+                refused: None,
+            })
+            .collect(),
+        }),
         tokens: vec![TokenView {
             element_id: "st".to_string(),
             wait_kind: "incident".to_string(),

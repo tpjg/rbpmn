@@ -35,12 +35,20 @@
 //! (`docs/design/boundary-messages.md` §3.5).
 //! `the_side_boundary_production_delivers_none_once_and_twice` is its
 //! non-vacuity guard.
+//!
+//! `ErrBoundary` (error boundaries on a service task) makes (b) a test of
+//! *which* boundary takes a failure: a host carries one for its own code, a
+//! catch-all, or both, and fails with its own code, another, or none. The
+//! oracle predicts the taker — the exact code before the catch-all, on one
+//! host — and the driver counts the boundary the engine actually started, so
+//! a core that let the catch-all win comes out a multiset apart.
+//! `the_error_boundary_production_takes_every_exit` is its non-vacuity guard.
 
 mod modelgen;
 
 use modelgen::{
-    Block, Decisions, Rng, boundary_hosts, build, decide, expected_executions, run,
-    side_boundary_hosts,
+    Block, Catch, Decisions, HostOutcome, Repairs, Rng, boundary_hosts, build, decide, error_hosts,
+    expected_executions, run, side_boundary_hosts,
 };
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
@@ -51,6 +59,30 @@ use std::collections::BTreeMap;
 /// The grammar minus every boundary — what a side path may hold *inside a
 /// scope of its own*. See [`side_body`] for the two things a side path cannot
 /// hold directly, and why.
+/// An error-boundary host around `inner`: a random choice of which boundaries
+/// it carries, and whether they sit one scope out.
+fn err_boundary(inner: impl Strategy<Value = Block>) -> impl Strategy<Value = Block> {
+    (
+        prop_oneof![Just(Catch::Coded), Just(Catch::All), Just(Catch::Both)],
+        any::<bool>(),
+        inner,
+    )
+        .prop_map(|(catch, scoped, body)| Block::ErrBoundary {
+            catch,
+            scoped,
+            body: Box::new(body),
+        })
+}
+
+/// The same, written out: for the hand-made shapes and oracle cases below.
+fn err(catch: Catch, scoped: bool, body: Block) -> Block {
+    Block::ErrBoundary {
+        catch,
+        scoped,
+        body: Box::new(body),
+    }
+}
+
 fn plain_block() -> impl Strategy<Value = Block> {
     let leaf = Just(Block::Task);
     leaf.prop_recursive(3, 16, 3, |inner| {
@@ -91,12 +123,16 @@ fn plain_block() -> impl Strategy<Value = Block> {
 /// Everything else composes freely and is generated: a loop on a side path
 /// really does run twice over, and the driver's loop budget is a count of
 /// *completions* precisely so that it still totals what the oracle predicts.
+/// An error boundary is generated here too. It is not an arm — nothing is
+/// subscribed; it is matched when its host fails — and a catch-all on a side
+/// path is the very shape the incident-scope round was about.
 fn side_body() -> impl Strategy<Value = Block> {
     let leaf = Just(Block::Task);
     leaf.prop_recursive(3, 16, 3, |inner| {
         prop_oneof![
             2 => prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Seq),
             2 => prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Xor),
+            1 => err_boundary(inner.clone()),
             1 => inner.prop_map(|b| Block::Loop(Box::new(b))),
             2 => plain_block().prop_map(|b| Block::Sub(Box::new(b))),
         ]
@@ -115,6 +151,7 @@ fn any_block() -> impl Strategy<Value = Block> {
             2 => prop::collection::vec(inner.clone(), 2..4).prop_map(Block::Par),
             1 => inner.clone().prop_map(|b| Block::Loop(Box::new(b))),
             1 => inner.clone().prop_map(|b| Block::Sub(Box::new(b))),
+            1 => err_boundary(inner.clone()),
             1 => inner.prop_map(|b| Block::MsgBoundary(Box::new(b))),
             1 => side_body().prop_map(|b| Block::SideBoundary(Box::new(b))),
         ]
@@ -132,6 +169,7 @@ fn any_block_wide() -> impl Strategy<Value = Block> {
             2 => prop::collection::vec(inner.clone(), 2..7).prop_map(Block::Par),
             1 => inner.clone().prop_map(|b| Block::Loop(Box::new(b))),
             1 => inner.clone().prop_map(|b| Block::Sub(Box::new(b))),
+            1 => err_boundary(inner.clone()),
             1 => inner.prop_map(|b| Block::MsgBoundary(Box::new(b))),
             1 => side_body().prop_map(|b| Block::SideBoundary(Box::new(b))),
         ]
@@ -151,6 +189,22 @@ fn compile(xml: &str, bindings: &Bindings) -> Result<ExecutableProcess, String> 
 /// straight into the playground.
 fn report(context: &str, block: &Block, xml: &str, detail: &str) -> String {
     format!("{context}\n  block: {block:?}\n  detail: {detail}\n--- model ---\n{xml}")
+}
+
+/// What a generated model must not produce: every diagnostic, bar one rule.
+///
+/// "A warning on a textbook model means the rule fires on something it
+/// should not" holds for every structural rule, and `side-path-failure-escapes`
+/// is not one. It is advisory about failure containment and fires on textbook
+/// models by design — on any side path running a task with no catch-all,
+/// which this generator's side paths do whenever they run a task
+/// (`docs/design/incident-scope.md`, D2). Where it lands, and where it must
+/// not, is pinned by the fixture corpus instead.
+fn unexpected(diagnostics: &[rbpmn_model::Diagnostic]) -> Vec<&rbpmn_model::Diagnostic> {
+    diagnostics
+        .iter()
+        .filter(|d| d.rule != rbpmn_model::rule::SIDE_PATH_FAILURE_ESCAPES)
+        .collect()
 }
 
 /// proptest reads `PROPTEST_CASES` only into `ProptestConfig::default()`; a
@@ -178,7 +232,7 @@ proptest! {
             .map_err(|e| report("generated XML did not parse", &block, &g.xml, &e.to_string()))
             .unwrap();
         prop_assert!(
-            checked.diagnostics.is_empty(),
+            unexpected(&checked.diagnostics).is_empty(),
             "{}",
             report(
                 "generated model is not lint-clean",
@@ -221,8 +275,12 @@ proptest! {
             // Every driver step is exactly one unit of work — a work item
             // completed, or a message delivered to a boundary — so the step
             // count must equal the total executions: a guard against a run
-            // that silently did nothing.
-            prop_assert_eq!(actual.steps, expected.values().sum::<usize>());
+            // that silently did nothing. A Retry is the one step that
+            // completes nothing: its task is completed later, and counted then.
+            prop_assert_eq!(
+                actual.steps,
+                expected.values().sum::<usize>() + actual.repairs.retried
+            );
             prop_assert_eq!(
                 &actual.executions,
                 &expected,
@@ -462,13 +520,55 @@ fn known_shapes_lint_clean_and_match_the_oracle() {
             "non-interrupting boundary on the handler of an interrupting one",
             Block::MsgBoundary(Box::new(Block::SideBoundary(Box::new(Block::Task)))),
         ),
+        // Error boundaries: each set a host can carry, on the host and one
+        // scope out, and in the positions that compose with them.
+        (
+            "coded error boundary",
+            err(Catch::Coded, false, Block::Task),
+        ),
+        (
+            "catch-all error boundary",
+            err(Catch::All, false, Block::Task),
+        ),
+        (
+            "coded and catch-all on one host",
+            err(Catch::Both, false, Block::Task),
+        ),
+        (
+            "catch-all one scope out",
+            err(Catch::All, true, Block::Task),
+        ),
+        (
+            "coded and catch-all one scope out, around a sequence",
+            err(
+                Catch::Both,
+                true,
+                Block::Seq(vec![Block::Task, Block::Task]),
+            ),
+        ),
+        (
+            "empty error-boundary path",
+            err(Catch::Coded, false, Block::Seq(vec![])),
+        ),
+        (
+            "error boundary in a parallel branch",
+            Block::Par(vec![err(Catch::Both, false, Block::Task), Block::Task]),
+        ),
+        (
+            "loop around an error boundary one scope out",
+            Block::Loop(Box::new(err(Catch::All, true, Block::Task))),
+        ),
+        (
+            "catch-all on a side path",
+            Block::SideBoundary(Box::new(err(Catch::All, false, Block::Task))),
+        ),
     ];
 
     for (name, block) in shapes {
         let g = build(&block);
         let checked = rbpmn_model::check(&g.xml).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
         assert!(
-            checked.diagnostics.is_empty(),
+            unexpected(&checked.diagnostics).is_empty(),
             "{}",
             report(
                 &format!("{name}: not lint-clean"),
@@ -500,7 +600,7 @@ fn known_shapes_lint_clean_and_match_the_oracle() {
             );
             assert_eq!(
                 actual.steps,
-                expected.values().sum::<usize>(),
+                expected.values().sum::<usize>() + actual.repairs.retried,
                 "{name} (seed {seed})"
             );
             assert_eq!(
@@ -539,6 +639,7 @@ fn the_oracle_itself_is_right() {
                 loops: Default::default(),
                 deliver: Default::default(),
                 side: Default::default(),
+                fail: Default::default(),
             },
             vec![("t1", 1)],
         ),
@@ -549,6 +650,7 @@ fn the_oracle_itself_is_right() {
                 loops: Default::default(),
                 deliver: Default::default(),
                 side: Default::default(),
+                fail: Default::default(),
             },
             vec![("t2", 1)],
         ),
@@ -560,6 +662,7 @@ fn the_oracle_itself_is_right() {
                 loops: [("l1".to_string(), 3)].into(),
                 deliver: Default::default(),
                 side: Default::default(),
+                fail: Default::default(),
             },
             vec![("t2", 3), ("lctl1", 3)],
         ),
@@ -579,6 +682,7 @@ fn the_oracle_itself_is_right() {
                 loops: Default::default(),
                 deliver: [("b1".to_string(), vec![true])].into(),
                 side: Default::default(),
+                fail: Default::default(),
             },
             vec![("b1", 1), ("t2", 1)],
         ),
@@ -591,6 +695,7 @@ fn the_oracle_itself_is_right() {
                 loops: [("l1".to_string(), 2)].into(),
                 deliver: [("b1".to_string(), vec![true, false])].into(),
                 side: Default::default(),
+                fail: Default::default(),
             },
             vec![("b1", 1), ("t3", 1), ("t2", 1), ("lctl1", 2)],
         ),
@@ -613,6 +718,7 @@ fn the_oracle_itself_is_right() {
                 loops: Default::default(),
                 deliver: Default::default(),
                 side: [("b1".to_string(), vec![1])].into(),
+                fail: Default::default(),
             },
             vec![("t1", 1), ("b1", 1), ("t2", 1)],
         ),
@@ -626,6 +732,7 @@ fn the_oracle_itself_is_right() {
                 loops: Default::default(),
                 deliver: Default::default(),
                 side: [("b1".to_string(), vec![2])].into(),
+                fail: Default::default(),
             },
             vec![("t1", 1), ("b1", 2), ("t2", 2)],
         ),
@@ -639,8 +746,41 @@ fn the_oracle_itself_is_right() {
                 loops: [("l1".to_string(), 2)].into(),
                 deliver: Default::default(),
                 side: [("b1".to_string(), vec![2, 0])].into(),
+                fail: Default::default(),
             },
             vec![("t2", 2), ("b1", 2), ("t3", 2), ("lctl1", 2)],
+        ),
+        // Error boundaries: the host counts when it completes; otherwise the
+        // boundary that takes the failure does, and only the coded one (or a
+        // lone catch-all) runs the wrapped block.
+        (
+            err(Catch::Coded, false, Block::Task),
+            Decisions::default(),
+            vec![("t1", 1)],
+        ),
+        (
+            err(Catch::Both, false, Block::Task),
+            Decisions {
+                fail: [("b1".to_string(), vec![HostOutcome::FailsWithItsCode])].into(),
+                ..Decisions::default()
+            },
+            vec![("b1", 1), ("t2", 1)],
+        ),
+        (
+            err(Catch::Both, false, Block::Task),
+            Decisions {
+                fail: [("b1".to_string(), vec![HostOutcome::FailsWithNoCode])].into(),
+                ..Decisions::default()
+            },
+            vec![("b1_any", 1)],
+        ),
+        (
+            err(Catch::All, true, Block::Task),
+            Decisions {
+                fail: [("b1".to_string(), vec![HostOutcome::FailsWithAnotherCode])].into(),
+                ..Decisions::default()
+            },
+            vec![("b1", 1), ("t2", 1)],
         ),
     ];
 
@@ -680,6 +820,17 @@ struct Sweep {
     side_boundaries: usize,
     side_histogram: BTreeMap<usize, usize>,
     side_with_open_work: usize,
+    /// Error-boundary hosts: models that carried one, and each exit taken —
+    /// counted from the boundary the engine started.
+    with_error: usize,
+    error_hosts_completed: usize,
+    caught_by_code: usize,
+    exact_beat_catch_all: usize,
+    caught_by_catch_all_with_code: usize,
+    caught_by_catch_all_without_code: usize,
+    /// Repairs: each one the production makes, counted from what the engine
+    /// did.
+    repairs: Repairs,
 }
 
 /// Deterministic on purpose — `TestRunner::deterministic()` and the seeded
@@ -704,7 +855,7 @@ fn sweep(models: usize, rounds: u64) -> Sweep {
         let checked =
             rbpmn_model::check(&g.xml).unwrap_or_else(|e| panic!("model {i}: parse: {e}"));
         assert!(
-            checked.diagnostics.is_empty(),
+            unexpected(&checked.diagnostics).is_empty(),
             "{}",
             report(
                 &format!("model {i}: not lint-clean"),
@@ -732,6 +883,9 @@ fn sweep(models: usize, rounds: u64) -> Sweep {
             sw.with_side += 1;
             sw.side_boundaries += side.len();
         }
+        if !error_hosts(&g.root).is_empty() {
+            sw.with_error += 1;
+        }
 
         let proc = compile(&g.xml, &g.bindings).unwrap_or_else(|e| panic!("model {i}: {e}"));
         for round in 0..rounds {
@@ -742,7 +896,11 @@ fn sweep(models: usize, rounds: u64) -> Sweep {
                 .unwrap_or_else(|e| panic!("{}", report("driving failed", &block, &g.xml, &e)));
 
             assert_eq!(actual.status, InstanceStatus::Completed, "model {i}");
-            assert_eq!(actual.steps, expected.values().sum::<usize>(), "model {i}");
+            assert_eq!(
+                actual.steps,
+                expected.values().sum::<usize>() + actual.repairs.retried,
+                "model {i}"
+            );
             assert_eq!(
                 actual.executions,
                 expected,
@@ -760,6 +918,12 @@ fn sweep(models: usize, rounds: u64) -> Sweep {
                 *sw.side_histogram.entry(n).or_default() += 1;
             }
             sw.side_with_open_work += actual.hosts_completed_with_side_work;
+            sw.error_hosts_completed += actual.error_hosts_completed;
+            sw.caught_by_code += actual.caught_by_code;
+            sw.exact_beat_catch_all += actual.exact_beat_catch_all;
+            sw.caught_by_catch_all_with_code += actual.caught_by_catch_all_with_code;
+            sw.caught_by_catch_all_without_code += actual.caught_by_catch_all_without_code;
+            sw.repairs.add(&actual.repairs);
         }
     }
     sw
@@ -859,6 +1023,102 @@ fn the_side_boundary_production_delivers_none_once_and_twice() {
     );
 }
 
+/// **Non-vacuity for the error boundary.** Every exit must be taken: a host
+/// completing, a failure its coded boundary takes, the exact code winning over
+/// a catch-all on the same host, and a catch-all taking a failure with a code
+/// and one without. Counted from what the engine started, so each is an
+/// observation rather than a schedule.
+#[test]
+fn the_error_boundary_production_takes_every_exit() {
+    let sw = sweep(200, 4);
+    println!(
+        "{}/{} generated models carried an error-boundary host; across {} runs hosts \
+         completed {} times, coded boundaries took {} failures ({} beside a \
+         catch-all), and catch-alls took {} with a code and {} without",
+        sw.with_error,
+        sw.models,
+        sw.runs,
+        sw.error_hosts_completed,
+        sw.caught_by_code,
+        sw.exact_beat_catch_all,
+        sw.caught_by_catch_all_with_code,
+        sw.caught_by_catch_all_without_code
+    );
+    for (count, what) in [
+        (
+            sw.with_error,
+            "no generated model carried an error-boundary host",
+        ),
+        (
+            sw.error_hosts_completed,
+            "no error-boundary host ever completed",
+        ),
+        (
+            sw.caught_by_code,
+            "no failure was ever taken by a coded boundary",
+        ),
+        (
+            sw.exact_beat_catch_all,
+            "no exact code ever won over a catch-all on the same host",
+        ),
+        (
+            sw.caught_by_catch_all_with_code,
+            "no catch-all ever took a failure that carried a code",
+        ),
+        (
+            sw.caught_by_catch_all_without_code,
+            "no catch-all ever took a failure without a code",
+        ),
+    ] {
+        assert!(
+            count > 0,
+            "{what} in {} runs — that exit went untested",
+            sw.runs
+        );
+    }
+}
+
+/// **Non-vacuity for repair** (docs/design/incident-scope.md, D5). Every repair
+/// the production makes must land somewhere in the sweep: a plain task retried
+/// and advanced, a coded-only host's codeless failure diverted into its own
+/// boundary — and along the way a frozen instance must have refused a
+/// sibling's completion and a stale repair. Counted from what the engine did;
+/// the oracle comparison above is what says each one landed *right*.
+#[test]
+fn the_repair_production_takes_every_repair() {
+    let sw = sweep(200, 4);
+    let r = &sw.repairs;
+    println!(
+        "across {} runs the instance froze {} times: {} retried, {} advanced, {} \
+         diverted; frozen, it refused {} sibling completions and {} stale repairs",
+        sw.runs, r.frozen, r.retried, r.advanced, r.diverted, r.siblings_refused, r.stale_refused
+    );
+    for (count, what) in [
+        (r.retried, "no frozen task was ever retried"),
+        (r.advanced, "no frozen task was ever advanced"),
+        (
+            r.diverted,
+            "no codeless failure was ever diverted into its boundary",
+        ),
+        (
+            r.siblings_refused,
+            "no sibling's completion was ever tried on a frozen instance",
+        ),
+        (r.stale_refused, "no stale repair was ever tried"),
+    ] {
+        assert!(
+            count > 0,
+            "{what} in {} runs — that repair went untested",
+            sw.runs
+        );
+    }
+    assert_eq!(
+        r.frozen,
+        r.retried + r.advanced + r.diverted,
+        "every freeze is repaired, once"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(128), ..ProptestConfig::default() })]
 
@@ -872,7 +1132,7 @@ proptest! {
             .map_err(|e| report("generated XML did not parse", &block, &g.xml, &e.to_string()))
             .unwrap();
         prop_assert!(
-            checked.diagnostics.is_empty(),
+            unexpected(&checked.diagnostics).is_empty(),
             "{}",
             report(
                 "wide model is not lint-clean",

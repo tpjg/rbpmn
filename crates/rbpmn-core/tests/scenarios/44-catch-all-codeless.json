@@ -1,0 +1,35 @@
+{
+  "fixture": "accept/44-catch-all-error-boundary.bpmn",
+  "actions": [
+    {
+      "fail": "st"
+    },
+    {
+      "complete": "th"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started st",
+      "work-item-created st service st",
+      "work-item-failed st",
+      "element-started be",
+      "element-completed be",
+      "flow-taken f3",
+      "element-started th",
+      "work-item-created th user th",
+      "work-item-completed th",
+      "element-completed th",
+      "flow-taken f4",
+      "element-started e2",
+      "element-completed e2",
+      "instance-completed"
+    ]
+  }
+}

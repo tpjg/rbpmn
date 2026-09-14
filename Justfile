@@ -160,12 +160,14 @@ parity: wasm
 # on a developer's machine and would make past hold/fail verdicts
 # irreproducible. To move to a new TLA+ release, bump both constants — the
 # recipe refuses to run on a mismatch rather than trusting the download.
-# Eight of the thirteen configs are EXPECTED to fail — they are the
+# Seventeen of the twenty-seven configs are EXPECTED to fail — they are the
 # counterexamples that show the checks have teeth, and three of them
 # reproduce bugs that were real (the AB/BA timer-claim sketch, the phase-6
 # scope teardown that left a timer row behind, and release_task guarded by
 # owner alone, which shipped and which a review caught before the model
 # could — the model had no notion of a retried request to catch it with).
+# One more prices a design decision rather than a bug: LeaseSiblings_Stranded,
+# the instance-wide freeze stranding a sibling.
 tla:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -231,6 +233,25 @@ tla:
     # A cancelled item (interrupting boundary, terminate, teardown) is the
     # second terminal state the lease configs reach; same -deadlock reason.
     check "lease: completing a cancelled item"      Lease_CancelIgnoresGuard.cfg Lease.tla fail "Action property NoCompletionAfterCancel is violated" -deadlock
+    # Two items on one instance: the lease above, instantiated twice and
+    # sharing the instance's status. -deadlock for the lease reason, and
+    # because a frozen instance is terminal here — the model has no repair.
+    # The failing config is not a bug: it prices the instance-wide freeze
+    # (docs/design/incident-scope.md, D3).
+    check "lease siblings: stranded only while frozen" LeaseSiblings.cfg          LeaseSiblings.tla hold "" -deadlock
+    check "lease siblings: the freeze strands a sibling"        LeaseSiblings_Stranded.cfg LeaseSiblings.tla fail "Invariant SiblingNeverStranded is violated" -deadlock
+    check "lease siblings: a caught failure is reached"         LeaseSiblings_CaughtIsReachable.cfg LeaseSiblings.tla fail "Invariant NoFailureWasCaught is violated" -deadlock
+    # Repair, the one transition out of a frozen instance. -deadlock for the
+    # lease reason, and because a terminated instance and a spent incident
+    # bound are terminal. The failing configs: a request landing on an
+    # incident it did not name (the resend), and a thaw shown reached.
+    check "repair: lands only on the incident it named"      Repair.cfg                   Repair.tla hold "" -deadlock
+    check "repair: without its incident check"               Repair_UncheckedIncident.cfg Repair.tla fail "Action property RepairLandsOnlyOnTheIncidentItNamed is violated" -deadlock
+    check "repair: a stranded sibling completes after a thaw" Repair_ThawIsReachable.cfg  Repair.tla fail "Invariant NoStrandedSiblingCompletes is violated" -deadlock
+    # A repair moves the timers the freeze kept (D8); the claim's re-check of
+    # due_at is what keeps a moved one from firing early.
+    check "repair clock: a moved timer fires on time"        RepairClock.cfg              RepairClock.tla hold "" -deadlock
+    check "repair clock: re-check without due_at"            RepairClock_NoDueRecheck.cfg RepairClock.tla fail "Invariant NeverFiresEarly is violated" -deadlock
     # -deadlock: a terminal state is legitimate here (everything torn down,
     # nothing armed). Deadlock freedom is a property under test only for
     # LockOrder, where the flag is deliberately absent.

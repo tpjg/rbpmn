@@ -1,0 +1,49 @@
+{
+  "fixture": "accept/47-side-path-user-task-wrapped.bpmn",
+  "actions": [
+    {
+      "fire": "remind"
+    },
+    {
+      "fail": "acknowledge"
+    },
+    {
+      "complete": "review"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started review",
+      "work-item-created review user review",
+      "timer-armed remind PT1H",
+      "timer-fired remind",
+      "element-started remind",
+      "element-completed remind",
+      "flow-taken f3",
+      "element-started follow_up",
+      "element-started fu_start",
+      "element-completed fu_start",
+      "flow-taken fi1",
+      "element-started acknowledge",
+      "work-item-created acknowledge user acknowledge",
+      "work-item-failed acknowledge",
+      "element-started follow_up_failed",
+      "element-completed follow_up_failed",
+      "flow-taken f5",
+      "element-started not_followed_up",
+      "element-completed not_followed_up",
+      "work-item-completed review",
+      "element-completed review",
+      "flow-taken f2",
+      "element-started reviewed",
+      "element-completed reviewed",
+      "instance-completed"
+    ]
+  }
+}

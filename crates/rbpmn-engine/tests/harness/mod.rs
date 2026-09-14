@@ -5,7 +5,9 @@
 // Shared by several test binaries; each uses a different part.
 #![allow(dead_code)]
 
-use rbpmn_core::{Command, Event, ExecutableProcess, InstanceState, InstanceStatus};
+use rbpmn_core::{
+    Command, Disposition, Event, ExecutableProcess, InstanceState, InstanceStatus, RepairKind,
+};
 use rbpmn_engine::Engine;
 use sqlx::{PgPool, Row};
 use std::fs;
@@ -155,13 +157,32 @@ const FSCK: &[(&str, &str)] = &[
          where t.scope_no <> 0 and s.scope_no is null",
     ),
     (
-        // At least one, not exactly one: the freeze parks every token that
-        // was still in flight (a parallel sibling mid-advance) as an
-        // incident too, so token conservation survives the freeze.
+        // Every freeze parks its cause at an incident, and whatever else it
+        // stopped is halted (docs/design/incident-scope.md, D6–D7). This and
+        // the next two are that sentence, one direction each.
         "a failed instance is not frozen at an incident token",
         "select i.id::text from rbpmn_instance i where i.status = 'failed' \
            and not exists (select 1 from rbpmn_token t \
                 where t.instance_id = i.id and t.wait_kind = 'incident')",
+    ),
+    (
+        // D8: the freeze's clock, set by every freeze and cleared by the
+        // step that leaves it.
+        "an instance's frozen_at disagrees with its status",
+        "select id::text from rbpmn_instance \
+         where (status = 'failed') <> (frozen_at is not null)",
+    ),
+    (
+        "an instance holds more than one incident token",
+        "select instance_id::text from rbpmn_token where wait_kind = 'incident' \
+         group by instance_id having count(*) > 1",
+    ),
+    (
+        "an instance that is not frozen holds an incident or halted token",
+        "select t.instance_id::text from rbpmn_token t \
+         join rbpmn_instance i on i.id = t.instance_id \
+         where t.wait_kind in ('incident', 'halted', 'halted_decision') \
+           and i.status <> 'failed'",
     ),
     (
         "a work item is locked without a live lease or an owner",
@@ -249,7 +270,7 @@ pub async fn core_events(pool: &PgPool, instance: Uuid) -> Vec<Event> {
 }
 
 /// Reconstruct the command sequence from the history. Most events are
-/// consequences; only these four are stimuli the outside world supplied. A
+/// consequences; only these five are stimuli the outside world supplied. A
 /// `variables-patched` immediately following its trigger carries that
 /// command's merge patch — `step` emits them adjacently.
 ///
@@ -283,6 +304,32 @@ pub fn commands_from(events: &[Event]) -> Vec<Command> {
             Event::MessageReceived { id, .. } => commands.push(Command::DeliverMessage {
                 id: *id,
                 patch: patch_after(i),
+            }),
+            // A repair names its incident and disposition in its own event;
+            // a patch it applied is the `variables-patched` right after it,
+            // as for every command (docs/design/incident-scope.md, D4).
+            Event::IncidentRepaired {
+                incident,
+                disposition,
+                code,
+                answer,
+                reason,
+                ..
+            } => commands.push(Command::Repair {
+                incident: *incident,
+                disposition: match disposition {
+                    RepairKind::Retry => Disposition::Retry {
+                        patch: patch_after(i),
+                    },
+                    RepairKind::Advance => Disposition::Advance {
+                        patch: patch_after(i),
+                        answer: answer.clone(),
+                    },
+                    RepairKind::Divert => Disposition::Divert { code: code.clone() },
+                    RepairKind::Abandon => Disposition::Abandon,
+                    RepairKind::AbandonInstance => Disposition::AbandonInstance,
+                },
+                reason: reason.clone(),
             }),
             Event::DecisionEvaluated { element, .. } => panic!(
                 "replay cannot reconstruct the decision at {element:?}: a decision's \

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
+  warn side-path-failure-escapes @ nudge
 -->
 <!-- "Nudge on the next two Mondays at midnight, Amsterdam time." The anchor
      fixes the *phase*, not a set of instants: the first due is the first

@@ -11,7 +11,10 @@
 //! round-trip assertions exist to prove exactly that — the document shows the
 //! operator the real value, byte for byte, without it becoming markup.
 
-use rbpmn_engine::{EventView, InstanceInspection, TokenView, WorkItemView};
+use rbpmn_engine::{
+    CaughtCode, EventView, InstanceInspection, OpenIncident, RepairKind, RepairOption, Takes,
+    TokenView, WorkItemView,
+};
 use rbpmn_ui::testing::{empty_inspection, sha256_base64};
 use rbpmn_ui::{render_editor, render_inspection};
 
@@ -187,6 +190,35 @@ fn hostile_data_cannot_escape_the_data_block() {
             // reaches the document the same way `display` does.
             detail: Some((*hostile).to_string()),
         }];
+        // The open incident names elements, and an element id comes from the
+        // model — so it is hostile input by the same route as every other
+        // string here (docs/design/incident-scope.md, D10).
+        inspection.incident = Some(OpenIncident {
+            incident: 0,
+            element: (*hostile).to_string(),
+            resume: (*hostile).to_string(),
+            halted: 0,
+            options: vec![
+                RepairOption {
+                    disposition: RepairKind::Retry,
+                    takes: Takes::Patch,
+                    codes: Vec::new(),
+                    refused: None,
+                },
+                // A Divert names elements and error codes, both of them
+                // strings out of the model, so both are hostile here.
+                RepairOption {
+                    disposition: RepairKind::Divert,
+                    takes: Takes::Code,
+                    codes: vec![CaughtCode {
+                        code: Some((*hostile).to_string()),
+                        caught_at: (*hostile).to_string(),
+                        tears_down: Some((*hostile).to_string()),
+                    }],
+                    refused: None,
+                },
+            ],
+        });
 
         let html = render_inspection(&inspection);
 

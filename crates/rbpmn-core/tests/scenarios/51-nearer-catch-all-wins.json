@@ -1,0 +1,36 @@
+{
+  "fixture": "accept/51-nearer-catch-all-beats-farther-code.bpmn",
+  "actions": [
+    {
+      "fail": "st",
+      "code": "CODE_X"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started sp",
+      "element-started s_start",
+      "element-completed s_start",
+      "flow-taken fi1",
+      "element-started st",
+      "work-item-created st service st",
+      "work-item-failed st CODE_X",
+      "element-started st_any",
+      "element-completed st_any",
+      "flow-taken fi3",
+      "element-started handled_inside",
+      "element-completed handled_inside",
+      "element-completed sp",
+      "flow-taken f2",
+      "element-started done",
+      "element-completed done",
+      "instance-completed"
+    ]
+  }
+}

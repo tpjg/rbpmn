@@ -200,6 +200,26 @@ counterexample in `tests/mutation.rs`; the generator's side-path body emits
 `Par` only under a `Sub` and carries no message arm, which is the rule as
 lint now states it.
 
+`ErrBoundary` — error boundaries on a service task, coded, catch-all, or
+both on one host — makes (b) a test of *which* boundary takes a failure. The
+driver completes the host or fails it with its own code, another, or none,
+scheduling only failures some boundary will take so every run still
+completes; the oracle predicts the taker (the exact code before the
+catch-all, on one host), and the driver counts the boundary the engine
+actually started. With `scoped`, the boundaries sit on a one-task subprocess
+around the host, so the failure walks outward one scope and tears it down
+first. The scope holds the host alone because a failure beside concurrent
+work cancels it, and how much had run is the interleaving's to decide — no
+count-based oracle can predict that, so that case is the explorer's, over the
+corpus and every declared code. On the day it landed it found the explorer's
+side-path closure following sequence flows only: a side token a catch-all
+takes lands on a path the saturation count never saw, and a re-arming
+boundary was offered delivery after delivery without end. The closure now
+follows boundary pseudo-edges too — the linter's own `boundary-side-path`
+definition. Storm and chaos carry the catch-all as well —
+fixture 46's contained side path, failing with a code and without — and
+assert each shape was taken, one catch per failure.
+
 Not yet generated, and why: error and timer boundaries (single-shot or
 `timeCycle`), and `EventGateway`.
 The message boundary's merge-back settles the structural question for all of

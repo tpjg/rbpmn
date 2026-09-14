@@ -10,6 +10,10 @@ const TOKEN: &str = "test-token-0123456789abcdef-0123456789abcdef";
 const INCLUSIVE_XML: &str =
     include_str!("../../rbpmn-model/tests/fixtures/reject/inclusive-gateway.bpmn");
 const MINIMAL_XML: &str = include_str!("../../rbpmn-model/tests/fixtures/accept/01-minimal.bpmn");
+const CATCH_ALL_XML: &str =
+    include_str!("../../rbpmn-model/tests/fixtures/accept/44-catch-all-error-boundary.bpmn");
+const MESSAGE_CATCH_XML: &str =
+    include_str!("../../rbpmn-model/tests/fixtures/accept/17-message-catch.bpmn");
 /// A user task with an interrupting message boundary: the payment that ends
 /// a contested ticket while a clerk holds the task.
 const BOUNDARY_XML: &str =
@@ -1211,5 +1215,499 @@ async fn deploy_carries_decision_artifacts() {
             .any(|d| d["rule"] == "unresolved-decision"),
         "{body}"
     );
+    db.drop().await;
+}
+
+/// "Skip this one" over the wire (design brief, Task API): the client keeps
+/// the ids it does not want and sends them with the next claim. It is a
+/// read-side filter and nothing else — the skipped item is written to in no
+/// way, and the very next caller is still offered it.
+#[tokio::test]
+async fn a_claim_can_skip_items_over_http() {
+    let (app, db) = test_app().await;
+    let post = |uri: String, body: serde_json::Value| {
+        let app = app.clone();
+        async move { app.oneshot(authed("POST", &uri, body)).await.unwrap() }
+    };
+    let resp = post(
+        "/v1/definitions".into(),
+        serde_json::json!({ "bpmn": MINIMAL_XML, "bindings": {} }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let mut items = Vec::new();
+    for n in 0..2 {
+        let resp = post(
+            "/v1/instances".into(),
+            serde_json::json!({ "definitionKey": "p", "variables": { "n": n } }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let instance = body_json(resp).await["instanceId"]
+            .as_str()
+            .expect("an instance id")
+            .to_string();
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "GET",
+                &format!("/v1/instances/{instance}/inspect"),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        items.push(
+            body_json(resp).await["workItems"][0]["id"]
+                .as_str()
+                .expect("a work item id")
+                .to_string(),
+        );
+    }
+
+    // The depth answers the same question the claim does.
+    let count = |exclude: serde_json::Value| {
+        post(
+            "/v1/tasks/count".into(),
+            serde_json::json!({ "topic": "review", "exclude": exclude }),
+        )
+    };
+    assert_eq!(
+        body_json(count(serde_json::json!([])).await).await["count"],
+        2
+    );
+    assert_eq!(
+        body_json(count(serde_json::json!([items[0]])).await).await["count"],
+        1
+    );
+
+    // Skip the head: the next one in FIFO order that was not skipped.
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({ "topic": "review", "owner": "alice", "exclude": [items[0]] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["task"]["id"], items[1]);
+
+    // ...and the skipped one is untouched: the next caller is offered it.
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({ "topic": "review", "owner": "bob" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["task"]["id"], items[0]);
+
+    // Skipping everything claimable is 204, not an error.
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({
+            "topic": "review", "owner": "carol", "exclude": [items[0], items[1]]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    db.drop().await;
+}
+
+/// The include half over the wire, and the one combination that is a
+/// contradiction rather than a combination.
+#[tokio::test]
+async fn a_claim_can_name_what_it_will_take_over_http() {
+    let (app, db) = test_app().await;
+    let post = |uri: String, body: serde_json::Value| {
+        let app = app.clone();
+        async move { app.oneshot(authed("POST", &uri, body)).await.unwrap() }
+    };
+    let resp = post(
+        "/v1/definitions".into(),
+        serde_json::json!({ "bpmn": MINIMAL_XML, "bindings": {} }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let mut items = Vec::new();
+    for n in 0..2 {
+        let resp = post(
+            "/v1/instances".into(),
+            serde_json::json!({ "definitionKey": "p", "variables": { "n": n } }),
+        )
+        .await;
+        let instance = body_json(resp).await["instanceId"]
+            .as_str()
+            .expect("an instance id")
+            .to_string();
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "GET",
+                &format!("/v1/instances/{instance}/inspect"),
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        items.push(
+            body_json(resp).await["workItems"][0]["id"]
+                .as_str()
+                .expect("a work item id")
+                .to_string(),
+        );
+    }
+
+    // Name the second one: FIFO order notwithstanding, that is what comes.
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({ "topic": "review", "owner": "alice", "include": [items[1]] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["task"]["id"], items[1]);
+
+    // Present and empty is "nothing acceptable", not "no filter" — 204,
+    // while the first item is still sitting there claimable.
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({ "topic": "review", "owner": "bob", "include": [] }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = post(
+        "/v1/tasks/count".into(),
+        serde_json::json!({ "topic": "review", "include": [] }),
+    )
+    .await;
+    assert_eq!(body_json(resp).await["count"], 0);
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({ "topic": "review", "owner": "bob" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["task"]["id"], items[0]);
+
+    // Saying both is refused rather than silently resolved one way.
+    let resp = post(
+        "/v1/tasks/get".into(),
+        serde_json::json!({
+            "topic": "review", "owner": "carol",
+            "exclude": [items[0]], "include": [items[1]]
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(resp).await["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("alternatives")),
+        "the 400 says why"
+    );
+    db.drop().await;
+}
+
+/// Repair over HTTP (docs/design/incident-scope.md, D10). An instance frozen on
+/// a correlation it could never make is repaired by naming its incident: a
+/// stale number is 409 with the incident to name instead, a malformed body or
+/// a field the disposition does not take is 400, a disposition the incident
+/// does not allow is 422 — and the Retry that fixes the key lands.
+#[tokio::test]
+async fn an_incident_is_repaired_over_http() {
+    let (app, db) = test_app().await;
+    let post = |uri: String, body: serde_json::Value| {
+        let app = app.clone();
+        async move { app.oneshot(authed("POST", &uri, body)).await.unwrap() }
+    };
+    let resp = post(
+        "/v1/definitions".into(),
+        serde_json::json!({
+            "bpmn": MESSAGE_CATCH_XML,
+            "bindings": { "correlations": { "c": "order.id" } }
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = post(
+        "/v1/instances".into(),
+        serde_json::json!({ "definitionKey": "p", "variables": {} }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let instance_id = body_json(resp).await["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let repair = format!("/v1/instances/{instance_id}/repair");
+
+    // What the inspection says a repair would do, before one is sent (D10):
+    // the number to name, where it failed and would re-enter, and per
+    // disposition what it takes — with the two this model cannot offer
+    // refused, in the prose an operator reads.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/v1/instances/{instance_id}/inspect"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let incident = body_json(resp).await["incident"].clone();
+    assert_eq!(
+        (
+            &incident["incident"],
+            &incident["element"],
+            &incident["resume"],
+            &incident["halted"]
+        ),
+        (
+            &serde_json::json!(0),
+            &serde_json::json!("c"),
+            &serde_json::json!("c"),
+            &serde_json::json!(0)
+        ),
+        "{incident}"
+    );
+    let option = |disposition: &str| {
+        incident["options"]
+            .as_array()
+            .expect("options")
+            .iter()
+            .find(|o| o["disposition"] == disposition)
+            .unwrap_or_else(|| panic!("{disposition} is an option: {incident}"))
+            .clone()
+    };
+    assert_eq!(option("retry")["takes"], "patch");
+    assert_eq!(option("retry")["refused"], serde_json::Value::Null);
+    assert_eq!(option("advance")["takes"], "patch");
+    assert_eq!(option("abandon")["takes"], "nothing");
+    // Nothing in this model catches an error.
+    assert_eq!(option("divert")["takes"], "code");
+    assert_eq!(option("divert")["refused"]["cause"], "nothing-catches");
+    assert!(
+        option("divert")["refused"]["reason"].is_string(),
+        "{incident}"
+    );
+    // Nothing catches here, so there is no code to offer either.
+    assert_eq!(option("divert")["codes"], serde_json::json!([]));
+
+    // Every disposition the read hands out is one this route takes. Each is
+    // named against an incident that is not open, so each is answered 409 —
+    // the 400 of a word the route does not know is what this catches, and
+    // nothing is stepped either way.
+    for option in incident["options"].as_array().expect("options") {
+        let disposition = option["disposition"].as_str().expect("a name");
+        let resp = post(
+            repair.clone(),
+            serde_json::json!({
+                "incident": 7, "disposition": disposition, "reason": "the spellings agree"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{disposition}");
+    }
+
+    let resp = post(
+        repair.clone(),
+        serde_json::json!({ "incident": 1, "disposition": "retry", "reason": "resent" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(resp).await["openIncident"], 0);
+
+    let resp = post(
+        repair.clone(),
+        serde_json::json!({
+            "incident": 0, "disposition": "abandon", "code": "X", "reason": "stray field"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A malformed body is 400 as well — a typo must not read as a refusal.
+    for malformed in [
+        serde_json::json!({ "incident": 0, "disposition": "advance", "anwser": 1, "reason": "typo" }),
+        serde_json::json!({ "incident": 0, "disposition": "retry" }),
+        serde_json::json!({ "incident": -1, "disposition": "retry", "reason": "negative" }),
+    ] {
+        let resp = post(repair.clone(), malformed).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(resp).await["error"].is_string());
+    }
+    // ...while the framework's own answers stand: no JSON content type is 415.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(&repair)
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::from(
+                    serde_json::json!({ "incident": 0, "disposition": "retry", "reason": "r" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let resp = post(
+        repair.clone(),
+        serde_json::json!({
+            "incident": 0, "disposition": "advance", "answer": 1, "reason": "not a decision"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // Which refusal, not merely 422: every Step error maps to this status, so
+    // an assertion on the status alone passes for the wrong reason too.
+    let body = body_json(resp).await;
+    assert!(body.to_string().contains("takes an answer"), "{body}");
+
+    let resp = post(
+        repair.clone(),
+        serde_json::json!({
+            "incident": 0,
+            "disposition": "retry",
+            "patch": { "order": { "id": "o-17" } },
+            "reason": "the order id was missing"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({ "status": "active", "incident": null })
+    );
+
+    // Repaired: there is nothing left to tell an operator about.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/v1/instances/{instance_id}/inspect"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["incident"], serde_json::Value::Null);
+
+    let resp = post(
+        "/v1/messages".into(),
+        serde_json::json!({ "name": "WarehouseAck", "correlationKey": "o-17" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/v1/instances/{instance_id}/inspect"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["status"], "completed");
+    db.drop().await;
+}
+
+/// The catch-all over HTTP (docs/design/incident-scope.md, D1): a failure
+/// reported with no `errorCode` is caught once its budget is spent, answered
+/// `errorCaught`, and the instance carries on. Before catch-alls a codeless
+/// failure could only ever end as an incident.
+#[tokio::test]
+async fn a_codeless_failure_is_caught_over_http() {
+    let (app, db) = test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/topics",
+            serde_json::json!({ "name": "st" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/definitions",
+            serde_json::json!({ "bpmn": CATCH_ALL_XML }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/v1/instances",
+            serde_json::json!({ "definitionKey": "p", "variables": {} }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let instance_id = body_json(resp).await["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let inspect = format!("/v1/instances/{instance_id}/inspect");
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &inspect, serde_json::json!({})))
+        .await
+        .unwrap();
+    let work_item = body_json(resp).await["workItems"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The default budget is three attempts, and none of them names a code.
+    for expected in ["retrying", "retrying", "errorCaught"] {
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                &format!("/v1/work-items/{work_item}/fail"),
+                serde_json::json!({ "errorMessage": "no code given" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["outcome"], expected);
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &inspect, serde_json::json!({})))
+        .await
+        .unwrap();
+    let inspection = body_json(resp).await;
+    assert_eq!(inspection["status"], "active");
+    let open: Vec<&serde_json::Value> = inspection["workItems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["state"] == "available")
+        .collect();
+    assert_eq!(open.len(), 1, "only the handler's task is open");
+    assert_eq!(open[0]["elementId"], "th");
+    let handler = open[0]["id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/work-items/{handler}/complete"),
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["outcome"], "advanced");
+    let resp = app
+        .oneshot(authed("GET", &inspect, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["status"], "completed");
     db.drop().await;
 }

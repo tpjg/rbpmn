@@ -10,9 +10,12 @@ Run with `just tla` (needs `java`; fetches `tla2tools.jar` on first use).
 |---|---|---|
 | `LockOrder.tla` | **every lock-taking transaction shape in the engine** — step, timer claim, work claim, retention, deploy — over per-instance rows plus the definition and floor rows | nobody holds rows while still needing the instance row; no AB/BA deadlock; every transaction returns to idle |
 | `Lease.tla` | the work-item lease: TTL, renewal, expiry, completion, the voluntary hand-back, the **process withdrawing the item** (interrupting boundary, terminate, teardown), and clients retrying their own requests | no double delivery; exactly-once completion under at-least-once delivery; a live lease ends only by the clock, its own holder, or the process; a cancelled item is never completed; a release frees only the lease it named; never stranded — an open item is always claimable or completable |
+| `LeaseSiblings.tla` | two work items on one instance — `Lease` instantiated twice, sharing the instance's status and the database clock | each item keeps its own safety; a stranded item is always a frozen instance, whatever froze it; a frozen instance advances nothing — no claim, completion, failure or cancel, only a holder handing its lease back; an active instance strands nobody, a caught failure included |
 | `TimerTeardown.tla` | the unlocked pick of an **arm row** — a timer by the scheduler, a boundary subscription by `correlate` — racing a scope teardown, and a claim transaction that rolls back after its re-check | no armed row — timer or subscription — outlives the token it is armed on; no arm ever fires with its token gone |
 | `BoundaryExit.tla` | one token at a host work item with an interrupting boundary subscription; `complete_task` and `correlate` racing to end the wait, from any node | exactly one exit ever reaches `step`; an armed row always means an open host; a late call of either verb is answered typed (`AlreadyClosed`, `NoSubscription`), never stepped |
 | `Retention.tla` | a retention pass across its transaction-free archive gap | nothing deleted without an archive; the truncation floor covers every deletion and invents none; only due records go |
+| `Repair.tla` | the one transition out of a frozen instance: operators whose requests name an incident and may arrive twice, a repair that lands or freezes the instance again, an abandon, and a sibling item — `Lease` instantiated — across the thaw | a request lands only on the incident it named; the sibling keeps every lease guarantee across the thaw, a Divert that cancels its item included; a landed repair strands nobody; an abandon leaves nothing open; a frozen instance advances nothing until a request lands |
+| `RepairClock.tla` | a repair moving a timer the freeze kept (D8), racing the scheduler's unlocked pick and locked re-check — the freeze as two steps, stamp and commit, with the claim's NOWAIT giving up while the freezing transaction holds the row | a moved timer never fires before its due |
 
 Each spec ships with a companion config that is **expected to fail**, so the
 checks are known to have teeth rather than passing vacuously:
@@ -26,6 +29,9 @@ checks are known to have teeth rather than passing vacuously:
 | `Lease_UncheckedRelease.cfg` | **violation** | `release_task` without its owner check, freeing a live holder's item |
 | `Lease_EpochlessRelease.cfg` | **violation** | `release_task` without its lease epoch — a retried release freeing the claim that replaced it |
 | `Lease_CancelIgnoresGuard.cfg` | **violation** | completion without its `AlreadyClosed` check — a clerk's decision landing on a task the process had withdrawn |
+| `LeaseSiblings.cfg` | holds | the shipped lease, two items at a time |
+| `LeaseSiblings_CaughtIsReachable.cfg` | **violation** | not a bug: a final failure a boundary caught, on an instance still active, is reached |
+| `LeaseSiblings_Stranded.cfg` | **violation** | not a bug: the price of the instance-wide freeze — a sibling's open item, perhaps leased mid-handler, stranded until an operator acts |
 | `TimerTeardown.cfg` | holds | the shipped teardown |
 | `TimerTeardown_Buggy.cfg` | **violation** | the phase-6 bug: teardown reaping tokens but not their timers |
 | `SubscriptionTeardown.cfg` | holds | the same module with `Timers` bound to subscription rows — `correlate`'s claim against teardown |
@@ -36,6 +42,11 @@ checks are known to have teeth rather than passing vacuously:
 | `Retention.cfg` | holds | the shipped pass |
 | `Retention_FloorFromPlan.cfg` | **violation** | advancing the floor from the plan instead of the deletions |
 | `Retention_NoRecheck.cfg` | **violation** | trusting the plan's DUE verdict across the archive gap |
+| `Repair.cfg` | holds | the shipped repair |
+| `Repair_UncheckedIncident.cfg` | **violation** | a request landing whenever the instance is frozen: a repair of incident 0 fails again into incident 1, and its resend lands there |
+| `Repair_ThawIsReachable.cfg` | **violation** | not a bug: a repair lands while the stranded sibling is open, and the sibling then completes — the thaw's case, reached |
+| `RepairClock.cfg` | holds | the shipped claim against the shipped move |
+| `RepairClock_NoDueRecheck.cfg` | **violation** | the claim's re-check without `due_at <= now()`: a timer that came due after the freeze stamped its clock, picked before the freeze committed, moved past now by the repair, fired early |
 
 ## What DMN changed here, and what it did not
 
@@ -217,13 +228,16 @@ paths. Every shape that takes a lock:
 | `delete_definition` | definition row → policy row | blocking |
 | deploy (`deploy.rs`) | advisory(key) → definition rows | blocking |
 | declared index build (`tasks.rs`) | [try-advisory(instance indexes)] → **no row locks at all** | try only |
+| instance inspection (`inspect.rs`) | one repeatable-read snapshot, **no locks at all** | none |
 
 `retire` and `deploy` were outside the model until the third audit. Three
 things are deliberately *not* modelled and are argued instead: the
 scheduler's `pg_try_advisory_xact_lock`, the migration advisory, and the
 declared index build's slot. All are excluded for the same reason — a
 try-lock never waits, so it cannot be an edge in a wait-for cycle; the
-migration one also runs only at startup.
+migration one also runs only at startup. The inspector is in the table for
+the opposite reason: it takes nothing at all, so there is no edge to place —
+its consistency comes from the snapshot, not from a lock.
 
 The index-build slot earns a paragraph, because it is the one place where
 "use a blocking lock, it is simpler" is not merely worse but **wrong**, and
@@ -408,3 +422,80 @@ change nothing here was an argument, later verified by checking that all four
 `rbpmn_scope` access sites sit under the instance row lock, but an argument
 nonetheless. When the locking or lease protocol changes, these files must be
 re-read; nothing will fail to tell you.
+
+## What the incident-scope round added
+
+`docs/design/incident-scope.md` keeps the freeze instance-wide (D3), and the
+price of that was an argument until `LeaseSiblings.tla` — `Lease`'s own
+`NeverStranded` comment says a one-item model cannot see a sibling stranded by
+the freeze. The composition instantiates `Lease` twice rather than restating
+it, so what it checks is the transcription the engine runs.
+
+`Fail` and `FailFinally` carry an `active` conjunct because the fail path
+refuses a frozen instance (`IncidentOpen`). A one-item model cannot tell that
+conjunct is there — its only freeze is its own final failure, which closes the
+item — so it is checked here instead: without it, `FreezeAdvancesNothing`
+fails. What a frozen instance's items can still do is exactly what that
+property allows and no more: a holder extending or handing back its lease,
+because `release_task` and `extend_lock` are single statements that never read
+instance status.
+
+`FailCaught` is a final failure a boundary takes: the item closes as failed
+and the instance stays active. `ActiveStrandsNobody` holds over it, and
+`LeaseSiblings_CaughtIsReachable.cfg` shows the case is reached rather than
+assumed.
+
+## What repair added
+
+Every model before it treated the freeze as terminal. Repair
+(`docs/design/incident-scope.md`, D4–D9) is the one transition out, and the
+standing warning applies to it twice over — it adds a step path, and it moves
+timer rows the scheduler claims.
+
+**`Repair.tla`.** `Lease` again, instantiated for a sibling item as
+`LeaseSiblings` does it, with the freeze made reversible: operators send
+requests naming the open incident, requests arrive at least once, and a
+repair lands the instance active or freezes it again under the next number.
+`RepairLandsOnlyOnTheIncidentItNamed` is the property `release_task` taught:
+a resend and a fresh request are the same request, so only what the landing
+step named — against what was open when it arrived — tells a stale one apart.
+`Repair_UncheckedIncident.cfg` lands whatever is frozen, and TLC finds the
+resend in five states: freeze, send a repair of incident 0, land it as a
+Retry that fails again into incident 1, and land the same request there. The
+sibling's lease properties are checked through the thaw — `active` had never
+gone from FALSE to TRUE in any model — and hold; `ActiveStrandsNobody` is
+`LeaseSiblings_Stranded.cfg`'s price paid back, but it restates the lease's
+guards: it holds whenever `active` does, and trivially while frozen, so it
+cannot tell a thaw from none. `Repair_ThawIsReachable.cfg` is what pins the
+thaw, by reaching a stranded sibling that completes after one — make the
+repair leave the instance frozen and it finds nothing. A thaw's real
+stranding — a lease that lapsed during the freeze, nobody woken for it — is
+latency no model here sees, and `resume_after_freeze`'s wake answers it.
+
+**`RepairClock.tla`.** The claim path is `TimerTeardown`'s — pick with no lock,
+lock NOWAIT, re-check — and what is new is a row picked while due being moved
+later, in a window that is the freeze's own. The move is
+`resume_after_freeze`'s, transcribed. `persist_step` stamps `frozen_at` inside
+the freezing transaction, and the freeze is visible only when it commits —
+which an embedder's `*_in_tx` transaction can hold off indefinitely. Until
+then the scheduler reads the instance as active and can pick a row that came
+due after the stamp; the repair moves it by an outage measured from the
+stamp, past the resume — a duration by the whole outage, a cycle occurrence
+along its grid. `RepairClock_NoDueRecheck.cfg` drops the claim's
+`due_at <= now()` and TLC fires it early. The conjunct was written for "timers
+never reschedule", which D8 made false; it is load-bearing now, and the claim
+path's comment says so. The freeze has to be two steps for the model to see
+any of this: an atomic one has no window, and concludes that a duration
+cannot be moved past now.
+
+**Re-read, unchanged.** `LockOrder` needs nothing at either arity: a repair is
+a step — the instance row `FOR UPDATE`, then its per-instance rows, the timer
+moves among them. `TimerTeardown` stands: a repair's teardown (a Divert into
+an enclosing scope) reaps a token's arms with it through the same
+`tear_down_scope`, and a moved row is still armed on a live token. The read
+of an open incident (D10) adds no shape either: `load_instance_snapshot`
+rebuilds the same state without the `FOR UPDATE` every stepping loader takes,
+inside the inspector's repeatable-read transaction, so it neither waits for a
+step nor makes one wait for it. Bounds:
+one operator (a resend is what matters, not a second sender), two incidents
+(what a Retry that fails again needs), and `LeaseSiblings`' lease bounds.

@@ -4,7 +4,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { diagnose } from '../src/inspector/diagnosis.js';
+import { describeRepair, diagnose } from '../src/inspector/diagnosis.js';
 
 function inspection(overrides = {}) {
   return {
@@ -176,4 +176,102 @@ test('a failed work item still explains itself', () => {
   );
   assert.match(result.detail, /handler answered 502/);
   assert.doesNotMatch(result.detail, /should not win/);
+});
+
+// What a repair would do is a read the engine answers (D10); the inspector
+// reports it and never offers to act on it (D13).
+const openIncident = {
+  incident: 3,
+  element: 'charge',
+  resume: 'charge',
+  halted: 2,
+  options: [
+    { disposition: 'retry', takes: 'patch', refused: null },
+    { disposition: 'abandon-instance', takes: 'nothing', refused: null },
+    {
+      disposition: 'divert',
+      takes: 'code',
+      refused: { cause: 'nothing-catches', reason: 'no boundary catches an error raised here' },
+      codes: [],
+    },
+  ],
+};
+
+/// The same incident in a model that does catch something: one code caught on
+/// the failing activity itself, one caught further out at the cost of the
+/// subprocess in between, and the codeless divert a catch-all takes.
+const divertible = {
+  ...openIncident,
+  options: [
+    {
+      disposition: 'divert',
+      takes: 'code',
+      refused: null,
+      codes: [
+        { code: null, caughtAt: 'any_error', tearsDown: null },
+        { code: 'PAYMENT_FAILED', caughtAt: 'be', tearsDown: null },
+        { code: 'ESCALATE', caughtAt: 'sub_be', tearsDown: 'sub' },
+      ],
+    },
+  ],
+};
+
+test('the headline names the number a repair has to give', () => {
+  const frozen = inspection({
+    status: 'failed',
+    tokens: [{ elementId: 'charge', waitKind: 'incident', scopeNo: 0 }],
+  });
+  assert.match(diagnose(frozen).headline, /^Incident at charge$/);
+  assert.match(
+    diagnose({ ...frozen, incident: openIncident }).headline,
+    /^Incident 3 at charge$/
+  );
+});
+
+test('the open incident is described disposition by disposition', () => {
+  const lines = describeRepair(inspection({ status: 'failed', incident: openIncident }));
+  const value = (label) => lines.find(([l]) => l === label)?.[1];
+
+  assert.equal(value('incident'), '3');
+  assert.equal(value('failed at'), 'charge');
+  assert.equal(value('a repair resumes at'), undefined, 'not repeated when it is the element');
+  assert.match(value('also stopped'), /2 token\(s\)/);
+  assert.match(value('retry'), /would land, takes a patch/);
+  assert.match(value('abandon-instance'), /takes nothing else/);
+  assert.match(value('divert'), /refused — no boundary catches/);
+});
+
+test('a repair that re-enters elsewhere says where', () => {
+  const lines = describeRepair(
+    inspection({
+      status: 'failed',
+      incident: { ...openIncident, element: 'be_timeout', resume: 'review', halted: 0 },
+    })
+  );
+  const value = (label) => lines.find(([l]) => l === label)?.[1];
+  assert.equal(value('a repair resumes at'), 'review');
+  assert.equal(value('also stopped'), undefined, 'no collateral, nothing to say');
+});
+
+test('a divert names its codes, where each lands, and what it costs', () => {
+  const lines = describeRepair(inspection({ status: 'failed', incident: divertible }));
+  const value = (label) => lines.find(([l]) => l === label)?.[1];
+
+  assert.match(value('with code PAYMENT_FAILED'), /^caught at be$/);
+  assert.match(value('with code ESCALATE'), /caught at sub_be, tearing down sub/);
+  assert.match(value('with no code'), /caught at any_error — a catch-all, so any code lands/);
+});
+
+test('a disposition that takes no code lists none', () => {
+  const lines = describeRepair(inspection({ status: 'failed', incident: openIncident }));
+  assert.equal(
+    lines.filter(([label]) => label.startsWith('with ')).length,
+    0,
+    'nothing catches here, so there is no code to name'
+  );
+});
+
+test('nothing frozen, nothing to describe', () => {
+  assert.equal(describeRepair(inspection()), null);
+  assert.equal(describeRepair(inspection({ status: 'completed' })), null);
 });

@@ -92,6 +92,27 @@ async fn the_projection_replays_exactly_as_the_core() {
         .await
         .unwrap();
 
+    // An incident and its repair: frozen at its first step for want of a key,
+    // then a Retry naming incident 0 with the key patched in.
+    let vars = serde_json::json!({});
+    let id = engine.start("msg", None, vars.clone()).await.unwrap().id;
+    started.push((id, vars));
+    engine
+        .repair(
+            id,
+            0,
+            rbpmn_engine::Disposition::Retry {
+                patch: serde_json::json!({ "order": { "id": "o-r" } }),
+            },
+            "the order id was missing",
+        )
+        .await
+        .unwrap();
+    engine
+        .correlate("WarehouseAck", "o-r", serde_json::json!({}))
+        .await
+        .unwrap();
+
     // An instance left mid-flight: replay must reproduce a partial history too.
     let vars = serde_json::json!({ "order": { "id": "o-open" } });
     let id = engine.start("msg", None, vars.clone()).await.unwrap().id;
@@ -206,6 +227,36 @@ async fn a_storm_holds_every_global_invariant() {
         .await
         .unwrap();
 
+    // The catch-all (docs/design/incident-scope.md, D1): the side path whose
+    // task fails into a catch-all while the review beside it is decided. The
+    // consumers claim `notify` like any other topic and, in rotation, fail it
+    // with a code, fail it without one, or complete it — one attempt each, so
+    // every failure reaches the catch-all — while other consumers race the
+    // review on the same instance. The reminder is due at once.
+    setup.declare_topic("notify").await.unwrap();
+    setup
+        .deploy(
+            &with_process_id(
+                &fixture("accept/46-side-path-failure-contained.bpmn").replace("PT1H", "PT0S"),
+                "contained",
+            ),
+            &rbpmn_core::Bindings::new()
+                .retries("notify", rbpmn_core::RetryPolicy::new().attempts(1)),
+        )
+        .await
+        .unwrap();
+
+    // Repair (docs/design/incident-scope.md, D5, D9): the message catch
+    // started without its key freezes at its first step, and is repaired
+    // below by two nodes at once.
+    setup
+        .deploy(
+            &with_process_id(&fixture("accept/17-message-catch.bpmn"), "frozen"),
+            &rbpmn_core::Bindings::new().correlation("c", "order.id"),
+        )
+        .await
+        .unwrap();
+
     // Crank with RBPMN_STORM_ROUNDS when hunting; 20 keeps the suite quick.
     let rounds: u32 = std::env::var("RBPMN_STORM_ROUNDS")
         .ok()
@@ -238,12 +289,14 @@ async fn a_storm_holds_every_global_invariant() {
 
     // Pull-mode consumers competing for the same user-task topics.
     let completed = Arc::new(AtomicUsize::new(0));
+    let notify_calls = Arc::new(AtomicUsize::new(0));
     for w in 0..6 {
         let (node, stop, completed) = (
             nodes[w % nodes.len()].clone(),
             stop.clone(),
             completed.clone(),
         );
+        let notify_calls = notify_calls.clone();
         actors.push(tokio::spawn(async move {
             let options = rbpmn_engine::GetTaskOptions::new(format!("worker-{w}"));
             while !stop.load(Ordering::Relaxed) {
@@ -260,9 +313,30 @@ async fn a_storm_holds_every_global_invariant() {
                     "review",
                     "file_note",
                     "add_late_fee",
+                    "notify",
                 ] {
                     if let Ok(Some(task)) = node.get_task(topic, &options).await {
                         idle = false;
+                        // `notify` is the catch-all's: in rotation it fails
+                        // with a code, fails without one, or completes, so
+                        // both shapes a catch-all takes run through the storm.
+                        if topic == "notify" {
+                            let (owner, id) = (&options.owner, task.id);
+                            let _ = match notify_calls.fetch_add(1, Ordering::Relaxed) % 3 {
+                                0 => node
+                                    .fail_task(id, owner, Some("STORM".into()), None)
+                                    .await
+                                    .map(|_| ()),
+                                1 => node.fail_task(id, owner, None, None).await.map(|_| ()),
+                                _ => node
+                                    .complete_task(id, owner, serde_json::json!({}))
+                                    .await
+                                    .map(|_| {
+                                        completed.fetch_add(1, Ordering::Relaxed);
+                                    }),
+                            };
+                            continue;
+                        }
                         // Completion may lose a race with a boundary timer;
                         // that is a legal outcome, not a failure.
                         if node
@@ -316,10 +390,11 @@ async fn a_storm_holds_every_global_invariant() {
     let mut instances: Vec<(Uuid, serde_json::Value)> = Vec::new();
     let mut cycle_backdates: u32 = 0;
     let (mut notes_delivered, mut notes_refused) = (0u32, 0u32);
+    let (mut stale_refused, mut races_resolved) = (0u32, 0u32);
     for round in 0..rounds {
         let node = &nodes[round as usize % nodes.len()];
         let empty = serde_json::json!({});
-        for key in ["par", "timed", "nested"] {
+        for key in ["par", "timed", "nested", "contained"] {
             let id = node.start(key, None, empty.clone()).await.unwrap().id;
             instances.push((id, empty.clone()));
         }
@@ -419,6 +494,54 @@ async fn a_storm_holds_every_global_invariant() {
         node.correlate("PAID", &reference, serde_json::json!({}))
             .await
             .unwrap_or_else(|e| panic!("correlate PAID {reference}: {e}"));
+
+        // Repair, raced: a stale number first, then two nodes naming incident
+        // 0 at once. Exactly one lands; the other is answered IncidentNotOpen,
+        // never stepped. The disposition rotates — a Retry (and the message it
+        // then waits for), an Advance, an abandon.
+        let vars = serde_json::json!({});
+        let id = node.start("frozen", None, vars.clone()).await.unwrap().id;
+        instances.push((id, vars));
+        let peer = &nodes[(round as usize + 1) % nodes.len()];
+        let disposition = || match round % 3 {
+            0 => rbpmn_engine::Disposition::Retry {
+                patch: serde_json::json!({ "order": { "id": format!("r-{round}") } }),
+            },
+            1 => rbpmn_engine::Disposition::Advance {
+                patch: serde_json::json!({}),
+                answer: None,
+            },
+            _ => rbpmn_engine::Disposition::AbandonInstance,
+        };
+        match peer.repair(id, 1, disposition(), "resent").await {
+            Err(rbpmn_engine::EngineError::Step(rbpmn_engine::StepError::IncidentNotOpen {
+                open: Some(0),
+                ..
+            })) => stale_refused += 1,
+            answer => panic!("a stale repair of {id} answered {answer:?}"),
+        }
+        let (a, b) = tokio::join!(
+            node.repair(id, 0, disposition(), "raced"),
+            peer.repair(id, 0, disposition(), "raced"),
+        );
+        let lost = |r: &Result<rbpmn_engine::Repaired, rbpmn_engine::EngineError>| {
+            matches!(
+                r,
+                Err(rbpmn_engine::EngineError::Step(
+                    rbpmn_engine::StepError::IncidentNotOpen { open: None, .. }
+                ))
+            )
+        };
+        assert!(
+            (a.is_ok() && lost(&b)) || (lost(&a) && b.is_ok()),
+            "two racing repairs of one incident: exactly one lands ({a:?}, {b:?})"
+        );
+        races_resolved += 1;
+        if round % 3 == 0 {
+            node.correlate("WarehouseAck", &format!("r-{round}"), serde_json::json!({}))
+                .await
+                .unwrap_or_else(|e| panic!("correlate r-{round}: {e}"));
+        }
     }
     // Deliver every message; each must land on exactly one subscription.
     let mut delivered = 0;
@@ -506,6 +629,103 @@ async fn a_storm_holds_every_global_invariant() {
     assert_eq!(
         double_deliveries, 0,
         "a message was delivered more than once"
+    );
+
+    // The catch-all through the storm: each shape of failure it takes and the
+    // success path beside them, exactly one catch per failure, and no
+    // `contained` instance left unfinished by a failure its model caught.
+    let caught_with_code = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'work-item-failed' \
+         and element_id = 'notify' and payload->>'code' is not null",
+    )
+    .await;
+    let caught_without_code = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'work-item-failed' \
+         and element_id = 'notify' and payload->>'code' is null",
+    )
+    .await;
+    let catches = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'element-started' \
+         and element_id = 'notify_failed'",
+    )
+    .await;
+    let notified = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'element-started' \
+         and element_id = 'notified'",
+    )
+    .await;
+    assert!(
+        caught_with_code > 0 && caught_without_code > 0 && notified > 0,
+        "the side-path catch-all never saw every shape through the storm \
+         ({caught_with_code} failures with a code, {caught_without_code} without, \
+         {notified} notifications that succeeded)"
+    );
+    assert_eq!(
+        catches,
+        caught_with_code + caught_without_code,
+        "every failure of notify is taken by its catch-all exactly once"
+    );
+    let unfinished = count(
+        &db.pool,
+        "select count(*) from rbpmn_instance where definition_key = 'contained' \
+         and status <> 'completed'",
+    )
+    .await;
+    assert_eq!(
+        unfinished, 0,
+        "a caught side-path failure left a `contained` instance unfinished"
+    );
+    println!(
+        "storm catch-all: {caught_with_code} failures with a code and \
+         {caught_without_code} without, all caught; {notified} notified"
+    );
+
+    // Repair through the storm: every frozen instance repaired exactly once
+    // though two nodes raced for each, every disposition in the rotation
+    // landed, and none was left frozen or unfinished.
+    let repaired = count(
+        &db.pool,
+        "select count(*) from rbpmn_event where kind = 'incident-repaired'",
+    )
+    .await;
+    let twice = count(
+        &db.pool,
+        "select count(*) from (select instance_id from rbpmn_event \
+         where kind = 'incident-repaired' group by 1 having count(*) > 1) x",
+    )
+    .await;
+    assert_eq!(twice, 0, "an incident was repaired twice");
+    assert_eq!(
+        repaired,
+        i64::from(rounds),
+        "every frozen instance repaired once"
+    );
+    assert_eq!((stale_refused, races_resolved), (rounds, rounds));
+    for kind in ["retry", "advance", "abandon-instance"] {
+        let landed = count(
+            &db.pool,
+            &format!(
+                "select count(*) from rbpmn_event where kind = 'incident-repaired' \
+                 and payload->>'disposition' = '{kind}'"
+            ),
+        )
+        .await;
+        assert!(landed > 0, "no {kind} repair landed through the storm");
+    }
+    let unfinished = count(
+        &db.pool,
+        "select count(*) from rbpmn_instance where definition_key = 'frozen' \
+         and status not in ('completed', 'terminated')",
+    )
+    .await;
+    assert_eq!(unfinished, 0, "a repaired instance was left unfinished");
+    println!(
+        "storm repairs: {repaired} landed, {races_resolved} races resolved, \
+         {stale_refused} stale refused"
     );
 
     // Non-vacuity: the storm must actually have raced. The boundary-timer

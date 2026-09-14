@@ -1,0 +1,72 @@
+{
+  "fixture": "accept/27-parallel-decision-and-freeze.bpmn",
+  "bindings": {
+    "decisions": {
+      "decide": {
+        "decision": "Discount",
+        "result": "order.pricing"
+      }
+    }
+  },
+  "variables": {},
+  "actions": [
+    {
+      "repair": 0,
+      "disposition": "retry",
+      "patch": {
+        "order": {
+          "slaDuration": "PT2H"
+        }
+      },
+      "reason": "the SLA was missing"
+    },
+    {
+      "decide": "decide",
+      "answer": 25
+    },
+    {
+      "fire": "wait"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {
+      "order": {
+        "slaDuration": "PT2H",
+        "pricing": 25
+      }
+    },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f0",
+      "element-started split",
+      "element-completed split",
+      "flow-taken fa",
+      "flow-taken fb",
+      "element-started decide",
+      "decision-requested decide Discount",
+      "element-started wait",
+      "timer-resolve-failed wait order.slaDuration",
+      "incident-raised wait",
+      "incident-repaired wait retry",
+      "variables-patched",
+      "element-started wait",
+      "timer-armed wait PT2H",
+      "decision-requested decide Discount",
+      "decision-evaluated decide",
+      "element-completed decide",
+      "flow-taken fa2",
+      "timer-fired wait",
+      "element-completed wait",
+      "flow-taken fb2",
+      "element-started join",
+      "element-completed join",
+      "flow-taken f3",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

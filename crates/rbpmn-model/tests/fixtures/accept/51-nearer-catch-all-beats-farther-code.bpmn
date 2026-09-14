@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+-->
+<!-- Precedence is per activity, nearest first. The failing task carries a
+     catch-all; the subprocess around it carries a boundary for the exact code
+     the task fails with. The task's catch-all wins: an error is caught by the
+     nearest activity able to catch it, and "exact before catch-all" is the
+     order *within* one activity — never a search of the whole chain for the
+     best match. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:error id="err_x" name="X" errorCode="CODE_X" />
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:subProcess id="sp" name="Outer">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:startEvent id="s_start">
+        <bpmn:outgoing>fi1</bpmn:outgoing>
+      </bpmn:startEvent>
+      <bpmn:serviceTask id="st" name="Inner">
+        <bpmn:incoming>fi1</bpmn:incoming>
+        <bpmn:outgoing>fi2</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="st_any" attachedToRef="st">
+        <bpmn:outgoing>fi3</bpmn:outgoing>
+        <bpmn:errorEventDefinition />
+      </bpmn:boundaryEvent>
+      <bpmn:endEvent id="s_end">
+        <bpmn:incoming>fi2</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:endEvent id="handled_inside">
+        <bpmn:incoming>fi3</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="fi1" sourceRef="s_start" targetRef="st" />
+      <bpmn:sequenceFlow id="fi2" sourceRef="st" targetRef="s_end" />
+      <bpmn:sequenceFlow id="fi3" sourceRef="st_any" targetRef="handled_inside" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="sp_x" attachedToRef="sp">
+      <bpmn:outgoing>f3</bpmn:outgoing>
+      <bpmn:errorEventDefinition errorRef="err_x" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="done">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="handled_outside">
+      <bpmn:incoming>f3</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sp" />
+    <bpmn:sequenceFlow id="f2" sourceRef="sp" targetRef="done" />
+    <bpmn:sequenceFlow id="f3" sourceRef="sp_x" targetRef="handled_outside" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_p">
+    <bpmndi:BPMNPlane id="BPMNPlane_p" bpmnElement="p">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="sp_di" bpmnElement="sp">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="sp_x_di" bpmnElement="sp_x">
+        <dc:Bounds x="207" y="92" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="done_di" bpmnElement="done">
+        <dc:Bounds x="357" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="handled_outside_di" bpmnElement="handled_outside">
+        <dc:Bounds x="357" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="357" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
+        <di:waypoint x="225" y="128" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="357" y="210" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_sp">
+    <bpmndi:BPMNPlane id="BPMNPlane_sp" bpmnElement="sp">
+      <bpmndi:BPMNShape id="s_start_di" bpmnElement="s_start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="st_di" bpmnElement="st">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="st_any_di" bpmnElement="st_any">
+        <dc:Bounds x="207" y="92" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="s_end_di" bpmnElement="s_end">
+        <dc:Bounds x="357" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="handled_inside_di" bpmnElement="handled_inside">
+        <dc:Bounds x="357" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="fi1_di" bpmnElement="fi1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fi2_di" bpmnElement="fi2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="357" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fi3_di" bpmnElement="fi3">
+        <di:waypoint x="225" y="128" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="357" y="210" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

@@ -29,7 +29,7 @@
 //! query alike (one shared map), so the two cannot disagree by construction.
 
 use crate::listen::Wakeup;
-use crate::runtime::{DefinitionRef, insert_engine_event, load_instance_nowait, persist_step};
+use crate::runtime::{DefinitionRef, Lock, insert_engine_event, load_instance_under, persist_step};
 use crate::{Engine, EngineError, MAX_RECORDED_TIMER_FAILURES};
 use rbpmn_core::{Command, InstanceStatus, TimerId};
 use sqlx::Row;
@@ -255,15 +255,20 @@ impl Engine {
         // instance's row lock for a while — the sequential drain loop must
         // move on to other instances' timers, not park behind it.
         let Some((definition, proc, bindings, mut state)) =
-            load_instance_nowait(self, &mut tx, instance_id, true).await?
+            load_instance_under(self, &mut tx, instance_id, Lock::NoWait).await?
         else {
             return Ok(Attempt::Busy); // a caller holds the instance row
         };
         if state.status != InstanceStatus::Active {
             return Ok(Attempt::Resolved); // resolved between pick and lock
         }
-        // Re-check under the instance lock: a concurrent step may have
-        // fired or cancelled it; due_at cannot move (timers never reschedule).
+        // Re-check under the instance lock: a concurrent step may have fired
+        // or cancelled it, or — the instance frozen and repaired between the
+        // pick and this lock — a repair's re-arm moved it later
+        // (docs/design/incident-scope.md, D8). `due_at <= now()` is what
+        // keeps a moved timer from firing early (`spec/RepairClock.tla`,
+        // NeverFiresEarly; RepairClock_NoDueRecheck.cfg drops it and TLC
+        // fires a moved timer early).
         let still_armed = sqlx::query(
             "select 1 from rbpmn_timer where instance_id = $1 and timer_no = $2 \
              and due_at <= now()",

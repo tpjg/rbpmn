@@ -83,6 +83,22 @@ fn fixture_corpus() {
             let mut expected = parse_expectations(&xml, &path);
             expected.sort();
 
+            // Every rule a fixture expects is one the published catalogue
+            // lists. The catalogue is exported to integrators (`catalogue()`
+            // over WASM), so a rule that fires without an entry there is
+            // public API nobody can look it up in.
+            for e in &expected {
+                if !rbpmn_model::CATALOGUE.iter().any(|r| r.id == e.rule) {
+                    writeln!(
+                        failures,
+                        "{}: rule '{}' is not in the published catalogue",
+                        path.display(),
+                        e.rule
+                    )
+                    .unwrap();
+                }
+            }
+
             let checked = match rbpmn_model::check(&xml) {
                 Ok(c) => c,
                 Err(e) => {

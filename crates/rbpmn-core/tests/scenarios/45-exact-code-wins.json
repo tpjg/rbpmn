@@ -1,0 +1,28 @@
+{
+  "fixture": "accept/45-exact-code-beats-catch-all.bpmn",
+  "actions": [
+    {
+      "fail": "charge",
+      "code": "CARD_DECLINED"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started charge",
+      "work-item-created charge service charge",
+      "work-item-failed charge CARD_DECLINED",
+      "element-started be_declined",
+      "element-completed be_declined",
+      "flow-taken f4",
+      "element-started declined",
+      "element-completed declined",
+      "instance-completed"
+    ]
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "fixture": "accept/25-business-rule-task.bpmn",
+  "bindings": {
+    "decisions": {
+      "decide": {
+        "decision": "Discount",
+        "result": "order.discount"
+      }
+    }
+  },
+  "variables": {
+    "Amount": 250
+  },
+  "actions": [
+    {
+      "decide": "decide",
+      "answer": null
+    },
+    {
+      "repair": 0,
+      "disposition": "divert",
+      "reason": "route it to pricing",
+      "refused": "RepairRefused(NothingCatches)"
+    },
+    {
+      "repair": 0,
+      "disposition": "abandon",
+      "reason": "the order was withdrawn"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {
+      "Amount": 250
+    },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started decide",
+      "decision-requested decide Discount",
+      "incident-raised decide",
+      "incident-repaired decide abandon",
+      "instance-completed"
+    ]
+  }
+}

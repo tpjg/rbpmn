@@ -1,0 +1,48 @@
+{
+  "fixture": "accept/48-side-path-failure-escapes.bpmn",
+  "variables": {},
+  "actions": [
+    {
+      "fire": "remind"
+    },
+    {
+      "fail": "notify"
+    },
+    {
+      "repair": 0,
+      "disposition": "abandon",
+      "reason": "the notification service is gone; nobody needs this one"
+    },
+    {
+      "complete": "work"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started work",
+      "work-item-created work service work",
+      "timer-armed remind PT1H",
+      "timer-fired remind",
+      "element-started remind",
+      "element-completed remind",
+      "flow-taken f4",
+      "element-started notify",
+      "work-item-created notify service notify",
+      "work-item-failed notify",
+      "incident-raised notify",
+      "incident-repaired notify abandon",
+      "work-item-completed work",
+      "element-completed work",
+      "flow-taken f2",
+      "element-started done",
+      "element-completed done",
+      "instance-completed"
+    ]
+  }
+}

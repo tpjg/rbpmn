@@ -293,9 +293,11 @@ no rbpmn-specific syntax anywhere.
   join's parked tokens / `SELECT FOR UPDATE` on instance-scope advance).
 - Terminate end event: delete all tokens/scopes/work items/timers/subscriptions of the
   instance in one transaction; write terminal event.
-- Error boundary: service-task failure past retry budget raises a named error; matched
-  by error code on the boundary event of the task or nearest enclosing scope; no match
-  → instance goes to a `failed`/incident state (do NOT silently swallow).
+- Error boundary: a work item failing past its retry budget raises an error, coded or
+  not. At each host from the failing task outward through enclosing scopes, a boundary
+  for the exact code is tried, then a catch-all (no `errorRef`); no match → instance
+  goes to a `failed`/incident state (do NOT silently swallow — a catch-all is the
+  author's handling, drawn and recorded, never the engine's).
 - At-least-once handler delivery is the contract; the engine guarantees exactly-once
   *state transition* (completion of an already-completed work item is a no-op returning
   a distinct result). Handlers must be idempotent; say so loudly in docs.
@@ -440,7 +442,39 @@ current registration state** and fails loudly with the same rule id
   consumers FIFO is fair-but-not-strict — `SKIP LOCKED` skips rows a peer is
   claiming; strict global FIFO would serialize all consumers, the wrong trade
   for a work queue. The same `order` parameter applies to
-  `get_task_filtered`. **Lease model, not long locks:** base TTL is
+  `get_task_filtered`. `ids` names, by id, which items this claim will
+  accept: `Exclude` for the "skip this one" button of a task UI, `Include`
+  for "offer me one of these". An enum rather than two lists because they are
+  alternatives — naming what you will take *and* what you will not is a
+  contradiction, so it is unrepresentable rather than refused at runtime —
+  and because it settles what an empty list means. `Include([])` is "nothing
+  here is acceptable", so nothing is offered; a bare list would have read
+  that as "no filter" and handed back an unrelated task, which is precisely
+  wrong for the caller whose candidate list came back empty. `Exclude([])` is
+  the identity, so it adds no SQL at all and the claim is the statement it
+  has always been. Either way it is a read-side filter and nothing more: no
+  row is written, the items keep the state they had, every other consumer
+  still sees them, and the order is untouched — the item claimed is the first
+  one in `order` that the filter admits. It is what a client would otherwise
+  fake by claiming, looking and handing back, which locks the very items it
+  did not want. Cost differs by form: excluded rows are exactly what the scan
+  walks before reaching a claimable one, so a claim with *n* skipped costs
+  *n* heap fetches, *n* join probes and up to *n* comparisons — and a session
+  that adds one skip at a time pays that sum, quadratic in the skips rather
+  than linear. Hence a cap on either list rather than an unbounded one.
+  An engine older than the release that added them *ignores* these fields
+  rather than refusing them — the task bodies are not `deny_unknown_fields` —
+  and what that costs differs sharply by form, which is worth saying out
+  loud. Skipping degrades benignly: the same item is offered again and the
+  button appears not to work. Including does not. The claim succeeds, the
+  caller is handed an arbitrary task it said it would not accept, and that
+  task is *locked to it* for the full lease — a task UI will open it. A
+  client that names ids must therefore check the id it got back against the
+  list it sent and `release_task` on a miss; that check costs nothing against
+  a current engine and is the whole defence against an old one. The
+  alternative is strictness, which cannot be given to one field — it is
+  per-body — so it would turn every other caller's stray field into a
+  400. **Lease model, not long locks:** base TTL is
   short (~10 min), and holders renew it while actively working. Expired locks make
   the item available again (no reaper needed — availability predicate is
   `state='available' OR lock_until < now()`).
@@ -556,7 +590,9 @@ current registration state** and fails loudly with the same rule id
   the indexed expression shape (`variables->>'field'` + literal definition_id) so
   declared indexes are actually used. EXPLAIN-based integration test: index usage
   for a declared field, correct results (via seq scan) for an undeclared one.
-- `count_tasks(topic, filter) -> u64` — dashboard indications; same index discipline.
+- `count_tasks(topic, filter, ids) -> u64` — dashboard indications; same
+  index discipline, and the same `TaskIds` `get_task` takes, so "how many
+  would I be offered" and "offer me one" answer one question.
 - `complete_task(id, owner, merge_patch)` / `fail_task(id, owner, error_code?)` —
   owner checked; completing advances the token in the same transaction.
 
@@ -709,8 +745,9 @@ Incident freeze (uniform, decided in the post-phase-3 review round): every
 incident converges on one shape — the token parks at the failing element
 with the `incident` wait kind, that token's in-flight arms (boundary
 timers, partial event-gateway arms) are withdrawn, and the instance
-freezes. Inspection always shows *where* it failed, and a future repair API
-has exactly one state to resume from. Anything the freeze deliberately
+freezes. Inspection always shows *where* it failed and what a repair would do
+about it (`docs/design/incident-scope.md`, D10), and a repair has exactly one
+state to resume from. Anything the freeze deliberately
 keeps (a sibling branch's subscription, say) is excluded from scheduler and
 correlation queries by instance status, never left to trip them.
 

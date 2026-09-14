@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  warn side-path-failure-escapes @ notify
+-->
+<!-- An enclosing catch-all stops the freeze but not the damage. notify's
+     failure walks outward past its side path to case, whose catch-all
+     catches it by tearing the whole scope down — review included, the very
+     flow the side path existed to leave alone. The instance does not freeze;
+     the warning still fires, because what it guards is whether a failure
+     stays on its side path. -->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="defs" targetNamespace="https://rbpmn.dev/fixtures">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:subProcess id="case" name="Handle the case">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:startEvent id="c_start">
+        <bpmn:outgoing>fi1</bpmn:outgoing>
+      </bpmn:startEvent>
+      <bpmn:userTask id="review" name="Review">
+        <bpmn:incoming>fi1</bpmn:incoming>
+        <bpmn:outgoing>fi2</bpmn:outgoing>
+      </bpmn:userTask>
+      <bpmn:boundaryEvent id="remind" cancelActivity="false" attachedToRef="review">
+        <bpmn:outgoing>fi3</bpmn:outgoing>
+        <bpmn:timerEventDefinition>
+          <bpmn:timeDuration>PT1H</bpmn:timeDuration>
+        </bpmn:timerEventDefinition>
+      </bpmn:boundaryEvent>
+      <bpmn:serviceTask id="notify" name="Notify">
+        <bpmn:incoming>fi3</bpmn:incoming>
+        <bpmn:outgoing>fi4</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="c_end">
+        <bpmn:incoming>fi2</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:endEvent id="notified">
+        <bpmn:incoming>fi4</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="fi1" sourceRef="c_start" targetRef="review" />
+      <bpmn:sequenceFlow id="fi2" sourceRef="review" targetRef="c_end" />
+      <bpmn:sequenceFlow id="fi3" sourceRef="remind" targetRef="notify" />
+      <bpmn:sequenceFlow id="fi4" sourceRef="notify" targetRef="notified" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="case_failed" name="Case failed" attachedToRef="case">
+      <bpmn:outgoing>f3</bpmn:outgoing>
+      <bpmn:errorEventDefinition />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="done">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="abandoned">
+      <bpmn:incoming>f3</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="case" />
+    <bpmn:sequenceFlow id="f2" sourceRef="case" targetRef="done" />
+    <bpmn:sequenceFlow id="f3" sourceRef="case_failed" targetRef="abandoned" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_p">
+    <bpmndi:BPMNPlane id="BPMNPlane_p" bpmnElement="p">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="case_di" bpmnElement="case">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="case_failed_di" bpmnElement="case_failed">
+        <dc:Bounds x="207" y="92" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="done_di" bpmnElement="done">
+        <dc:Bounds x="357" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="abandoned_di" bpmnElement="abandoned">
+        <dc:Bounds x="357" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="357" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
+        <di:waypoint x="225" y="128" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="357" y="210" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_case">
+    <bpmndi:BPMNPlane id="BPMNPlane_case" bpmnElement="case">
+      <bpmndi:BPMNShape id="c_start_di" bpmnElement="c_start">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="review_di" bpmnElement="review">
+        <dc:Bounds x="175" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="remind_di" bpmnElement="remind">
+        <dc:Bounds x="207" y="92" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="c_end_di" bpmnElement="c_end">
+        <dc:Bounds x="357" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="notify_di" bpmnElement="notify">
+        <dc:Bounds x="325" y="170" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="notified_di" bpmnElement="notified">
+        <dc:Bounds x="507" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="fi1_di" bpmnElement="fi1">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="175" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fi2_di" bpmnElement="fi2">
+        <di:waypoint x="275" y="70" />
+        <di:waypoint x="357" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fi3_di" bpmnElement="fi3">
+        <di:waypoint x="225" y="128" />
+        <di:waypoint x="225" y="210" />
+        <di:waypoint x="325" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="fi4_di" bpmnElement="fi4">
+        <di:waypoint x="425" y="210" />
+        <di:waypoint x="507" y="210" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

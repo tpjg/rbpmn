@@ -36,10 +36,13 @@ pub use compile::{
     NodeIx, RetryPolicies, RetryPolicy, ScopeIx, TimerDue, WorkKind,
 };
 pub use decisions::{DecisionCheck, DecisionValidator, Invocable, NoDecisions};
-pub use event::Event;
+pub use event::{Event, RepairKind};
 pub use merge_patch::merge_patch;
 pub use state::{
-    Counters, InstanceState, InstanceStatus, ScopeId, ScopeState, SubscriptionId,
+    Counters, Halt, InstanceState, InstanceStatus, ScopeId, ScopeState, SubscriptionId,
     SubscriptionState, TimerId, TimerState, Token, TokenId, WaitKind, WorkItemId, WorkItemState,
 };
-pub use step::{Command, StepError, step};
+pub use step::{
+    CaughtCode, Command, Disposition, OpenIncident, Refusal, RefusedBecause, RepairOption,
+    StepError, Takes, open_incident, step,
+};

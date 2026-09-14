@@ -523,13 +523,24 @@ fn error_incident_parks_the_token_at_the_failed_task() {
     )
     .unwrap();
     let id = work_item_at(&proc, &state, "review");
-    step(&proc, &mut state, Command::RaiseError { id, code: None }).unwrap();
+    assert_eq!(state.open_incident(), None);
+    let events = step(&proc, &mut state, Command::RaiseError { id, code: None }).unwrap();
 
     assert_eq!(state.status, InstanceStatus::Failed);
     let tokens: Vec<_> = state.tokens().collect();
     assert_eq!(tokens.len(), 1);
     assert_eq!(tokens[0].1.node, proc.node_by_id("review").unwrap());
     assert_eq!(tokens[0].1.wait, WaitKind::Incident);
+    // The first incident an instance raises is number 0, and it is the open
+    // one: what a repair names (docs/design/incident-scope.md, D9).
+    assert_eq!(state.open_incident(), Some(0));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::IncidentRaised { incident: 0, .. })),
+        "{events:?}"
+    );
+    assert_eq!(state.counters().next_incident, 1);
 }
 
 /// Several timer boundaries on one task: the first to fire wins, interrupts
@@ -702,19 +713,16 @@ fn a_non_interrupting_delivery_leaves_the_host_open_and_re_arms() {
 }
 
 /// ...and the one way that delivery can still fail. The re-arm evaluates the
-/// key against the **patched** document, so a delivery that spoils the key
-/// freezes the instance — and it must freeze *before* the side token, which
-/// is the early return in `side_path_triggered`. A sibling spawned into a
-/// failed instance would be a token nothing can ever advance.
+/// key against the **patched** document, so a delivery that spoils the key is
+/// refused before anything changes: the subscription stays open, the host
+/// keeps waiting, the patch is not applied. A freeze here would take the
+/// waiting host's work with it (docs/design/incident-scope.md, D11).
 #[test]
-fn a_re_arm_that_cannot_resolve_its_key_freezes_before_the_side_token() {
+fn a_delivery_whose_boundary_cannot_re_arm_is_refused() {
     let defs = load("accept/33-non-interrupting-message-boundary.bpmn");
     let bindings = Bindings::new().correlation("note_received", "case.id");
     let proc = ExecutableProcess::compile(&defs, "casefile", &bindings).unwrap();
-    let (boundary, side) = (
-        proc.node_by_id("note_received").unwrap(),
-        proc.node_by_id("file_note").unwrap(),
-    );
+    let boundary = proc.node_by_id("note_received").unwrap();
 
     let mut state = InstanceState::new();
     step(
@@ -726,33 +734,95 @@ fn a_re_arm_that_cannot_resolve_its_key_freezes_before_the_side_token() {
     )
     .unwrap();
     let first = state.armed_subscription_at(boundary).unwrap();
+    let before = state.clone();
 
     // A float key can never match (no canonical spelling across a jsonb
     // round-trip), so the re-arm cannot be made.
-    let events = step(
+    let refused = step(
         &proc,
         &mut state,
         Command::DeliverMessage {
             id: first,
             patch: json!({"case": {"id": 1.5}}),
         },
+    );
+    match refused {
+        Err(StepError::BoundaryCannotRearm { element, reason }) => {
+            assert_eq!(element, "note_received");
+            assert!(reason.contains("case.id"), "{reason}");
+        }
+        other => panic!("expected the delivery refused, got {other:?}"),
+    }
+    assert_eq!(state, before, "the refused delivery changed the instance");
+}
+
+/// The other way a re-arm fails: the patched key lands on a `(message, key)`
+/// another open subscription already waits on — here a sibling branch's catch
+/// for the same message under another binding. Refused the same way.
+#[test]
+fn a_delivery_whose_re_arm_would_duplicate_a_subscription_is_refused() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m" name="NOTE"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:userTask id="review"/>
+    <bpmn:boundaryEvent id="nb" cancelActivity="false" attachedToRef="review">
+      <bpmn:messageEventDefinition messageRef="m"/>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="filed"/>
+    <bpmn:intermediateCatchEvent id="other">
+      <bpmn:messageEventDefinition messageRef="m"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="review"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ps" targetRef="other"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="review" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="other" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="pj" targetRef="end"/>
+    <bpmn:sequenceFlow id="f7" sourceRef="nb" targetRef="filed"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let defs = rbpmn_model::parse(xml).unwrap();
+    let bindings = Bindings::new()
+        .correlation("nb", "case.id")
+        .correlation("other", "other.id");
+    let proc = ExecutableProcess::compile(&defs, "p", &bindings).unwrap();
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({"case": {"id": "a"}, "other": {"id": "b"}}),
+        },
     )
     .unwrap();
+    let armed = state
+        .armed_subscription_at(proc.node_by_id("nb").unwrap())
+        .unwrap();
+    let before = state.clone();
 
-    assert_eq!(state.status, InstanceStatus::Failed);
-    assert!(
-        events
-            .iter()
-            .any(|e| e.to_string() == "correlation-failed note_received case.id"),
-        "{events:?}"
+    // The note moves the case onto key "b", which the sibling's catch holds.
+    let refused = step(
+        &proc,
+        &mut state,
+        Command::DeliverMessage {
+            id: armed,
+            patch: json!({"case": {"id": "b"}}),
+        },
     );
-    // No sibling: one token, parked at the boundary that could not re-arm.
-    assert_eq!(state.tokens().count(), 1);
-    assert!(state.open_work_item_at(side).is_none());
-    let (_, token) = state.tokens().next().unwrap();
-    assert_eq!(token.wait, WaitKind::Incident);
-    assert_eq!(token.node, boundary);
-    assert_eq!(state.subscriptions().count(), 0);
+    match refused {
+        Err(StepError::BoundaryCannotRearm { element, reason }) => {
+            assert_eq!(element, "nb");
+            assert!(reason.contains("(NOTE, b)"), "{reason}");
+        }
+        other => panic!("expected the delivery refused, got {other:?}"),
+    }
+    assert_eq!(state, before, "the refused delivery changed the instance");
 }
 
 /// The core-level statement of `spec/BoundaryExit.tla`: on one host with one
@@ -920,9 +990,10 @@ fn a_message_boundary_and_its_host_have_exactly_one_exit() {
 }
 
 /// Token conservation across a mid-advance freeze: a parallel sibling still
-/// queued when the incident fires must park (Incident wait at its target),
-/// never silently vanish — a frozen instance that lost a branch could never
-/// be repaired.
+/// queued when the incident fires is halted at its target with the flow it
+/// was on, never silently lost — a frozen instance that lost a branch could
+/// never be repaired, and a sibling that forgot its flow could never rejoin
+/// (docs/design/incident-scope.md, D7).
 #[test]
 fn freeze_parks_in_flight_sibling_tokens() {
     let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -975,9 +1046,10 @@ fn freeze_parks_in_flight_sibling_tokens() {
     let c = proc.node_by_id("c").unwrap();
     let ut = proc.node_by_id("ut").unwrap();
     assert!(tokens.contains(&(c, WaitKind::Incident)), "{tokens:?}");
+    let via = proc.flow_by_id("f3");
     assert!(
-        tokens.contains(&(ut, WaitKind::Incident)),
-        "the in-flight sibling parks at its target: {tokens:?}"
+        tokens.contains(&(ut, WaitKind::Halted(Halt::InFlight { via }))),
+        "the in-flight sibling is halted at its target, on its flow: {tokens:?}"
     );
     // The sibling never entered its node: no work item was created for it.
     assert_eq!(state.open_work_items().count(), 0);
@@ -1249,6 +1321,18 @@ fn a_freeze_takes_a_sibling_decision_with_it() {
     let at: Vec<&str> = state.tokens().map(|(_, t)| proc.node_id(t.node)).collect();
     assert!(at.contains(&"decide"), "{at:?}");
     assert!(at.contains(&"wait"), "{at:?}");
+    // ...the failing one as the cause, the decision halted awaiting its
+    // answer, so a repair asks again rather than starting it twice.
+    let wait_of = |id: &str| {
+        let node = proc.node_by_id(id).unwrap();
+        state
+            .tokens()
+            .find(|(_, t)| t.node == node)
+            .map(|(_, t)| t.wait.clone())
+            .unwrap()
+    };
+    assert_eq!(wait_of("wait"), WaitKind::Incident);
+    assert_eq!(wait_of("decide"), WaitKind::Halted(Halt::AwaitingDecision));
 }
 
 /// A history is self-contained: it records the document it started from.
@@ -1295,4 +1379,222 @@ fn the_history_records_what_the_instance_started_with() {
     let payload = serde_json::to_value(&events[0]).unwrap();
     assert_eq!(payload["kind"], "instance-started");
     assert_eq!(payload["variables"], opening);
+}
+
+/// An instance frozen before repair existed may hold several tokens at an
+/// incident, and its cause cannot be told from its collateral: a repair is
+/// refused, typed, and only abandoning the instance — which needs no cause —
+/// lands (docs/design/incident-scope.md, D7).
+#[test]
+fn a_frozen_instance_with_two_incident_tokens_can_only_be_abandoned() {
+    let proc = compile("accept/03-parallel-gateway.bpmn");
+    let at = |id: &str| Token {
+        node: proc.node_by_id(id).unwrap(),
+        scope: ScopeId::ROOT,
+        wait: WaitKind::Incident,
+    };
+    let legacy = InstanceState::rehydrate(
+        InstanceStatus::Failed,
+        json!({}),
+        [(TokenId(1), at("ta")), (TokenId(2), at("tb"))],
+        [],
+        [],
+        [],
+        [],
+        Counters {
+            next_token: 3,
+            next_work_item: 2,
+            next_incident: 1,
+            ..Counters::default()
+        },
+    );
+    let repair = |disposition| Command::Repair {
+        incident: 0,
+        disposition,
+        reason: "frozen before the upgrade".to_string(),
+    };
+    let mut state = legacy.clone();
+    assert_eq!(
+        step(
+            &proc,
+            &mut state,
+            repair(Disposition::Retry { patch: json!({}) })
+        ),
+        Err(StepError::RepairRefused(Refusal::CauseUnknown))
+    );
+    assert_eq!(state, legacy);
+    let events = step(&proc, &mut state, repair(Disposition::AbandonInstance)).unwrap();
+    assert_eq!(state.status, InstanceStatus::Terminated);
+    assert_eq!(
+        events.last().map(|e| e.to_string()),
+        Some("instance-terminated".to_string())
+    );
+}
+
+/// `incident-repaired` keeps a null answer apart from none: an Advance may
+/// answer a decision with null, and a replay must rebuild exactly that.
+#[test]
+fn a_repair_event_keeps_a_null_answer_apart_from_none() {
+    let with = |answer| Event::IncidentRepaired {
+        incident: 0,
+        element: "decide".to_string(),
+        disposition: RepairKind::Advance,
+        code: None,
+        answer,
+        reason: "priced by hand".to_string(),
+    };
+    for event in [with(Some(Value::Null)), with(Some(json!(30))), with(None)] {
+        let stored = serde_json::to_value(&event).unwrap();
+        assert_eq!(serde_json::from_value::<Event>(stored).unwrap(), event);
+    }
+    assert_eq!(with(None).to_string(), "incident-repaired decide advance");
+}
+
+/// A Divert names the codes that reach a boundary, where each one lands, and
+/// what it costs to get there (docs/design/incident-scope.md, D10). Here the
+/// failing task is inside a subprocess and only the subprocess's own boundary
+/// catches: naming its code reaches `be`, and `sp` goes down on the way with
+/// everything still running in it. A codeless Divert is not offered at all —
+/// nothing here is a catch-all.
+#[test]
+fn the_read_names_where_a_diverts_code_lands_and_what_it_tears_down() {
+    let xml =
+        include_str!("../../rbpmn-model/tests/fixtures/accept/20-subprocess-error-boundary.bpmn");
+    let defs = rbpmn_model::parse(xml).unwrap();
+    let proc = ExecutableProcess::compile(&defs, "p", &Bindings::default()).unwrap();
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({}),
+        },
+    )
+    .unwrap();
+
+    // A codeless failure at `reserve`: its own boundary is a timer, and the
+    // subprocess's wants OUT_OF_STOCK, so nothing catches it.
+    let (id, _) = state.open_work_items().next().expect("reserve is open");
+    step(&proc, &mut state, Command::RaiseError { id, code: None }).unwrap();
+    assert_eq!(state.status, InstanceStatus::Failed);
+
+    let read = rbpmn_core::open_incident(&proc, &state).expect("a frozen instance has one");
+    assert_eq!((&*read.element, &*read.resume), ("reserve", "reserve"));
+    let divert = read
+        .options
+        .iter()
+        .find(|o| o.disposition == rbpmn_core::RepairKind::Divert)
+        .expect("divert is an option");
+    assert!(divert.refused.is_none());
+    assert_eq!(
+        divert
+            .codes
+            .iter()
+            .map(|c| {
+                (
+                    c.code.as_deref(),
+                    c.caught_at.as_str(),
+                    c.tears_down.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [(Some("OUT_OF_STOCK"), "be", Some("sp"))],
+        "the one code that lands, where it lands, and the scope it costs"
+    );
+}
+
+/// A catch-all takes any code, and no list can enumerate that — so the read
+/// says it with the codeless entry rather than by guessing an alphabet
+/// (docs/design/incident-scope.md, D10). The freeze here fails no work item
+/// at all (a correlation key that will not resolve), which is what puts a
+/// catch-all on the walk in the first place: an error raised at `c` would
+/// have been caught by it and never frozen.
+#[test]
+fn a_catch_all_on_the_walk_is_the_codeless_entry_and_takes_any_code() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m" name="Go"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:subProcess id="sp">
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+      <bpmn:startEvent id="s2"><bpmn:outgoing>fi1</bpmn:outgoing></bpmn:startEvent>
+      <bpmn:intermediateCatchEvent id="c">
+        <bpmn:incoming>fi1</bpmn:incoming>
+        <bpmn:outgoing>fi2</bpmn:outgoing>
+        <bpmn:messageEventDefinition messageRef="m"/>
+      </bpmn:intermediateCatchEvent>
+      <bpmn:endEvent id="e2"><bpmn:incoming>fi2</bpmn:incoming></bpmn:endEvent>
+      <bpmn:sequenceFlow id="fi1" sourceRef="s2" targetRef="c"/>
+      <bpmn:sequenceFlow id="fi2" sourceRef="c" targetRef="e2"/>
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="sp_any" attachedToRef="sp">
+      <bpmn:outgoing>f3</bpmn:outgoing>
+      <bpmn:errorEventDefinition/>
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="e_fail"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="end"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="sp"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="sp" targetRef="end"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="sp_any" targetRef="e_fail"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let defs = rbpmn_model::parse(xml).unwrap();
+    let bindings = Bindings::new().correlation("c", "order.id");
+    let proc = ExecutableProcess::compile(&defs, "p", &bindings).unwrap();
+    let mut state = InstanceState::new();
+    step(
+        &proc,
+        &mut state,
+        Command::Start {
+            variables: json!({}), // no order.id, so `c` cannot arm
+        },
+    )
+    .unwrap();
+    assert_eq!(state.status, InstanceStatus::Failed);
+
+    let read = rbpmn_core::open_incident(&proc, &state).expect("a frozen instance has one");
+    assert_eq!(&*read.element, "c");
+    let divert = read
+        .options
+        .iter()
+        .find(|o| o.disposition == rbpmn_core::RepairKind::Divert)
+        .expect("divert is an option");
+    assert!(divert.refused.is_none());
+    assert_eq!(
+        divert
+            .codes
+            .iter()
+            .map(|c| {
+                (
+                    c.code.as_deref(),
+                    c.caught_at.as_str(),
+                    c.tears_down.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [(None, "sp_any", Some("sp"))],
+        "the catch-all is one entry, not an alphabet"
+    );
+
+    // And what that entry means: a code the read never named lands there too.
+    let mut diverted = state.clone();
+    step(
+        &proc,
+        &mut diverted,
+        Command::Repair {
+            incident: read.incident,
+            disposition: Disposition::Divert {
+                code: Some("A_CODE_NOBODY_DECLARED".to_string()),
+            },
+            reason: "the warehouse will never ack this one".to_string(),
+        },
+    )
+    .expect("a catch-all takes any code");
+    // ...and what it costs: `sp` comes down with the token still inside it,
+    // the boundary's path runs, and `e_fail` is the last token there is.
+    assert_eq!(diverted.status, InstanceStatus::Completed);
+    assert_eq!(diverted.tokens().count(), 0);
 }

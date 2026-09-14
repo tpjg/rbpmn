@@ -6,7 +6,9 @@
 //! Traces are compared line by line — the `Display` format of `Event` is
 //! stable API, like rule IDs.
 
-use rbpmn_core::{Bindings, Command, ExecutableProcess, InstanceState, InstanceStatus, step};
+use rbpmn_core::{
+    Bindings, Command, Disposition, ExecutableProcess, InstanceState, InstanceStatus, step,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fmt::Write as _;
@@ -59,6 +61,87 @@ struct DeliverAction {
     deliver: String,
     #[serde(default)]
     patch: Option<Value>,
+    #[serde(default)]
+    refused: Option<String>,
+}
+
+/// Repair the instance's open incident (`docs/design/incident-scope.md`,
+/// D4–D5). `repair` is the incident number the request names (D9), and
+/// `refused`, as on a delivery, is the `StepError` variant the step must
+/// answer with — typed, before any mutation, and naming its cause
+/// (`RepairRefused(NothingCatches)`), so a refusal fired by the wrong rule
+/// does not pass.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairAction {
+    repair: u64,
+    disposition: String,
+    #[serde(default)]
+    patch: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    answer: Option<Value>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    refused: Option<String>,
+}
+
+/// A field that is present is `Some`, even when it is `null`: an Advance may
+/// answer a decision with null, which is an answer, where leaving the field
+/// out gives none.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+/// The command a repair action states. A field its disposition does not take
+/// is a scenario error, never ignored.
+fn repair_command(r: &RepairAction) -> Command {
+    let patch = r.patch.clone().unwrap_or_else(|| serde_json::json!({}));
+    let takes_no = |absent: bool, what: &str| {
+        assert!(
+            absent,
+            "repair of incident {}: {} takes no {what}",
+            r.repair, r.disposition
+        );
+    };
+    let disposition = match r.disposition.as_str() {
+        "retry" => {
+            takes_no(r.answer.is_none() && r.code.is_none(), "answer or code");
+            Disposition::Retry { patch }
+        }
+        "advance" => {
+            takes_no(r.code.is_none(), "code");
+            Disposition::Advance {
+                patch,
+                answer: r.answer.clone(),
+            }
+        }
+        "divert" => {
+            takes_no(r.patch.is_none() && r.answer.is_none(), "patch or answer");
+            Disposition::Divert {
+                code: r.code.clone(),
+            }
+        }
+        "abandon" | "abandon-instance" => {
+            takes_no(
+                r.patch.is_none() && r.answer.is_none() && r.code.is_none(),
+                "patch, answer or code",
+            );
+            if r.disposition == "abandon" {
+                Disposition::Abandon
+            } else {
+                Disposition::AbandonInstance
+            }
+        }
+        other => panic!("repair of incident {}: no disposition '{other}'", r.repair),
+    };
+    Command::Repair {
+        incident: r.repair,
+        disposition,
+        reason: r.reason.clone().unwrap_or_else(|| "scenario".to_string()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -69,6 +152,7 @@ enum Action {
     Fail(FailAction),
     Fire(FireAction),
     Deliver(DeliverAction),
+    Repair(RepairAction),
 }
 
 /// Answer the decision a business-rule task is waiting on.
@@ -119,6 +203,12 @@ fn run_scenario(path: &Path, failures: &mut String) {
     trace.extend(events.iter().map(|e| e.to_string()));
 
     for action in &scenario.actions {
+        let refused = match action {
+            Action::Deliver(d) => d.refused.as_deref(),
+            Action::Repair(r) => r.refused.as_deref(),
+            _ => None,
+        };
+        let label: String;
         let (element, command) = match action {
             Action::Complete(CompleteAction { complete, patch }) => {
                 let node = proc
@@ -175,7 +265,7 @@ fn run_scenario(path: &Path, failures: &mut String) {
                     .unwrap_or_else(|| panic!("{name}: no armed timer at '{fire}'"));
                 (fire, Command::FireTimer { id })
             }
-            Action::Deliver(DeliverAction { deliver, patch }) => {
+            Action::Deliver(DeliverAction { deliver, patch, .. }) => {
                 let node = proc
                     .node_by_id(deliver)
                     .unwrap_or_else(|| panic!("{name}: no element '{deliver}'"));
@@ -185,10 +275,52 @@ fn run_scenario(path: &Path, failures: &mut String) {
                 let patch = patch.clone().unwrap_or_else(|| serde_json::json!({}));
                 (deliver, Command::DeliverMessage { id, patch })
             }
+            Action::Repair(r) => {
+                label = format!("incident {}", r.repair);
+                (&label, repair_command(r))
+            }
         };
-        let events = step(&proc, &mut state, command)
-            .unwrap_or_else(|e| panic!("{name}: action on '{element}' failed: {e}"));
-        trace.extend(events.iter().map(|e| e.to_string()));
+        let before = state.clone();
+        match (step(&proc, &mut state, command), refused) {
+            (Ok(events), None) => trace.extend(events.iter().map(|e| e.to_string())),
+            // A refusal is typed and comes before any mutation, so the state
+            // it leaves is the state it found.
+            //
+            // The expectation is a Debug *prefix*, deliberately: a scenario
+            // pins as much of a refusal as is stable — the numbers
+            // `IncidentNotOpen` carries, which are what D9 turns on, or the
+            // element `BoundaryCannotRearm` names — and stops before prose
+            // that may be reworded. A bare variant name pins the variant
+            // alone, which for a refusal with fields is rarely enough.
+            (Err(e), Some(variant)) if format!("{e:?}").starts_with(variant) => {
+                if state != before {
+                    writeln!(
+                        failures,
+                        "{name}: the refusal at '{element}' changed the state"
+                    )
+                    .unwrap();
+                    return;
+                }
+            }
+            (Err(e), Some(variant)) => {
+                writeln!(
+                    failures,
+                    "{name}: '{element}' was refused with {e:?}, not {variant}"
+                )
+                .unwrap();
+                return;
+            }
+            (Ok(events), Some(variant)) => {
+                let stepped: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+                writeln!(
+                    failures,
+                    "{name}: '{element}' should have been refused with {variant}, and stepped: {stepped:?}"
+                )
+                .unwrap();
+                return;
+            }
+            (Err(e), None) => panic!("{name}: action on '{element}' failed: {e}"),
+        }
     }
 
     let status = match state.status {

@@ -1,0 +1,31 @@
+{
+  "fixture": "accept/10-error-boundary.bpmn",
+  "variables": {},
+  "actions": [
+    {
+      "fail": "st",
+      "code": "UNKNOWN_CODE"
+    },
+    {
+      "repair": 0,
+      "disposition": "abandon",
+      "reason": "the order was cancelled"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started st",
+      "work-item-created st service st",
+      "work-item-failed st UNKNOWN_CODE",
+      "incident-raised st UNKNOWN_CODE",
+      "incident-repaired st abandon",
+      "instance-completed"
+    ]
+  }
+}

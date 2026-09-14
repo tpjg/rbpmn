@@ -38,9 +38,24 @@ export function annotate(viewer, annotations) {
       canvas.addMarker(elementId, `rbpmn-mark-${kind}`);
       marks.push([elementId, kind]);
     }
+    // `inert` is a modifier, not a kind: it composes with whichever kind the
+    // consumer chose, so the mark still answers *what* is parked here. It
+    // applies only when everything on the element is inert — one live mark
+    // among inert ones is the one that matters, and dashing the element would
+    // mute it.
+    // A mark that records something already over does not vote: `history`
+    // marks are never inert because they are never live, and counting them
+    // undashes an element whose real arms cannot fire — which is the
+    // mispaint the dashes exist to prevent.
+    const pending = items.filter((a) => !a.history);
+    const allInert = pending.length > 0 && pending.every((a) => a.inert);
+    if (allInert) {
+      canvas.addMarker(elementId, 'rbpmn-mark-inert');
+      marks.push([elementId, 'inert']);
+    }
     const kinds = [...new Set(items.map((a) => a.kind))];
     const badge = document.createElement('div');
-    badge.className = `rbpmn-badge rbpmn-badge-${kinds[0]}`;
+    badge.className = `rbpmn-badge rbpmn-badge-${kinds[0]}${allInert ? ' rbpmn-badge-inert' : ''}`;
     badge.textContent = String(items.length);
     // textContent, not innerHTML: payload titles carry model and runtime
     // strings (element names, handler failure messages).

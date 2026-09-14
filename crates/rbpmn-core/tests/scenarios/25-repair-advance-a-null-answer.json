@@ -1,0 +1,50 @@
+{
+  "fixture": "accept/25-business-rule-task.bpmn",
+  "bindings": {
+    "decisions": {
+      "decide": {
+        "decision": "Discount",
+        "result": "order.discount"
+      }
+    }
+  },
+  "variables": {
+    "Amount": 250
+  },
+  "actions": [
+    {
+      "decide": "decide",
+      "answer": null
+    },
+    {
+      "repair": 0,
+      "disposition": "advance",
+      "answer": null,
+      "reason": "no discount applies"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {
+      "Amount": 250,
+      "order": {
+        "discount": null
+      }
+    },
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started decide",
+      "decision-requested decide Discount",
+      "incident-raised decide",
+      "incident-repaired decide advance",
+      "element-completed decide",
+      "flow-taken f2",
+      "element-started end",
+      "element-completed end",
+      "instance-completed"
+    ]
+  }
+}

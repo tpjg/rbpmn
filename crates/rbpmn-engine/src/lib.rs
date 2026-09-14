@@ -38,7 +38,8 @@ mod worker;
 
 pub use definitions::{DEFINITION_DECISION_VIEW, DEFINITION_VIEW};
 pub use error::{
-    Completion, Correlation, DeployError, Deployment, EngineError, FailOutcome, StartedInstance,
+    Completion, Correlation, DeployError, Deployment, EngineError, FailOutcome, Repaired,
+    StartedInstance,
 };
 pub use events::{EventCursor, EventRecord};
 #[cfg(feature = "http")]
@@ -47,7 +48,10 @@ pub use inspect::{
     EventView, InstanceInspection, ScopeView, SubscriptionView, TimerView, TokenView, WorkItemView,
 };
 pub use instances::{INSTANCE_VIEW, InstanceMatch, MAX_FIND_LIMIT};
-pub use rbpmn_core::{Bindings, Event, IndexDeclaration, IndexScope};
+pub use rbpmn_core::{
+    Bindings, CaughtCode, Disposition, Event, IndexDeclaration, IndexScope, InstanceStatus,
+    OpenIncident, Refusal, RefusedBecause, RepairKind, RepairOption, StepError, Takes,
+};
 pub use retention::{
     ArchiveBatch, ArchiveError, InstanceRecord, PrunableDefinition, RetentionArchive,
     RetentionBatch, RetentionOptions, RetentionPolicy, RetentionReport,
@@ -57,8 +61,8 @@ pub use scheduler::SchedulerOptions;
 pub use sqlx::PgPool;
 pub use subscriptions::SUBSCRIPTION_VIEW;
 pub use tasks::{
-    DeclaredIndex, GetTaskOptions, LockExtension, LockedTask, Released, TaskFilter, TaskOrder,
-    declared_index_name, shared_index_name,
+    DeclaredIndex, GetTaskOptions, LockExtension, LockedTask, MAX_TASK_IDS, Released, TaskFilter,
+    TaskIds, TaskOrder, declared_index_name, shared_index_name,
 };
 pub use timers::TIMER_VIEW;
 pub use work_items::{QueueDepth, WORK_ITEM_VIEW};
@@ -167,6 +171,12 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         19,
         "retry_policy",
         include_str!("../migrations/0019_retry_policy.sql"),
+    ),
+    (20, "repair", include_str!("../migrations/0020_repair.sql")),
+    (
+        21,
+        "frozen_at",
+        include_str!("../migrations/0021_frozen_at.sql"),
     ),
 ];
 

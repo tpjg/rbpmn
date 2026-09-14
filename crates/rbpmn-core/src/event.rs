@@ -103,6 +103,36 @@ pub enum Event {
         /// none to give. Same split as above: payload, not `Display`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// The incident's number on its instance: each freeze mints the
+        /// next, and a repair names the one it repairs
+        /// (docs/design/incident-scope.md, D9). Payload, not `Display`. An
+        /// event written before the number existed reads as 0, the number
+        /// the migration gives the one incident such an instance can hold.
+        #[serde(default)]
+        incident: u64,
+    },
+    /// The instance's open incident was repaired
+    /// (docs/design/incident-scope.md, D4–D5). `element` is where the
+    /// incident was raised, the pair of `incident-raised`, and the events
+    /// that follow are the disposition taken there. A patch the repair
+    /// applied is its `variables-patched`, as for every command; an answer
+    /// given to a decision is here, as `decision-evaluated` carries one.
+    /// `reason` is the operator's, opaque to the engine and outside
+    /// `Display`, which is what makes the history an audit trail.
+    IncidentRepaired {
+        incident: u64,
+        element: String,
+        disposition: RepairKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        /// Present means answered — null included, which is an answer.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present"
+        )]
+        answer: Option<Value>,
+        reason: String,
     },
     VariablesPatched {
         patch: Value,
@@ -190,6 +220,35 @@ pub enum Event {
     InstanceTerminated,
 }
 
+/// Which disposition a repair took, as `incident-repaired` records it
+/// (docs/design/incident-scope.md, D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepairKind {
+    Retry,
+    Advance,
+    Divert,
+    Abandon,
+    AbandonInstance,
+}
+
+impl fmt::Display for RepairKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            RepairKind::Retry => "retry",
+            RepairKind::Advance => "advance",
+            RepairKind::Divert => "divert",
+            RepairKind::Abandon => "abandon",
+            RepairKind::AbandonInstance => "abandon-instance",
+        })
+    }
+}
+
+/// A field that is present is `Some`, even when it is `null`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
 impl fmt::Display for Event {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -224,6 +283,15 @@ impl fmt::Display for Event {
             Event::IncidentRaised { element, code, .. } => match code {
                 Some(code) => write!(f, "incident-raised {element} {code}"),
                 None => write!(f, "incident-raised {element}"),
+            },
+            Event::IncidentRepaired {
+                element,
+                disposition,
+                code,
+                ..
+            } => match code {
+                Some(code) => write!(f, "incident-repaired {element} {disposition} {code}"),
+                None => write!(f, "incident-repaired {element} {disposition}"),
             },
             Event::VariablesPatched { .. } => write!(f, "variables-patched"),
             Event::TimerArmed { element, due, .. } => {

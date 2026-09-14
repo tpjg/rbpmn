@@ -16,11 +16,11 @@
 //! and poisons the state.
 
 use crate::compile::{ExecKind, ExecutableProcess, FlowIx, NodeIx, TimerDue};
-use crate::event::Event;
+use crate::event::{Event, RepairKind};
 use crate::merge_patch::merge_patch;
 use crate::state::{
-    InstanceState, InstanceStatus, ScopeId, ScopeState, SubscriptionId, SubscriptionState, TimerId,
-    TimerState, Token, TokenId, WaitKind, WorkItemId, WorkItemState,
+    Halt, InstanceState, InstanceStatus, ScopeId, ScopeState, SubscriptionId, SubscriptionState,
+    TimerId, TimerState, Token, TokenId, WaitKind, WorkItemId, WorkItemState,
 };
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -32,9 +32,11 @@ pub enum Command {
     /// Complete an open work item, applying an RFC 7386 merge patch to the
     /// variables in the same step that advances the token.
     CompleteWorkItem { id: WorkItemId, patch: Value },
-    /// A work item's retry budget is exhausted: raise the named error. A
-    /// matching error boundary on the host interrupts the task and takes the
-    /// boundary path; no match freezes the instance in the incident state.
+    /// A work item's retry budget is exhausted: raise the error, with its
+    /// code if it has one. The nearest matching error boundary — on the host,
+    /// else on an enclosing subprocess, an exact code before a catch-all at
+    /// each — interrupts and takes the boundary path; no match freezes the
+    /// instance in the incident state.
     RaiseError {
         id: WorkItemId,
         code: Option<String>,
@@ -74,6 +76,164 @@ pub enum Command {
         answer: Option<Value>,
         reason: Option<String>,
     },
+    /// Repair the instance's open incident (docs/design/incident-scope.md,
+    /// D4–D5). Never a state edit: the disposition acts at the incident's
+    /// resume point through the advancer every command uses, so every state
+    /// it reaches is one a normal execution could have, and a history with
+    /// repairs in it replays through this core. `incident` is the number the
+    /// request names (D9); any other is refused, so a resent or stale request
+    /// is answered rather than stepped.
+    Repair {
+        incident: u64,
+        disposition: Disposition,
+        reason: String,
+    },
+}
+
+/// What a repair does at its incident's resume point
+/// (docs/design/incident-scope.md, D5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Disposition {
+    /// Merge the patch, then enter the resume point as if for the first
+    /// time: a new work item with the manifest's budget, the decision asked
+    /// again, arms resolved against the patched document.
+    Retry { patch: Value },
+    /// Complete the resume point and leave along its outgoing flow: a task,
+    /// catch or subprocess with `patch` merged; a business-rule task with the
+    /// `answer` its decision could not give, written by replacement, and no
+    /// patch.
+    Advance { patch: Value, answer: Option<Value> },
+    /// Raise the error at the resume point and walk outward as `RaiseError`
+    /// does; `None` is caught by a catch-all only.
+    Divert { code: Option<String> },
+    /// Consume the token as though it reached an end event.
+    Abandon,
+    /// End the instance as `Terminated`.
+    AbandonInstance,
+}
+
+impl Disposition {
+    /// Which disposition this is, as `incident-repaired` records it.
+    pub fn kind(&self) -> RepairKind {
+        match self {
+            Disposition::Retry { .. } => RepairKind::Retry,
+            Disposition::Advance { .. } => RepairKind::Advance,
+            Disposition::Divert { .. } => RepairKind::Divert,
+            Disposition::Abandon => RepairKind::Abandon,
+            Disposition::AbandonInstance => RepairKind::AbandonInstance,
+        }
+    }
+}
+
+/// The instance's open incident, and what a repair could do with it
+/// (docs/design/incident-scope.md, D10). A read: diagnosing which
+/// dispositions are legal is one, offering the button is not.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenIncident {
+    /// The number a repair must name (D9).
+    pub incident: u64,
+    /// Where it failed — what `incident-raised` names.
+    pub element: String,
+    /// Where a repair re-enters, which for a boundary that could not arm is
+    /// its host, and for an event-gateway alternative the gateway.
+    pub resume: String,
+    /// Tokens the freeze halted beside the cause; they resume with it (D7).
+    pub halted: usize,
+    pub options: Vec<RepairOption>,
+}
+
+/// One disposition, and whether it would land here.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairOption {
+    pub disposition: RepairKind,
+    /// What the caller supplies with it.
+    pub takes: Takes,
+    /// For a Divert that would land, where each code it can send is caught.
+    /// Every declared code on the walk appears; a catch-all does not expand
+    /// into the codes it would take, it says so through the codeless entry.
+    /// Empty for every other disposition, and whenever `refused` is set.
+    pub codes: Vec<CaughtCode>,
+    /// Why it would be refused, or `None` when it lands.
+    pub refused: Option<RefusedBecause>,
+}
+
+/// A code a Divert can send, and what sending it does
+/// (docs/design/incident-scope.md, D10).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaughtCode {
+    /// The code to send. `None` is the codeless Divert, which only a
+    /// catch-all takes — and a catch-all takes *any* code, so a `None` entry
+    /// means every code lands, each wherever this list says it is caught.
+    pub code: Option<String>,
+    /// The boundary that takes it.
+    pub caught_at: String,
+    /// The subprocess torn down on the way, when the boundary that catches
+    /// is not on the failing activity itself: an error walks outward, and
+    /// the scope it leaves goes with everything still running in it.
+    pub tears_down: Option<String>,
+}
+
+/// What a disposition takes beside its reason. A patch is optional — the
+/// repair of a world that fixed itself carries none — an answer is required
+/// where it is taken, and which codes a Divert may send is
+/// [`RepairOption::codes`], the codeless one included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Takes {
+    Nothing,
+    Patch,
+    Answer,
+    Code,
+}
+
+/// A refusal as a reader needs it: the cause to match on, the prose to show.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefusedBecause {
+    pub cause: Refusal,
+    pub reason: String,
+}
+
+/// Why a repair was refused, before anything changed (D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Refusal {
+    #[error("a repair needs a reason: it is what makes the history an audit trail")]
+    NoReason,
+    #[error(
+        "the instance froze before repair existed, with several tokens at an incident, so its \
+         cause cannot be told from its collateral — abandon the instance instead"
+    )]
+    CauseUnknown,
+    #[error("an event-based gateway has no single way on — retry it, or divert")]
+    GatewayHasNoSingleWayOn,
+    #[error(
+        "a business-rule task advances with the answer its decision could not give, and no \
+         patch"
+    )]
+    DecisionNeedsAnAnswer,
+    #[error("only a business-rule task takes an answer — advance anything else with a patch")]
+    AnswerOnlyForADecision,
+    #[error(
+        "no boundary catches it here or further out, and diverting into nothing would lose \
+         the token"
+    )]
+    NothingCatches,
+    #[error(
+        "a join could wait for this token forever — abandon only on a side path, or the last \
+         token of its scope"
+    )]
+    AJoinWouldWait,
+}
+
+fn open_incident_text(open: &Option<u64>) -> String {
+    match open {
+        Some(n) => format!("the open incident is {n}"),
+        None => "the instance is not frozen".to_string(),
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -95,6 +255,19 @@ pub enum StepError {
     UnknownTimer(TimerId),
     #[error("no open subscription {0:?} in this instance")]
     UnknownSubscription(SubscriptionId),
+    /// A delivery refused before anything changed: the non-interrupting
+    /// boundary it triggers could not re-arm afterwards
+    /// (docs/design/incident-scope.md, D11).
+    #[error("delivery refused: boundary '{element}' could not re-arm — {reason}")]
+    BoundaryCannotRearm { element: String, reason: String },
+    /// A repair named an incident that is not the open one: resent, stale,
+    /// or for an instance no longer frozen (docs/design/incident-scope.md,
+    /// D9).
+    #[error("incident {named} is not open — {}", open_incident_text(.open))]
+    IncidentNotOpen { named: u64, open: Option<u64> },
+    /// A repair the incident's resume point does not allow (D5).
+    #[error("repair refused: {0}")]
+    RepairRefused(Refusal),
     #[error("internal invariant violated: {0} — state is poisoned")]
     Invariant(String),
 }
@@ -129,6 +302,268 @@ fn assign(document: &mut Value, path: &[String], value: Value) {
         .as_object_mut()
         .expect("made an object above")
         .insert(last.clone(), value);
+}
+
+/// Why a message arm could not be opened.
+enum ArmFailure {
+    /// The key did not resolve to a string or an exact integer.
+    Unusable { name: String },
+    /// Another open subscription already waits on this `(message, key)`.
+    Duplicate { message: String, key: String },
+}
+
+impl ArmFailure {
+    fn describe(&self) -> String {
+        match self {
+            ArmFailure::Unusable { name } => {
+                format!("its correlation key '{name}' would not be a string or an exact integer")
+            }
+            ArmFailure::Duplicate { message, key } => format!(
+                "a subscription for ({message}, {key}) is already open, and a second would \
+                 make every delivery ambiguous"
+            ),
+        }
+    }
+}
+
+/// The `(message, key)` the message arm at `element` — a catch, a receive
+/// task or a message boundary — opens with against `variables`, or why it
+/// cannot open. Keys must be strings or exact integers (floats have no
+/// canonical spelling across a jsonb round-trip, so the same logical value
+/// would arm two different keys), and a second open subscription for one
+/// `(message, key)` would make every delivery permanently ambiguous.
+/// `excluding` is a subscription about to be consumed, which its own re-arm
+/// cannot collide with.
+fn arm_key(
+    proc: &ExecutableProcess,
+    state: &InstanceState,
+    variables: &Value,
+    element: NodeIx,
+    excluding: Option<SubscriptionId>,
+) -> Result<(String, String), ArmFailure> {
+    let Some((message, key)) = proc.message_arm(element) else {
+        unreachable!("arm_key is only called on message arms");
+    };
+    let key_value = match rbpmn_model::condition::resolve_path(variables, key) {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => n
+            .as_i64()
+            .map(|i| i.to_string())
+            .or_else(|| n.as_u64().map(|u| u.to_string())),
+        _ => None,
+    };
+    let Some(key_value) = key_value else {
+        return Err(ArmFailure::Unusable {
+            name: key.join("."),
+        });
+    };
+    if state
+        .subscriptions
+        .iter()
+        .any(|(id, s)| Some(*id) != excluding && s.message == message && s.key == key_value)
+    {
+        return Err(ArmFailure::Duplicate {
+            message: message.to_string(),
+            key: key_value,
+        });
+    }
+    Ok((message.to_string(), key_value))
+}
+
+/// Where an error raised at `host` is offered, outward: the host itself,
+/// then each enclosing subprocess, with the token each step would interrupt
+/// — `token` at the host, an enclosing subprocess's parked token further
+/// out, whose whole scope is torn down with it.
+fn outward(
+    state: &InstanceState,
+    host: NodeIx,
+    token: TokenId,
+    scope: ScopeId,
+) -> Vec<(TokenId, NodeIx)> {
+    let (mut host, mut target, mut scope) = (host, token, scope);
+    let mut hosts = vec![(target, host)];
+    while let Some(enclosing) = state.scopes.get(&scope) {
+        host = enclosing.element;
+        target = enclosing.token;
+        scope = enclosing.parent;
+        hosts.push((target, host));
+    }
+    hosts
+}
+
+/// The error boundary that catches `code` raised at `host`, and the token it
+/// interrupts: on `host` itself, else on the nearest enclosing subprocess —
+/// an exact code before a catch-all at each. `None` is uncaught.
+fn catcher(
+    proc: &ExecutableProcess,
+    state: &InstanceState,
+    host: NodeIx,
+    token: TokenId,
+    scope: ScopeId,
+    code: Option<&str>,
+) -> Option<(TokenId, NodeIx)> {
+    outward(state, host, token, scope)
+        .into_iter()
+        .find_map(|(target, host)| proc.error_boundary(host, code).map(|b| (target, b)))
+}
+
+/// The codes a Divert can send from `host`, and where each one lands — every
+/// answer from `catcher`, the walk the command itself takes, asked once per
+/// candidate. A code no boundary declares is left out: nothing but a
+/// catch-all could take it, and the catch-all is the `None` entry.
+fn landing_codes(
+    proc: &ExecutableProcess,
+    state: &InstanceState,
+    host: NodeIx,
+    token: TokenId,
+    scope: ScopeId,
+) -> Vec<CaughtCode> {
+    let walk = outward(state, host, token, scope);
+    // The codeless divert first, then every code a boundary on the walk
+    // declares, innermost host first and without repeats.
+    let mut candidates: Vec<Option<String>> = vec![None];
+    for (_, h) in &walk {
+        for b in proc.error_boundaries(*h) {
+            if let ExecKind::ErrorBoundary { code: Some(c) } = &proc.node(b).kind
+                && !candidates.iter().any(|x| x.as_deref() == Some(c.as_str()))
+            {
+                candidates.push(Some(c.clone()));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|code| {
+            let (target, boundary) = catcher(proc, state, host, token, scope, code.as_deref())?;
+            // Which level caught it is told by the token it interrupts: the
+            // cause's own means the failing activity's boundary took it,
+            // anything else is an enclosing subprocess — and that scope is
+            // torn down with everything still running inside it.
+            let tears_down = walk
+                .iter()
+                .position(|(t, _)| *t == target)
+                .filter(|&i| i > 0)
+                .map(|i| proc.node_id(walk[i].1).to_string());
+            Some(CaughtCode {
+                code,
+                caught_at: proc.node_id(boundary).to_string(),
+                tears_down,
+            })
+        })
+        .collect()
+}
+
+/// Abandon's rule (D5): consuming the token must leave no join waiting for
+/// it — it is on a side path, where nothing joins, or it is the last token
+/// of its scope. The command and the read ask this one function.
+fn abandon_would_strand_a_join(
+    proc: &ExecutableProcess,
+    state: &InstanceState,
+    cause: TokenId,
+    scope: ScopeId,
+    resume: NodeIx,
+) -> bool {
+    let last_of_its_scope = !state
+        .tokens()
+        .any(|(id, t)| id != cause && t.scope == scope);
+    !proc.on_side_path(resume) && !last_of_its_scope
+}
+
+/// What a repair would do at the instance's open incident, for a reader —
+/// the inspector's, and anyone else's (docs/design/incident-scope.md, D10).
+/// `None` when the instance is not frozen — and for a frozen instance that
+/// holds no token at an incident at all, which is corruption rather than a
+/// state a step can produce: `fsck` reports it ("a failed instance is not
+/// frozen at an incident token") and the command answers the same state with
+/// `StepError::Invariant`. Every verdict here is the one the command
+/// reaches, from the same functions: a read that could disagree with the
+/// verb would be worse than no read.
+pub fn open_incident(proc: &ExecutableProcess, state: &InstanceState) -> Option<OpenIncident> {
+    let incident = state.open_incident()?;
+    let causes: Vec<TokenId> = state
+        .tokens()
+        .filter(|(_, t)| t.wait == WaitKind::Incident)
+        .map(|(id, _)| id)
+        .collect();
+    let &cause = causes.first()?;
+    let parked = state.tokens.get(&cause)?.clone();
+    let resume = proc.resume_point(parked.node);
+    // An instance frozen before repair existed can hold several: only
+    // abandoning it, which needs no cause, is left (D7).
+    let unknown_cause = (causes.len() > 1).then_some(Refusal::CauseUnknown);
+    let divert_codes = landing_codes(proc, state, resume, cause, parked.scope);
+    let refusal = |disposition: RepairKind| -> Option<Refusal> {
+        if disposition == RepairKind::AbandonInstance {
+            return None;
+        }
+        if unknown_cause.is_some() {
+            return unknown_cause;
+        }
+        match disposition {
+            RepairKind::Advance
+                if matches!(proc.node(resume).kind, ExecKind::EventBasedGateway) =>
+            {
+                Some(Refusal::GatewayHasNoSingleWayOn)
+            }
+            RepairKind::Divert if divert_codes.is_empty() => Some(Refusal::NothingCatches),
+            RepairKind::Abandon
+                if abandon_would_strand_a_join(proc, state, cause, parked.scope, resume) =>
+            {
+                Some(Refusal::AJoinWouldWait)
+            }
+            _ => None,
+        }
+    };
+    let takes = |disposition: RepairKind| match disposition {
+        RepairKind::Retry => Takes::Patch,
+        RepairKind::Advance if matches!(proc.node(resume).kind, ExecKind::BusinessRule { .. }) => {
+            Takes::Answer
+        }
+        RepairKind::Advance => Takes::Patch,
+        RepairKind::Divert => Takes::Code,
+        RepairKind::Abandon | RepairKind::AbandonInstance => Takes::Nothing,
+    };
+    Some(OpenIncident {
+        incident,
+        element: proc.node_id(parked.node).to_string(),
+        resume: proc.node_id(resume).to_string(),
+        halted: state
+            .tokens()
+            .filter(|(_, t)| matches!(t.wait, WaitKind::Halted(_)))
+            .count(),
+        options: [
+            RepairKind::Retry,
+            RepairKind::Advance,
+            RepairKind::Divert,
+            RepairKind::Abandon,
+            RepairKind::AbandonInstance,
+        ]
+        .into_iter()
+        .map(|disposition| {
+            let refused = refusal(disposition);
+            RepairOption {
+                disposition,
+                takes: takes(disposition),
+                // Nothing is offered under a refusal. `CauseUnknown` is the
+                // one that does not already empty this, and a list of codes
+                // printed beneath "which token failed is unknown" reads as
+                // an offer of something that cannot be sent.
+                codes: match (disposition, &refused) {
+                    (RepairKind::Divert, None) => divert_codes.clone(),
+                    _ => Vec::new(),
+                },
+                refused: refused.map(|cause| RefusedBecause {
+                    reason: cause.to_string(),
+                    cause,
+                }),
+            }
+        })
+        .collect(),
+    })
+}
+
+fn is_empty(patch: &Value) -> bool {
+    *patch == Value::Object(serde_json::Map::new())
 }
 
 pub fn step(
@@ -233,12 +668,13 @@ pub fn step(
                 // and the instance freezes — so inspection shows *where*, and
                 // a repair API has one state to resume from.
                 //
-                // Deliberately not caught by an error boundary. Boundaries
-                // match an error *code*, and a failed decision has none to
-                // give: DMN has no error codes, so catching one would mean
-                // inventing a reserved code and teaching modelers to write it
-                // in their BPMN. That is a designed contract, and a feature is
-                // never the reason one ships early.
+                // Deliberately not caught by an error boundary, a catch-all
+                // included. A failed decision raises no error: it has no work
+                // item to fail, and is an incident of the same kind as a
+                // deadline that will not resolve. Whether a catch-all *should*
+                // reach it is open (`docs/design/incident-scope.md`) — that is
+                // a designed contract, and a feature is never the reason one
+                // ships early.
                 adv.freeze(state, token, element, None, reason);
                 return adv.run(state);
             };
@@ -305,29 +741,19 @@ pub fn step(
             // failing that — by one on the nearest enclosing subprocess:
             // the scoped error handler. Each step outward interrupts that
             // subprocess's token, tearing its whole scope down.
-            let mut caught = None;
-            if let Some(c) = code.as_deref() {
-                let mut host = element;
-                let mut target = token_id;
-                let mut scope = state
-                    .tokens
-                    .get(&token_id)
-                    .map(|t| t.scope)
-                    .unwrap_or(ScopeId::ROOT);
-                loop {
-                    if let Some(boundary) = proc.error_boundary(host, c) {
-                        caught = Some((target, boundary));
-                        break;
-                    }
-                    let Some(enclosing) = state.scopes.get(&scope) else {
-                        break; // reached the instance root uncaught
-                    };
-                    host = enclosing.element;
-                    target = enclosing.token;
-                    scope = enclosing.parent;
-                }
-            }
-            match caught {
+            //
+            // At each host the exact code is tried before the catch-all, and
+            // the walk moves outward only when neither is there — so a nearer
+            // catch-all beats a farther exact code. A failure with no code
+            // can only ever meet a catch-all, and the walk runs for it too:
+            // it is the shape of the failure nobody anticipated, which is
+            // what a catch-all exists for.
+            let scope = state
+                .tokens
+                .get(&token_id)
+                .map(|t| t.scope)
+                .unwrap_or(ScopeId::ROOT);
+            match catcher(proc, state, element, token_id, scope, code.as_deref()) {
                 Some((target, boundary_ix)) => {
                     // When the catcher is an enclosing subprocess, the
                     // failing task's token is inside the doomed scope, so
@@ -347,6 +773,161 @@ pub fn step(
                     Ok(adv.events)
                 }
             }
+        }
+        Command::Repair {
+            incident,
+            disposition,
+            reason,
+        } => {
+            // Everything is checked before anything changes, as for every
+            // refusal here: the incident named, the reason, and whether the
+            // disposition is one the incident's resume point allows
+            // (docs/design/incident-scope.md, D5, D9).
+            let open = state.open_incident();
+            if open != Some(incident) {
+                return Err(StepError::IncidentNotOpen {
+                    named: incident,
+                    open,
+                });
+            }
+            if reason.trim().is_empty() {
+                return Err(StepError::RepairRefused(Refusal::NoReason));
+            }
+            // One cause per incident (D6). An instance frozen before repair
+            // existed may hold several tokens at an incident and nothing to
+            // tell its cause from its collateral; only abandoning it, which
+            // needs no cause, is left — and its event names the first.
+            let causes: Vec<TokenId> = state
+                .tokens()
+                .filter(|(_, t)| t.wait == WaitKind::Incident)
+                .map(|(id, _)| id)
+                .collect();
+            let Some(&cause) = causes.first() else {
+                return Err(StepError::Invariant(
+                    "a frozen instance has no token at an incident".to_string(),
+                ));
+            };
+            if causes.len() > 1 && disposition != Disposition::AbandonInstance {
+                return Err(StepError::RepairRefused(Refusal::CauseUnknown));
+            }
+            let parked = state.tokens[&cause].clone();
+            let resume = proc.resume_point(parked.node);
+            let mut diverted_to = None;
+            match &disposition {
+                Disposition::Retry { .. } | Disposition::AbandonInstance => {}
+                Disposition::Advance { patch, answer } => {
+                    let decision = matches!(proc.node(resume).kind, ExecKind::BusinessRule { .. });
+                    if matches!(proc.node(resume).kind, ExecKind::EventBasedGateway) {
+                        return Err(StepError::RepairRefused(Refusal::GatewayHasNoSingleWayOn));
+                    }
+                    if decision && (answer.is_none() || !is_empty(patch)) {
+                        return Err(StepError::RepairRefused(Refusal::DecisionNeedsAnAnswer));
+                    }
+                    if !decision && answer.is_some() {
+                        return Err(StepError::RepairRefused(Refusal::AnswerOnlyForADecision));
+                    }
+                }
+                Disposition::Divert { code } => {
+                    diverted_to =
+                        catcher(proc, state, resume, cause, parked.scope, code.as_deref());
+                    if diverted_to.is_none() {
+                        return Err(StepError::RepairRefused(Refusal::NothingCatches));
+                    }
+                }
+                Disposition::Abandon => {
+                    if abandon_would_strand_a_join(proc, state, cause, parked.scope, resume) {
+                        return Err(StepError::RepairRefused(Refusal::AJoinWouldWait));
+                    }
+                }
+            }
+
+            let mut adv = Advancer::new(proc);
+            adv.events.push(Event::IncidentRepaired {
+                incident,
+                element: proc.node_id(parked.node).to_string(),
+                disposition: disposition.kind(),
+                code: match &disposition {
+                    Disposition::Divert { code } => code.clone(),
+                    _ => None,
+                },
+                answer: match &disposition {
+                    Disposition::Advance { answer, .. } => answer.clone(),
+                    _ => None,
+                },
+                reason,
+            });
+            if let Disposition::Retry { patch } | Disposition::Advance { patch, .. } = &disposition
+                && !is_empty(patch)
+            {
+                merge_patch(&mut state.variables, patch);
+                adv.events.push(Event::VariablesPatched {
+                    patch: patch.clone(),
+                });
+            }
+            // Status is derived (D6): once the cause moves nothing is parked
+            // at an incident, so the instance is active before its moves run
+            // and the ordinary tests apply after them — an emptied root
+            // completes, a Retry that fails again freezes under a new number.
+            state.status = InstanceStatus::Active;
+            adv.scope = parked.scope;
+            match disposition {
+                Disposition::Retry { .. } => {
+                    state.tokens.remove(&cause);
+                    adv.queue.push_back(Move {
+                        token: cause,
+                        node: resume,
+                        via: None,
+                        scope: parked.scope,
+                    });
+                }
+                Disposition::Advance { answer, .. } => {
+                    state.tokens.remove(&cause);
+                    if let (Some(answer), ExecKind::BusinessRule { result, .. }) =
+                        (answer, &proc.node(resume).kind)
+                    {
+                        assign(&mut state.variables, result, answer);
+                    }
+                    adv.element_completed(resume);
+                    adv.leave_single(state, cause, resume)?;
+                }
+                Disposition::Divert { .. } => {
+                    let (target, boundary) = diverted_to.expect("checked above");
+                    adv.interrupt_to_boundary(state, target, boundary)?;
+                }
+                Disposition::Abandon => {
+                    state.tokens.remove(&cause);
+                    adv.complete_scope_if_empty(state, parked.scope)?;
+                }
+                Disposition::AbandonInstance => {
+                    adv.terminate(state);
+                    return Ok(adv.events);
+                }
+            }
+            // Collateral resumes with the cause, whatever the disposition,
+            // in token order (D7): a move in flight enters its node on the
+            // flow it was on; a pending decision is asked again once the
+            // moves have settled.
+            let halted: Vec<(TokenId, Token)> = state
+                .tokens()
+                .filter(|(_, t)| matches!(t.wait, WaitKind::Halted(_)))
+                .map(|(id, t)| (id, t.clone()))
+                .collect();
+            for (id, t) in halted {
+                match t.wait {
+                    WaitKind::Halted(Halt::InFlight { via }) => {
+                        state.tokens.remove(&id);
+                        adv.queue.push_back(Move {
+                            token: id,
+                            node: t.node,
+                            via,
+                            scope: t.scope,
+                        });
+                    }
+                    WaitKind::Halted(Halt::AwaitingDecision) => adv.reask.push(id),
+                    _ => unreachable!("filtered to halted tokens"),
+                }
+            }
+            adv.run(state)
         }
         Command::FireTimer { id } => {
             if state.status != InstanceStatus::Active {
@@ -416,10 +997,11 @@ pub fn step(
                 }
                 // `Decision` cannot be reached: it is resolved inside the
                 // transaction that created it, so no timer can fire against a
-                // token still holding it.
+                // token still holding it. A halted token never armed anything.
                 WaitKind::Timer(_)
                 | WaitKind::Join { .. }
                 | WaitKind::Incident
+                | WaitKind::Halted(_)
                 | WaitKind::Decision => Err(StepError::Invariant(format!(
                     "timer {id:?} fired on a token in an unrelated wait state"
                 ))),
@@ -429,10 +1011,33 @@ pub fn step(
             if state.status != InstanceStatus::Active {
                 return Err(StepError::InstanceNotActive(state.status));
             }
-            let sub = state
+            let element = state
                 .subscriptions
-                .remove(&id)
-                .ok_or(StepError::UnknownSubscription(id))?;
+                .get(&id)
+                .ok_or(StepError::UnknownSubscription(id))?
+                .element;
+            // A non-interrupting boundary re-arms on this delivery, its key
+            // read from the document *after* this patch. When that would
+            // fail, the delivery is refused here, before anything changes:
+            // the alternative is a freeze that takes the waiting host's work
+            // with it (docs/design/incident-scope.md, D11).
+            if matches!(
+                proc.node(element).kind,
+                ExecKind::MessageBoundary {
+                    interrupting: false,
+                    ..
+                }
+            ) {
+                let mut patched = state.variables.clone();
+                merge_patch(&mut patched, &patch);
+                if let Err(failure) = arm_key(proc, state, &patched, element, Some(id)) {
+                    return Err(StepError::BoundaryCannotRearm {
+                        element: proc.node_id(element).to_string(),
+                        reason: failure.describe(),
+                    });
+                }
+            }
+            let sub = state.subscriptions.remove(&id).expect("looked up above");
             let mut adv = Advancer::new(proc);
             adv.events.push(Event::MessageReceived {
                 id,
@@ -485,9 +1090,8 @@ pub fn step(
                 // is opened immediately: a new id, and the key re-evaluated
                 // against the now-patched document, because this is an arm and
                 // arms evaluate at arm time. The old row is already gone, so
-                // the duplicate check cannot trip on itself; a key that has
-                // become unusable freezes exactly as it would have at the
-                // first arm, and the helper stops before the side token.
+                // the duplicate check cannot trip on itself, and a re-arm that
+                // would fail was refused above, before anything changed.
                 //
                 // The emission order is the one the golden traces pin:
                 // `message-received`, `variables-patched`, **then** the
@@ -504,12 +1108,13 @@ pub fn step(
                     adv.run(state)
                 }
                 // A timer catch hosts nothing, a join holds no arm, an
-                // incident advances nothing, and a decision never survives the
-                // transaction that parked it — so none of these can own a
-                // subscription.
+                // incident advances nothing, a halted token never armed
+                // anything, and a decision never survives the transaction
+                // that parked it — so none of these can own a subscription.
                 WaitKind::Timer(_)
                 | WaitKind::Join { .. }
                 | WaitKind::Incident
+                | WaitKind::Halted(_)
                 | WaitKind::Decision => Err(StepError::Invariant(format!(
                     "message {id:?} delivered to a token in an unrelated wait state"
                 ))),
@@ -541,6 +1146,9 @@ struct Advancer<'a> {
     /// signature. The two places that *do* change scope — entering a
     /// subprocess and resuming its parent — set it explicitly.
     scope: ScopeId,
+    /// Halted decisions a repair asks again once its moves have settled
+    /// (docs/design/incident-scope.md, D7).
+    reask: Vec<TokenId>,
 }
 
 impl<'a> Advancer<'a> {
@@ -550,6 +1158,7 @@ impl<'a> Advancer<'a> {
             events: Vec::new(),
             queue: VecDeque::new(),
             scope: ScopeId::ROOT,
+            reask: Vec::new(),
         }
     }
 
@@ -560,6 +1169,24 @@ impl<'a> Advancer<'a> {
             }
             self.scope = mv.scope;
             self.enter(state, mv.token, mv.node, mv.via)?;
+        }
+        // A repair's halted decisions are asked again once its moves have
+        // settled — unless one of those froze the instance again, and then
+        // they stay halted for the next repair.
+        if state.status == InstanceStatus::Active {
+            for token in std::mem::take(&mut self.reask) {
+                let Some(t) = state.tokens.get_mut(&token) else {
+                    continue; // reaped by a teardown one of the moves ran
+                };
+                t.wait = WaitKind::Decision;
+                let node = t.node;
+                if let ExecKind::BusinessRule { decision, .. } = &self.proc.node(node).kind {
+                    self.events.push(Event::DecisionRequested {
+                        element: self.proc.node_id(node).to_string(),
+                        decision: decision.clone(),
+                    });
+                }
+            }
         }
         if state.status == InstanceStatus::Active && state.tokens.is_empty() {
             state.status = InstanceStatus::Completed;
@@ -816,26 +1443,32 @@ impl<'a> Advancer<'a> {
                     self.tear_down_scope(state, scope);
                     return self.complete_scope(state, scope);
                 }
-                let open: Vec<WorkItemId> = state
-                    .work_items
-                    .iter()
-                    .filter(|(_, w)| w.open)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in open {
-                    self.cancel_work_item(state, id);
-                }
-                // Everything of the instance goes in one transaction:
-                // tokens, work items, timers, subscriptions, scopes.
-                self.withdraw_arms(state, None);
-                state.tokens.clear();
-                state.scopes.clear();
-                self.queue.clear();
-                state.status = InstanceStatus::Terminated;
-                self.events.push(Event::InstanceTerminated);
+                self.terminate(state);
                 Ok(())
             }
         }
+    }
+
+    /// End the instance as `Terminated`: every open work item cancelled,
+    /// every arm withdrawn, every token and scope gone — everything of the
+    /// instance in one transaction. A terminate end at the root and the
+    /// abandon-instance repair both end here.
+    fn terminate(&mut self, state: &mut InstanceState) {
+        let open: Vec<WorkItemId> = state
+            .work_items
+            .iter()
+            .filter(|(_, w)| w.open)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in open {
+            self.cancel_work_item(state, id);
+        }
+        self.withdraw_arms(state, None);
+        state.tokens.clear();
+        state.scopes.clear();
+        self.queue.clear();
+        state.status = InstanceStatus::Terminated;
+        self.events.push(Event::InstanceTerminated);
     }
 
     /// Parallel join: arrivals park silently; the join executes once, when
@@ -1171,15 +1804,17 @@ impl<'a> Advancer<'a> {
     /// The order is the whole content of this function, and the golden traces
     /// pin it:
     ///
-    /// 1. the **host's scope**, before anything can freeze in it: a re-arm
-    ///    that cannot resolve its key parks the host as an incident, and an
-    ///    advancer still pointing at the root would file it in the wrong
-    ///    scope;
+    /// 1. the **host's scope**, before anything is armed or spawned in it —
+    ///    an advancer still pointing at the root would file both in the
+    ///    wrong scope;
     /// 2. the **re-arm** — a fresh subscription for a message boundary, the
     ///    next occurrence for a cycle, nothing at all for a single-shot timer
-    ///    (it fired once, which is what a `timeDuration` says). `false` means
-    ///    the re-arm failed and already froze the instance, so there is no
-    ///    side path to run: the caller flushes the events it produced;
+    ///    (it fired once, which is what a `timeDuration` says). `false` would
+    ///    mean the re-arm failed and froze the instance, leaving no side path
+    ///    to run. Neither kind reaches it: a cycle re-arms from a due already
+    ///    resolved, and a message re-arm that would fail was refused as a
+    ///    delivery before anything changed (docs/design/incident-scope.md,
+    ///    D11);
     /// 3. the **side token**. A live host is never observably without its
     ///    boundary, which is what puts the re-arm ahead of this.
     fn side_path_triggered(
@@ -1255,13 +1890,10 @@ impl<'a> Advancer<'a> {
 
     /// Open a subscription for the message arm at `element` — a catch, a
     /// receive task or a message boundary, all three through here —
-    /// evaluating its correlation key from the variables **now** (arm time).
-    /// Keys must be strings or exact integers (floats have no canonical
-    /// spelling across a jsonb round-trip — the same logical value would arm
-    /// two different keys); anything else can never match. Both cases, and a
-    /// duplicate open (message, key) in this instance (which would make
-    /// every delivery permanently ambiguous), freeze the instance as an
-    /// incident instead of waiting forever. A boundary's freeze parks its
+    /// evaluating its correlation key from the variables **now** (arm time),
+    /// through [`arm_key`]. When the arm cannot open — an unusable key, or a
+    /// duplicate `(message, key)` in this instance — the instance freezes as
+    /// an incident instead of waiting forever. A boundary's freeze parks its
     /// host's token **at the boundary element**, exactly as `arm_timer`'s
     /// does, so inspection names the arm that could not be made.
     fn subscribe(
@@ -1270,64 +1902,48 @@ impl<'a> Advancer<'a> {
         token: TokenId,
         element: NodeIx,
     ) -> Option<SubscriptionId> {
-        let Some((message, key)) = self.proc.message_arm(element) else {
-            unreachable!("subscribe is only called on message arms");
+        let (message, key) = match arm_key(self.proc, state, &state.variables, element, None) {
+            Ok(arm) => arm,
+            Err(failure) => {
+                let at = self.proc.node_id(element).to_string();
+                self.events.push(match failure {
+                    ArmFailure::Unusable { name } => Event::CorrelationFailed { element: at, name },
+                    ArmFailure::Duplicate { message, key } => Event::DuplicateSubscription {
+                        element: at,
+                        message,
+                        key,
+                    },
+                });
+                self.freeze(state, token, element, None, None);
+                return None;
+            }
         };
-        let value = rbpmn_model::condition::resolve_path(&state.variables, key);
-        let key_value = match value {
-            Value::String(s) => Some(s.clone()),
-            Value::Number(n) => n
-                .as_i64()
-                .map(|i| i.to_string())
-                .or_else(|| n.as_u64().map(|u| u.to_string())),
-            _ => None,
-        };
-        let Some(key_value) = key_value else {
-            self.events.push(Event::CorrelationFailed {
-                element: self.proc.node_id(element).to_string(),
-                name: key.join("."),
-            });
-            self.freeze(state, token, element, None, None);
-            return None;
-        };
-        if state
-            .subscriptions
-            .values()
-            .any(|s| s.message == message && s.key == key_value)
-        {
-            self.events.push(Event::DuplicateSubscription {
-                element: self.proc.node_id(element).to_string(),
-                message: message.to_string(),
-                key: key_value,
-            });
-            self.freeze(state, token, element, None, None);
-            return None;
-        }
         let id = state.alloc_subscription(SubscriptionState {
             element,
             token,
-            message: message.to_string(),
-            key: key_value.clone(),
+            message: message.clone(),
+            key: key.clone(),
         });
         self.events.push(Event::MessageSubscribed {
             id,
             element: self.proc.node_id(element).to_string(),
-            message: message.to_string(),
-            key: key_value,
+            message,
+            key,
             token,
         });
         Some(id)
     }
 
     /// Every incident converges here: withdraw the token's in-flight arms,
-    /// park it at the failing element (`WaitKind::Incident` — inspection
-    /// shows *where*, and a future repair API has one shape to resume), and
-    /// freeze the instance. Tokens still queued in this advancement (a
-    /// parallel sibling mid-transit) park at their target elements the same
-    /// way — frozen means *nothing advances and nothing vanishes*; token
-    /// conservation must survive the freeze or no repair can ever resume.
-    /// The cause event is pushed by the caller first; `incident-raised`
-    /// closes the sequence.
+    /// park it at the failing element as the cause (`WaitKind::Incident` —
+    /// inspection shows *where*, and a repair has one token to resume), and
+    /// freeze the instance under the next incident number. Everything else
+    /// the freeze stops is collateral, halted where it stood — a parallel
+    /// sibling mid-transit at its target, with the flow it was on; a sibling
+    /// parked on a decision, awaiting it. Frozen means *nothing advances and
+    /// nothing vanishes*: token conservation must survive the freeze or no
+    /// repair can resume (docs/design/incident-scope.md, D7). The cause event
+    /// is pushed by the caller first; `incident-raised` closes the sequence.
     fn freeze(
         &mut self,
         state: &mut InstanceState,
@@ -1356,10 +1972,13 @@ impl<'a> Advancer<'a> {
         for id in open {
             self.cancel_work_item(state, id);
         }
-        // A scope this token owns has no members and no owner left once the
-        // freeze parks it as an incident; leaving it behind would project a
-        // `rbpmn_scope` row whose token_no points at a token in another wait
-        // state, which is precisely what a resume would trip on.
+        // A scope this token owns is the empty one its entry had just opened
+        // — the one freeze that could take a waiting host, a non-interrupting
+        // boundary failing to re-arm, is refused as a delivery instead (D11).
+        // It has no owner left once the freeze parks the token as an
+        // incident; leaving it behind would project a `rbpmn_scope` row whose
+        // token_no points at a token in another wait state, which is
+        // precisely what a resume would trip on.
         let owned_scope = match state.tokens.get(&token).map(|t| &t.wait) {
             Some(WaitKind::Scope(child)) => Some(*child),
             _ => None,
@@ -1393,8 +2012,9 @@ impl<'a> Advancer<'a> {
         // instance was never created, the incident never recorded, and every
         // retry did the same thing.
         //
-        // They park at their own node, like the queue below, so inspection
-        // still shows where each branch stood.
+        // They are halted at their own node, like the queue below, so
+        // inspection still shows where each branch stood — and a repair asks
+        // their question again rather than starting the element twice.
         let pending: Vec<TokenId> = state
             .tokens
             .iter()
@@ -1403,7 +2023,7 @@ impl<'a> Advancer<'a> {
             .collect();
         for id in pending {
             if let Some(t) = state.tokens.get_mut(&id) {
-                t.wait = WaitKind::Incident;
+                t.wait = WaitKind::Halted(Halt::AwaitingDecision);
             }
         }
         for mv in std::mem::take(&mut self.queue) {
@@ -1412,15 +2032,17 @@ impl<'a> Advancer<'a> {
                 Token {
                     node: mv.node,
                     scope: mv.scope,
-                    wait: WaitKind::Incident,
+                    wait: WaitKind::Halted(Halt::InFlight { via: mv.via }),
                 },
             );
         }
         state.status = InstanceStatus::Failed;
+        let incident = state.alloc_incident();
         self.events.push(Event::IncidentRaised {
             element: self.proc.node_id(element).to_string(),
             code,
             detail,
+            incident,
         });
     }
 

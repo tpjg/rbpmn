@@ -17,7 +17,8 @@ import { annotate, focus } from '../shared/annotations.js';
 import { ensureDi } from '../shared/layout.js';
 import { clear, el, field, jsonTree, section } from '../shared/dom.js';
 import { describeElement } from '../shared/model-facts.js';
-import { diagnose } from './diagnosis.js';
+import { describeRepair, diagnose } from './diagnosis.js';
+import { marksFor } from './marks.js';
 import { onThemeChange, rendererColors } from '../shared/theme.js';
 
 /// One trace line. `display` is the golden-trace format and therefore stable
@@ -81,48 +82,6 @@ function renderDiagnosis(box, data, viewer) {
     box.append(link);
   }
   return elementId;
-}
-
-/// Every annotation the diagram carries, derived from runtime rows only.
-function annotationsFor(data) {
-  const marks = [];
-  for (const token of data.tokens) {
-    marks.push({
-      elementId: token.elementId,
-      kind: token.waitKind === 'incident' ? 'error' : 'token',
-      payload: { title: `token — ${token.waitKind}` },
-    });
-  }
-  for (const item of data.workItems) {
-    if (item.state === 'available' || item.state === 'locked') {
-      marks.push({
-        elementId: item.elementId,
-        kind: 'work',
-        payload: { title: `work item ${item.state} (${item.kind} / ${item.topic})` },
-      });
-    } else if (item.state === 'failed') {
-      marks.push({
-        elementId: item.elementId,
-        kind: 'error',
-        payload: { title: `work item failed: ${item.lastFailure ?? 'no detail recorded'}` },
-      });
-    }
-  }
-  for (const timer of data.timers) {
-    marks.push({
-      elementId: timer.elementId,
-      kind: 'timer',
-      payload: { title: `timer ${timer.dueSpec} — due ${timer.dueAt}` },
-    });
-  }
-  for (const sub of data.subscriptions) {
-    marks.push({
-      elementId: sub.elementId,
-      kind: 'message',
-      payload: { title: `awaiting ${sub.messageName} (key ${sub.correlationKey})` },
-    });
-  }
-  return marks;
 }
 
 /// The element pane: static model facts, the wiring the manifest supplies,
@@ -277,7 +236,18 @@ async function main() {
   const varsSection = el('section', 'pane');
   const { wrap: varsWrap, body: varsBody } = section('Variables');
   varsBody.append(jsonTree(data.variables));
-  varsSection.append(el('h2', null, 'Instance'), varsWrap);
+  varsSection.append(el('h2', null, 'Instance'));
+
+  // What a repair would do, when one is open. Text, and only text: the
+  // inspector is read-only, and a repair is an API call with a reason
+  // attached (docs/design/incident-scope.md, D13).
+  const repairLines = describeRepair(data);
+  if (repairLines) {
+    const { wrap, body } = section('Open incident');
+    for (const [label, value] of repairLines) body.append(field(label, value));
+    varsSection.append(wrap);
+  }
+  varsSection.append(varsWrap);
 
   const { wrap: bindWrap, body: bindBody } = section('Deployed manifest', { open: false });
   bindBody.append(jsonTree(data.bindings ?? {}));
@@ -310,7 +280,7 @@ async function main() {
       canvasNote.hidden = false;
       canvasNote.textContent = `diagram imported with ${warnings.length} warning(s)`;
     }
-    const { missing } = annotate(viewer, annotationsFor(data));
+    const { missing } = annotate(viewer, marksFor(data));
     if (missing.length) {
       canvasNote.hidden = false;
       canvasNote.textContent =

@@ -427,7 +427,7 @@ function renderErrorRef(container, modeler, element, definition) {
         definitions.get('rootElements').push(error);
         modeling.updateModdleProperties(element, definition, { errorRef: error });
       },
-      { placeholder: 'CARD_DECLINED', hint: 'matched against the failure code a handler reports' }
+      { placeholder: 'CARD_DECLINED', hint: 'matched against the failure code a handler reports — leave empty to catch every error' }
     )
   );
 }

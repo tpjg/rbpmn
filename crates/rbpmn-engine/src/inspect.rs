@@ -1,8 +1,9 @@
 //! Instance inspection: the read model behind the playground's token-overlay
 //! debug view (phase-2 exit criterion) and any dashboard. Read-only.
 
+use crate::runtime::load_instance_snapshot;
 use crate::{Engine, EngineError};
-use rbpmn_core::Bindings;
+use rbpmn_core::{Bindings, OpenIncident};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -20,6 +21,11 @@ pub struct InstanceInspection {
     /// and since the manifest is deliberately absent from the XML, there is
     /// nowhere else a reader could recover it from.
     pub bindings: Bindings,
+    /// The open incident and what a repair would do with it, on a frozen
+    /// instance and nowhere else (`docs/design/incident-scope.md`, D10).
+    /// Every verdict in it comes from the core functions the repair command
+    /// itself asks, so what this says would happen is what happens.
+    pub incident: Option<OpenIncident>,
     pub tokens: Vec<TokenView>,
     pub scopes: Vec<ScopeView>,
     pub work_items: Vec<WorkItemView>,
@@ -146,6 +152,29 @@ impl Engine {
             }
         })?;
 
+        // Only a frozen instance has an incident, and only a frozen one
+        // pays for the rehydration this needs.
+        let status: String = inst.get("status");
+        let incident = if status == "failed" {
+            // Best effort, and deliberately so: this is the view an operator
+            // opens *because* something is wrong. What it buys is the errors
+            // raised in Rust — a stored definition that no longer compiles,
+            // a row the core will not rehydrate — where the rest of the
+            // inspection still stands and the instance is unrepairable
+            // anyway, `repair` failing on the same load. A database error
+            // aborts this transaction and fails the read whatever happens
+            // here; there is nothing to swallow.
+            match load_instance_snapshot(self, tx, id).await {
+                Ok((_, proc, _, state)) => rbpmn_core::open_incident(&proc, &state),
+                Err(e) => {
+                    tracing::warn!(instance = %id, error = %e, "cannot read the open incident");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let tokens = sqlx::query(
             "select element_id, wait_kind, scope_no from rbpmn_token \
              where instance_id = $1 order by token_no",
@@ -265,10 +294,11 @@ impl Engine {
         Ok(InstanceInspection {
             id,
             definition_key,
-            status: inst.get("status"),
+            status,
             variables: inst.get("variables"),
             bpmn_xml: inst.get("bpmn_xml"),
             bindings,
+            incident,
             tokens,
             scopes,
             work_items,

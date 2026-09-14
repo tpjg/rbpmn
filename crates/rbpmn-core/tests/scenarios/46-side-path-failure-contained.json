@@ -1,0 +1,45 @@
+{
+  "fixture": "accept/46-side-path-failure-contained.bpmn",
+  "actions": [
+    {
+      "fire": "remind"
+    },
+    {
+      "fail": "notify"
+    },
+    {
+      "complete": "review"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started review",
+      "work-item-created review user review",
+      "timer-armed remind PT1H",
+      "timer-fired remind",
+      "element-started remind",
+      "element-completed remind",
+      "flow-taken f3",
+      "element-started notify",
+      "work-item-created notify service notify",
+      "work-item-failed notify",
+      "element-started notify_failed",
+      "element-completed notify_failed",
+      "flow-taken f5",
+      "element-started not_notified",
+      "element-completed not_notified",
+      "work-item-completed review",
+      "element-completed review",
+      "flow-taken f2",
+      "element-started reviewed",
+      "element-completed reviewed",
+      "instance-completed"
+    ]
+  }
+}

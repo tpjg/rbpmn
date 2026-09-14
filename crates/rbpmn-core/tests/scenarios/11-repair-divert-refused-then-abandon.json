@@ -1,0 +1,38 @@
+{
+  "fixture": "accept/11-event-based-gateway.bpmn",
+  "bindings": {
+    "correlations": {
+      "c_paid": "order.id",
+      "c_cancel": "order.id"
+    }
+  },
+  "variables": {},
+  "actions": [
+    {
+      "repair": 0,
+      "disposition": "divert",
+      "reason": "treat it as cancelled",
+      "refused": "RepairRefused(NothingCatches)"
+    },
+    {
+      "repair": 0,
+      "disposition": "abandon",
+      "reason": "the order never existed"
+    }
+  ],
+  "expect": {
+    "status": "completed",
+    "variables": {},
+    "trace": [
+      "instance-started",
+      "element-started start",
+      "element-completed start",
+      "flow-taken f1",
+      "element-started ebg",
+      "correlation-failed c_paid order.id",
+      "incident-raised c_paid",
+      "incident-repaired c_paid abandon",
+      "instance-completed"
+    ]
+  }
+}

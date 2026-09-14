@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- expect-diagnostics:
+  warn side-path-failure-escapes @ chase
 -->
 <!-- A side path *inside* a subprocess, and an interrupting boundary on that
      subprocess. A side token is an ordinary token: when the deadline tears

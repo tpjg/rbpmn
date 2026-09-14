@@ -24,6 +24,7 @@ export default {
         'rbpmn/boundary-on-supported-host': 'error',
         'rbpmn/boundary-side-path': 'error',
         'rbpmn/side-path-message-arm': 'warn',
+        'rbpmn/side-path-failure-escapes': 'warn',
         'rbpmn/no-implicit-split': 'error',
         'rbpmn/implicit-merge-after-parallel': 'warn',
         'rbpmn/bpmn-structure': 'error',

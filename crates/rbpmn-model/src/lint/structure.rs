@@ -128,6 +128,20 @@ impl<'a> Graph<'a> {
         out
     }
 
+    /// Successors over sequence flows alone — no boundary pseudo-edges at
+    /// all: where a token goes when nothing interrupts it.
+    ///
+    /// This is what a side path's own end is asked over
+    /// (`boundary-side-path`). Every boundary is optional: a timer fires only
+    /// if it fires, an error handler runs only if the activity fails. So an
+    /// end behind one is an end the side token may never reach, and cannot be
+    /// the end that discharges the path. A non-interrupting boundary is
+    /// optional twice over — it spawns a sibling, whose path answers for
+    /// itself.
+    pub fn flow_succs(&self, v: usize) -> Vec<usize> {
+        self.flow_out[v].iter().map(|&fi| self.tgt(fi)).collect()
+    }
+
     /// Successors over sequence flows plus **interrupting** host->boundary
     /// pseudo-edges only — what the region analysis walks.
     ///

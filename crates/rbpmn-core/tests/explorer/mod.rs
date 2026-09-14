@@ -117,6 +117,7 @@ pub fn check(proc: &ExecutableProcess, s: &InstanceState) -> Result<(), String> 
             WaitKind::Join { .. }
             | WaitKind::EventGateway
             | WaitKind::Incident
+            | WaitKind::Halted(_)
             | WaitKind::Decision => {}
         }
     }
@@ -168,18 +169,51 @@ pub fn check(proc: &ExecutableProcess, s: &InstanceState) -> Result<(), String> 
         }
     }
 
-    // The uniform incident freeze: at least one token parked where it
-    // failed. NOT exactly one — `Advancer::freeze` deliberately parks every
-    // sibling that was still in flight as `Incident` too, so that a frozen
-    // parallel branch is not silently lost (token conservation survives the
-    // freeze, which is what makes a future repair API possible).
+    // The uniform incident freeze: exactly one token is the cause, parked
+    // where it failed, and whatever else the freeze stopped is halted where
+    // it stood — neither exists on an instance that is not frozen
+    // (docs/design/incident-scope.md, D6–D7). Exactly one is what lets a
+    // repair name the instance rather than a token.
+    let incidents = s
+        .tokens()
+        .filter(|(_, t)| t.wait == WaitKind::Incident)
+        .count();
+    let halted = s
+        .tokens()
+        .filter(|(_, t)| matches!(t.wait, WaitKind::Halted(_)))
+        .count();
     if s.status == InstanceStatus::Failed {
-        let incidents = s
-            .tokens()
-            .filter(|(_, t)| matches!(t.wait, WaitKind::Incident))
-            .count();
-        if incidents == 0 {
-            return Err("failed instance has no incident token".to_string());
+        if incidents != 1 {
+            return Err(format!(
+                "failed instance has {incidents} incident tokens, not one"
+            ));
+        }
+        if s.open_incident().is_none() {
+            return Err("failed instance has no open incident number".to_string());
+        }
+    } else if incidents + halted > 0 {
+        return Err(format!(
+            "{:?} instance holds {incidents} incident and {halted} halted tokens",
+            s.status
+        ));
+    }
+    if open_incident(proc, s).is_some() != (s.status == InstanceStatus::Failed) {
+        return Err(format!(
+            "{:?} instance and the incident read disagree about being frozen",
+            s.status
+        ));
+    }
+    // A halted move bound for a join must still know the flow it was on: the
+    // join counts arrivals by incoming flow.
+    for (id, t) in s.tokens() {
+        if t.wait == WaitKind::Halted(Halt::InFlight { via: None })
+            && matches!(proc.node(t.node).kind, ExecKind::ParallelGateway)
+            && proc.node(t.node).incoming.len() > 1
+        {
+            return Err(format!(
+                "halted token {id:?} bound for join '{}' lost its flow",
+                proc.node_id(t.node)
+            ));
         }
     }
 
@@ -250,6 +284,11 @@ pub fn canonical(proc: &ExecutableProcess, s: &InstanceState) -> String {
             WaitKind::Message(_) => "message".into(),
             WaitKind::EventGateway => "gateway".into(),
             WaitKind::Incident => "incident".into(),
+            WaitKind::Halted(Halt::InFlight { via }) => format!(
+                "halted@{}",
+                via.map_or_else(|| "-".to_string(), |f| proc.flow(f).id.clone())
+            ),
+            WaitKind::Halted(Halt::AwaitingDecision) => "halted:decision".into(),
             WaitKind::Decision => "decision".into(),
             WaitKind::Scope(_) => "subprocess".into(),
         };
@@ -277,6 +316,23 @@ pub fn canonical(proc: &ExecutableProcess, s: &InstanceState) -> String {
 
 // ------------------------------------------------------------------ stimuli
 
+/// Every error code a model declares, in document order: the codes worth
+/// raising when exploring it, beside the codeless failure `explore` always
+/// adds. Read off the XML because the compiled process keeps codes only on
+/// the boundaries that match them.
+pub fn declared_error_codes(xml: &str) -> Vec<String> {
+    let mut codes = Vec::new();
+    for part in xml.split("errorCode=\"").skip(1) {
+        if let Some(end) = part.find('"') {
+            let code = part[..end].to_string();
+            if !codes.contains(&code) {
+                codes.push(code);
+            }
+        }
+    }
+    codes
+}
+
 /// Walk every node reachable from the start, boundary events included, and
 /// collect the conditions on their outgoing flows.
 pub fn reachable_conditions(proc: &ExecutableProcess, codes: &[String]) -> Vec<Expr> {
@@ -303,7 +359,12 @@ pub fn reachable_conditions(proc: &ExecutableProcess, codes: &[String]) -> Vec<E
         for &b in proc.boundaries(n) {
             queue.push_back(b);
         }
-        for code in codes {
+        // Error boundaries are matched, never armed, so they are reached
+        // per failure the exploration can raise: every declared code, and
+        // the codeless failure — which only a catch-all takes, and which a
+        // model declaring no codes at all can still raise.
+        let failures = codes.iter().map(|c| Some(c.as_str())).chain([None]);
+        for code in failures {
             if let Some(b) = proc.error_boundary(n, code) {
                 queue.push_back(b);
             }
@@ -355,11 +416,18 @@ pub fn patch_alphabet(proc: &ExecutableProcess, codes: &[String]) -> Vec<Value> 
 /// The nodes reachable from `boundary` over sequence flows: the side path a
 /// non-interrupting boundary spawns tokens onto.
 fn side_path(proc: &ExecutableProcess, boundary: NodeIx) -> HashSet<NodeIx> {
+    // The closure the linter's `boundary-side-path` computes: sequence flows
+    // *and* the boundaries on the path's own activities. Flows alone lose any
+    // token a boundary takes — a side token whose failure a catch-all catches
+    // lands on a path this set never counted, the saturation check stops
+    // seeing it, and a re-arming boundary is offered delivery after delivery
+    // without end.
     let mut seen = HashSet::from([boundary]);
     let mut queue = vec![boundary];
     while let Some(n) = queue.pop() {
-        for &f in &proc.node(n).outgoing {
-            let target = proc.flow(f).target;
+        let flows = proc.node(n).outgoing.iter().map(|&f| proc.flow(f).target);
+        let arms = proc.boundaries(n).iter().copied();
+        for target in flows.chain(arms).chain(proc.error_boundaries(n)) {
             if seen.insert(target) {
                 queue.push(target);
             }
@@ -381,6 +449,160 @@ fn side_path_saturated(proc: &ExecutableProcess, s: &InstanceState, element: Nod
     s.tokens().filter(|(_, t)| path.contains(&t.node)).count() >= MAX_SIDE_TOKENS
 }
 
+/// The read of an open incident says the same as the command that repairs
+/// it (docs/design/incident-scope.md, D10). `open_incident` exists so an
+/// operator can be told what a repair would do before sending one; it
+/// answers off the functions the command itself asks, and this is what
+/// holds the two together — every disposition, at every frozen state the
+/// exploration reaches.
+pub fn read_agrees(
+    proc: &ExecutableProcess,
+    s: &InstanceState,
+    codes: &[Option<String>],
+) -> Result<(), String> {
+    let Some(read) = open_incident(proc, s) else {
+        return Ok(());
+    };
+    let halted = s
+        .tokens()
+        .filter(|(_, t)| matches!(t.wait, WaitKind::Halted(_)))
+        .count();
+    if read.halted != halted {
+        return Err(format!(
+            "the read counts {} halted tokens, the state holds {halted}",
+            read.halted
+        ));
+    }
+    // What the command refuses on the shape of the state, which is all the
+    // read claims to know. Whether a payload is legal for a disposition is
+    // `takes`, checked below.
+    let structural = |disposition| {
+        let mut next = s.clone();
+        match step(
+            proc,
+            &mut next,
+            Command::Repair {
+                incident: read.incident,
+                disposition,
+                reason: "read".to_string(),
+            },
+        ) {
+            Err(StepError::RepairRefused(c))
+                if matches!(
+                    c,
+                    Refusal::CauseUnknown
+                        | Refusal::GatewayHasNoSingleWayOn
+                        | Refusal::NothingCatches
+                        | Refusal::AJoinWouldWait
+                ) =>
+            {
+                Some(c)
+            }
+            _ => None,
+        }
+    };
+    for option in &read.options {
+        let verdict = match option.disposition {
+            RepairKind::Retry => structural(Disposition::Retry { patch: json!({}) }),
+            RepairKind::Advance => structural(Disposition::Advance {
+                patch: json!({}),
+                answer: (option.takes == Takes::Answer).then(|| json!(1)),
+            }),
+            // The read names the codes, so this is exact in both
+            // directions: every code it names lands, and every code in the
+            // model's alphabet it leaves out is refused. The alphabet is
+            // every code the model declares plus the codeless failure, so a
+            // boundary that exists is offered its own code here.
+            RepairKind::Divert => {
+                for landing in &option.codes {
+                    if let Some(cause) = structural(Disposition::Divert {
+                        code: landing.code.clone(),
+                    }) {
+                        return Err(format!(
+                            "the read says a divert with {:?} lands at {}, the command says {cause:?}",
+                            landing.code, landing.caught_at
+                        ));
+                    }
+                }
+                // A catch-all takes any code at all, which no list can
+                // enumerate — the read says it with the codeless entry
+                // instead. So the omission half asks the opposite question
+                // there: with that entry every code must land, and without
+                // it every code the read leaves out must be refused. Exact
+                // either way.
+                let named: Vec<&Option<String>> = option.codes.iter().map(|c| &c.code).collect();
+                let catch_all = option.codes.iter().any(|c| c.code.is_none());
+                for code in codes {
+                    let lands = structural(Disposition::Divert { code: code.clone() }).is_none();
+                    if catch_all && !lands {
+                        return Err(format!(
+                            "the read names a catch-all, and a divert with {code:?} is refused"
+                        ));
+                    }
+                    if !catch_all && !named.contains(&code) && lands {
+                        return Err(format!(
+                            "a divert with {code:?} lands, and the read does not name it"
+                        ));
+                    }
+                }
+                if option.codes.is_empty() {
+                    structural(Disposition::Divert { code: None })
+                } else {
+                    None
+                }
+            }
+            RepairKind::Abandon => structural(Disposition::Abandon),
+            RepairKind::AbandonInstance => structural(Disposition::AbandonInstance),
+        };
+        if option.refused.as_ref().map(|r| r.cause) != verdict {
+            return Err(format!(
+                "the read says {} is {:?}, the command says {verdict:?}",
+                option.disposition,
+                option.refused.as_ref().map(|r| r.cause)
+            ));
+        }
+        if let Some(refused) = &option.refused
+            && refused.reason != refused.cause.to_string()
+        {
+            return Err(format!(
+                "the read's prose for {} is not its own cause",
+                option.disposition
+            ));
+        }
+        // `takes` is the other half of the read: what a caller supplies.
+        // An answer where none is taken and none where one is are both
+        // refusals, so the claim is checkable in both directions.
+        if option.disposition == RepairKind::Advance && option.refused.is_none() {
+            let answer = (option.takes != Takes::Answer).then(|| json!(1));
+            let expected = if option.takes == Takes::Answer {
+                Refusal::DecisionNeedsAnAnswer
+            } else {
+                Refusal::AnswerOnlyForADecision
+            };
+            let mut next = s.clone();
+            let refusal = step(
+                proc,
+                &mut next,
+                Command::Repair {
+                    incident: read.incident,
+                    disposition: Disposition::Advance {
+                        patch: json!({}),
+                        answer,
+                    },
+                    reason: "read".to_string(),
+                },
+            );
+            if !matches!(refusal, Err(StepError::RepairRefused(c)) if c == expected) {
+                return Err(format!(
+                    "the read says Advance takes {:?}, the command disagrees",
+                    option.takes
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Every command the outside world could issue against this state.
 pub fn stimuli(
     proc: &ExecutableProcess,
@@ -389,6 +611,34 @@ pub fn stimuli(
     codes: &[Option<String>],
 ) -> Vec<Command> {
     let mut out = Vec::new();
+    // A frozen instance takes one kind of command: a repair of its open
+    // incident — every disposition over the alphabet everything else gets
+    // (docs/design/incident-scope.md, D5). Refusals are typed and skipped
+    // like any other; a repair that lands is explored like any other step.
+    if let Some(incident) = s.open_incident() {
+        let repair = |disposition| Command::Repair {
+            incident,
+            disposition,
+            reason: "explored".to_string(),
+        };
+        for p in patches {
+            out.push(repair(Disposition::Retry { patch: p.clone() }));
+            out.push(repair(Disposition::Advance {
+                patch: p.clone(),
+                answer: None,
+            }));
+            out.push(repair(Disposition::Advance {
+                patch: json!({}),
+                answer: Some(p.clone()),
+            }));
+        }
+        for c in codes {
+            out.push(repair(Disposition::Divert { code: c.clone() }));
+        }
+        out.push(repair(Disposition::Abandon));
+        out.push(repair(Disposition::AbandonInstance));
+        return out;
+    }
     for (id, _) in s.open_work_items() {
         for p in patches {
             out.push(Command::CompleteWorkItem {
@@ -453,12 +703,16 @@ pub struct Report {
     pub violations: Vec<String>,
     /// Hit the state budget: the exploration is incomplete, not clean.
     pub capped: bool,
+    /// Repairs that landed, by disposition (docs/design/incident-scope.md,
+    /// D5): what tells a clean report apart from one in which every repair
+    /// was refused and nothing past a freeze was ever reached.
+    pub repairs: BTreeMap<String, usize>,
 }
 
 pub fn explore(proc: &ExecutableProcess, initial: Value, codes: &[String]) -> Report {
     let patches = patch_alphabet(proc, codes);
     let mut codes_opt: Vec<Option<String>> = codes.iter().cloned().map(Some).collect();
-    codes_opt.push(None); // an unmatched failure: the incident path
+    codes_opt.push(None); // a codeless failure: the incident path, unless a catch-all takes it
 
     let mut state = InstanceState::new();
     step(proc, &mut state, Command::Start { variables: initial }).expect("start");
@@ -470,23 +724,36 @@ pub fn explore(proc: &ExecutableProcess, initial: Value, codes: &[String]) -> Re
         terminals: 0,
         violations: Vec::new(),
         capped: false,
+        repairs: BTreeMap::new(),
     };
 
     while let Some(s) = frontier.pop_front() {
-        if let Err(v) = check(proc, &s) {
+        for v in check(proc, &s)
+            .err()
+            .into_iter()
+            .chain(read_agrees(proc, &s, &codes_opt).err())
+        {
             r.violations.push(v);
             if r.violations.len() > 20 {
                 return r;
             }
         }
+        // A frozen instance is a terminal of the run that froze it and the
+        // start of every repair (D5): counted, then expanded.
         if s.status != InstanceStatus::Active {
             r.terminals += 1;
-            continue;
+            if s.status != InstanceStatus::Failed {
+                continue;
+            }
         }
         for cmd in stimuli(proc, &s, &patches, &codes_opt) {
             let mut next = s.clone();
             match step(proc, &mut next, cmd.clone()) {
-                Ok(_) => {}
+                Ok(_) => {
+                    if let Command::Repair { disposition, .. } = &cmd {
+                        *r.repairs.entry(disposition.kind().to_string()).or_default() += 1;
+                    }
+                }
                 // A typed refusal is the engine correctly declining an illegal
                 // stimulus — not a finding. `Invariant` is one by definition:
                 // lint-clean models cannot reach it.
@@ -516,6 +783,16 @@ pub fn assert_clean(
     initial: Value,
     codes: &[String],
 ) -> usize {
+    assert_clean_report(label, proc, initial, codes).states
+}
+
+/// [`assert_clean`], handing back the whole report.
+pub fn assert_clean_report(
+    label: &str,
+    proc: &ExecutableProcess,
+    initial: Value,
+    codes: &[String],
+) -> Report {
     let r = explore(proc, initial, codes);
     assert!(
         !r.capped,
@@ -533,5 +810,5 @@ pub fn assert_clean(
         "{label}: explored {} states but reached no terminal state",
         r.states
     );
-    r.states
+    r
 }

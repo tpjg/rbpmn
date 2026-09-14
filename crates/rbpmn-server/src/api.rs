@@ -104,6 +104,35 @@ pub struct GetTaskBody {
     pub order: Option<String>,
     #[serde(default)]
     pub filter: Option<FilterBody>,
+    /// Items this caller does not want offered — the ids behind a "skip this
+    /// one" button, kept by the client and sent with the next claim. Nothing
+    /// is written and nothing is locked: they stay claimable, for everyone.
+    #[serde(default)]
+    pub exclude: Vec<Uuid>,
+    /// The other way round: offer only these. Present and empty means
+    /// nothing is acceptable, so nothing is offered — never "no filter",
+    /// which is what omitting the field says. Sending both is refused.
+    #[serde(default)]
+    pub include: Option<Vec<Uuid>>,
+}
+
+/// The flat pair a client sends, as the one thing the engine takes. Both at
+/// once is a contradiction rather than a combination, so it is refused here
+/// and unrepresentable past here.
+fn task_ids(
+    exclude: Vec<Uuid>,
+    include: Option<Vec<Uuid>>,
+) -> Result<Option<rbpmn_engine::TaskIds>, String> {
+    match (exclude.is_empty(), include) {
+        (false, Some(_)) => Err(
+            "exclude and include are alternatives: name what you will not take, \
+             or what you will, not both"
+                .to_string(),
+        ),
+        (_, Some(include)) => Ok(Some(rbpmn_engine::TaskIds::Include(include))),
+        (false, None) => Ok(Some(rbpmn_engine::TaskIds::Exclude(exclude))),
+        (true, None) => Ok(None),
+    }
 }
 
 #[derive(Deserialize)]
@@ -137,6 +166,10 @@ pub async fn get_task(State(engine): State<Engine>, Json(body): Json<GetTaskBody
     }
     options.order = order;
     options.filter = body.filter.map(FilterBody::into_filter);
+    options.ids = match task_ids(body.exclude, body.include) {
+        Ok(ids) => ids,
+        Err(why) => return bad_request(why),
+    };
     match engine.get_task(&body.topic, &options).await {
         Ok(Some(task)) => Json(serde_json::json!({ "task": task })).into_response(),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
@@ -150,6 +183,12 @@ pub struct CountTasksBody {
     pub topic: String,
     #[serde(default)]
     pub filter: Option<FilterBody>,
+    /// The same id filter [`GetTaskBody`] takes, so a depth and a claim
+    /// answer one question.
+    #[serde(default)]
+    pub exclude: Vec<Uuid>,
+    #[serde(default)]
+    pub include: Option<Vec<Uuid>>,
 }
 
 pub async fn count_tasks(
@@ -157,7 +196,14 @@ pub async fn count_tasks(
     Json(body): Json<CountTasksBody>,
 ) -> Response {
     let filter = body.filter.map(FilterBody::into_filter);
-    match engine.count_tasks(&body.topic, filter.as_ref()).await {
+    let ids = match task_ids(body.exclude, body.include) {
+        Ok(ids) => ids,
+        Err(why) => return bad_request(why),
+    };
+    match engine
+        .count_tasks(&body.topic, filter.as_ref(), ids.as_ref())
+        .await
+    {
         Ok(count) => Json(serde_json::json!({ "count": count })).into_response(),
         Err(e) => engine_error(e),
     }
@@ -431,6 +477,120 @@ pub async fn message(State(engine): State<Engine>, Json(body): Json<MessageBody>
     }
 }
 
+/// Repair the instance's open incident (docs/design/incident-scope.md, D5,
+/// D9–D10): the fields `Engine::repair` takes, with the disposition's own
+/// beside them. A field the disposition does not take is refused, never
+/// ignored.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairBody {
+    pub incident: u64,
+    /// `retry`, `advance`, `divert`, `abandon` or `abandon-instance` — the
+    /// word the inspection hands out and the `incident-repaired` event
+    /// records, which is why it is parsed through `RepairKind` below.
+    pub disposition: String,
+    #[serde(default)]
+    pub patch: Option<serde_json::Value>,
+    /// Present means answered — null included, which is an answer.
+    #[serde(default, deserialize_with = "present")]
+    pub answer: Option<serde_json::Value>,
+    #[serde(default)]
+    pub code: Option<String>,
+    pub reason: String,
+}
+
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(d).map(Some)
+}
+
+fn disposition_of(
+    kind: &str,
+    patch: Option<serde_json::Value>,
+    answer: Option<serde_json::Value>,
+    code: Option<String>,
+) -> Result<rbpmn_engine::Disposition, String> {
+    use rbpmn_engine::{Disposition, RepairKind};
+    let refuse = |what: &str| Err(format!("a {kind} repair takes no {what}"));
+    let patch_or_empty = |p: Option<serde_json::Value>| p.unwrap_or_else(|| json!({}));
+    // Through `RepairKind`'s own serde, never a second table of spellings:
+    // the word a caller sends is the word the inspection offers and the
+    // event records (docs/design/incident-scope.md, D9–D10). Spelling this
+    // out by hand is what let `abandonInstance` here diverge from the
+    // `abandon-instance` every other surface writes.
+    let Ok(kind) = serde_json::from_value::<RepairKind>(json!(kind)) else {
+        return Err(format!(
+            "no disposition '{kind}': retry, advance, divert, abandon or abandon-instance"
+        ));
+    };
+    match kind {
+        RepairKind::Retry if answer.is_some() || code.is_some() => refuse("answer or code"),
+        RepairKind::Retry => Ok(Disposition::Retry {
+            patch: patch_or_empty(patch),
+        }),
+        RepairKind::Advance if code.is_some() => refuse("code"),
+        RepairKind::Advance => Ok(Disposition::Advance {
+            patch: patch_or_empty(patch),
+            answer,
+        }),
+        RepairKind::Divert if patch.is_some() || answer.is_some() => refuse("patch or answer"),
+        RepairKind::Divert => Ok(Disposition::Divert { code }),
+        RepairKind::Abandon | RepairKind::AbandonInstance
+            if patch.is_some() || answer.is_some() || code.is_some() =>
+        {
+            refuse("patch, answer or code")
+        }
+        RepairKind::Abandon => Ok(Disposition::Abandon),
+        RepairKind::AbandonInstance => Ok(Disposition::AbandonInstance),
+    }
+}
+
+/// The repair verb. 200 carries the status the instance is in after the
+/// step, and the incident to name next if it froze again; a stale incident
+/// is 409 with the open one as a field; a disposition the incident does not
+/// allow is 422 with its reason.
+pub async fn repair(
+    State(engine): State<Engine>,
+    Path(id): Path<Uuid>,
+    payload: Result<Json<RepairBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    // Malformed JSON is the caller's mistake, 400 like a field the
+    // disposition does not take — never the extractor's 422, which on this
+    // route means the incident refused the disposition. Every other
+    // rejection keeps the framework's own answer (413 for a body over the
+    // limit, 415 without a JSON content type), which clients switch on.
+    let Json(body) = match payload {
+        Ok(body) => body,
+        Err(
+            rejection @ (axum::extract::rejection::JsonRejection::JsonDataError(_)
+            | axum::extract::rejection::JsonRejection::JsonSyntaxError(_)),
+        ) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": rejection.body_text() })),
+            )
+                .into_response();
+        }
+        Err(rejection) => return rejection.into_response(),
+    };
+    let disposition = match disposition_of(&body.disposition, body.patch, body.answer, body.code) {
+        Ok(disposition) => disposition,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
+    match engine
+        .repair(id, body.incident, disposition, &body.reason)
+        .await
+    {
+        Ok(repaired) => Json(json!({
+            "status": repaired.status,
+            "incident": repaired.incident,
+        }))
+        .into_response(),
+        Err(e) => engine_error(e),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct TopicBody {
     pub name: String,
@@ -448,6 +608,16 @@ pub async fn declare_topic(State(engine): State<Engine>, Json(body): Json<TopicB
 
 fn engine_error(e: EngineError) -> Response {
     let (status, message) = match &e {
+        // A repair naming an incident that is not open (D9). The conflict is
+        // the instance's state, and the incident to name instead — when the
+        // instance is frozen at all — is a field, not only prose.
+        EngineError::Step(rbpmn_engine::StepError::IncidentNotOpen { open, .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": e.to_string(), "openIncident": open })),
+            )
+                .into_response();
+        }
         EngineError::UnknownDefinition(_)
         | EngineError::UnknownWorkItem(_)
         | EngineError::UnknownInstance(_)

@@ -7,8 +7,9 @@ mod harness;
 use rbpmn_core::Bindings;
 use rbpmn_engine::testing::TestDb;
 use rbpmn_engine::{
-    Completion, DeployError, Engine, FailOptions, FailOutcome, HandlerFailure, HttpPostHandler,
-    ServiceTaskHandler, WorkItem, WorkerOptions,
+    Completion, DeployError, Disposition, Engine, EngineError, FailOptions, FailOutcome,
+    HandlerFailure, HttpPostHandler, InstanceStatus, Refusal, RepairKind, ServiceTaskHandler,
+    StepError, Takes, TaskIds, WorkItem, WorkerOptions,
 };
 use sqlx::{PgPool, Row};
 use std::fs;
@@ -438,6 +439,200 @@ async fn exhausted_retries_take_a_matching_error_boundary() {
         .await
         .unwrap();
     wait_for_status(&db.pool, started.id, "completed").await;
+    db.drop().await;
+}
+
+/// What the published claim predicate says about one element's item right
+/// now — `rbpmn_v_work_item.claimable`, the column `CLAIMABLE` projects.
+async fn claimable_now(pool: &PgPool, instance: uuid::Uuid, element: &str) -> bool {
+    sqlx::query_scalar(
+        "select claimable from rbpmn_v_work_item where instance_id = $1 and element_id = $2",
+    )
+    .bind(instance)
+    .bind(element)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The catch-all, end to end (docs/design/incident-scope.md, D1): an error
+/// boundary with no errorRef takes a failure that carries no code — the shape
+/// of the one nobody anticipated, and one no coded boundary can match. One
+/// attempt, so the engine's trace is the core's golden trace with nothing of
+/// the retry bookkeeping between.
+#[tokio::test]
+async fn a_catch_all_takes_a_failure_with_no_code() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("st").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/44-catch-all-error-boundary.bpmn"),
+            &Bindings::new().retries("st", rbpmn_core::RetryPolicy::new().attempts(1)),
+        )
+        .await
+        .unwrap();
+
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let id = open_items(&db.pool, started.id).await[0].0;
+    match engine
+        .fail_work_item(id, &FailOptions::default())
+        .await
+        .unwrap()
+    {
+        FailOutcome::ErrorCaught(events) => {
+            assert!(events.iter().any(|e| e.to_string() == "element-started be"));
+        }
+        other => panic!("expected ErrorCaught, got {other:?}"),
+    }
+    assert_eq!(status_of(&db.pool, started.id).await, "active");
+
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(
+        open.iter().map(|(_, e)| e.as_str()).collect::<Vec<_>>(),
+        ["th"]
+    );
+    engine
+        .complete_work_item(open[0].0, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("44-catch-all-codeless.json")
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// The motivating case of the incident-scope round, through the real engine:
+/// a side path's task fails past its budget with no code, the catch-all on it
+/// takes the side path to an end of its own, and the flow the side path exists
+/// to leave alone never notices — the instance stays active, the review is
+/// still claimable, and the process finishes.
+#[tokio::test]
+async fn a_contained_side_path_failure_leaves_the_process_running() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("notify").await.unwrap();
+    let xml = fixture("accept/46-side-path-failure-contained.bpmn").replace("PT1H", "PT0S");
+    engine
+        .deploy(
+            &xml,
+            &Bindings::new().retries("notify", rbpmn_core::RetryPolicy::new().attempts(1)),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    let notify = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .find(|(_, e)| e == "notify")
+        .expect("the side token reached notify")
+        .0;
+    assert!(matches!(
+        engine
+            .fail_work_item(notify, &FailOptions::default())
+            .await
+            .unwrap(),
+        FailOutcome::ErrorCaught(_)
+    ));
+
+    // What the freeze would have taken: the instance is still active, and the
+    // review is still on offer.
+    assert_eq!(status_of(&db.pool, started.id).await, "active");
+    assert!(claimable_now(&db.pool, started.id, "review").await);
+    let review = engine
+        .get_task("review", &rbpmn_engine::GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .expect("the review is still claimable");
+    assert!(matches!(
+        engine
+            .complete_task(review.id, "clerk", serde_json::json!({}))
+            .await
+            .unwrap(),
+        Completion::Advanced(_)
+    ));
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("46-side-path-failure-contained.json")
+            .into_iter()
+            .map(|e| e.replace("timer-armed remind PT1H", "timer-armed remind PT0S"))
+            .collect::<Vec<_>>()
+    );
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// The contrast, and the cost the freeze is kept for (D3). The host's
+/// catch-all does not reach its side path — side tokens run beside the host,
+/// and an error walks outward, never sideways — so a failure with no code on
+/// the side path finds nothing to catch it and freezes the instance, exactly
+/// as every codeless failure did before catch-alls existed. The host's own
+/// item is then what `spec/LeaseSiblings.tla` calls stranded: still open,
+/// neither claimable nor completable.
+#[tokio::test]
+async fn a_side_path_failure_the_host_cannot_catch_freezes_the_instance() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("work").await.unwrap();
+    engine.declare_topic("notify").await.unwrap();
+    let xml = fixture("accept/48-side-path-failure-escapes.bpmn").replace("PT1H", "PT0S");
+    engine
+        .deploy(
+            &xml,
+            &Bindings::new().retries("notify", rbpmn_core::RetryPolicy::new().attempts(1)),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(engine.fire_due_timer().await.unwrap());
+
+    let items = open_items(&db.pool, started.id).await;
+    let item = |name: &str| items.iter().find(|(_, e)| e == name).expect(name).0;
+    assert!(
+        claimable_now(&db.pool, started.id, "work").await,
+        "the host's item is on offer until the freeze"
+    );
+    assert!(matches!(
+        engine
+            .fail_work_item(item("notify"), &FailOptions::default())
+            .await
+            .unwrap(),
+        FailOutcome::IncidentRaised
+    ));
+    assert_eq!(status_of(&db.pool, started.id).await, "failed");
+
+    // Stranded: still open, no longer on offer, and refused if completed.
+    assert_eq!(item_state(&db.pool, started.id, "work").await, "available");
+    assert!(!claimable_now(&db.pool, started.id, "work").await);
+    assert!(matches!(
+        engine
+            .complete_work_item(item("work"), serde_json::json!({}))
+            .await,
+        Err(rbpmn_engine::EngineError::IncidentOpen(_))
+    ));
+    assert_eq!(
+        event_trace(&db.pool, started.id).await,
+        golden_trace("48-host-catch-all-does-not-reach-side-path.json")
+            .into_iter()
+            .map(|e| e.replace("timer-armed remind PT1H", "timer-armed remind PT0S"))
+            .collect::<Vec<_>>()
+    );
+    assert_fsck_clean(&db.pool).await;
     db.drop().await;
 }
 
@@ -1752,6 +1947,872 @@ async fn missing_correlation_key_freezes_loudly() {
     db.drop().await;
 }
 
+/// A delivery whose non-interrupting boundary could not re-arm is refused
+/// before anything changes (docs/design/incident-scope.md, D11): `correlate`
+/// answers the typed step refusal, the transaction rolls back, and the host
+/// keeps its work item, the boundary its subscription, the document its key.
+#[tokio::test]
+async fn a_delivery_that_would_break_its_boundary_is_refused() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("file_note").await.unwrap();
+    let bindings = Bindings::new().correlation("note_received", "case.id");
+    engine
+        .deploy(
+            &fixture("accept/33-non-interrupting-message-boundary.bpmn"),
+            &bindings,
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start(
+            "casefile",
+            None,
+            serde_json::json!({"case": {"id": "c-33"}}),
+        )
+        .await
+        .unwrap();
+
+    let refused = engine
+        .correlate("NOTE", "c-33", serde_json::json!({"case": {"id": 1.5}}))
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(rbpmn_engine::EngineError::Step(
+                rbpmn_core::StepError::BoundaryCannotRearm { .. }
+            ))
+        ),
+        "{refused:?}"
+    );
+    let (status, variables): (String, serde_json::Value) =
+        sqlx::query_as("select status, variables from rbpmn_instance where id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "active");
+    assert_eq!(variables, serde_json::json!({"case": {"id": "c-33"}}));
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 1);
+    let open = |items: Vec<(uuid::Uuid, String)>| -> Vec<String> {
+        items.into_iter().map(|(_, element)| element).collect()
+    };
+    assert_eq!(open(open_items(&db.pool, started.id).await), ["review"]);
+
+    // The boundary is still armed: a delivery that keeps the key goes through.
+    engine
+        .correlate("NOTE", "c-33", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        open(open_items(&db.pool, started.id).await),
+        ["review", "file_note"]
+    );
+    db.drop().await;
+}
+
+/// Fail `item` with no code until its budget is spent and the instance
+/// freezes on it.
+async fn freeze_on(engine: &Engine, item: uuid::Uuid) {
+    for _ in 0..5 {
+        if engine
+            .fail_work_item(item, &FailOptions::default())
+            .await
+            .unwrap()
+            == FailOutcome::IncidentRaised
+        {
+            return;
+        }
+    }
+    panic!("failing {item} five times never raised an incident");
+}
+
+/// A repair is a command (docs/design/incident-scope.md, D4–D5), and a
+/// retried incident enters its task as if for the first time: a new work item
+/// with the budget the manifest gives it, while the failed row stays failed —
+/// a worker holding its id gets the ordinary `AlreadyClosed`. The repaired
+/// history replays through the pure core like any other.
+#[tokio::test]
+async fn a_retried_incident_mints_a_new_work_item_with_its_budget() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("st").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/10-error-boundary.bpmn"),
+            &Bindings::new().retries("st", rbpmn_core::RetryPolicy::new().attempts(2)),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    let (failed, _) = open_items(&db.pool, started.id).await[0].clone();
+    assert_eq!(
+        engine
+            .fail_work_item(failed, &fail_code("UNKNOWN_CODE"))
+            .await
+            .unwrap(),
+        FailOutcome::Retrying { retries_left: 1 }
+    );
+    assert_eq!(
+        engine
+            .fail_work_item(failed, &fail_code("UNKNOWN_CODE"))
+            .await
+            .unwrap(),
+        FailOutcome::IncidentRaised
+    );
+
+    let repaired = engine
+        .repair(
+            started.id,
+            0,
+            Disposition::Retry {
+                patch: serde_json::json!({"card": "renewed"}),
+            },
+            "the card was renewed",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (repaired.status, repaired.incident),
+        (InstanceStatus::Active, None)
+    );
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    let (fresh, element) = open[0].clone();
+    assert_eq!(element, "st");
+    assert_ne!(fresh, failed, "a repair creates an item, never reopens one");
+    let row = |id: uuid::Uuid| {
+        sqlx::query_as::<_, (String, i32)>(
+            "select state, retries from rbpmn_work_item where id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db.pool)
+    };
+    assert_eq!(row(fresh).await.unwrap(), ("available".to_string(), 2));
+    assert_eq!(row(failed).await.unwrap().0, "failed");
+    assert!(matches!(
+        engine
+            .complete_work_item(failed, serde_json::json!({}))
+            .await
+            .unwrap(),
+        Completion::AlreadyClosed { .. }
+    ));
+
+    engine
+        .complete_work_item(fresh, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// The price of the instance-wide freeze, paid back (D3, and
+/// `spec/LeaseSiblings.tla`'s stranded sibling): a clerk holding a sibling's
+/// task cannot record it while the instance is frozen, and can — with the
+/// same lease — the moment a repair lands.
+#[tokio::test]
+async fn a_repair_frees_the_sibling_the_freeze_stranded() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/03-parallel-gateway.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    let held = engine
+        .get_task("tb", &GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .expect("tb is on offer");
+    let (ta, _) = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .find(|(_, element)| element == "ta")
+        .unwrap();
+    freeze_on(&engine, ta).await;
+    assert!(matches!(
+        engine
+            .complete_task(held.id, "clerk", serde_json::json!({}))
+            .await,
+        Err(EngineError::IncidentOpen(_))
+    ));
+
+    let repaired = engine
+        .repair(
+            started.id,
+            0,
+            Disposition::Advance {
+                patch: serde_json::json!({}),
+                answer: None,
+            },
+            "packed by hand",
+        )
+        .await
+        .unwrap();
+    assert_eq!(repaired.status, InstanceStatus::Active);
+    engine
+        .complete_task(held.id, "clerk", serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// A repair names the incident it repairs (D9). Another number, an instance
+/// that is not frozen and no instance at all are answered typed, before
+/// anything changes, and so is a patch that is not an object. A Retry that
+/// fails again freezes under the next number, which is then the one to name.
+#[tokio::test]
+async fn a_repair_names_its_incident() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/17-message-catch.bpmn"),
+            &Bindings::new().correlation("c", "order.id"),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    assert_eq!(status_of(&db.pool, started.id).await, "failed");
+    let retry = |patch: serde_json::Value| Disposition::Retry { patch };
+    let empty = || serde_json::json!({});
+
+    assert!(matches!(
+        engine.repair(started.id, 1, retry(empty()), "resent").await,
+        Err(EngineError::Step(StepError::IncidentNotOpen {
+            named: 1,
+            open: Some(0)
+        }))
+    ));
+    assert!(matches!(
+        engine
+            .repair(uuid::Uuid::new_v4(), 0, retry(empty()), "nobody")
+            .await,
+        Err(EngineError::UnknownInstance(_))
+    ));
+    assert!(matches!(
+        engine
+            .repair(
+                started.id,
+                0,
+                retry(serde_json::json!(["a", "list"])),
+                "bad"
+            )
+            .await,
+        Err(EngineError::InvalidVariables(_))
+    ));
+
+    let again = engine
+        .repair(started.id, 0, retry(empty()), "try again")
+        .await
+        .unwrap();
+    assert_eq!(
+        (again.status, again.incident),
+        (InstanceStatus::Failed, Some(1))
+    );
+    assert!(matches!(
+        engine.repair(started.id, 0, retry(empty()), "resent").await,
+        Err(EngineError::Step(StepError::IncidentNotOpen {
+            named: 0,
+            open: Some(1)
+        }))
+    ));
+
+    let fixed = engine
+        .repair(
+            started.id,
+            1,
+            retry(serde_json::json!({"order": {"id": "o-17"}})),
+            "the order id was missing",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (fixed.status, fixed.incident),
+        (InstanceStatus::Active, None)
+    );
+    engine
+        .correlate("WarehouseAck", "o-17", empty())
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    assert!(matches!(
+        engine.repair(started.id, 1, retry(empty()), "late").await,
+        Err(EngineError::Step(StepError::IncidentNotOpen {
+            named: 1,
+            open: None
+        }))
+    ));
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// What the inspection says a repair would do is what a repair does (D10).
+/// It names the open incident, where a repair re-enters, and per disposition
+/// what the caller supplies and why it would be refused — and each verdict is
+/// the one `Engine::repair` reaches, because both come from the same core
+/// functions. An instance that is not frozen carries none.
+#[tokio::test]
+async fn the_inspection_says_what_a_repair_would_do() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/03-parallel-gateway.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    assert!(
+        engine
+            .inspect_instance(started.id)
+            .await
+            .unwrap()
+            .incident
+            .is_none()
+    );
+    let (ta, _) = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .find(|(_, element)| element == "ta")
+        .unwrap();
+    freeze_on(&engine, ta).await;
+
+    let incident = engine
+        .inspect_instance(started.id)
+        .await
+        .unwrap()
+        .incident
+        .expect("a frozen instance has one");
+    assert_eq!(
+        (
+            incident.incident,
+            &*incident.element,
+            &*incident.resume,
+            incident.halted
+        ),
+        (0, "ta", "ta", 0)
+    );
+    let option = |kind: RepairKind| {
+        incident
+            .options
+            .iter()
+            .find(|o| o.disposition == kind)
+            .unwrap_or_else(|| panic!("{kind} is an option"))
+    };
+    assert_eq!(option(RepairKind::Retry).takes, Takes::Patch);
+    assert!(option(RepairKind::Retry).refused.is_none());
+    assert_eq!(option(RepairKind::Advance).takes, Takes::Patch);
+    assert!(option(RepairKind::Advance).refused.is_none());
+    assert_eq!(option(RepairKind::AbandonInstance).takes, Takes::Nothing);
+    assert!(option(RepairKind::AbandonInstance).refused.is_none());
+    // Nothing in this model catches an error, and `tb` is still open in the
+    // same scope: the two dispositions that cannot land say so, in the prose
+    // an operator reads.
+    let divert = option(RepairKind::Divert);
+    assert_eq!(divert.takes, Takes::Code);
+    assert_eq!(
+        divert.refused.as_ref().map(|r| (r.cause, r.reason.clone())),
+        Some((Refusal::NothingCatches, Refusal::NothingCatches.to_string()))
+    );
+    assert_eq!(
+        option(RepairKind::Abandon)
+            .refused
+            .as_ref()
+            .map(|r| r.cause),
+        Some(Refusal::AJoinWouldWait)
+    );
+
+    // Refusal for refusal, the command says the same.
+    assert!(matches!(
+        engine
+            .repair(started.id, 0, Disposition::Divert { code: None }, "divert")
+            .await,
+        Err(EngineError::Step(StepError::RepairRefused(
+            Refusal::NothingCatches
+        )))
+    ));
+    assert!(matches!(
+        engine
+            .repair(started.id, 0, Disposition::Abandon, "drop it")
+            .await,
+        Err(EngineError::Step(StepError::RepairRefused(
+            Refusal::AJoinWouldWait
+        )))
+    ));
+    let repaired = engine
+        .repair(
+            started.id,
+            0,
+            Disposition::Advance {
+                patch: serde_json::json!({}),
+                answer: None,
+            },
+            "filed by hand",
+        )
+        .await
+        .unwrap();
+    assert_eq!(repaired.status, InstanceStatus::Active);
+    assert!(
+        engine
+            .inspect_instance(started.id)
+            .await
+            .unwrap()
+            .incident
+            .is_none()
+    );
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// A freeze halts what was in flight, and the row has to carry the flow it
+/// was on (D7): a token halted on its way to a join is written `halted` with
+/// `arrived_via`, and a repair puts it back on that flow. Lose it and the
+/// join waits forever for an arrival it can no longer count — which is why
+/// this goes through the database rather than the core alone.
+#[tokio::test]
+async fn a_halted_token_keeps_the_flow_it_was_on() {
+    // Branch f2 fails its correlation while branch f3's token is still
+    // queued behind it in the same advancement, so the freeze finds one
+    // token in flight and parks it where it stood.
+    const XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m" name="Go"/>
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:parallelGateway id="ps"/>
+    <bpmn:intermediateCatchEvent id="c">
+      <bpmn:messageEventDefinition messageRef="m"/>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:userTask id="ut"/>
+    <bpmn:parallelGateway id="pj"/>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="ps"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="ps" targetRef="c"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="ps" targetRef="ut"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="c" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="ut" targetRef="pj"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="pj" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(XML, &Bindings::new().correlation("c", "order.id"))
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    assert_eq!(status_of(&db.pool, started.id).await, "failed");
+
+    let halted: Vec<(String, String, Option<String>)> = sqlx::query(
+        "select element_id, wait_kind, arrived_via from rbpmn_token \
+         where instance_id = $1 and wait_kind like 'halted%' order by token_no",
+    )
+    .bind(started.id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| {
+        (
+            r.get("element_id"),
+            r.get("wait_kind"),
+            r.get("arrived_via"),
+        )
+    })
+    .collect();
+    assert_eq!(
+        halted,
+        vec![(
+            "ut".to_string(),
+            "halted".to_string(),
+            Some("f3".to_string())
+        )],
+        "the halted token carries the flow it arrived on"
+    );
+    let inspection = engine.inspect_instance(started.id).await.unwrap();
+    assert_eq!(inspection.incident.expect("frozen").halted, 1);
+
+    engine
+        .repair(
+            started.id,
+            0,
+            Disposition::Retry {
+                patch: serde_json::json!({"order": {"id": "o-1"}}),
+            },
+            "the order id was missing",
+        )
+        .await
+        .unwrap();
+    // Both branches now arrive at the join by their own flow. A halted token
+    // that lost `arrived_via` would leave this instance waiting forever.
+    let held = engine
+        .get_task("ut", &GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .expect("the halted branch entered its task");
+    engine
+        .complete_task(held.id, "clerk", serde_json::json!({}))
+        .await
+        .unwrap();
+    engine
+        .correlate("Go", "o-1", serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// A Divert lands on a boundary the failure never reached (D5): the incident
+/// is thrown as the code the operator names, the boundary that matches takes
+/// it, and the recovery path runs. The failed work item stays failed — a
+/// repair never reopens a closed item.
+#[tokio::test]
+async fn a_diverted_incident_takes_the_boundary_the_code_names() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("st").await.unwrap();
+    engine
+        .deploy(
+            &fixture("accept/10-error-boundary.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    let (failed, _) = open_items(&db.pool, started.id).await[0].clone();
+    freeze_on(&engine, failed).await;
+
+    // What the read offers before anything is sent: the one code that
+    // reaches a boundary from here, where it lands, and — `be` being on the
+    // failing activity itself — nothing torn down to get there (D10).
+    let incident = engine
+        .inspect_instance(started.id)
+        .await
+        .unwrap()
+        .incident
+        .expect("a frozen instance has one");
+    let divert = incident
+        .options
+        .iter()
+        .find(|o| o.disposition == RepairKind::Divert)
+        .expect("divert is an option");
+    assert!(divert.refused.is_none());
+    assert_eq!(
+        divert
+            .codes
+            .iter()
+            .map(|c| {
+                (
+                    c.code.as_deref(),
+                    c.caught_at.as_str(),
+                    c.tears_down.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [(Some("PAYMENT_FAILED"), "be", None)]
+    );
+
+    let repaired = engine
+        .repair(
+            started.id,
+            0,
+            Disposition::Divert {
+                code: Some("PAYMENT_FAILED".to_string()),
+            },
+            "the acquirer will not settle this one; hand it to the clerk",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (repaired.status, repaired.incident),
+        (InstanceStatus::Active, None)
+    );
+    let open: Vec<String> = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .map(|(_, element)| element)
+        .collect();
+    assert_eq!(open, ["t_fix"], "the boundary's recovery path is what runs");
+    let state: String = sqlx::query("select state from rbpmn_work_item where id = $1")
+        .bind(failed)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .get("state");
+    assert_eq!(state, "failed", "a repair never reopens a closed item");
+
+    let held = engine
+        .get_task("t_fix", &GetTaskOptions::new("clerk"))
+        .await
+        .unwrap()
+        .expect("t_fix is on offer");
+    engine
+        .complete_task(held.id, "clerk", serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// Abandoning a frozen instance ends it as `Terminated` (D5): the sibling's
+/// open item is cancelled with everything else, and the instance becomes
+/// retention's to retire, which a `failed` one never is.
+#[tokio::test]
+async fn abandoning_a_frozen_instance_hands_it_to_retention() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/03-parallel-gateway.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({});
+    let started = engine.start("p", None, initial.clone()).await.unwrap();
+    let items = open_items(&db.pool, started.id).await;
+    let item_at = |element: &str| items.iter().find(|(_, e)| e == element).unwrap().0;
+    let (ta, tb) = (item_at("ta"), item_at("tb"));
+    freeze_on(&engine, ta).await;
+
+    let repaired = engine
+        .repair(started.id, 0, Disposition::AbandonInstance, "written off")
+        .await
+        .unwrap();
+    assert_eq!(
+        (repaired.status, repaired.incident),
+        (InstanceStatus::Terminated, None)
+    );
+    let (status, closed): (String, bool) =
+        sqlx::query_as("select status, completed_at is not null from rbpmn_instance where id = $1")
+            .bind(started.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!((status.as_str(), closed), ("terminated", true));
+    let tb_state: String = sqlx::query_scalar("select state from rbpmn_work_item where id = $1")
+        .bind(tb)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(tb_state, "cancelled");
+    harness::replay_verify(&db.pool, started.id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
+/// A review whose timers a frozen instance keeps: a duration, a date and a
+/// cycle on the host, while a note's side path is what freezes it.
+const CLOCK_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  id="defs" targetNamespace="urn:test">
+  <bpmn:message id="m_note" name="NOTE"/>
+  <bpmn:process id="clock" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:userTask id="review"/>
+    <bpmn:boundaryEvent id="sla" attachedToRef="review">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT1H</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="deadline" attachedToRef="review">
+      <bpmn:timerEventDefinition><bpmn:timeDate>2099-01-01T00:00:00Z</bpmn:timeDate></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="remind" cancelActivity="false" attachedToRef="review">
+      <bpmn:timerEventDefinition><bpmn:timeCycle>R/P7D</bpmn:timeCycle></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="chase" cancelActivity="false" attachedToRef="review">
+      <bpmn:timerEventDefinition><bpmn:timeCycle>R/P3D</bpmn:timeCycle></bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="note" cancelActivity="false" attachedToRef="review">
+      <bpmn:messageEventDefinition messageRef="m_note"/>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="file_note"/>
+    <bpmn:endEvent id="done"/>
+    <bpmn:endEvent id="escalated"/>
+    <bpmn:endEvent id="expired"/>
+    <bpmn:endEvent id="reminded"/>
+    <bpmn:endEvent id="chased"/>
+    <bpmn:endEvent id="filed"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="review"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="review" targetRef="done"/>
+    <bpmn:sequenceFlow id="f3" sourceRef="sla" targetRef="escalated"/>
+    <bpmn:sequenceFlow id="f4" sourceRef="deadline" targetRef="expired"/>
+    <bpmn:sequenceFlow id="f5" sourceRef="remind" targetRef="reminded"/>
+    <bpmn:sequenceFlow id="f8" sourceRef="chase" targetRef="chased"/>
+    <bpmn:sequenceFlow id="f6" sourceRef="note" targetRef="file_note"/>
+    <bpmn:sequenceFlow id="f7" sourceRef="file_note" targetRef="filed"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+async fn due_of(pool: &PgPool, instance: uuid::Uuid, element: &str) -> f64 {
+    sqlx::query_scalar(
+        "select extract(epoch from due_at)::float8 from rbpmn_timer \
+         where instance_id = $1 and element_id = $2",
+    )
+    .bind(instance)
+    .bind(element)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A frozen instance's clock stops (docs/design/incident-scope.md, D8): the
+/// repair that lands re-arms every timer the freeze kept. A duration moves by
+/// the outage, keeping the time it had left; a cycle whose occurrence came due
+/// while frozen steps along its own grid to the first occurrence at or after
+/// the resume, skipping the missed ones, while one owed before the freeze
+/// fires on resume; a date keeps its instant.
+#[tokio::test]
+async fn a_repair_stops_the_clock_for_the_time_frozen() {
+    const DAY: f64 = 86_400.0;
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.declare_topic("file_note").await.unwrap();
+    engine
+        .deploy(
+            CLOCK_XML,
+            &Bindings::new()
+                .correlation("note", "case.id")
+                .retries("file_note", rbpmn_core::RetryPolicy::new().attempts(1)),
+        )
+        .await
+        .unwrap();
+    let initial = serde_json::json!({"case": {"id": "c-1"}});
+    let started = engine.start("clock", None, initial.clone()).await.unwrap();
+    let id = started.id;
+    engine
+        .correlate("NOTE", "c-1", serde_json::json!({}))
+        .await
+        .unwrap();
+    let (note, _) = open_items(&db.pool, id)
+        .await
+        .into_iter()
+        .find(|(_, element)| element == "file_note")
+        .unwrap();
+    assert_eq!(
+        engine
+            .fail_work_item(note, &FailOptions::default())
+            .await
+            .unwrap(),
+        FailOutcome::IncidentRaised
+    );
+
+    // Twenty-two days frozen: the reminder's occurrence came due in them, the
+    // chaser's was due before the freeze began. Backdated in epoch seconds —
+    // `interval '22 days'` is calendar days, an hour off across a DST change.
+    sqlx::query(
+        "update rbpmn_instance set frozen_at = to_timestamp(extract(epoch from frozen_at) - $2) \
+         where id = $1",
+    )
+    .bind(id)
+    .bind(22.0 * DAY)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    for (element, days) in [("remind", 22.0), ("chase", 30.0)] {
+        sqlx::query(
+            "update rbpmn_timer set due_at = to_timestamp(extract(epoch from due_at) - $3) \
+             where instance_id = $1 and element_id = $2",
+        )
+        .bind(id)
+        .bind(element)
+        .bind(days * DAY)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let chase = due_of(&db.pool, id, "chase").await;
+    let (sla, remind, deadline) = (
+        due_of(&db.pool, id, "sla").await,
+        due_of(&db.pool, id, "remind").await,
+        due_of(&db.pool, id, "deadline").await,
+    );
+
+    let repaired = engine
+        .repair(id, 0, Disposition::Abandon, "filed by hand")
+        .await
+        .unwrap();
+    assert_eq!(repaired.status, InstanceStatus::Active);
+    let now: f64 = sqlx::query_scalar("select extract(epoch from clock_timestamp())::float8")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let moved = due_of(&db.pool, id, "sla").await - sla;
+    assert!(
+        (22.0 * DAY..22.0 * DAY + 60.0).contains(&moved),
+        "the duration moved {moved} s, not the 22 days frozen"
+    );
+    let rearmed = due_of(&db.pool, id, "remind").await;
+    let steps = (rearmed - remind) / (7.0 * DAY);
+    assert!(
+        (steps - steps.round()).abs() < 1e-6 && steps.round() >= 1.0,
+        "the cycle moved {steps} periods, not a whole number of them"
+    );
+    assert!(
+        rearmed >= now - 1.0 && rearmed < now + 7.0 * DAY,
+        "the cycle's next occurrence is not the first at or after now"
+    );
+    assert_eq!(due_of(&db.pool, id, "deadline").await, deadline);
+    assert_eq!(
+        due_of(&db.pool, id, "chase").await,
+        chase,
+        "an occurrence owed before the freeze fires on resume, not a period later"
+    );
+    let frozen_at: Option<f64> = sqlx::query_scalar(
+        "select extract(epoch from frozen_at)::float8 from rbpmn_instance where id = $1",
+    )
+    .bind(id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        frozen_at, None,
+        "the step that left the freeze keeps its clock"
+    );
+    harness::replay_verify(&db.pool, id, &initial)
+        .await
+        .unwrap();
+    assert!(harness::fsck(&db.pool).await.is_empty());
+    db.drop().await;
+}
+
 /// Terminate tears everything down in one transaction — including armed
 /// timers (fixture-12 shape with a timer in the surviving branch).
 #[tokio::test]
@@ -2433,6 +3494,428 @@ async fn tasks_are_fifo_by_default_lifo_on_request() {
     db.drop().await;
 }
 
+/// "Skip this one": the caller keeps the ids it does not want and sends them
+/// with the next claim. Nothing is written and nothing is locked — the
+/// skipped item stays exactly where it was in the queue, for this caller and
+/// every other, which is what claiming-then-releasing to skip cannot say.
+#[tokio::test]
+async fn a_claim_can_be_told_which_items_to_skip() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let ids = three_review_instances(&engine).await;
+    let mut items = Vec::new();
+    for id in &ids {
+        items.push(open_items(&db.pool, *id).await[0].0);
+    }
+
+    // FIFO, skipping the head: the next one in order, not the one after the
+    // caller's last claim.
+    let mut skip_head = GetTaskOptions::new("w1");
+    skip_head.ids = Some(TaskIds::Exclude(vec![items[0]]));
+    let task = engine
+        .get_task("review", &skip_head)
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(
+        task.id, items[1],
+        "the next claimable one that was not skipped"
+    );
+
+    // And the skipped one is untouched: another caller is still offered it,
+    // still at the head.
+    let other = engine
+        .get_task("review", &GetTaskOptions::new("w2"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(
+        other.id, items[0],
+        "skipping locks nothing, defers nothing, and is this caller's alone"
+    );
+
+    // LIFO reads the same list from the other end.
+    let mut skip_tail = GetTaskOptions::new("w3");
+    skip_tail.order = TaskOrder::Lifo;
+    skip_tail.ids = Some(TaskIds::Exclude(vec![items[2]]));
+    assert!(
+        engine
+            .get_task("review", &skip_tail)
+            .await
+            .unwrap()
+            .is_none(),
+        "the other two are claimed; the only one left is the skipped one"
+    );
+    db.drop().await;
+}
+
+/// Skipping everything offers nothing, and the count says the same — the two
+/// answer one question, so a queue depth cannot promise what a claim refuses.
+#[tokio::test]
+async fn skipping_every_item_offers_nothing_and_counts_none() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let ids = three_review_instances(&engine).await;
+    let mut items = Vec::new();
+    for id in &ids {
+        items.push(open_items(&db.pool, *id).await[0].0);
+    }
+
+    assert_eq!(engine.count_tasks("review", None, None).await.unwrap(), 3);
+    assert_eq!(
+        engine
+            .count_tasks("review", None, Some(&TaskIds::Exclude(items.clone())))
+            .await
+            .unwrap(),
+        0
+    );
+    let mut skip_all = GetTaskOptions::new("w1");
+    skip_all.ids = Some(TaskIds::Exclude(items.clone()));
+    assert!(
+        engine
+            .get_task("review", &skip_all)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // One fewer skipped, one left to offer.
+    assert_eq!(
+        engine
+            .count_tasks("review", None, Some(&TaskIds::Exclude(items[1..].to_vec())))
+            .await
+            .unwrap(),
+        1
+    );
+    db.drop().await;
+}
+
+/// A skip list and a filter in one claim. This is the only shape in which
+/// the exclude conjunct shifts the filter's parameter numbers along — `$5`
+/// in the claim, `$3` in the count — and an off-by-one there would bind a
+/// filter's text value to the uuid array, which every test that passes one
+/// without the other would still call green.
+#[tokio::test]
+async fn a_skip_list_and_a_filter_hold_their_own_parameters() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    let mut north = Vec::new();
+    for n in 0..3 {
+        let started = engine
+            .start("p", None, serde_json::json!({ "region": "north", "n": n }))
+            .await
+            .unwrap();
+        north.push(open_items(&db.pool, started.id).await[0].0);
+    }
+    engine
+        .start("p", None, serde_json::json!({ "region": "south" }))
+        .await
+        .unwrap();
+
+    let filter = || TaskFilter::new("p").field("region", "north");
+    assert_eq!(
+        engine
+            .count_tasks("review", Some(&filter()), None)
+            .await
+            .unwrap(),
+        3,
+        "the filter alone"
+    );
+    assert_eq!(
+        engine
+            .count_tasks(
+                "review",
+                Some(&filter()),
+                Some(&TaskIds::Exclude(north[..1].to_vec()))
+            )
+            .await
+            .unwrap(),
+        2,
+        "the filter and the skip list together"
+    );
+
+    let mut options = GetTaskOptions::new("w1");
+    options.filter = Some(filter());
+    options.ids = Some(TaskIds::Exclude(vec![north[0]]));
+    let task = engine
+        .get_task("review", &options)
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(
+        task.id, north[1],
+        "the filter still filters and the skip list still skips"
+    );
+    assert_eq!(task.variables["region"], "north");
+    db.drop().await;
+}
+
+/// The claim's seek survives the skip list. `rbpmn_work_item_pull (topic,
+/// created_at, item_no)` is what orders the queue, and the exclusion is a
+/// filter over what that scan walks — not part of what it seeks to. Asserted
+/// the way the declared-index test asserts its own: against
+/// `pg_stat_user_indexes` for the real query, on enough rows for the planner
+/// to have a choice. It says the seek still used the index, which is the
+/// measurable claim; it does not say the plan is unchanged byte for byte.
+#[tokio::test]
+async fn a_skip_list_does_not_cost_the_claim_its_index() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    let mut items = Vec::new();
+    for n in 0..300 {
+        let started = engine
+            .start("p", None, serde_json::json!({ "n": n }))
+            .await
+            .unwrap();
+        if n < 5 {
+            items.push(open_items(&db.pool, started.id).await[0].0);
+        }
+    }
+    sqlx::query("analyze rbpmn_work_item")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("analyze rbpmn_instance")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let scans = || async {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "select idx_scan::bigint from pg_stat_user_indexes \
+             where indexrelname = 'rbpmn_work_item_pull'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .unwrap_or(0)
+    };
+    let before = scans().await;
+
+    let mut options = GetTaskOptions::new("w1");
+    options.ids = Some(TaskIds::Exclude(items.clone()));
+    let task = engine
+        .get_task("review", &options)
+        .await
+        .unwrap()
+        .expect("a task");
+    assert!(!items.contains(&task.id), "it skipped what it was given");
+
+    let mut after = before;
+    for _ in 0..20 {
+        after = scans().await;
+        if after > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await; // stats lag
+    }
+    assert!(
+        after > before,
+        "a claim carrying a skip list no longer used rbpmn_work_item_pull"
+    );
+    db.drop().await;
+}
+
+/// The other way round: name what you will take. Everything the skip list
+/// says about not locking and not deferring holds here too — this decides
+/// what *this* claim accepts, and leaves the queue as it was for everyone.
+#[tokio::test]
+async fn a_claim_can_be_told_which_items_it_will_take() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let ids = three_review_instances(&engine).await;
+    let mut items = Vec::new();
+    for id in &ids {
+        items.push(open_items(&db.pool, *id).await[0].0);
+    }
+
+    // Only the last one is acceptable, so FIFO order notwithstanding, that
+    // is the one claimed.
+    let mut only_last = GetTaskOptions::new("w1");
+    only_last.ids = Some(TaskIds::Include(vec![items[2]]));
+    let task = engine
+        .get_task("review", &only_last)
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(task.id, items[2]);
+
+    // The two it did not name are untouched, and still first in line.
+    let next = engine
+        .get_task("review", &GetTaskOptions::new("w2"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(next.id, items[0]);
+
+    assert_eq!(
+        engine
+            .count_tasks("review", None, Some(&TaskIds::Include(items[..2].to_vec())))
+            .await
+            .unwrap(),
+        1,
+        "one of the two named is still claimable; the other is now held"
+    );
+    db.drop().await;
+}
+
+/// Naming nothing acceptable offers nothing — the reading a bare list could
+/// not express, and the reason `TaskIds` is an enum. A caller whose candidate
+/// list came back empty is exactly the caller who must not be handed an
+/// unrelated task.
+#[tokio::test]
+async fn an_empty_include_is_nothing_acceptable_not_no_filter() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    three_review_instances(&engine).await;
+
+    let mut nothing = GetTaskOptions::new("w1");
+    nothing.ids = Some(TaskIds::Include(Vec::new()));
+    assert!(engine.get_task("review", &nothing).await.unwrap().is_none());
+    assert_eq!(
+        engine
+            .count_tasks("review", None, Some(&TaskIds::Include(Vec::new())))
+            .await
+            .unwrap(),
+        0
+    );
+    // ...while naming none at all is every claimable one, as it always was.
+    assert_eq!(engine.count_tasks("review", None, None).await.unwrap(), 3);
+    assert!(
+        engine
+            .get_task("review", &GetTaskOptions::new("w2"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    db.drop().await;
+}
+
+/// The include form renumbers the filter's parameters exactly as the exclude
+/// form does — `$5` in the claim, `$3` in the count — so it needs the same
+/// proof: an off-by-one would bind a filter's text value to the uuid array,
+/// and a suite that never pairs them would stay green.
+#[tokio::test]
+async fn an_include_list_and_a_filter_hold_their_own_parameters() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    let mut north = Vec::new();
+    for n in 0..2 {
+        let started = engine
+            .start("p", None, serde_json::json!({ "region": "north", "n": n }))
+            .await
+            .unwrap();
+        north.push(open_items(&db.pool, started.id).await[0].0);
+    }
+    let south = engine
+        .start("p", None, serde_json::json!({ "region": "south" }))
+        .await
+        .unwrap();
+    let south_item = open_items(&db.pool, south.id).await[0].0;
+
+    // Naming the southern item and filtering for northern ones is an empty
+    // intersection, and both halves have to be applied to see that.
+    assert_eq!(
+        engine
+            .count_tasks(
+                "review",
+                Some(&TaskFilter::new("p").field("region", "north")),
+                Some(&TaskIds::Include(vec![south_item])),
+            )
+            .await
+            .unwrap(),
+        0,
+        "the filter and the named list are both applied, not one or the other"
+    );
+    let mut options = GetTaskOptions::new("w1");
+    options.filter = Some(TaskFilter::new("p").field("region", "north"));
+    options.ids = Some(TaskIds::Include(vec![south_item, north[1]]));
+    let task = engine
+        .get_task("review", &options)
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_eq!(task.id, north[1], "the named one that the filter admits");
+    assert_eq!(task.variables["region"], "north");
+    db.drop().await;
+}
+
+/// An included item is reached however far down the queue it sits. Which
+/// plan Postgres picks for `w.id = any(...)` is its own affair — the primary
+/// key or the queue seek — so this asserts what is true either way rather
+/// than which index was used: the named item comes back, from behind three
+/// hundred older ones that a plain claim would have taken first.
+#[tokio::test]
+async fn an_include_list_reaches_an_item_deep_in_the_queue() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    let mut last = None;
+    for n in 0..300 {
+        let started = engine
+            .start("p", None, serde_json::json!({ "n": n }))
+            .await
+            .unwrap();
+        last = Some(open_items(&db.pool, started.id).await[0].0);
+    }
+    let tail = last.expect("three hundred of them");
+
+    let mut only_tail = GetTaskOptions::new("w1");
+    only_tail.ids = Some(TaskIds::Include(vec![tail]));
+    let task = engine
+        .get_task("review", &only_tail)
+        .await
+        .unwrap()
+        .expect("the named item, wherever it sits");
+    assert_eq!(task.id, tail);
+
+    // And it really was deep: FIFO hands a plain claim something else.
+    let head = engine
+        .get_task("review", &GetTaskOptions::new("w2"))
+        .await
+        .unwrap()
+        .expect("a task");
+    assert_ne!(head.id, tail, "the named item was not simply the head");
+    db.drop().await;
+}
+
+/// A person skips a handful, so the list is bounded rather than unbounded —
+/// and refused loudly at the edge, like every other bound this engine takes.
+#[tokio::test]
+async fn a_skip_list_is_capped() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    let mut options = GetTaskOptions::new("w1");
+    options.ids = Some(TaskIds::Exclude(
+        (0..1001).map(|_| uuid::Uuid::new_v4()).collect(),
+    ));
+    assert!(matches!(
+        engine.get_task("review", &options).await,
+        Err(EngineError::InvalidVariables(_))
+    ));
+    assert!(matches!(
+        engine
+            .count_tasks("review", None, options.ids.as_ref())
+            .await,
+        Err(EngineError::InvalidVariables(_))
+    ));
+    db.drop().await;
+}
+
 #[tokio::test]
 async fn a_claimed_task_names_the_pinned_definition_not_the_latest() {
     let db = TestDb::create().await;
@@ -2888,10 +4371,13 @@ async fn filters_match_live_instance_variables() {
         .await
         .unwrap();
 
-    assert_eq!(engine.count_tasks("review", None).await.unwrap(), 2);
+    assert_eq!(engine.count_tasks("review", None, None).await.unwrap(), 2);
     let filter = TaskFilter::new("p").field("region", "north");
     assert_eq!(
-        engine.count_tasks("review", Some(&filter)).await.unwrap(),
+        engine
+            .count_tasks("review", Some(&filter), None)
+            .await
+            .unwrap(),
         1
     );
 
@@ -2947,7 +4433,7 @@ async fn declared_indexes_serve_the_filter_queries() {
     let undeclared = TaskFilter::new("p").field("shade", "s7");
     assert_eq!(
         engine
-            .count_tasks("review", Some(&undeclared))
+            .count_tasks("review", Some(&undeclared), None)
             .await
             .unwrap(),
         1
@@ -2956,7 +4442,10 @@ async fn declared_indexes_serve_the_filter_queries() {
     // Declared field: correct AND index-served.
     let declared = TaskFilter::new("p").field("region", "r250");
     assert_eq!(
-        engine.count_tasks("review", Some(&declared)).await.unwrap(),
+        engine
+            .count_tasks("review", Some(&declared), None)
+            .await
+            .unwrap(),
         1
     );
     let mut options = GetTaskOptions::new("w1");

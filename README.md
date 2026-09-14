@@ -76,11 +76,17 @@ how a process transition and a business write become one commit.
 
 Everything through embedded subprocesses, boundary events (interrupting,
 non-interrupting, cyclic timers), DMN decisions, message correlation, timers,
-incidents and retention is implemented and covered by the corpus. The known
-gaps, each with its status in the design brief's
-[open-items table](bpmn-engine-design.md#everything-still-open--one-visible-list):
+incidents and the repair that resolves them, and retention is implemented and
+covered by the corpus. The known gaps, each with its status in the design
+brief's [open-items table](bpmn-engine-design.md#everything-still-open--one-visible-list):
 cross-definition messaging (message start/throw between definitions lint clean
 but refuse to compile) and the instance migration API.
+
+Upgrading: once a model with a catch-all error boundary (no `errorRef`) is
+deployed, every engine process must be on this release — an older one refuses
+to start. Migration 0020 (repair) needs every engine on this release too: an
+older one still starts, but cannot load a halted token or number the
+incidents a repair names.
 
 ## Workspace
 

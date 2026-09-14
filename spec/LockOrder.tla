@@ -118,6 +118,13 @@ LastOf(n) == Len(Order(n))
 \*             there is no order to invert. A separate row kind would model a
 \*             contention that cannot arise.
 \*
+\* The inspector reads the instance row the same way — one repeatable-read
+\* transaction, plain SELECTs, `load_instance_snapshot` deliberately without
+\* the `FOR UPDATE` every stepping loader takes (`inspect.rs`, D10). A
+\* transaction that takes no row lock can neither be in a cycle nor make
+\* another wait, so it is a shape with nothing to order: the consistency it
+\* needs comes from the snapshot, not from a lock.
+\*
 \* P3 added decision evaluation to the step path and no lock with it: it runs
 \* inside the transaction that already holds the instance row, reads
 \* `rbpmn_definition_decision` with a plain SELECT (ACCESS SHARE on the table,

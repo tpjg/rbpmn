@@ -165,6 +165,7 @@ pub mod testing {
             variables: serde_json::json!({}),
             bpmn_xml: "<definitions/>".to_string(),
             bindings: Bindings::default(),
+            incident: None,
             tokens: Vec::new(),
             scopes: Vec::new(),
             work_items: Vec::new(),

@@ -13,11 +13,11 @@
 //! until then). Remote (HTTP) callers cannot share a transaction by nature;
 //! their contract is per-call atomicity plus idempotent retries.
 
-use crate::{Completion, Correlation, Engine, EngineError, FailOutcome, StartedInstance};
+use crate::{Completion, Correlation, Engine, EngineError, FailOutcome, Repaired, StartedInstance};
 use rbpmn_core::{
-    Bindings, Command, Counters, Event, ExecutableProcess, InstanceState, InstanceStatus, ScopeId,
-    ScopeState, SubscriptionId, SubscriptionState, TimerDue, TimerId, TimerState, Token, TokenId,
-    WaitKind, WorkItemId, WorkItemState, WorkKind, step,
+    Bindings, Command, Counters, Disposition, Event, ExecutableProcess, Halt, InstanceState,
+    InstanceStatus, ScopeId, ScopeState, SubscriptionId, SubscriptionState, TimerDue, TimerId,
+    TimerState, Token, TokenId, WaitKind, WorkItemId, WorkItemState, WorkKind, step,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
@@ -61,6 +61,8 @@ pub(crate) mod item_state {
 #[derive(Debug, Clone, Default)]
 pub struct FailOptions {
     /// Error code for boundary matching once the retry budget is exhausted.
+    /// `None` is still catchable, but only by a catch-all (an error boundary
+    /// with no `errorRef`) on the host or an enclosing subprocess.
     pub error_code: Option<String>,
     /// Human-readable failure reason, recorded on the work item
     /// (`last_failure`) and in the retry events — what makes an incident
@@ -540,6 +542,102 @@ impl Engine {
         };
         Ok(outcome)
     }
+
+    /// Repair the instance's open incident (docs/design/incident-scope.md,
+    /// D4–D5): the disposition acts at the incident's resume point in one
+    /// step under the instance lock, like every other step path, so a
+    /// repaired history replays through the core like any other.
+    ///
+    /// `incident` is the number the request names. Any other number, or an
+    /// instance no longer frozen, is `StepError::IncidentNotOpen`; a
+    /// disposition the resume point does not allow is
+    /// `StepError::RepairRefused` with its cause. Both are typed and come
+    /// before anything changes, so a resent or stale request is answered
+    /// rather than stepped (D9) — model checked in `spec/Repair.tla`
+    /// (`RepairLandsOnlyOnTheIncidentItNamed`).
+    pub async fn repair(
+        &self,
+        instance: Uuid,
+        incident: u64,
+        disposition: Disposition,
+        reason: &str,
+    ) -> Result<Repaired, EngineError> {
+        let mut tx = self.pool().begin().await?;
+        let repaired = self
+            .repair_in_tx(&mut tx, instance, incident, disposition, reason)
+            .await?;
+        tx.commit().await?;
+        Ok(repaired)
+    }
+
+    /// [`Engine::repair`] inside the caller's transaction.
+    pub async fn repair_in_tx(
+        &self,
+        tx: &mut PgConnection,
+        instance_id: Uuid,
+        incident: u64,
+        disposition: Disposition,
+        reason: &str,
+    ) -> Result<Repaired, EngineError> {
+        // What the core cannot know: a patch is a merge patch into a stored
+        // document, so it must be an object — a scalar would replace every
+        // variable — and nothing stored may hold a NUL. An answer is any
+        // value, as a decision's is.
+        match &disposition {
+            Disposition::Retry { patch } | Disposition::Advance { patch, .. } => {
+                reject_nul(patch)?;
+                require_object(patch, "repair patch")?;
+            }
+            _ => {}
+        }
+        if let Disposition::Advance {
+            answer: Some(answer),
+            ..
+        } = &disposition
+        {
+            reject_nul(answer)?;
+        }
+        if let Disposition::Divert { code: Some(code) } = &disposition {
+            reject_nul_text(code, "divert code")?;
+        }
+        reject_nul_text(reason, "repair reason")?;
+        let (definition, proc, bindings, mut state) =
+            match load_instance(self, &mut *tx, instance_id).await {
+                Ok(loaded) => loaded,
+                Err(EngineError::Db(sqlx::Error::RowNotFound)) => {
+                    return Err(EngineError::UnknownInstance(instance_id));
+                }
+                Err(e) => return Err(e),
+            };
+        let events = step_answering_decisions(
+            self,
+            tx,
+            &proc,
+            &definition,
+            &mut state,
+            Command::Repair {
+                incident,
+                disposition,
+                reason: reason.to_string(),
+            },
+        )
+        .await?;
+        persist_step(
+            tx,
+            &proc,
+            &definition,
+            &bindings,
+            instance_id,
+            &state,
+            &events,
+        )
+        .await?;
+        Ok(Repaired {
+            status: state.status,
+            incident: state.open_incident(),
+            events,
+        })
+    }
 }
 
 fn status_to_db(status: InstanceStatus) -> &'static str {
@@ -847,7 +945,7 @@ pub(crate) async fn load_instance(
     ),
     EngineError,
 > {
-    load_instance_nowait(engine, tx, instance_id, false)
+    load_instance_under(engine, tx, instance_id, Lock::Wait)
         .await?
         // Only the NOWAIT variant can report lock-busy; a blocking load
         // waits instead. Surfaced as an error rather than a panic: this is
@@ -855,15 +953,49 @@ pub(crate) async fn load_instance(
         .ok_or_else(|| internal("blocking instance load reported lock-busy".to_string()))
 }
 
-/// [`load_instance`] with an optional `FOR UPDATE NOWAIT`: `Ok(None)` when
-/// someone else holds the instance row lock — for callers with other work
-/// to do (the scheduler must not park its whole drain loop behind one
-/// long-running caller transaction).
-pub(crate) async fn load_instance_nowait(
+/// Rebuilds the same state without taking the row lock — a reader's load,
+/// for a caller that will not step. The inspector's: it reads inside one
+/// repeatable-read transaction, so its snapshot is consistent without a
+/// lock, and a read must never make a step queue behind it.
+pub(crate) async fn load_instance_snapshot(
     engine: &Engine,
     tx: &mut PgConnection,
     instance_id: Uuid,
-    nowait: bool,
+) -> Result<
+    (
+        DefinitionRef,
+        std::sync::Arc<ExecutableProcess>,
+        std::sync::Arc<Bindings>,
+        InstanceState,
+    ),
+    EngineError,
+> {
+    load_instance_under(engine, tx, instance_id, Lock::Snapshot)
+        .await?
+        .ok_or_else(|| internal("snapshot instance load reported lock-busy".to_string()))
+}
+
+/// How a load takes the instance row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lock {
+    /// A step waits for it.
+    Wait,
+    /// The scheduler gives up rather than queue behind a held one.
+    NoWait,
+    /// A read takes nothing.
+    Snapshot,
+}
+
+/// [`load_instance`] under a chosen lock: `Lock::NoWait` yields `Ok(None)`
+/// when someone else holds the instance row — for callers with other work
+/// to do (the scheduler must not park its whole drain loop behind one
+/// long-running caller transaction) — and `Lock::Snapshot` takes no lock at
+/// all, which only a caller that will not step may ask for.
+pub(crate) async fn load_instance_under(
+    engine: &Engine,
+    tx: &mut PgConnection,
+    instance_id: Uuid,
+    lock: Lock,
 ) -> Result<
     Option<(
         DefinitionRef,
@@ -877,9 +1009,13 @@ pub(crate) async fn load_instance_nowait(
         "select i.definition_id, i.definition_key, i.definition_version, \
                 i.status, i.variables, \
                 i.next_token, i.next_work_item, i.next_timer, i.next_subscription, \
-                i.next_scope \
-         from rbpmn_instance i where i.id = $1 for update{}",
-        if nowait { " nowait" } else { "" }
+                i.next_scope, i.next_incident \
+         from rbpmn_instance i where i.id = $1{}",
+        match lock {
+            Lock::Wait => " for update",
+            Lock::NoWait => " for update nowait",
+            Lock::Snapshot => "",
+        }
     );
     let inst = match sqlx::query(&sql)
         .bind(instance_id)
@@ -1058,6 +1194,18 @@ pub(crate) async fn load_instance_nowait(
             ),
             "event_gateway" => WaitKind::EventGateway,
             "incident" => WaitKind::Incident,
+            // Collateral of an incident: a move in flight keeps the flow it
+            // was on (nullable — a scope's first move has none), a pending
+            // decision is asked again.
+            "halted" => WaitKind::Halted(Halt::InFlight {
+                via: match row.get::<Option<String>, _>("arrived_via") {
+                    Some(flow_id) => Some(proc.flow_by_id(&flow_id).ok_or_else(|| {
+                        internal(format!("token references unknown flow '{flow_id}'"))
+                    })?),
+                    None => None,
+                },
+            }),
+            "halted_decision" => WaitKind::Halted(Halt::AwaitingDecision),
             // A token parked at a subprocess waits on the scope it opened —
             // the one whose parked token is this one.
             "scope" => WaitKind::Scope(
@@ -1121,6 +1269,7 @@ pub(crate) async fn load_instance_nowait(
             next_timer: inst.get::<i64, _>("next_timer") as u64,
             next_subscription: inst.get::<i64, _>("next_subscription") as u64,
             next_scope: inst.get::<i64, _>("next_scope") as u64,
+            next_incident: inst.get::<i64, _>("next_incident") as u64,
         },
     );
     Ok(Some((definition, proc, bindings, state)))
@@ -1186,10 +1335,21 @@ pub(crate) async fn persist_step(
 ) -> Result<(), EngineError> {
     let status = status_to_db(state.status);
     let counters = state.counters();
+    // A repair re-arms what the freeze kept (docs/design/incident-scope.md,
+    // D8): the instance's clock stopped while it was frozen. Before the row
+    // below moves `frozen_at` on, and before this step's own timers are
+    // written — those are armed now and owe nothing to the outage.
+    if events
+        .iter()
+        .any(|e| matches!(e, Event::IncidentRepaired { .. }))
+    {
+        resume_after_freeze(tx, instance_id).await?;
+    }
     sqlx::query(
         "update rbpmn_instance set status = $2, variables = $3, next_token = $4, \
          next_work_item = $5, next_timer = $6, next_subscription = $7, \
-         next_scope = $8, \
+         next_scope = $8, next_incident = $9, \
+         frozen_at = case when $2 = 'failed' then clock_timestamp() end, \
          completed_at = case when $2 in ('completed', 'terminated') \
          then now() else completed_at end where id = $1",
     )
@@ -1201,6 +1361,7 @@ pub(crate) async fn persist_step(
     .bind(counters.next_timer as i64)
     .bind(counters.next_subscription as i64)
     .bind(counters.next_scope as i64)
+    .bind(counters.next_incident as i64)
     .execute(&mut *tx)
     .await?;
 
@@ -1264,6 +1425,10 @@ pub(crate) async fn persist_step(
             WaitKind::Message(_) => ("message", None, None),
             WaitKind::EventGateway => ("event_gateway", None, None),
             WaitKind::Incident => ("incident", None, None),
+            WaitKind::Halted(Halt::InFlight { via }) => {
+                ("halted", via.map(|f| proc.flow(f).id.clone()), None)
+            }
+            WaitKind::Halted(Halt::AwaitingDecision) => ("halted_decision", None, None),
             WaitKind::Scope(_) => ("scope", None, None),
             // A decision is answered inside the transaction that asks for
             // it, so no token should reach persistence still holding one.
@@ -1473,6 +1638,9 @@ pub(crate) async fn persist_step(
             | Event::FlowTaken { .. }
             | Event::VariablesPatched { .. }
             | Event::IncidentRaised { .. }
+            // A repair's rows move with the events that follow it; this one
+            // records who decided what there, and why.
+            | Event::IncidentRepaired { .. }
             | Event::CorrelationFailed { .. }
             // Recorded, never projected: the freeze that follows is what
             // changes rows. These carry the *reason* an operator needs.
@@ -1529,6 +1697,96 @@ pub(crate) async fn persist_step(
         .bind(&event_payloads)
         .execute(&mut *tx)
         .await?;
+    }
+    Ok(())
+}
+
+/// D8's resume: every timer a frozen instance kept, moved as though the
+/// instance's clock had stopped at `frozen_at`, and the scheduler and workers
+/// woken for what the repair made due or claimable.
+///
+/// A duration moves by the outage and keeps exactly the time it had left. A
+/// cycle occurrence that came due while the instance was frozen steps along
+/// its own grid to the first occurrence at or after now — missed occurrences
+/// are skipped, never replayed, the rule every cycle re-arm follows, and a
+/// bounded `R<n>` spends nothing on them because it counts fires. One already
+/// due when the instance froze was owed before the freeze and fires on
+/// resume, as a duration overdue then does. A date keeps its instant, and
+/// fires once if it passed.
+///
+/// All of it is epoch arithmetic: `timestamptz - timestamptz` is a
+/// days-and-hours interval, and adding it back adds calendar days in the
+/// session's time zone — an hour wrong across a daylight-saving change.
+///
+/// `frozen_at` is stamped inside the freezing transaction, so a row that
+/// came due after the stamp can be picked before the freeze commits — the
+/// scheduler still reads the instance as active — and is moved past the
+/// resume; the claim's `due_at <= now()` re-check is what keeps it from
+/// firing early (`spec/RepairClock.tla`, `NeverFiresEarly`).
+async fn resume_after_freeze(tx: &mut PgConnection, instance_id: Uuid) -> Result<(), EngineError> {
+    sqlx::query(
+        "update rbpmn_timer t set due_at = to_timestamp(extract(epoch from t.due_at) \
+           + extract(epoch from clock_timestamp()) - extract(epoch from i.frozen_at)) \
+         from rbpmn_instance i \
+         where i.id = $1 and t.instance_id = $1 and t.due_kind = 'duration' \
+           and i.frozen_at is not null",
+    )
+    .bind(instance_id)
+    .execute(&mut *tx)
+    .await?;
+    // The period is fixed-length (lint) and comes from the spec, which only
+    // Rust can split.
+    let mut numbers: Vec<i64> = Vec::new();
+    let mut periods: Vec<f64> = Vec::new();
+    for row in sqlx::query(
+        "select timer_no, due_spec from rbpmn_timer \
+         where instance_id = $1 and due_kind = 'cycle'",
+    )
+    .bind(instance_id)
+    .fetch_all(&mut *tx)
+    .await?
+    {
+        let spec: String = row.get("due_spec");
+        let parts = rbpmn_model::iso8601::split_cycle(&spec)
+            .map_err(|e| internal(format!("armed cycle '{spec}' is not valid: {e}")))?;
+        numbers.push(row.get("timer_no"));
+        periods.push(parts.period_seconds);
+    }
+    if !numbers.is_empty() {
+        sqlx::query(
+            "update rbpmn_timer t set due_at = to_timestamp(extract(epoch from t.due_at) \
+               + c.period * greatest(0, ceil((extract(epoch from clock_timestamp()) \
+                                              - extract(epoch from t.due_at)) / c.period))) \
+             from unnest($2::bigint[], $3::float8[]) as c(no, period), rbpmn_instance i \
+             where t.instance_id = $1 and t.timer_no = c.no and i.id = $1 \
+               and i.frozen_at is not null and t.due_at >= i.frozen_at",
+        )
+        .bind(instance_id)
+        .bind(&numbers)
+        .bind(&periods)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // Wake whoever the freeze put to sleep: a timer the moves made due, and a
+    // service item that became claimable again, would otherwise wait out a
+    // poll interval — their own NOTIFY was spent while the instance was
+    // frozen. Claimable again includes a lease that lapsed during the freeze:
+    // a worker whose completion the freeze refused keeps its lease rather
+    // than re-run the handler, and that lease runs out. Items this step
+    // creates notify for themselves.
+    sqlx::query("select pg_notify('rbpmn_timer', '')")
+        .execute(&mut *tx)
+        .await?;
+    let topics: Vec<String> = sqlx::query_scalar(
+        "select distinct topic from rbpmn_work_item \
+         where instance_id = $1 and kind = 'service' \
+           and (state = 'available' or (state = 'locked' and lock_until < now()))",
+    )
+    .bind(instance_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    for topic in topics {
+        notify_work(tx, &topic).await?;
     }
     Ok(())
 }
