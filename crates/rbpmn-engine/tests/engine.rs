@@ -2079,6 +2079,55 @@ async fn freeze_on(engine: &Engine, item: uuid::Uuid) {
     panic!("failing {item} five times never raised an incident");
 }
 
+/// Reading the open incident is best effort for errors raised in Rust, never
+/// for database errors: those abort the inspection's transaction, and
+/// swallowing one would fail the next read with "current transaction is
+/// aborted" instead of the cause.
+#[tokio::test]
+async fn inspection_returns_a_database_error_and_carries_on_past_a_rust_one() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(
+            &fixture("accept/03-parallel-gateway.bpmn"),
+            &Bindings::default(),
+        )
+        .await
+        .unwrap();
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let (ta, _) = open_items(&db.pool, started.id)
+        .await
+        .into_iter()
+        .find(|(_, element)| element == "ta")
+        .unwrap();
+    freeze_on(&engine, ta).await;
+
+    // A row the core will not rehydrate: no incident, the rest still stands.
+    sqlx::query("update rbpmn_token set element_id = 'nowhere' where element_id = 'ta'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let inspection = engine.inspect_instance(started.id).await.unwrap();
+    assert!(inspection.incident.is_none());
+    assert!(inspection.tokens.iter().any(|t| t.element_id == "nowhere"));
+
+    // A schema behind this build: the missing column itself, 42703.
+    sqlx::query("alter table rbpmn_instance drop column next_incident")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    match engine.inspect_instance(started.id).await {
+        Err(EngineError::Db(sqlx::Error::Database(e))) => {
+            assert_eq!(e.code().as_deref(), Some("42703"), "{e}");
+        }
+        other => panic!("expected the undefined-column error, got {other:?}"),
+    }
+    db.drop().await;
+}
+
 /// A repair is a command (docs/design/incident-scope.md, D4–D5), and a
 /// retried incident enters its task as if for the first time: a new work item
 /// with the budget the manifest gives it, while the failed row stays failed —
