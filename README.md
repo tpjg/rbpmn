@@ -86,7 +86,8 @@ Upgrading: once a model with a catch-all error boundary (no `errorRef`) is
 deployed, every engine process must be on this release — an older one refuses
 to start. Migration 0020 (repair) needs every engine on this release too: an
 older one still starts, but cannot load a halted token or number the
-incidents a repair names.
+incidents a repair names. An application that does not run `migrate` itself
+can ask `Engine::schema_version()` whether the database is behind this build.
 
 ## Workspace
 

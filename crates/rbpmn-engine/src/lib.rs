@@ -180,6 +180,55 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
     ),
 ];
 
+/// A database's schema against this build. See [`Engine::schema_version`].
+///
+/// `applied < required` means `migrate` is owed: until it runs, calls fail on
+/// the first thing a missing migration adds, wherever that is. `applied >
+/// required` means a newer build migrated this database; nothing promises this
+/// build runs against it — README's upgrade notes say, per release, which
+/// migrations need every engine on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaVersion {
+    /// The highest migration the database has applied; 0 for none.
+    pub applied: i64,
+    /// The highest migration this build embeds — what `migrate` brings a
+    /// database to.
+    pub required: i64,
+}
+
+/// The migration ledger, version → checksum. Empty when the ledger table does
+/// not exist, so that reading it never creates it.
+async fn read_ledger(conn: &mut sqlx::PgConnection) -> Result<BTreeMap<i64, String>, EngineError> {
+    let exists: bool = sqlx::query_scalar("select to_regclass('rbpmn_migrations') is not null")
+        .fetch_one(&mut *conn)
+        .await?;
+    if !exists {
+        return Ok(BTreeMap::new());
+    }
+    let rows: Vec<(i64, String)> = sqlx::query_as("select version, checksum from rbpmn_migrations")
+        .fetch_all(&mut *conn)
+        .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Refuses a ledger holding a migration this build embeds with other content.
+fn refuse_drift(ledger: &BTreeMap<i64, String>) -> Result<(), EngineError> {
+    for &(version, description, sql) in MIGRATIONS {
+        if ledger
+            .get(&version)
+            .is_some_and(|applied| *applied != checksum(sql))
+        {
+            return Err(EngineError::MigrationDrift(version, description));
+        }
+    }
+    Ok(())
+}
+
+fn checksum(sql: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(sql.as_bytes()))
+}
+
 /// The retry budget an item gets when its manifest says nothing: the same
 /// number as `rbpmn_work_item.retries`'s column default in migration 0001,
 /// which is what makes this a *restatement* rather than a second policy.
@@ -462,7 +511,6 @@ impl Engine {
     /// application running its own sqlx migrations in the shared schema.
     /// Every rbpmn relation — this ledger included — is `rbpmn_`-prefixed.
     pub async fn migrate(&self) -> Result<(), EngineError> {
-        use sha2::{Digest, Sha256};
         let mut tx = self.inner.pool.begin().await?;
         // Serialize concurrent migrators (replicas booting together).
         sqlx::query("select pg_advisory_xact_lock(hashtext('rbpmn_migrations'))")
@@ -477,32 +525,43 @@ impl Engine {
         )
         .execute(&mut *tx)
         .await?;
+        let ledger = read_ledger(&mut tx).await?;
+        refuse_drift(&ledger)?;
         for &(version, description, sql) in MIGRATIONS {
-            let checksum = format!("{:x}", Sha256::digest(sql.as_bytes()));
-            let applied: Option<String> =
-                sqlx::query_scalar("select checksum from rbpmn_migrations where version = $1")
-                    .bind(version)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            match applied {
-                Some(existing) if existing == checksum => continue,
-                Some(_) => return Err(EngineError::MigrationDrift(version, description)),
-                None => {
-                    sqlx::raw_sql(sql).execute(&mut *tx).await?;
-                    sqlx::query(
-                        "insert into rbpmn_migrations (version, description, checksum) \
-                         values ($1, $2, $3)",
-                    )
-                    .bind(version)
-                    .bind(description)
-                    .bind(&checksum)
-                    .execute(&mut *tx)
-                    .await?;
-                }
+            if ledger.contains_key(&version) {
+                continue;
             }
+            sqlx::raw_sql(sql).execute(&mut *tx).await?;
+            sqlx::query(
+                "insert into rbpmn_migrations (version, description, checksum) \
+                 values ($1, $2, $3)",
+            )
+            .bind(version)
+            .bind(description)
+            .bind(checksum(sql))
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Where this database's schema stands against this build, so an
+    /// application can ask before a missing column fails some unrelated call.
+    ///
+    /// Read-only: it takes no lock and creates nothing, so it answers
+    /// `applied: 0` for a database `migrate` has never touched. A migration
+    /// this build embeds that was applied with different content is
+    /// [`EngineError::MigrationDrift`] — the same check, and the same error,
+    /// that `migrate` refuses on, so the two never disagree about a database.
+    pub async fn schema_version(&self) -> Result<SchemaVersion, EngineError> {
+        let mut conn = self.inner.pool.acquire().await?;
+        let ledger = read_ledger(&mut conn).await?;
+        refuse_drift(&ledger)?;
+        Ok(SchemaVersion {
+            applied: ledger.last_key_value().map_or(0, |(&version, _)| version),
+            required: MIGRATIONS.last().map_or(0, |&(version, _, _)| version),
+        })
     }
 
     /// Announce that out-of-process workers poll this topic. Idempotent;

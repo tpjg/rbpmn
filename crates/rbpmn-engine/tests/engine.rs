@@ -1182,6 +1182,58 @@ async fn non_object_handler_body_fails_instead_of_wiping_variables() {
     db.drop().await;
 }
 
+/// An application can ask where the schema stands instead of finding out from
+/// a missing column, and the answer never disagrees with `migrate`.
+#[tokio::test]
+async fn schema_version_answers_what_migrate_would_decide() {
+    let db = TestDb::create().await;
+    let engine = Engine::builder(db.pool.clone()).build();
+
+    // Never migrated: behind, and asking created nothing.
+    let before = engine.schema_version().await.unwrap();
+    assert_eq!(before.applied, 0);
+    assert!(before.required > 0);
+    let ledger: Option<String> = sqlx::query_scalar("select to_regclass('rbpmn_migrations')::text")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(ledger, None);
+
+    engine.migrate().await.unwrap();
+    let current = engine.schema_version().await.unwrap();
+    assert_eq!(current.applied, current.required);
+    assert_eq!(current.required, before.required);
+
+    // A newer build's migration: ahead.
+    sqlx::query(
+        "insert into rbpmn_migrations (version, description, checksum) \
+         values ($1, 'from_a_newer_build', '')",
+    )
+    .bind(current.required + 1)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        engine.schema_version().await.unwrap().applied,
+        current.required + 1
+    );
+
+    // Edited content: refused, exactly as migrate refuses it.
+    sqlx::query("update rbpmn_migrations set checksum = 'edited' where version = 1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        engine.schema_version().await,
+        Err(EngineError::MigrationDrift(1, "runtime"))
+    ));
+    assert!(matches!(
+        engine.migrate().await,
+        Err(EngineError::MigrationDrift(1, "runtime"))
+    ));
+    db.drop().await;
+}
+
 #[tokio::test]
 async fn api_declared_topics_survive_restart() {
     let db = TestDb::create().await;
