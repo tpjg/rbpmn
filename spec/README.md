@@ -422,10 +422,23 @@ archived, and deleted under the row lock without looking again — a review
 found it deleting an instance a repair had thawed during the upload. Status
 alone is not enough either: thawed and frozen again, the instance is back at
 `failed` with history the archive never saw, which `_StatusOnly.cfg`
-demonstrates. The shipped re-check compares the event count read with the
-probe, because every transition writes an event and only a deletion removes
-one; it reads it in a second statement after the lock, since a sub-select
-in the locking statement keeps the snapshot from before the lock wait.
+demonstrates. The shipped re-check compares the event count of the record
+that was archived, because every transition writes an event and only a
+deletion removes one; it reads it in a second statement after the lock,
+since a sub-select in the locking statement keeps the snapshot from before
+the lock wait. The record itself is read in one REPEATABLE READ snapshot
+(two statements), closed before the sink is called. A first version compared
+against a separate probe taken before the record, which refused instances
+that had only changed before their record was read; a follow-up review
+caught it.
+
+A refused deletion archives again once before it answers
+`InstanceChanged`, so the sink can receive one id twice with different
+content, and can hold a record of an instance that was not deleted. That is
+the sink's contract (`RetentionArchive`: at-least-once, latest delivery
+supersedes, archived is not deleted) and it was already true of the sweep;
+the model's `archivedN` is overwritten by every delivery accordingly, and
+`NoEventDeletedUnarchived` is about the latest copy.
 
 TLC also found a bug in this spec while checking it: `undue' = undue \/ X`
 parses as `(undue' = undue) \/ X`, so the variable went unassigned whenever

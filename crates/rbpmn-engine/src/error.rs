@@ -87,11 +87,12 @@ pub enum EngineError {
     #[error("instance {0} is still active; terminate it before deleting it")]
     InstanceStillActive(Uuid),
     /// `delete_instance` archived a record, and the instance moved on before
-    /// the deletion could lock it — a repair thawed it, or history was
-    /// appended. Nothing was deleted; the archived copy is stale, and a
-    /// second call archives the current record.
+    /// the deletion could lock it — a repair thawed and re-froze it, or
+    /// history was appended — and did so again on the one retry. Nothing was
+    /// deleted; the sink holds a superseded copy (within its contract), and
+    /// a later call archives and deletes the current record.
     #[error(
-        "instance {0} changed while it was being archived; nothing was deleted — \
+        "instance {0} changed while it was being archived, twice; nothing was deleted — \
          call again to archive and delete the current record"
     )]
     InstanceChanged(Uuid),

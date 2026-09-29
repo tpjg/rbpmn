@@ -175,7 +175,28 @@ impl ArchiveError {
 /// A sink for records about to be deleted — object storage, a data
 /// warehouse, a compliance log. Called with **no transaction open**, so it
 /// may take as long as it needs; nothing is deleted unless it returns `Ok`.
-/// Delivery is at-least-once, keyed by [`InstanceRecord::id`].
+///
+/// Delivery is at-least-once, keyed by [`InstanceRecord::id`], and a sink
+/// must be written for all three consequences:
+///
+/// * **The same id can arrive more than once** — overlapping sweeps, a
+///   retried pass, [`Engine::delete_instance`]'s retry.
+/// * **With different content.** A `failed` instance is not terminal: a
+///   repair can change it while its record is at the sink, and
+///   `delete_instance` then archives it again. The later delivery
+///   supersedes the earlier one; a sink that upserts by id is correct, one
+///   with an insert-only unique key on the id is not.
+/// * **An archived record is not a promise of deletion.** A sweep skips an
+///   instance another transaction holds, or one whose policy changed during
+///   the upload; `delete_instance` refuses one that was thawed. Its record
+///   stays in the sink, and the instance stays in the database until a
+///   later pass archives and deletes it.
+///
+/// What is guaranteed is the other direction: the latest delivery for a
+/// deleted id is its whole record. The sweep gets that from selecting only
+/// terminal records, which do not change; `delete_instance`, which also
+/// takes `failed` ones, re-checks it under the row lock
+/// (`spec/DeleteInstance.tla`, `NoEventDeletedUnarchived`).
 pub trait RetentionArchive: Send + Sync {
     fn archive<'a>(
         &'a self,
@@ -583,37 +604,63 @@ impl Engine {
     ///
     /// Refuses an active instance; terminate it first. A `failed` instance
     /// is deletable but not terminal — a repair can thaw it while the sink
-    /// runs — so an instance that changed between the archive and the
-    /// deletion is refused too ([`EngineError::InstanceChanged`]): what was
-    /// archived is no longer the whole record. Calling again archives the
-    /// current one.
+    /// runs — so the deletion lands only if the archived record is still the
+    /// whole record. If it is not, the current record is archived once more
+    /// and the deletion retried; an instance that changes across both
+    /// attempts is refused ([`EngineError::InstanceChanged`]), and one that
+    /// is active again is [`EngineError::InstanceStillActive`]. Either way
+    /// the sink may already hold a record for an instance that was not
+    /// deleted — see [`RetentionArchive`] for why that is within its
+    /// contract.
     pub async fn delete_instance(&self, id: Uuid) -> Result<RetentionReport, EngineError> {
-        let mut conn = self.pool().acquire().await?;
         // Probe the status *before* materialising anything: loading a large
         // instance's whole history only to refuse it would make the rejection
-        // path the expensive one.
-        //
-        // The event count is read in the same statement: it is the snapshot
-        // the deletion below re-checks against, and it must not straddle a
-        // commit the status did not see.
-        let probe: Option<(String, i64)> = sqlx::query_as(
-            "select i.status, \
-                    (select count(*) from rbpmn_event e where e.instance_id = i.id) \
-             from rbpmn_instance i where i.id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&mut *conn)
-        .await?;
-        let seen_events = match probe {
+        // path the expensive one. Only a fast path — the verdict that counts
+        // is taken from the archived record and re-checked under the lock.
+        let status: Option<String> =
+            sqlx::query_scalar("select status from rbpmn_instance where id = $1")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?;
+        match status.as_deref() {
             None => return Err(EngineError::UnknownInstance(id)),
-            Some((status, events)) if is_deletable(&status) => events,
+            Some(status) if is_deletable(status) => {}
             Some(_) => return Err(EngineError::InstanceStillActive(id)),
-        };
-        let record = load_records(&mut conn, &[id], true)
+        }
+        // One retry: an instance that changed while its record was at the
+        // sink is archived again, as it is now, and deleted — the caller
+        // sees `InstanceChanged` only if it changes across both gaps. The
+        // sink gets the same id twice, which its contract already allows
+        // (`RetentionArchive`: the later delivery supersedes).
+        match self.archive_and_delete(id).await {
+            Err(EngineError::InstanceChanged(_)) => self.archive_and_delete(id).await,
+            other => other,
+        }
+    }
+
+    /// One attempt of [`Engine::delete_instance`]: snapshot, archive, and
+    /// delete only if the archived record is still the whole record.
+    async fn archive_and_delete(&self, id: Uuid) -> Result<RetentionReport, EngineError> {
+        // The record is the verdict: status and history come from one
+        // snapshot, and the re-check below compares against exactly what the
+        // sink was handed — not against an earlier probe, which would refuse
+        // an instance that only changed *before* the record was taken.
+        // `load_records` is two statements, so they share a REPEATABLE READ
+        // snapshot; the transaction is read-only, short, and committed before
+        // the sink is called — the archive gap still holds none.
+        let mut snapshot = self.pool().begin().await?;
+        sqlx::query("set transaction isolation level repeatable read, read only")
+            .execute(&mut *snapshot)
+            .await?;
+        let record = load_records(&mut snapshot, &[id], true)
             .await?
             .pop()
             .ok_or(EngineError::UnknownInstance(id))?;
-        drop(conn);
+        snapshot.commit().await?;
+        if !is_deletable(&record.status) {
+            return Err(EngineError::InstanceStillActive(id));
+        }
+        let archived_events = record.events.len() as i64;
 
         self.run_archive(&ArchiveBatch {
             instances: vec![record],
@@ -623,16 +670,16 @@ impl Engine {
         let mut tx = self.pool().begin().await?;
         // Same lock order as every other path: the instance row first.
         //
-        // The probe above is *re-checked* under the lock, whole, because the
-        // archive gap holds no transaction and `failed` is not terminal: a
-        // repair can thaw the instance while the sink runs, step it, even
+        // The archived record is *re-checked* under the lock, whole, because
+        // the archive gap holds no transaction and `failed` is not terminal:
+        // a repair can thaw the instance while the sink runs, step it, even
         // freeze it again. Status alone would miss the last of those — back
-        // at `failed`, with history the archived copy never saw — so the
-        // event count taken with the status must still hold too. Every
-        // transition writes an event, and nothing but this deletion removes
-        // one. Model checked in `spec/DeleteInstance.tla`
-        // (`NoLiveInstanceDeleted`, `NoEventDeletedUnarchived`; the
-        // status-only re-check is `DeleteInstance_StatusOnly.cfg`).
+        // at `failed`, with history the archived copy never saw — so its
+        // event count must still hold too. Every transition writes an event,
+        // and nothing but this deletion removes one. Model checked in
+        // `spec/DeleteInstance.tla` (`NoLiveInstanceDeleted`,
+        // `NoEventDeletedUnarchived`; the status-only re-check is
+        // `DeleteInstance_StatusOnly.cfg`).
         //
         // Two statements, deliberately: a lock that waited re-reads the
         // *row* at its newest version, but a sub-select in the same
@@ -653,7 +700,7 @@ impl Engine {
                     .bind(id)
                     .fetch_one(&mut *tx)
                     .await?;
-            if events != seen_events {
+            if events != archived_events {
                 return Err(EngineError::InstanceChanged(id));
             }
         }
