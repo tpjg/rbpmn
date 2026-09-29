@@ -86,6 +86,15 @@ pub enum EngineError {
     IncidentOpen(Uuid),
     #[error("instance {0} is still active; terminate it before deleting it")]
     InstanceStillActive(Uuid),
+    /// `delete_instance` archived a record, and the instance moved on before
+    /// the deletion could lock it — a repair thawed it, or history was
+    /// appended. Nothing was deleted; the archived copy is stale, and a
+    /// second call archives the current record.
+    #[error(
+        "instance {0} changed while it was being archived; nothing was deleted — \
+         call again to archive and delete the current record"
+    )]
+    InstanceChanged(Uuid),
     /// A stored bindings manifest no longer deserializes. Startup
     /// re-validation refuses to boot on this, so reaching it means the row
     /// was written by something other than `deploy`.

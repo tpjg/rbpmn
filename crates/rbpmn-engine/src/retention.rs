@@ -581,23 +581,34 @@ impl Engine {
     /// sink is registered: an escape hatch that silently bypassed the audit
     /// trail would not be one.
     ///
-    /// Refuses an active instance; terminate it first.
+    /// Refuses an active instance; terminate it first. A `failed` instance
+    /// is deletable but not terminal — a repair can thaw it while the sink
+    /// runs — so an instance that changed between the archive and the
+    /// deletion is refused too ([`EngineError::InstanceChanged`]): what was
+    /// archived is no longer the whole record. Calling again archives the
+    /// current one.
     pub async fn delete_instance(&self, id: Uuid) -> Result<RetentionReport, EngineError> {
         let mut conn = self.pool().acquire().await?;
         // Probe the status *before* materialising anything: loading a large
         // instance's whole history only to refuse it would make the rejection
-        // path the expensive one. Terminal states are listed positively, so a
-        // status added later is refused rather than silently deletable.
-        let status: Option<String> =
-            sqlx::query_scalar("select status from rbpmn_instance where id = $1")
-                .bind(id)
-                .fetch_optional(&mut *conn)
-                .await?;
-        match status.as_deref() {
+        // path the expensive one.
+        //
+        // The event count is read in the same statement: it is the snapshot
+        // the deletion below re-checks against, and it must not straddle a
+        // commit the status did not see.
+        let probe: Option<(String, i64)> = sqlx::query_as(
+            "select i.status, \
+                    (select count(*) from rbpmn_event e where e.instance_id = i.id) \
+             from rbpmn_instance i where i.id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let seen_events = match probe {
             None => return Err(EngineError::UnknownInstance(id)),
-            Some("completed") | Some("terminated") | Some("failed") => {}
+            Some((status, events)) if is_deletable(&status) => events,
             Some(_) => return Err(EngineError::InstanceStillActive(id)),
-        }
+        };
         let record = load_records(&mut conn, &[id], true)
             .await?
             .pop()
@@ -610,14 +621,42 @@ impl Engine {
         .await?;
 
         let mut tx = self.pool().begin().await?;
-        // Same lock order as every other path: the instance row first. It is
-        // terminal, so no step path contends for it; at worst a sweep's own
-        // short delete transaction holds it for a moment.
-        let locked: Option<Uuid> =
-            sqlx::query_scalar("select id from rbpmn_instance where id = $1 for update")
+        // Same lock order as every other path: the instance row first.
+        //
+        // The probe above is *re-checked* under the lock, whole, because the
+        // archive gap holds no transaction and `failed` is not terminal: a
+        // repair can thaw the instance while the sink runs, step it, even
+        // freeze it again. Status alone would miss the last of those — back
+        // at `failed`, with history the archived copy never saw — so the
+        // event count taken with the status must still hold too. Every
+        // transition writes an event, and nothing but this deletion removes
+        // one. Model checked in `spec/DeleteInstance.tla`
+        // (`NoLiveInstanceDeleted`, `NoEventDeletedUnarchived`; the
+        // status-only re-check is `DeleteInstance_StatusOnly.cfg`).
+        //
+        // Two statements, deliberately: a lock that waited re-reads the
+        // *row* at its newest version, but a sub-select in the same
+        // statement keeps the statement's original snapshot — it would count
+        // the events of the version it waited behind. The count runs after
+        // the lock is held, so it sees everything that committed before.
+        let locked: Option<String> =
+            sqlx::query_scalar("select status from rbpmn_instance where id = $1 for update")
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?;
+        if let Some(status) = &locked {
+            if !is_deletable(status) {
+                return Err(EngineError::InstanceStillActive(id));
+            }
+            let events: i64 =
+                sqlx::query_scalar("select count(*) from rbpmn_event where instance_id = $1")
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if events != seen_events {
+                return Err(EngineError::InstanceChanged(id));
+            }
+        }
         let mut report = RetentionReport::default();
         if locked.is_some() {
             let (events, instances) = delete_records(&mut tx, &[id]).await?;
@@ -758,6 +797,12 @@ const ERROR_BACKOFF: Duration = Duration::from_secs(60);
 /// Records due for deletion, materialised whole. Bounded by both instance and
 /// event count, and never splitting an instance — an archived record is
 /// complete or absent. Three set-based queries, whatever the batch size.
+/// The statuses `delete_instance` accepts. Listed positively, so a status
+/// added later is refused rather than silently deletable.
+fn is_deletable(status: &str) -> bool {
+    matches!(status, "completed" | "terminated" | "failed")
+}
+
 async fn plan_due(
     conn: &mut PgConnection,
     options: &RetentionOptions,

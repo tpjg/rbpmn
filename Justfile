@@ -272,6 +272,13 @@ tla:
     check "retention: floor and the archive gap" Retention.cfg              Retention.tla hold "" -deadlock
     check "retention: floor from the plan"       Retention_FloorFromPlan.cfg Retention.tla fail "Invariant FloorIsSomethingDeleted is violated" -deadlock
     check "retention: no DUE re-check"           Retention_NoRecheck.cfg     Retention.tla fail "Invariant OnlyDueRecordsDeleted is violated" -deadlock
+    # delete_instance: the sweep's archive gap, on an instance that is not
+    # terminal — `failed` thaws under a repair. -deadlock: a deleted instance
+    # is terminal.
+    check "delete instance: re-checked under the lock"   DeleteInstance.cfg                   DeleteInstance.tla hold "" -deadlock
+    check "delete instance: status-only re-check"        DeleteInstance_StatusOnly.cfg        DeleteInstance.tla fail "Invariant NoEventDeletedUnarchived is violated" -deadlock
+    check "delete instance: no re-check"                 DeleteInstance_NoRecheck.cfg         DeleteInstance.tla fail "Invariant NoLiveInstanceDeleted is violated" -deadlock
+    check "delete instance: a refused delete lands later" DeleteInstance_DeleteIsReachable.cfg DeleteInstance.tla fail "Invariant NeverDeleted is violated" -deadlock
 
 # Differential the FEEL subset against dsntk (the DMN-TCK-verified reference):
 # every condition we accept must evaluate identically there. Outside the

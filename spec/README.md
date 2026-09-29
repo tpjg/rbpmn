@@ -14,6 +14,7 @@ Run with `just tla` (needs `java`; fetches `tla2tools.jar` on first use).
 | `TimerTeardown.tla` | the unlocked pick of an **arm row** — a timer by the scheduler, a boundary subscription by `correlate` — racing a scope teardown, and a claim transaction that rolls back after its re-check | no armed row — timer or subscription — outlives the token it is armed on; no arm ever fires with its token gone |
 | `BoundaryExit.tla` | one token at a host work item with an interrupting boundary subscription; `complete_task` and `correlate` racing to end the wait, from any node | exactly one exit ever reaches `step`; an armed row always means an open host; a late call of either verb is answered typed (`AlreadyClosed`, `NoSubscription`), never stepped |
 | `Retention.tla` | a retention pass across its transaction-free archive gap | nothing deleted without an archive; the truncation floor covers every deletion and invents none; only due records go |
+| `DeleteInstance.tla` | `delete_instance` across the same archive gap, on an instance that is **not terminal** — a `failed` one a repair can thaw, step and freeze again while its record is at the sink | no active instance is deleted; no event is deleted that the archived copy does not carry |
 | `Repair.tla` | the one transition out of a frozen instance: operators whose requests name an incident and may arrive twice, a repair that lands or freezes the instance again, an abandon, and a sibling item — `Lease` instantiated — across the thaw | a request lands only on the incident it named; the sibling keeps every lease guarantee across the thaw, a Divert that cancels its item included; a landed repair strands nobody; an abandon leaves nothing open; a frozen instance advances nothing until a request lands |
 | `RepairClock.tla` | a repair moving a timer the freeze kept (D8), racing the scheduler's unlocked pick and locked re-check — the freeze as two steps, stamp and commit, with the claim's NOWAIT giving up while the freezing transaction holds the row | a moved timer never fires before its due |
 
@@ -42,6 +43,10 @@ checks are known to have teeth rather than passing vacuously:
 | `Retention.cfg` | holds | the shipped pass |
 | `Retention_FloorFromPlan.cfg` | **violation** | advancing the floor from the plan instead of the deletions |
 | `Retention_NoRecheck.cfg` | **violation** | trusting the plan's DUE verdict across the archive gap |
+| `DeleteInstance.cfg` | holds | the shipped deletion: status and event count re-checked under the row lock |
+| `DeleteInstance_StatusOnly.cfg` | **violation** | re-checking the status alone — thawed and frozen again in the gap, the archived copy lacks the repair |
+| `DeleteInstance_NoRecheck.cfg` | **violation** | trusting the probe across the gap (the code before this spec) — a repair's thaw deleted a running instance |
+| `DeleteInstance_DeleteIsReachable.cfg` | **violation** | a refused deletion called again does land, so the checks are not vacuous |
 | `Repair.cfg` | holds | the shipped repair |
 | `Repair_UncheckedIncident.cfg` | **violation** | a request landing whenever the instance is frozen: a repair of incident 0 fails again into incident 1, and its resend lands there |
 | `Repair_ThawIsReachable.cfg` | **violation** | not a bug: a repair lands while the stranded sibling is open, and the sibling then completes — the thaw's case, reached |
@@ -375,6 +380,19 @@ reader above it loses events silently), and the floor may not sit above
 everything actually deleted (or readers get `CursorTruncated` for nothing).
 The second is exactly what `delete_records`' comment warns about, and
 `Retention_FloorFromPlan.cfg` is that mistake made on purpose.
+
+`DeleteInstance.tla` is the escape hatch with the same gap and one premise
+fewer. The sweep only ever selects `completed`/`terminated` records, which
+cannot change across it; `delete_instance` also takes `failed`, and `failed`
+is the one status a repair leaves. The first version probed the status,
+archived, and deleted under the row lock without looking again — a review
+found it deleting an instance a repair had thawed during the upload. Status
+alone is not enough either: thawed and frozen again, the instance is back at
+`failed` with history the archive never saw, which `_StatusOnly.cfg`
+demonstrates. The shipped re-check compares the event count read with the
+probe, because every transition writes an event and only a deletion removes
+one; it reads it in a second statement after the lock, since a sub-select
+in the locking statement keeps the snapshot from before the lock wait.
 
 TLC also found a bug in this spec while checking it: `undue' = undue \/ X`
 parses as `(undue' = undue) \/ X`, so the variable went unassigned whenever

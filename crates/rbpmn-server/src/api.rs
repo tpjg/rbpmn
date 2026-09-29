@@ -642,7 +642,9 @@ fn engine_error(e: EngineError) -> Response {
             )
                 .into_response();
         }
-        EngineError::InstanceStillActive(_) | EngineError::DefinitionInUse { .. } => {
+        EngineError::InstanceStillActive(_)
+        | EngineError::InstanceChanged(_)
+        | EngineError::DefinitionInUse { .. } => {
             (StatusCode::CONFLICT, e.to_string())
         }
         EngineError::InvalidRetentionPolicy(_) => (StatusCode::BAD_REQUEST, e.to_string()),
