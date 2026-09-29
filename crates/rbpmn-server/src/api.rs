@@ -310,6 +310,10 @@ pub async fn complete_task(
 #[serde(rename_all = "camelCase")]
 pub struct FailTaskBody {
     pub owner: String,
+    /// The `leaseNo` the claim returned — required, for the reason
+    /// [`ReleaseTaskBody::lease_no`] is: a failure leaves the item open, so
+    /// a retried request without it would spend another retry.
+    pub lease_no: i64,
     #[serde(default)]
     pub error_code: Option<String>,
     #[serde(default)]
@@ -323,7 +327,13 @@ pub async fn fail_task(
 ) -> Response {
     fail_response(
         engine
-            .fail_task(id, &body.owner, body.error_code, body.error_message)
+            .fail_task(
+                id,
+                &body.owner,
+                body.lease_no,
+                body.error_code,
+                body.error_message,
+            )
             .await,
     )
 }
@@ -423,6 +433,13 @@ fn fail_response(result: Result<FailOutcome, EngineError>) -> Response {
         Ok(FailOutcome::IncidentRaised) => {
             Json(json!({ "outcome": "incidentRaised" })).into_response()
         }
+        // The heartbeat's and the release's vocabulary: the claim this
+        // failure named is gone, and nothing changed.
+        Ok(FailOutcome::Lost { state }) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "outcome": "lockLost", "state": state })),
+        )
+            .into_response(),
         Err(e) => engine_error(e),
     }
 }
@@ -449,6 +466,7 @@ pub async fn fail(
         error_code: body.error_code,
         detail: body.error_message,
         owner: None,
+        lease: None,
     };
     fail_response(engine.fail_work_item(id, &options).await)
 }

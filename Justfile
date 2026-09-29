@@ -230,6 +230,7 @@ tla:
     check "lease: double belief is reachable" Lease_DoubleBelief.cfg  Lease.tla     fail "Invariant DoubleBeliefIsReachable is violated" -deadlock
     check "lease: release without its owner check" Lease_UncheckedRelease.cfg Lease.tla fail "Action property LiveLeaseEndsOnlyByItsHolderOrTheProcess is violated" -deadlock
     check "lease: release without its lease epoch"  Lease_EpochlessRelease.cfg Lease.tla fail "Action property ReleaseFreesOnlyTheLeaseItNamed is violated" -deadlock
+    check "lease: fail without its lease epoch"     Lease_EpochlessFail.cfg    Lease.tla fail "Action property FailSpendsOnlyTheLeaseItNamed is violated" -deadlock
     # A cancelled item (interrupting boundary, terminate, teardown) is the
     # second terminal state the lease configs reach; same -deadlock reason.
     check "lease: completing a cancelled item"      Lease_CancelIgnoresGuard.cfg Lease.tla fail "Action property NoCompletionAfterCancel is violated" -deadlock

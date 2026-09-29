@@ -6274,7 +6274,7 @@ async fn message_boundary_interrupts_a_leased_user_task() {
     );
     assert!(matches!(
         engine
-            .fail_task(task.id, "clerk", Some("NOPE".into()), None)
+            .fail_task(task.id, "clerk", task.lease_no, Some("NOPE".into()), None)
             .await
             .unwrap(),
         FailOutcome::AlreadyClosed { state } if state == "cancelled"
@@ -9130,6 +9130,129 @@ async fn a_lapsed_lease_returns_to_the_queue_and_a_live_one_does_not() {
     db.drop().await;
 }
 
+async fn retries_of(pool: &sqlx::PgPool, item: uuid::Uuid) -> i32 {
+    sqlx::query_scalar("select retries from rbpmn_work_item where id = $1")
+        .bind(item)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A failure leaves the item open, so unlike a completion it cannot
+/// converge on `AlreadyClosed`: guarded by owner alone, a retried request
+/// found the item `available` and spent a second retry — two lost responses
+/// froze an instance on one real failure. Scoped to the claim's lease, the
+/// retry is `Lost` and changes nothing.
+#[tokio::test]
+async fn a_retried_fail_does_not_spend_a_second_retry() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+    let budget = retries_of(&db.pool, task.id).await;
+
+    let first = engine
+        .fail_task(task.id, "w1", task.lease_no, None, Some("boom".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        FailOutcome::Retrying {
+            retries_left: budget - 1
+        }
+    );
+    // The response was lost; the client sends it again.
+    for _ in 0..2 {
+        assert_eq!(
+            engine
+                .fail_task(task.id, "w1", task.lease_no, None, Some("boom".into()))
+                .await
+                .unwrap(),
+            FailOutcome::Lost {
+                state: "available".into()
+            }
+        );
+    }
+    assert_eq!(retries_of(&db.pool, task.id).await, budget - 1);
+    db.drop().await;
+}
+
+/// The release_task hazard on the fail verb. FIFO hands a failed item back
+/// to the worker that failed it, so a stale failure from the first claim
+/// arrives while the same owner holds the second one — and, guarded by owner
+/// alone, freed it mid-handler and spent budget. The epoch tells them apart.
+#[tokio::test]
+async fn a_stale_fail_does_not_end_the_same_owners_next_claim() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine
+        .deploy(&fixture("accept/01-minimal.bpmn"), &Bindings::default())
+        .await
+        .unwrap();
+    engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    let first = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        engine
+            .fail_task(first.id, "w1", first.lease_no, None, None)
+            .await
+            .unwrap(),
+        FailOutcome::Retrying { .. }
+    ));
+    let second = engine
+        .get_task("review", &GetTaskOptions::new("w1"))
+        .await
+        .unwrap()
+        .expect("zero backoff: the failed item is claimable at once");
+    assert_eq!(second.id, first.id);
+    assert!(second.lease_no > first.lease_no);
+    let budget = retries_of(&db.pool, first.id).await;
+
+    assert_eq!(
+        engine
+            .fail_task(first.id, "w1", first.lease_no, None, None)
+            .await
+            .unwrap(),
+        FailOutcome::Lost {
+            state: "locked".into()
+        }
+    );
+    assert_eq!(retries_of(&db.pool, first.id).await, budget);
+    // The live claim is untouched: it still extends, and its own failure lands.
+    assert!(matches!(
+        engine
+            .extend_lock(second.id, "w1", Duration::from_secs(600))
+            .await
+            .unwrap(),
+        LockExtension::Extended { .. }
+    ));
+    assert!(matches!(
+        engine
+            .fail_task(second.id, "w1", second.lease_no, None, None)
+            .await
+            .unwrap(),
+        FailOutcome::Retrying { .. }
+    ));
+    db.drop().await;
+}
+
 /// Retry backoff is a promise not to try again yet. A dashboard that counted
 /// a backed-off item as waiting would send someone to a queue the engine will
 /// refuse to serve from.
@@ -9157,7 +9280,7 @@ async fn an_item_in_retry_backoff_is_not_waiting_until_it_is_due() {
         .unwrap();
     assert!(matches!(
         engine
-            .fail_task(task.id, "w1", None, Some("nope".into()))
+            .fail_task(task.id, "w1", task.lease_no, None, Some("nope".into()))
             .await
             .unwrap(),
         FailOutcome::Retrying { .. }
@@ -9298,23 +9421,25 @@ async fn a_frozen_instance_holds_its_sibling_work_out_of_the_queue() {
         .await
         .unwrap()
         .unwrap();
+    let mut lease = ta.lease_no;
     for _ in 0..2 {
         assert!(matches!(
             engine
-                .fail_task(ta.id, "w1", None, Some("boom".into()))
+                .fail_task(ta.id, "w1", lease, None, Some("boom".into()))
                 .await
                 .unwrap(),
             FailOutcome::Retrying { .. }
         ));
-        engine
+        lease = engine
             .get_task("ta", &GetTaskOptions::new("w1"))
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .lease_no;
     }
     assert_eq!(
         engine
-            .fail_task(ta.id, "w1", None, Some("boom".into()))
+            .fail_task(ta.id, "w1", lease, None, Some("boom".into()))
             .await
             .unwrap(),
         FailOutcome::IncidentRaised

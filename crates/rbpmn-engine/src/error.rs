@@ -163,6 +163,12 @@ pub enum FailOutcome {
     /// Budget exhausted, no boundary matched: the work item is failed and
     /// the instance is frozen in the incident state.
     IncidentRaised,
+    /// A failure scoped to a claim ([`crate::FailOptions::lease`]) whose
+    /// claim is gone: the item is open, but not under that owner and epoch
+    /// — a retried request whose first copy already landed, or a lease that
+    /// lapsed and was claimed again. Nothing changed; `state` is the item's
+    /// state now, as [`crate::Released::Lost`] reports it.
+    Lost { state: String },
 }
 
 /// What a repair did (docs/design/incident-scope.md, D4–D6): the status the

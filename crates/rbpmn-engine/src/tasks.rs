@@ -751,11 +751,22 @@ impl Engine {
     }
 
     /// Owner-checked failure — [`Engine::fail_work_item`] with the caller's
-    /// lease identity filled in.
+    /// lease identity filled in, scoped to one claim like
+    /// [`Engine::release_task`]: `lease` is the [`LockedTask::lease_no`] the
+    /// claim handed back.
+    ///
+    /// That is what makes this verb safe to retry. A completion converges on
+    /// `AlreadyClosed`, but a failure leaves the item *open*: guarded by
+    /// owner alone, a retried request found it `available` and spent a
+    /// second retry — two lost responses froze an instance on one real
+    /// failure — or found the same owner's next claim and ended it. A
+    /// request whose claim is gone is [`FailOutcome::Lost`] and changes
+    /// nothing.
     pub async fn fail_task(
         &self,
         task: Uuid,
         owner: &str,
+        lease: i64,
         error_code: Option<String>,
         detail: Option<String>,
     ) -> Result<FailOutcome, EngineError> {
@@ -765,6 +776,7 @@ impl Engine {
                 error_code,
                 detail,
                 owner: Some(owner.to_string()),
+                lease: Some(lease),
             },
         )
         .await

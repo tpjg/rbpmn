@@ -66,6 +66,7 @@ CONSTANTS
     MaxLeases, \* epoch bound, likewise: claim/release can cycle in one instant
     UncheckedRelease, \* TRUE = drop release_task's owner check (a bug)
     EpochlessRelease, \* TRUE = drop its lease_no check (the shipped bug)
+    EpochlessFail,    \* TRUE = fail guarded by guard_lease alone (the shipped bug)
     CompleteIgnoresClosed \* TRUE = drop completion's AlreadyClosed check (a bug)
 
 ASSUME NoOne \notin Workers
@@ -77,6 +78,7 @@ ASSUME MaxTime \in Nat
 ASSUME MaxLeases \in Nat /\ MaxLeases > 0
 ASSUME UncheckedRelease \in BOOLEAN
 ASSUME EpochlessRelease \in BOOLEAN
+ASSUME EpochlessFail \in BOOLEAN
 \* Stated rather than assumed silently, because a manifest supplies these
 \* now: a zero backoff would let a failed item be re-claimed in the same
 \* instant it failed, and a zero budget would freeze the instance without
@@ -97,8 +99,8 @@ VARIABLES
     completions,  \* how many times the item transitioned to done
     lastActor,    \* who took the step: a worker, NoOne for the clock, Process for the engine
     leaseNo,      \* rbpmn_work_item.lease_no: bumped by every claim
-    named,        \* the epoch the step's release named; NoLease otherwise
-    issued        \* Workers -> the release requests it has actually sent
+    named,        \* the epoch the step's release or fail named; NoLease otherwise
+    issued        \* Workers -> the epochs its release and fail requests named
 
 vars ==
     <<state, owner, until, retryAt, retries, active, now, believes, completions,
@@ -188,6 +190,23 @@ ReleaseGuard(w, e) ==
     /\ state = "locked"
     /\ UncheckedRelease \/ owner = w
     /\ EpochlessRelease \/ e = leaseNo
+
+\* `fail_task` (tasks.rs) scopes a failure to one claim the way release_task
+\* does: `lock_owner = $me AND lease_no = $mine AND state = 'locked'`, for a
+\* request naming epoch `e`, under guard_lease's row lock. A failure is not
+\* idempotent the way a completion is — it leaves the item OPEN — so a
+\* replay has something to land on. `EpochlessFail` is the guard it
+\* replaced: guard_lease alone, which passes an `available` item (no live
+\* lease to refuse) and the same owner's next claim alike.
+\*
+\* `e >= 1` is the client, not the engine: an epoch comes from a claim, and a
+\* claim always yields at least 1 (the ReleaseReplay lesson — a trace naming
+\* epoch 0 is one no client can produce).
+FailGuard(w, e) ==
+    /\ e >= 1
+    /\ IF EpochlessFail
+       THEN state \in {"available", "locked"} /\ GuardAllows(w)
+       ELSE state = "locked" /\ owner = w /\ e = leaseNo
 
 TypeOK ==
     /\ state \in {"available", "locked", "done", "cancelled", "failed"}
@@ -297,6 +316,9 @@ ReleaseWith(w, e) ==
 \* This is the action the model was missing when `release_task` first
 \* shipped. Without it a replay and a fresh release are the same step, and
 \* `just tla` stays green over the whole hazard.
+\*
+\* `issued` holds the epochs of the fail requests too: every one of them is a
+\* lease this worker was really given, which is all a replay needs.
 ReleaseReplay(w) == \E e \in issued[w] : ReleaseWith(w, e)
 
 \* ...and the typed Released::Lost when the statement matches no row. A
@@ -343,16 +365,18 @@ CompleteAlreadyClosed(w) ==
     /\ UNCHANGED <<state, owner, until, retryAt, retries, active, now,
                    completions, leaseNo, issued>>
 
-\* fail_work_item_in_tx: back to available behind a backoff, budget spent.
-\* Exhausting it raises an incident, which freezes the instance. Like
-\* completion, it is refused on a frozen instance (`IncidentOpen`) — the
-\* `active` conjunct. A one-item model cannot tell it is there: its only
-\* freeze is this item's own FailFinally, which closes the item. With a
-\* sibling it matters, and LeaseSiblings.tla's FreezeAdvancesNothing fails
-\* without it.
-Fail(w) ==
-    /\ state = "locked"
-    /\ GuardAllows(w)
+\* fail_task: back to available behind a backoff, budget spent. Exhausting
+\* it raises an incident, which freezes the instance. Like completion, it is
+\* refused on a frozen instance (`IncidentOpen`) — the `active` conjunct. A
+\* one-item model cannot tell it is there: its only freeze is this item's
+\* own FailFinally, which closes the item. With a sibling it matters, and
+\* LeaseSiblings.tla's FreezeAdvancesNothing fails without it.
+\*
+\* Parameterized by the epoch the request carries, like ReleaseWith, and
+\* for the same reason: it is the only thing that tells a worker failing
+\* the claim it holds from a retry of a failure that already landed.
+FailWith(w, e) ==
+    /\ FailGuard(w, e)
     /\ active          \* refused on a frozen instance: IncidentOpen
     /\ retries > 0
     /\ state' = "available"
@@ -362,25 +386,26 @@ Fail(w) ==
     /\ retries' = retries - 1
     /\ believes' = [believes EXCEPT ![w] = FALSE]
     /\ lastActor' = w
-    /\ named' = NoLease
-    /\ UNCHANGED <<active, now, completions, leaseNo, issued>>
+    /\ named' = e
+    /\ issued' = [issued EXCEPT ![w] = @ \cup {e}]
+    /\ UNCHANGED <<active, now, completions, leaseNo>>
 
 \* RaiseError: the core emits WorkItemFailed and persist_step writes
 \* `state = 'failed'` — the state column and nothing else, like Cancel. This
 \* model used to leave the item `locked` here, which the engine never does;
 \* a finally-failed item answers AlreadyClosed { state: "failed" } exactly as
 \* a cancelled one does, and is closed, not stranded.
-FailFinally(w) ==
-    /\ state = "locked"
-    /\ GuardAllows(w)
+FailFinallyWith(w, e) ==
+    /\ FailGuard(w, e)
     /\ active          \* refused on a frozen instance: IncidentOpen
     /\ retries = 0
     /\ state' = "failed"
     /\ active' = FALSE          \* incident: the instance freezes for repair
     /\ believes' = [believes EXCEPT ![w] = FALSE]
     /\ lastActor' = w
-    /\ named' = NoLease
-    /\ UNCHANGED <<owner, until, retryAt, retries, now, completions, leaseNo, issued>>
+    /\ named' = e
+    /\ issued' = [issued EXCEPT ![w] = @ \cup {e}]
+    /\ UNCHANGED <<owner, until, retryAt, retries, now, completions, leaseNo>>
 
 \* RaiseError that a boundary catches: the item closes as `failed` exactly as
 \* above, and the instance stays active — the boundary's path runs instead of
@@ -388,17 +413,30 @@ FailFinally(w) ==
 \* boundaries, which this spec does not see, so both are enabled wherever a
 \* final failure is: FailFinally is the uncaught branch, FailCaught the caught
 \* one (docs/design/incident-scope.md, D1).
-FailCaught(w) ==
-    /\ state = "locked"
-    /\ GuardAllows(w)
+FailCaughtWith(w, e) ==
+    /\ FailGuard(w, e)
     /\ active          \* refused on a frozen instance: IncidentOpen
     /\ retries = 0
     /\ state' = "failed"
     /\ believes' = [believes EXCEPT ![w] = FALSE]
     /\ lastActor' = w
-    /\ named' = NoLease
+    /\ named' = e
+    /\ issued' = [issued EXCEPT ![w] = @ \cup {e}]
     /\ UNCHANGED <<owner, until, retryAt, retries, active, now, completions,
-                   leaseNo, issued>>
+                   leaseNo>>
+
+\* A worker failing the claim it holds — the form LeaseSiblings and Repair
+\* compose.
+Fail(w) == FailWith(w, leaseNo)
+FailFinally(w) == FailFinallyWith(w, leaseNo)
+FailCaught(w) == FailCaughtWith(w, leaseNo)
+
+\* At-least-once delivery of the client's own fail requests: one whose
+\* response never came back arrives again, naming an epoch it was given.
+\* A replay the guard refuses is the typed FailOutcome::Lost, which changes
+\* nothing and is not a step here.
+FailReplay(w) == \E e \in issued[w] :
+    FailWith(w, e) \/ FailFinallyWith(w, e) \/ FailCaughtWith(w, e)
 
 \* The process withdraws the item: an interrupting boundary on the host, a
 \* terminate end, the teardown of an enclosing scope. Transcribed from
@@ -429,7 +467,7 @@ Next ==
         \/ Acquire(w) \/ Extend(w) \/ ExtendLost(w)
         \/ ReleaseWith(w, leaseNo) \/ ReleaseReplay(w) \/ ReleaseLost(w)
         \/ Complete(w) \/ CompleteRefused(w) \/ CompleteAlreadyClosed(w)
-        \/ Fail(w) \/ FailFinally(w) \/ FailCaught(w)
+        \/ Fail(w) \/ FailFinally(w) \/ FailCaught(w) \/ FailReplay(w)
 
 Spec == Init /\ [][Next]_vars
 
@@ -500,9 +538,28 @@ NeverStranded ==
 (* to somebody else. Lease_EpochlessRelease.cfg drops `e = leaseNo` and TLC *)
 (* produces the trace: claim, release, re-claim, retry.                     *)
 (***************************************************************************)
+\*
+\* `retries' = retries` keeps it to releases: a Fail also names its epoch and
+\* also frees the item, and has a property of its own below.
 ReleaseFreesOnlyTheLeaseItNamed ==
-    [][ (state = "locked" /\ state' = "available" /\ named' # NoLease)
+    [][ (state = "locked" /\ state' = "available" /\ named' # NoLease
+         /\ retries' = retries)
           => named' = leaseNo ]_vars
+
+(***************************************************************************)
+(* The same obligation on the fail verb, and one more: a failure that       *)
+(* LANDS — spends budget or closes the item — was a claim failing itself.   *)
+(* The item was `locked`, under the epoch the request named. A review found *)
+(* the fail verb guarded by owner alone: a retried request found the item   *)
+(* `available` (its first copy had landed) and spent a second retry, or     *)
+(* found the same owner's next claim and ended it. Every property about WHO *)
+(* acted held throughout — the owner is the actor in both. Lease_Epochless- *)
+(* Fail.cfg restores that guard and TLC produces the trace: claim, release, *)
+(* then a fail naming the ended claim lands on the `available` item.        *)
+(***************************************************************************)
+FailSpendsOnlyTheLeaseItNamed ==
+    [][ (retries' < retries \/ (state' = "failed" /\ state # "failed"))
+          => (state = "locked" /\ named' = leaseNo) ]_vars
 
 (***************************************************************************)
 (* A live lease ends by the clock or by its own holder's hand, never by     *)

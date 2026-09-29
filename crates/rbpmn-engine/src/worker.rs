@@ -234,6 +234,7 @@ impl Engine {
                                     "handler returned invalid variables: {message}"
                                 )),
                                 owner: Some(options.owner.clone()),
+                                lease: Some(lease_no),
                                 ..FailOptions::default()
                             },
                         )
@@ -257,6 +258,7 @@ impl Engine {
                             error_code: failure.code,
                             detail: Some(failure.message),
                             owner: Some(options.owner.clone()),
+                            lease: Some(lease_no),
                         },
                     )
                     .await;

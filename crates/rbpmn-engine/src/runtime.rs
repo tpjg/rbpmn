@@ -72,6 +72,13 @@ pub struct FailOptions {
     /// ownerless calls on a live lease are refused (`ItemLeased`) so an HTTP
     /// fail cannot yank an item out from under a running worker.
     pub owner: Option<String>,
+    /// The claim this failure reports: the [`crate::LockedTask::lease_no`]
+    /// the claim handed back. With it, the failure lands only on that claim
+    /// — `owner`, this epoch and `locked` — and anything else is
+    /// [`FailOutcome::Lost`], so a retried request cannot spend a second
+    /// retry or end the lease that replaced it. `None` is the unscoped
+    /// operator path.
+    pub lease: Option<i64>,
 }
 
 impl Engine {
@@ -413,6 +420,7 @@ impl Engine {
             error_code: options.error_code.as_deref().map(scrub_nul),
             detail: options.detail.as_deref().map(scrub_nul),
             owner: options.owner.clone(),
+            lease: options.lease,
         };
         let item = sqlx::query("select instance_id, item_no from rbpmn_work_item where id = $1")
             .bind(work_item)
@@ -424,14 +432,47 @@ impl Engine {
 
         let (definition, proc, bindings, mut state) =
             load_instance(self, &mut *tx, instance_id).await?;
-        let item_state = guard_lease(
-            &mut *tx,
-            instance_id,
-            item_no,
-            options.owner.as_deref(),
-            work_item,
-        )
-        .await?;
+        let item_state = match options.lease {
+            // Scoped to one claim. A failure is not idempotent the way a
+            // completion is — it leaves the item *open*, so a replay would
+            // find it `available` and spend another retry, or find the same
+            // owner's next claim and end it (the release_task hazard,
+            // `ReleaseFreesOnlyTheLeaseItNamed`, on the fail verb). Model
+            // checked in `spec/Lease.tla` (`FailSpendsOnlyTheLeaseItNamed`;
+            // `Lease_EpochlessFail.cfg` is the owner-only guard this
+            // replaced).
+            Some(lease) => {
+                let row = sqlx::query(
+                    "select state, lock_owner, lease_no from rbpmn_work_item \
+                     where instance_id = $1 and item_no = $2 for update",
+                )
+                .bind(instance_id)
+                .bind(item_no)
+                .fetch_one(&mut *tx)
+                .await?;
+                let item_state: String = row.get("state");
+                let named = item_state == item_state::LOCKED
+                    && row.get::<Option<String>, _>("lock_owner").as_deref()
+                        == options.owner.as_deref()
+                    && row.get::<i64, _>("lease_no") == lease;
+                if !named
+                    && (item_state == item_state::AVAILABLE || item_state == item_state::LOCKED)
+                {
+                    return Ok(FailOutcome::Lost { state: item_state });
+                }
+                item_state
+            }
+            None => {
+                guard_lease(
+                    &mut *tx,
+                    instance_id,
+                    item_no,
+                    options.owner.as_deref(),
+                    work_item,
+                )
+                .await?
+            }
+        };
         if item_state != item_state::AVAILABLE && item_state != item_state::LOCKED {
             // The idempotent no-op, mirroring completion.
             return Ok(FailOutcome::AlreadyClosed { state: item_state });

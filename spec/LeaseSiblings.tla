@@ -44,7 +44,7 @@ EXTENDS Naturals
 
 CONSTANTS
     Workers, NoOne, Process, NoLease, TTL, Backoff, Retries, MaxTime,
-    MaxLeases, UncheckedRelease, EpochlessRelease, CompleteIgnoresClosed
+    MaxLeases, UncheckedRelease, EpochlessRelease, EpochlessFail, CompleteIgnoresClosed
 
 VARIABLES
     active, now,
