@@ -46,6 +46,11 @@ changed.
   nothing**; a `_ =>` arm that treats every `Ok` as recorded is now wrong.
 - `EngineError::InstanceChanged(Uuid)` is new (see `delete_instance` below).
   The HTTP server maps it to 409.
+- `EngineError` and `FailOutcome` are now `#[non_exhaustive]`, so every
+  `match` on them outside `rbpmn-engine` needs a wildcard arm. This is a
+  one-time break that makes future variants non-breaking. Map an unknown
+  `FailOutcome` to "not recorded", never to success. The HTTP server answers
+  an unmapped one with a logged 500.
 
 **If you call `fail_work_item` / `fail_work_item_in_tx` yourself with an
 `owner`,** set `lease: Some(lease_no)` as well. With `lease: None` you keep

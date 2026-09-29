@@ -17,7 +17,11 @@ pub enum DeployError {
     Db(#[from] sqlx::Error),
 }
 
+/// Marked `#[non_exhaustive]`: a new failure mode is a new variant, and
+/// adding one must not break every downstream `match`. Match the variants you
+/// handle and give the rest a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum EngineError {
     #[error("no deployed definition with key '{0}'")]
     UnknownDefinition(String),
@@ -150,7 +154,11 @@ pub enum Completion {
     AlreadyClosed { state: String },
 }
 
+/// Marked `#[non_exhaustive]` like [`EngineError`]. A wildcard arm must not
+/// read as "recorded": [`FailOutcome::Lost`] is an outcome that changed
+/// nothing, and a future variant may be too.
 #[derive(Debug, PartialEq)]
+#[non_exhaustive]
 pub enum FailOutcome {
     /// The item went back to `available` with one fewer retry (claimable
     /// again once its backoff `retry_at` passes).

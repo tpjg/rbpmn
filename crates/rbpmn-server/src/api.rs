@@ -440,6 +440,18 @@ fn fail_response(result: Result<FailOutcome, EngineError>) -> Response {
             Json(json!({ "outcome": "lockLost", "state": state })),
         )
             .into_response(),
+        // `FailOutcome` is `#[non_exhaustive]`. An outcome this server does
+        // not know is never reported as recorded — a 2xx here would tell a
+        // worker its failure landed when it may have changed nothing. Map a
+        // new variant explicitly above when it ships.
+        Ok(outcome) => {
+            tracing::error!(?outcome, "unmapped fail outcome");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            )
+                .into_response()
+        }
         Err(e) => engine_error(e),
     }
 }
@@ -704,6 +716,18 @@ fn engine_error(e: EngineError) -> Response {
         // so nothing leaks through a wildcard.
         EngineError::MigrationDrift(..) => {
             tracing::error!(error = %e, "migration drift surfaced via API");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
+        }
+        // `EngineError` is `#[non_exhaustive]`, so a wildcard is required —
+        // but it is the backstop, not a mapping: every variant the engine has
+        // today is listed above, and a new one belongs there too. Until it
+        // is, it is a logged 500 with the detail kept out of the response,
+        // the conservative answer for an error nobody has classified.
+        _ => {
+            tracing::error!(error = %e, "unmapped engine error surfaced via API");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal error".to_string(),
