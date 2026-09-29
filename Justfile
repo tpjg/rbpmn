@@ -269,6 +269,10 @@ tla:
     check "boundary exit: no re-check under the lock" BoundaryExit_NoRecheck.cfg   BoundaryExit.tla fail "Invariant ExactlyOneExit is violated" -deadlock
     check "boundary exit: completion keeps the arm"   BoundaryExit_NoWithdraw.cfg  BoundaryExit.tla fail "Invariant ArmDiesWithTheWait is violated" -deadlock
     check "boundary exit: re-check of any row"        BoundaryExit_AnyRowRecheck.cfg BoundaryExit.tla fail "Invariant LateCallsAreTyped is violated" -deadlock
+    # Non-interrupting: a delivery re-arms instead of exiting, so a second
+    # delivery's re-check can fail while the re-armed row waits for it.
+    check "boundary exit: non-interrupting, concurrent deliveries" BoundaryExit_NonInterrupting.cfg BoundaryExit.tla hold "" -deadlock
+    check "boundary exit: non-interrupting, no re-resolve"  BoundaryExit_NonInterruptingNoReResolve.cfg BoundaryExit.tla fail "Invariant NoFalseNotFound is violated" -deadlock
     check "retention: floor and the archive gap" Retention.cfg              Retention.tla hold "" -deadlock
     check "retention: floor from the plan"       Retention_FloorFromPlan.cfg Retention.tla fail "Invariant FloorIsSomethingDeleted is violated" -deadlock
     check "retention: no DUE re-check"           Retention_NoRecheck.cfg     Retention.tla fail "Invariant OnlyDueRecordsDeleted is violated" -deadlock

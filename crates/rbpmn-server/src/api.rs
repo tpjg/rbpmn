@@ -644,9 +644,7 @@ fn engine_error(e: EngineError) -> Response {
         }
         EngineError::InstanceStillActive(_)
         | EngineError::InstanceChanged(_)
-        | EngineError::DefinitionInUse { .. } => {
-            (StatusCode::CONFLICT, e.to_string())
-        }
+        | EngineError::DefinitionInUse { .. } => (StatusCode::CONFLICT, e.to_string()),
         EngineError::InvalidRetentionPolicy(_) => (StatusCode::BAD_REQUEST, e.to_string()),
         EngineError::ArchiveFailed(_) => {
             tracing::error!(error = %e, "retention archive sink failed");

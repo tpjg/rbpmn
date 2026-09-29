@@ -12,7 +12,7 @@ Run with `just tla` (needs `java`; fetches `tla2tools.jar` on first use).
 | `Lease.tla` | the work-item lease: TTL, renewal, expiry, completion, the voluntary hand-back, the **process withdrawing the item** (interrupting boundary, terminate, teardown), and clients retrying their own requests | no double delivery; exactly-once completion under at-least-once delivery; a live lease ends only by the clock, its own holder, or the process; a cancelled item is never completed; a release frees only the lease it named; never stranded — an open item is always claimable or completable |
 | `LeaseSiblings.tla` | two work items on one instance — `Lease` instantiated twice, sharing the instance's status and the database clock | each item keeps its own safety; a stranded item is always a frozen instance, whatever froze it; a frozen instance advances nothing — no claim, completion, failure or cancel, only a holder handing its lease back; an active instance strands nobody, a caught failure included |
 | `TimerTeardown.tla` | the unlocked pick of an **arm row** — a timer by the scheduler, a boundary subscription by `correlate` — racing a scope teardown, and a claim transaction that rolls back after its re-check | no armed row — timer or subscription — outlives the token it is armed on; no arm ever fires with its token gone |
-| `BoundaryExit.tla` | one token at a host work item with an interrupting boundary subscription; `complete_task` and `correlate` racing to end the wait, from any node | exactly one exit ever reaches `step`; an armed row always means an open host; a late call of either verb is answered typed (`AlreadyClosed`, `NoSubscription`), never stepped |
+| `BoundaryExit.tla` | one token at a host work item with a boundary subscription — interrupting, or non-interrupting and re-armed by every delivery; `complete_task` and `correlate` racing to end the wait, from any node | exactly one exit ever reaches `step`; an armed row always means an open host; a late call of either verb is answered typed (`AlreadyClosed`, `NoSubscription`), never stepped; a `NoSubscription` is true — never answered while a row of the key waits |
 | `Retention.tla` | a retention pass across its transaction-free archive gap | nothing deleted without an archive; the truncation floor covers every deletion and invents none; only due records go |
 | `DeleteInstance.tla` | `delete_instance` across the same archive gap, on an instance that is **not terminal** — a `failed` one a repair can thaw, step and freeze again while its record is at the sink | no active instance is deleted; no event is deleted that the archived copy does not carry |
 | `Repair.tla` | the one transition out of a frozen instance: operators whose requests name an incident and may arrive twice, a repair that lands or freezes the instance again, an abandon, and a sibling item — `Lease` instantiated — across the thaw | a request lands only on the incident it named; the sibling keeps every lease guarantee across the thaw, a Divert that cancels its item included; a landed repair strands nobody; an abandon leaves nothing open; a frozen instance advances nothing until a request lands |
@@ -40,6 +40,8 @@ checks are known to have teeth rather than passing vacuously:
 | `BoundaryExit_NoRecheck.cfg` | **violation** | `correlate` stepping on its unlocked pick: a completion in the window, then a second exit |
 | `BoundaryExit_NoWithdraw.cfg` | **violation** | completion leaving the boundary's subscription row behind — an arm outliving its wait |
 | `BoundaryExit_AnyRowRecheck.cfg` | **violation** | a re-check satisfied by *some* open subscription instead of *this* one — a late delivery reaching `step` where the contract says 404 |
+| `BoundaryExit_NonInterrupting.cfg` | holds | concurrent deliveries to a non-interrupting boundary: a failed re-check resolves once more under the lock and lands on the re-armed row |
+| `BoundaryExit_NonInterruptingNoReResolve.cfg` | **violation** | the row-specific re-check alone — the second of two concurrent deliveries answered 404 while the re-armed row waited for it |
 | `Retention.cfg` | holds | the shipped pass |
 | `Retention_FloorFromPlan.cfg` | **violation** | advancing the floor from the plan instead of the deletions |
 | `Retention_NoRecheck.cfg` | **violation** | trusting the plan's DUE verdict across the archive gap |
@@ -170,6 +172,15 @@ same token, written in the delivering transaction (there is never a
 committed state with a live host and no arm), and teardown withdraws it with
 the token like any other row — `SubscriptionTeardown.cfg` already covers
 that shape.
+
+Correction, found by a later review: "the only exit race is still the
+interrupting one" looked at `complete` against `correlate` only. `correlate`
+against `correlate` was a gap — both resolve the same row, the first consumes
+it and re-arms a new one, and the second's row-specific re-check failed into
+a 404 while the re-armed row waited for its message. `BoundaryExit` now
+models the re-arm (`Interrupting = FALSE`) and the shipped fix, a second
+resolve under the lock held to the same row-specific test, with
+`NoFalseNotFound` and a counterexample config.
 
 ### Slice 3 (`timeCycle`): re-read, nothing to model
 

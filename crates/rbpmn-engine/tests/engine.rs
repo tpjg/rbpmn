@@ -7132,6 +7132,142 @@ async fn a_non_interrupting_message_leaves_the_lease_alive() {
     db.drop().await;
 }
 
+/// Two notes at once. The second resolves the boundary's row before the
+/// first commits, then waits on the instance lock; by the time it holds it,
+/// the first delivery has consumed that row and re-armed a new one on the
+/// same key. Serially both notes land, so concurrently they must too — the
+/// row-specific re-check alone answered the second one 404, telling the
+/// sender nothing was waiting while the re-armed boundary was.
+#[tokio::test]
+async fn concurrent_deliveries_to_a_non_interrupting_boundary_both_land() {
+    let db = TestDb::create().await;
+    let engine = casefile_engine(&db).await;
+    let started = engine
+        .start(
+            "casefile",
+            None,
+            serde_json::json!({ "case": { "id": "c-race" } }),
+        )
+        .await
+        .unwrap();
+
+    // The first note, uncommitted: the instance row is locked and the
+    // boundary's row consumed and re-armed inside this transaction.
+    let mut tx = db.pool.begin().await.unwrap();
+    engine
+        .correlate_in_tx(&mut tx, "NOTE", "c-race", serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let second = engine.clone();
+    let second = tokio::spawn(async move {
+        second
+            .correlate("NOTE", "c-race", serde_json::json!({}))
+            .await
+    });
+    // Parked on the instance row lock means its resolve already ran — on a
+    // snapshot that still holds the first row.
+    let mut blocked = false;
+    for _ in 0..200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "select count(*) from pg_stat_activity where datname = current_database() \
+             and wait_event_type = 'Lock' and query like '%rbpmn_instance%for update%'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        blocked,
+        "the second delivery never blocked on the instance lock"
+    );
+    tx.commit().await.unwrap();
+
+    let delivered = second.await.unwrap();
+    assert!(delivered.is_ok(), "{delivered:?}");
+    // One side token per note, and the boundary still armed for a third.
+    let open = open_items(&db.pool, started.id).await;
+    assert_eq!(
+        open.iter()
+            .filter(|(_, e)| e.as_str() == "file_note")
+            .count(),
+        2,
+        "{open:?}"
+    );
+    assert_eq!(subscription_rows(&db.pool, started.id).await, 1);
+    assert_fsck_clean(&db.pool).await;
+    db.drop().await;
+}
+
+/// A late message is still answered typed: the host completed, its arm went
+/// with it, and a delivery that resolved the row before that commit finds
+/// nothing on the second resolve either.
+#[tokio::test]
+async fn a_delivery_behind_host_completion_is_still_a_404() {
+    let db = TestDb::create().await;
+    let engine = casefile_engine(&db).await;
+    engine
+        .start(
+            "casefile",
+            None,
+            serde_json::json!({ "case": { "id": "c-late" } }),
+        )
+        .await
+        .unwrap();
+    let task = engine
+        .get_task("review", &GetTaskOptions::new("reviewer"))
+        .await
+        .unwrap()
+        .expect("the reviewer's task");
+    // One note first: its side token keeps the instance active after the
+    // host completes, so the late note meets the re-check rather than
+    // `InstanceNotActive`.
+    engine
+        .correlate("NOTE", "c-late", serde_json::json!({}))
+        .await
+        .unwrap();
+
+    let mut tx = db.pool.begin().await.unwrap();
+    engine
+        .complete_work_item_in_tx(&mut tx, task.id, Some("reviewer"), serde_json::json!({}))
+        .await
+        .unwrap();
+    let note = engine.clone();
+    let note = tokio::spawn(async move {
+        note.correlate("NOTE", "c-late", serde_json::json!({}))
+            .await
+    });
+    let mut blocked = false;
+    for _ in 0..200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "select count(*) from pg_stat_activity where datname = current_database() \
+             and wait_event_type = 'Lock' and query like '%rbpmn_instance%for update%'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(blocked, "the delivery never blocked on the instance lock");
+    tx.commit().await.unwrap();
+
+    let late = note.await.unwrap();
+    assert!(
+        matches!(late, Err(EngineError::NoSubscription { .. })),
+        "{late:?}"
+    );
+    db.drop().await;
+}
+
 /// The other order. Host completion withdraws the arm exactly as an
 /// interrupting one's would — non-interrupting says what a delivery *does*,
 /// never how long the boundary lives — so a note arriving afterwards is the
