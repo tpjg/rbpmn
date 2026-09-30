@@ -321,13 +321,16 @@ async fn a_storm_holds_every_global_invariant() {
                         // with a code, fails without one, or completes, so
                         // both shapes a catch-all takes run through the storm.
                         if topic == "notify" {
-                            let (owner, id) = (&options.owner, task.id);
+                            let (owner, id, lease) = (&options.owner, task.id, task.lease_no);
                             let _ = match notify_calls.fetch_add(1, Ordering::Relaxed) % 3 {
                                 0 => node
-                                    .fail_task(id, owner, Some("STORM".into()), None)
+                                    .fail_task(id, owner, lease, Some("STORM".into()), None)
                                     .await
                                     .map(|_| ()),
-                                1 => node.fail_task(id, owner, None, None).await.map(|_| ()),
+                                1 => node
+                                    .fail_task(id, owner, lease, None, None)
+                                    .await
+                                    .map(|_| ()),
                                 _ => node
                                     .complete_task(id, owner, serde_json::json!({}))
                                     .await

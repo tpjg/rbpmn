@@ -17,7 +17,11 @@ pub enum DeployError {
     Db(#[from] sqlx::Error),
 }
 
+/// Marked `#[non_exhaustive]`: a new failure mode is a new variant, and
+/// adding one must not break every downstream `match`. Match the variants you
+/// handle and give the rest a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum EngineError {
     #[error("no deployed definition with key '{0}'")]
     UnknownDefinition(String),
@@ -86,6 +90,16 @@ pub enum EngineError {
     IncidentOpen(Uuid),
     #[error("instance {0} is still active; terminate it before deleting it")]
     InstanceStillActive(Uuid),
+    /// `delete_instance` archived a record, and the instance moved on before
+    /// the deletion could lock it — a repair thawed and re-froze it, or
+    /// history was appended — and did so again on the one retry. Nothing was
+    /// deleted; the sink holds a superseded copy (within its contract), and
+    /// a later call archives and deletes the current record.
+    #[error(
+        "instance {0} changed while it was being archived, twice; nothing was deleted — \
+         call again to archive and delete the current record"
+    )]
+    InstanceChanged(Uuid),
     /// A stored bindings manifest no longer deserializes. Startup
     /// re-validation refuses to boot on this, so reaching it means the row
     /// was written by something other than `deploy`.
@@ -140,7 +154,11 @@ pub enum Completion {
     AlreadyClosed { state: String },
 }
 
+/// Marked `#[non_exhaustive]` like [`EngineError`]. A wildcard arm must not
+/// read as "recorded": [`FailOutcome::Lost`] is an outcome that changed
+/// nothing, and a future variant may be too.
 #[derive(Debug, PartialEq)]
+#[non_exhaustive]
 pub enum FailOutcome {
     /// The item went back to `available` with one fewer retry (claimable
     /// again once its backoff `retry_at` passes).
@@ -154,6 +172,12 @@ pub enum FailOutcome {
     /// Budget exhausted, no boundary matched: the work item is failed and
     /// the instance is frozen in the incident state.
     IncidentRaised,
+    /// A failure scoped to a claim ([`crate::FailOptions::lease`]) whose
+    /// claim is gone: the item is open, but not under that owner and epoch
+    /// — a retried request whose first copy already landed, or a lease that
+    /// lapsed and was claimed again. Nothing changed; `state` is the item's
+    /// state now, as [`crate::Released::Lost`] reports it.
+    Lost { state: String },
 }
 
 /// What a repair did (docs/design/incident-scope.md, D4–D6): the status the

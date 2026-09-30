@@ -342,9 +342,11 @@ not a per-commit check). CI is the backstop; the point of the table in README's
   demonstration: UI routes are behind the bearer, browsers cannot send it on a
   navigation, and supplying it is the embedding application's job.
 - `just tla` — TLA+ model checking of the concurrency protocol (`spec/`).
-  Twenty-seven configs; seventeen are *expected* to fail, each matched against the
-  specific violation it demonstrates (a spec that stops parsing must not read
-  as "fails as expected"). Three reproduce bugs that were real. The lock order
+  Thirty-four configs; twenty-two are *expected* to fail, each matched against
+  the specific violation it demonstrates (a spec that stops parsing must not
+  read as "fails as expected"). Six reproduce bugs that were real — three of
+  them found by reading the specs against the code, which is the point of the
+  section below. The lock order
   is checked at two arities. `Lease.tla` models the process withdrawing a
   leased item (`Cancel`) and `BoundaryExit.tla` the correlate-vs-complete race
   on one token; both came with message boundaries, and `Lease`'s old
@@ -392,18 +394,24 @@ So: **touching any of these means re-reading `spec/` and re-running
 - lock acquisition order anywhere (`runtime.rs`, `scheduler.rs`, `tasks.rs`)
 - the work-item lease: TTL, renewal, ownership, the lease epoch a claim
   mints (only a claim mints one — a renewal continues the same lease), the
-  voluntary hand-back (`release_task`), the `guard_lease` predicate
+  voluntary hand-back (`release_task`), the failure's lease scope
+  (`fail_task`, `FailSpendsOnlyTheLeaseItNamed`), the `guard_lease` predicate
 - the scheduler's claim path (`try_fire`) — pick, NOWAIT, re-check, and the
   in-transaction decision evaluation that can now abort a claim already made
 - `correlate_in_tx`'s resolve → lock → re-check (`runtime.rs`): the re-check
   confirms *this* subscription row is still in the rehydrated state, never
   "some open subscription" (`spec/BoundaryExit.tla`, `LateCallsAreTyped` —
   `BoundaryExit_AnyRowRecheck.cfg` is the loosened form failing), and like the
-  timer claim it sees the row, never its token (`SubscriptionTeardown.cfg`)
+  timer claim it sees the row, never its token (`SubscriptionTeardown.cfg`);
+  a failed re-check resolves once more under the lock before it answers 404,
+  because a non-interrupting delivery re-arms the key it consumed
+  (`NoFalseNotFound`)
 - what scope teardown reaps (`step.rs::tear_down_scope`) — specifically that
   a reaped token's arms are withdrawn *with* it
 - retention's plan/archive/execute split, the DUE re-check under the row
   lock, or how the truncation floor is advanced (`retention.rs`)
+- `delete_instance`'s probe → archive → re-check under the lock: `failed` is
+  not terminal, so the re-check is status *and* history — `spec/DeleteInstance.tla`
 - a repair's incident check or what it may land on (`step.rs`'s
   `Command::Repair`, `runtime.rs`'s `repair_in_tx`) — `spec/Repair.tla`
 - how a repair moves the timers a freeze kept (`resume_after_freeze`), or the

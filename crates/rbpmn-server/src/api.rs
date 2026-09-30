@@ -310,6 +310,10 @@ pub async fn complete_task(
 #[serde(rename_all = "camelCase")]
 pub struct FailTaskBody {
     pub owner: String,
+    /// The `leaseNo` the claim returned — required, for the reason
+    /// [`ReleaseTaskBody::lease_no`] is: a failure leaves the item open, so
+    /// a retried request without it would spend another retry.
+    pub lease_no: i64,
     #[serde(default)]
     pub error_code: Option<String>,
     #[serde(default)]
@@ -323,7 +327,13 @@ pub async fn fail_task(
 ) -> Response {
     fail_response(
         engine
-            .fail_task(id, &body.owner, body.error_code, body.error_message)
+            .fail_task(
+                id,
+                &body.owner,
+                body.lease_no,
+                body.error_code,
+                body.error_message,
+            )
             .await,
     )
 }
@@ -423,6 +433,25 @@ fn fail_response(result: Result<FailOutcome, EngineError>) -> Response {
         Ok(FailOutcome::IncidentRaised) => {
             Json(json!({ "outcome": "incidentRaised" })).into_response()
         }
+        // The heartbeat's and the release's vocabulary: the claim this
+        // failure named is gone, and nothing changed.
+        Ok(FailOutcome::Lost { state }) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "outcome": "lockLost", "state": state })),
+        )
+            .into_response(),
+        // `FailOutcome` is `#[non_exhaustive]`. An outcome this server does
+        // not know is never reported as recorded — a 2xx here would tell a
+        // worker its failure landed when it may have changed nothing. Map a
+        // new variant explicitly above when it ships.
+        Ok(outcome) => {
+            tracing::error!(?outcome, "unmapped fail outcome");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            )
+                .into_response()
+        }
         Err(e) => engine_error(e),
     }
 }
@@ -449,6 +478,7 @@ pub async fn fail(
         error_code: body.error_code,
         detail: body.error_message,
         owner: None,
+        lease: None,
     };
     fail_response(engine.fail_work_item(id, &options).await)
 }
@@ -642,9 +672,9 @@ fn engine_error(e: EngineError) -> Response {
             )
                 .into_response();
         }
-        EngineError::InstanceStillActive(_) | EngineError::DefinitionInUse { .. } => {
-            (StatusCode::CONFLICT, e.to_string())
-        }
+        EngineError::InstanceStillActive(_)
+        | EngineError::InstanceChanged(_)
+        | EngineError::DefinitionInUse { .. } => (StatusCode::CONFLICT, e.to_string()),
         EngineError::InvalidRetentionPolicy(_) => (StatusCode::BAD_REQUEST, e.to_string()),
         EngineError::ArchiveFailed(_) => {
             tracing::error!(error = %e, "retention archive sink failed");
@@ -686,6 +716,18 @@ fn engine_error(e: EngineError) -> Response {
         // so nothing leaks through a wildcard.
         EngineError::MigrationDrift(..) => {
             tracing::error!(error = %e, "migration drift surfaced via API");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
+        }
+        // `EngineError` is `#[non_exhaustive]`, so a wildcard is required —
+        // but it is the backstop, not a mapping: every variant the engine has
+        // today is listed above, and a new one belongs there too. Until it
+        // is, it is a logged 500 with the detail kept out of the response,
+        // the conservative answer for an error nobody has classified.
+        _ => {
+            tracing::error!(error = %e, "unmapped engine error surfaced via API");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal error".to_string(),

@@ -537,6 +537,188 @@ async fn active_and_failed_instances_are_never_swept() {
     db.drop().await;
 }
 
+/// What an operator's repair does to an instance while `delete_instance`
+/// is blocked on its sink — the archive gap holds no transaction, and
+/// `failed` is not terminal.
+#[derive(Clone, Copy)]
+enum DuringArchive {
+    /// Retry the incident: the instance is active again.
+    Thaw,
+    /// Retry it, then fail the fresh item past its budget: back at
+    /// `failed`, with history the archived copy never saw.
+    ThawAndRefreeze,
+}
+
+/// An archive sink that records every batch and, on its first `repairs`
+/// deliveries, repairs the instance it is handed before accepting — the
+/// interleaving `spec/DeleteInstance.tla` checks.
+struct RepairingSink {
+    engine: Engine,
+    pool: PgPool,
+    action: DuringArchive,
+    repairs: usize,
+    seen: Mutex<Vec<rbpmn_engine::InstanceRecord>>,
+}
+
+impl RepairingSink {
+    fn records(&self) -> Vec<rbpmn_engine::InstanceRecord> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl RetentionArchive for RepairingSink {
+    fn archive<'a>(
+        &'a self,
+        batch: &'a ArchiveBatch,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ArchiveError>> + Send + 'a>> {
+        Box::pin(async move {
+            let delivery = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.extend(batch.instances.iter().cloned());
+                seen.len()
+            };
+            if delivery > self.repairs {
+                return Ok(());
+            }
+            let id = batch.instances[0].id;
+            // The incident open now: the first one, or the one the previous
+            // delivery's re-freeze minted.
+            let incident: i64 =
+                sqlx::query_scalar("select next_incident - 1 from rbpmn_instance where id = $1")
+                    .bind(id)
+                    .fetch_one(&self.pool)
+                    .await
+                    .unwrap();
+            self.engine
+                .repair(
+                    id,
+                    incident as u64,
+                    rbpmn_engine::Disposition::Retry {
+                        patch: serde_json::json!({}),
+                    },
+                    "repaired while being archived",
+                )
+                .await
+                .unwrap();
+            if let DuringArchive::ThawAndRefreeze = self.action {
+                let item: Uuid = sqlx::query_scalar(
+                    "select id from rbpmn_work_item where instance_id = $1 \
+                     and element_id = 'st' and state = 'available'",
+                )
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap();
+                while let FailOutcome::Retrying { .. } = self
+                    .engine
+                    .fail_work_item(item, &FailOptions::default())
+                    .await
+                    .unwrap()
+                {}
+            }
+            Ok(())
+        })
+    }
+}
+
+/// A failed instance, a `RepairingSink` registered for it, and the result of
+/// deleting it.
+async fn delete_while_repaired(
+    action: DuringArchive,
+    repairs: usize,
+) -> (
+    Result<rbpmn_engine::RetentionReport, EngineError>,
+    Arc<RepairingSink>,
+    Uuid,
+    TestDb,
+) {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    deploy_task_kinds(&engine).await;
+    let failed = failed_instance(&engine, &db.pool, "o-thawed").await;
+    let sink = Arc::new(RepairingSink {
+        engine: engine.clone(),
+        pool: db.pool.clone(),
+        action,
+        repairs,
+        seen: Mutex::new(Vec::new()),
+    });
+    engine.register_archive(sink.clone());
+    let result = engine.delete_instance(failed).await;
+    (result, sink, failed, db)
+}
+
+async fn instance_exists(pool: &PgPool, id: Uuid) -> bool {
+    count(
+        pool,
+        "select count(*) from rbpmn_instance where id = $1",
+        id,
+    )
+    .await
+        == 1
+}
+
+/// `failed` is deletable but not terminal: a repair can thaw the instance
+/// while its record is at the sink. The deletion re-checks under the row
+/// lock and refuses — before, it deleted a running instance. No retry: an
+/// active instance is not deletable however many times it is archived.
+#[tokio::test]
+async fn delete_instance_refuses_an_instance_thawed_during_the_archive() {
+    let (result, sink, id, db) = delete_while_repaired(DuringArchive::Thaw, 1).await;
+    assert!(
+        matches!(result, Err(EngineError::InstanceStillActive(_))),
+        "{result:?}"
+    );
+    assert!(instance_exists(&db.pool, id).await);
+    assert_eq!(sink.records().len(), 1, "an active instance is not retried");
+    db.drop().await;
+}
+
+/// The case a status-only re-check misses: thawed and frozen again during
+/// the gap, the instance is `failed` once more, but the archived copy lacks
+/// the repair and everything after it. The first attempt is refused under
+/// the lock; the retry archives the current record and deletes — and that
+/// latest delivery is the whole record, which is the sink's contract.
+#[tokio::test]
+async fn delete_instance_archives_again_when_the_instance_changed() {
+    let (result, sink, id, db) = delete_while_repaired(DuringArchive::ThawAndRefreeze, 1).await;
+    let report = result.unwrap();
+    assert_eq!(report.instances_deleted, 1);
+    assert!(!instance_exists(&db.pool, id).await);
+    let records = sink.records();
+    assert_eq!(records.len(), 2, "archived, changed, archived again");
+    assert!(records.iter().all(|r| r.id == id));
+    let repaired =
+        |r: &rbpmn_engine::InstanceRecord| r.events.iter().any(|e| e.kind == "incident-repaired");
+    assert!(!repaired(&records[0]), "the first copy predates the repair");
+    assert!(repaired(&records[1]), "the latest copy carries it");
+    assert_eq!(report.events_deleted, records[1].events.len() as u64);
+    db.drop().await;
+}
+
+/// Changed across both gaps: refused, nothing deleted, and a later call —
+/// once the instance holds still — archives and deletes it.
+#[tokio::test]
+async fn delete_instance_refuses_an_instance_that_keeps_changing() {
+    let (result, sink, id, db) = delete_while_repaired(DuringArchive::ThawAndRefreeze, 2).await;
+    assert!(
+        matches!(result, Err(EngineError::InstanceChanged(_))),
+        "{result:?}"
+    );
+    assert!(instance_exists(&db.pool, id).await);
+    assert_eq!(sink.records().len(), 2);
+
+    let engine = engine(&db).await;
+    let quiet = Recorder::new(false);
+    engine.register_archive(quiet.clone());
+    assert_eq!(
+        engine.delete_instance(id).await.unwrap().instances_deleted,
+        1
+    );
+    assert_eq!(quiet.records().len(), 1);
+    db.drop().await;
+}
+
 /// Retention is opt-in twice over: no sweeper, nothing happens; and a
 /// sweeper whose policy is `forever` deletes nothing either.
 #[tokio::test]

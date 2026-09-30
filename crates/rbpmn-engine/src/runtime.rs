@@ -72,6 +72,13 @@ pub struct FailOptions {
     /// ownerless calls on a live lease are refused (`ItemLeased`) so an HTTP
     /// fail cannot yank an item out from under a running worker.
     pub owner: Option<String>,
+    /// The claim this failure reports: the [`crate::LockedTask::lease_no`]
+    /// the claim handed back. With it, the failure lands only on that claim
+    /// — `owner`, this epoch and `locked` — and anything else is
+    /// [`FailOutcome::Lost`], so a retried request cannot spend a second
+    /// retry or end the lease that replaced it. `None` is the unscoped
+    /// operator path.
+    pub lease: Option<i64>,
 }
 
 impl Engine {
@@ -287,6 +294,13 @@ impl Engine {
     ///   arms on one token — and TLC shows it lets a withdrawn arm's message
     ///   through. `StepError::UnknownSubscription` would catch it as an
     ///   internal error; the contract is a 404, not a 500.
+    /// * **A failed re-check resolves once more before it says 404**
+    ///   (`spec/BoundaryExit.tla`, `NoFalseNotFound`). A non-interrupting
+    ///   delivery consumes its row and re-arms a new one for the same key in
+    ///   one transaction, so a concurrent delivery's row can be gone while
+    ///   its message still has a destination. The second resolve runs under
+    ///   the lock and is held to the same row-specific test;
+    ///   `BoundaryExit_NonInterruptingNoReResolve.cfg` is the false 404.
     /// * **The re-check confirms the row, never its token**
     ///   (`spec/TimerTeardown.tla` under `spec/SubscriptionTeardown.cfg`,
     ///   which binds the module's arm rows to subscriptions). That second
@@ -309,33 +323,7 @@ impl Engine {
         // subscription rows (frozen for repair), and those must not block
         // delivery to a live instance sharing the key — or answer for a key
         // that otherwise has no destination.
-        let matches = sqlx::query(
-            "select s.instance_id, s.subscription_no from rbpmn_subscription s \
-             join rbpmn_instance i on i.id = s.instance_id \
-             where s.message_name = $1 and s.correlation_key = $2 \
-               and i.status = 'active' limit 2",
-        )
-        .bind(message)
-        .bind(key)
-        .fetch_all(&mut *tx)
-        .await?;
-        let row = match matches.as_slice() {
-            [] => {
-                return Err(EngineError::NoSubscription {
-                    message: message.to_string(),
-                    key: key.to_string(),
-                });
-            }
-            [row] => row,
-            _ => {
-                return Err(EngineError::AmbiguousCorrelation {
-                    message: message.to_string(),
-                    key: key.to_string(),
-                });
-            }
-        };
-        let instance_id: Uuid = row.get("instance_id");
-        let subscription_no: i64 = row.get("subscription_no");
+        let (instance_id, subscription_no) = resolve_subscription(tx, message, key).await?;
 
         let (definition, proc, bindings, mut state) =
             load_instance(self, &mut *tx, instance_id).await?;
@@ -350,12 +338,31 @@ impl Engine {
         }
         // A concurrent step (boundary timer, terminate, another delivery)
         // may have withdrawn it between resolve and lock.
-        let sub_id = SubscriptionId(subscription_no as u64);
+        let mut sub_id = SubscriptionId(subscription_no as u64);
         if !state.subscriptions().any(|(id, _)| id == sub_id) {
-            return Err(EngineError::NoSubscription {
+            // Withdrawn is not the same as "nothing is waiting". A delivery
+            // to a non-interrupting boundary (or any step that loops back to
+            // the same catch) consumes the row and arms a fresh one for the
+            // same key in one transaction — the row this call resolved is
+            // gone, and the message it carries has a destination. So resolve
+            // once more, now that the lock is held: nothing on this instance
+            // can move until we commit, so one retry is enough. The answer
+            // is still row-specific — the row it names must be in the state
+            // rebuilt under the lock — and a row on *another* instance is not
+            // taken: that would lock a second instance row, which the lock
+            // order does not allow. Model checked in `spec/BoundaryExit.tla`
+            // (`NoFalseNotFound`; `BoundaryExit_NonInterruptingNoReResolve.cfg`
+            // is the 404 this replaced).
+            let not_found = || EngineError::NoSubscription {
                 message: message.to_string(),
                 key: key.to_string(),
-            });
+            };
+            let (again, again_no) = resolve_subscription(tx, message, key).await?;
+            let again_id = SubscriptionId(again_no as u64);
+            if again != instance_id || !state.subscriptions().any(|(id, _)| id == again_id) {
+                return Err(not_found());
+            }
+            sub_id = again_id;
         }
 
         let events = step_answering_decisions(
@@ -413,6 +420,7 @@ impl Engine {
             error_code: options.error_code.as_deref().map(scrub_nul),
             detail: options.detail.as_deref().map(scrub_nul),
             owner: options.owner.clone(),
+            lease: options.lease,
         };
         let item = sqlx::query("select instance_id, item_no from rbpmn_work_item where id = $1")
             .bind(work_item)
@@ -424,14 +432,47 @@ impl Engine {
 
         let (definition, proc, bindings, mut state) =
             load_instance(self, &mut *tx, instance_id).await?;
-        let item_state = guard_lease(
-            &mut *tx,
-            instance_id,
-            item_no,
-            options.owner.as_deref(),
-            work_item,
-        )
-        .await?;
+        let item_state = match options.lease {
+            // Scoped to one claim. A failure is not idempotent the way a
+            // completion is — it leaves the item *open*, so a replay would
+            // find it `available` and spend another retry, or find the same
+            // owner's next claim and end it (the release_task hazard,
+            // `ReleaseFreesOnlyTheLeaseItNamed`, on the fail verb). Model
+            // checked in `spec/Lease.tla` (`FailSpendsOnlyTheLeaseItNamed`;
+            // `Lease_EpochlessFail.cfg` is the owner-only guard this
+            // replaced).
+            Some(lease) => {
+                let row = sqlx::query(
+                    "select state, lock_owner, lease_no from rbpmn_work_item \
+                     where instance_id = $1 and item_no = $2 for update",
+                )
+                .bind(instance_id)
+                .bind(item_no)
+                .fetch_one(&mut *tx)
+                .await?;
+                let item_state: String = row.get("state");
+                let named = item_state == item_state::LOCKED
+                    && row.get::<Option<String>, _>("lock_owner").as_deref()
+                        == options.owner.as_deref()
+                    && row.get::<i64, _>("lease_no") == lease;
+                if !named
+                    && (item_state == item_state::AVAILABLE || item_state == item_state::LOCKED)
+                {
+                    return Ok(FailOutcome::Lost { state: item_state });
+                }
+                item_state
+            }
+            None => {
+                guard_lease(
+                    &mut *tx,
+                    instance_id,
+                    item_no,
+                    options.owner.as_deref(),
+                    work_item,
+                )
+                .await?
+            }
+        };
         if item_state != item_state::AVAILABLE && item_state != item_state::LOCKED {
             // The idempotent no-op, mirroring completion.
             return Ok(FailOutcome::AlreadyClosed { state: item_state });
@@ -761,6 +802,40 @@ pub(crate) fn compile_row(
         .map_err(|e| internal(e.to_string()))?;
     let proc = ExecutableProcess::compile(&defs, key, &bindings)?;
     Ok((proc, bindings))
+}
+
+/// The unlocked resolve of a (message, key) pair to its one open
+/// subscription row, on an *active* instance: an incident-frozen instance
+/// keeps its subscription rows (frozen for repair), and those must not block
+/// delivery to a live instance sharing the key — or answer for a key that
+/// otherwise has no destination. No match is `NoSubscription`, more than one
+/// is `AmbiguousCorrelation`: delivery would be a guess.
+async fn resolve_subscription(
+    tx: &mut PgConnection,
+    message: &str,
+    key: &str,
+) -> Result<(Uuid, i64), EngineError> {
+    let matches = sqlx::query(
+        "select s.instance_id, s.subscription_no from rbpmn_subscription s \
+         join rbpmn_instance i on i.id = s.instance_id \
+         where s.message_name = $1 and s.correlation_key = $2 \
+           and i.status = 'active' limit 2",
+    )
+    .bind(message)
+    .bind(key)
+    .fetch_all(&mut *tx)
+    .await?;
+    match matches.as_slice() {
+        [row] => Ok((row.get("instance_id"), row.get("subscription_no"))),
+        [] => Err(EngineError::NoSubscription {
+            message: message.to_string(),
+            key: key.to_string(),
+        }),
+        _ => Err(EngineError::AmbiguousCorrelation {
+            message: message.to_string(),
+            key: key.to_string(),
+        }),
+    }
 }
 
 /// The one lease gate: taken under the instance lock (every caller locks

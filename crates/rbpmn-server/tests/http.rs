@@ -661,6 +661,34 @@ async fn task_api_lifecycle_over_http() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["task"]["id"], task_id);
 
+    // A failure is scoped to a claim the same way, and for the same reason:
+    // it leaves the item open, so a replay has something to land on. No
+    // epoch is a 422; alice's spent one is the typed 409 and leaves carol's
+    // claim alone.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/tasks/{task_id}/fail"),
+            serde_json::json!({ "owner": "carol" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/tasks/{task_id}/fail"),
+            serde_json::json!({ "owner": "alice", "leaseNo": lease_no }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert_eq!(body["outcome"], "lockLost");
+    assert_eq!(body["state"], "locked");
+
     // Completion is owner-checked: a stranger is refused — and after the
     // hand-back that includes alice, who no longer holds anything.
     for stranger in ["bob", "alice"] {

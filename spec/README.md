@@ -9,11 +9,12 @@ Run with `just tla` (needs `java`; fetches `tla2tools.jar` on first use).
 | Spec | Models | Checks |
 |---|---|---|
 | `LockOrder.tla` | **every lock-taking transaction shape in the engine** — step, timer claim, work claim, retention, deploy — over per-instance rows plus the definition and floor rows | nobody holds rows while still needing the instance row; no AB/BA deadlock; every transaction returns to idle |
-| `Lease.tla` | the work-item lease: TTL, renewal, expiry, completion, the voluntary hand-back, the **process withdrawing the item** (interrupting boundary, terminate, teardown), and clients retrying their own requests | no double delivery; exactly-once completion under at-least-once delivery; a live lease ends only by the clock, its own holder, or the process; a cancelled item is never completed; a release frees only the lease it named; never stranded — an open item is always claimable or completable |
+| `Lease.tla` | the work-item lease: TTL, renewal, expiry, completion, the voluntary hand-back, the **process withdrawing the item** (interrupting boundary, terminate, teardown), and clients retrying their own requests | no double delivery; exactly-once completion under at-least-once delivery; a live lease ends only by the clock, its own holder, or the process; a cancelled item is never completed; a release frees only the lease it named, and a failure spends only the lease it named; never stranded — an open item is always claimable or completable |
 | `LeaseSiblings.tla` | two work items on one instance — `Lease` instantiated twice, sharing the instance's status and the database clock | each item keeps its own safety; a stranded item is always a frozen instance, whatever froze it; a frozen instance advances nothing — no claim, completion, failure or cancel, only a holder handing its lease back; an active instance strands nobody, a caught failure included |
 | `TimerTeardown.tla` | the unlocked pick of an **arm row** — a timer by the scheduler, a boundary subscription by `correlate` — racing a scope teardown, and a claim transaction that rolls back after its re-check | no armed row — timer or subscription — outlives the token it is armed on; no arm ever fires with its token gone |
-| `BoundaryExit.tla` | one token at a host work item with an interrupting boundary subscription; `complete_task` and `correlate` racing to end the wait, from any node | exactly one exit ever reaches `step`; an armed row always means an open host; a late call of either verb is answered typed (`AlreadyClosed`, `NoSubscription`), never stepped |
+| `BoundaryExit.tla` | one token at a host work item with a boundary subscription — interrupting, or non-interrupting and re-armed by every delivery; `complete_task` and `correlate` racing to end the wait, from any node | exactly one exit ever reaches `step`; an armed row always means an open host; a late call of either verb is answered typed (`AlreadyClosed`, `NoSubscription`), never stepped; a `NoSubscription` is true — never answered while a row of the key waits |
 | `Retention.tla` | a retention pass across its transaction-free archive gap | nothing deleted without an archive; the truncation floor covers every deletion and invents none; only due records go |
+| `DeleteInstance.tla` | `delete_instance` across the same archive gap, on an instance that is **not terminal** — a `failed` one a repair can thaw, step and freeze again while its record is at the sink | no active instance is deleted; no event is deleted that the archived copy does not carry |
 | `Repair.tla` | the one transition out of a frozen instance: operators whose requests name an incident and may arrive twice, a repair that lands or freezes the instance again, an abandon, and a sibling item — `Lease` instantiated — across the thaw | a request lands only on the incident it named; the sibling keeps every lease guarantee across the thaw, a Divert that cancels its item included; a landed repair strands nobody; an abandon leaves nothing open; a frozen instance advances nothing until a request lands |
 | `RepairClock.tla` | a repair moving a timer the freeze kept (D8), racing the scheduler's unlocked pick and locked re-check — the freeze as two steps, stamp and commit, with the claim's NOWAIT giving up while the freezing transaction holds the row | a moved timer never fires before its due |
 
@@ -28,6 +29,7 @@ checks are known to have teeth rather than passing vacuously:
 | `Lease_DoubleBelief.cfg` | **violation** | two workers really can both believe they hold one item |
 | `Lease_UncheckedRelease.cfg` | **violation** | `release_task` without its owner check, freeing a live holder's item |
 | `Lease_EpochlessRelease.cfg` | **violation** | `release_task` without its lease epoch — a retried release freeing the claim that replaced it |
+| `Lease_EpochlessFail.cfg` | **violation** | `fail_task` guarded by `guard_lease` alone — a retried or stale failure spending budget on an `available` item, or ending the same owner's next claim |
 | `Lease_CancelIgnoresGuard.cfg` | **violation** | completion without its `AlreadyClosed` check — a clerk's decision landing on a task the process had withdrawn |
 | `LeaseSiblings.cfg` | holds | the shipped lease, two items at a time |
 | `LeaseSiblings_CaughtIsReachable.cfg` | **violation** | not a bug: a final failure a boundary caught, on an instance still active, is reached |
@@ -39,9 +41,15 @@ checks are known to have teeth rather than passing vacuously:
 | `BoundaryExit_NoRecheck.cfg` | **violation** | `correlate` stepping on its unlocked pick: a completion in the window, then a second exit |
 | `BoundaryExit_NoWithdraw.cfg` | **violation** | completion leaving the boundary's subscription row behind — an arm outliving its wait |
 | `BoundaryExit_AnyRowRecheck.cfg` | **violation** | a re-check satisfied by *some* open subscription instead of *this* one — a late delivery reaching `step` where the contract says 404 |
+| `BoundaryExit_NonInterrupting.cfg` | holds | concurrent deliveries to a non-interrupting boundary: a failed re-check resolves once more under the lock and lands on the re-armed row |
+| `BoundaryExit_NonInterruptingNoReResolve.cfg` | **violation** | the row-specific re-check alone — the second of two concurrent deliveries answered 404 while the re-armed row waited for it |
 | `Retention.cfg` | holds | the shipped pass |
 | `Retention_FloorFromPlan.cfg` | **violation** | advancing the floor from the plan instead of the deletions |
 | `Retention_NoRecheck.cfg` | **violation** | trusting the plan's DUE verdict across the archive gap |
+| `DeleteInstance.cfg` | holds | the shipped deletion: status and event count re-checked under the row lock |
+| `DeleteInstance_StatusOnly.cfg` | **violation** | re-checking the status alone — thawed and frozen again in the gap, the archived copy lacks the repair |
+| `DeleteInstance_NoRecheck.cfg` | **violation** | trusting the probe across the gap (the code before this spec) — a repair's thaw deleted a running instance |
+| `DeleteInstance_DeleteIsReachable.cfg` | **violation** | a refused deletion called again does land, so the checks are not vacuous |
 | `Repair.cfg` | holds | the shipped repair |
 | `Repair_UncheckedIncident.cfg` | **violation** | a request landing whenever the instance is frozen: a repair of incident 0 fails again into incident 1, and its resend lands there |
 | `Repair_ThawIsReachable.cfg` | **violation** | not a bug: a repair lands while the stranded sibling is open, and the sibling then completes — the thaw's case, reached |
@@ -165,6 +173,15 @@ same token, written in the delivering transaction (there is never a
 committed state with a live host and no arm), and teardown withdraws it with
 the token like any other row — `SubscriptionTeardown.cfg` already covers
 that shape.
+
+Correction, found by a later review: "the only exit race is still the
+interrupting one" looked at `complete` against `correlate` only. `correlate`
+against `correlate` was a gap — both resolve the same row, the first consumes
+it and re-arms a new one, and the second's row-specific re-check failed into
+a 404 while the re-armed row waited for its message. `BoundaryExit` now
+models the re-arm (`Interrupting = FALSE`) and the shipped fix, a second
+resolve under the lock held to the same row-specific test, with
+`NoFalseNotFound` and a counterexample config.
 
 ### Slice 3 (`timeCycle`): re-read, nothing to model
 
@@ -360,6 +377,27 @@ torn-down scope; deadlock freedom remains a property under test only for
 frozen instance, a state reachable only while `FailFinally` left the item
 `locked`.)
 
+### The same hazard on the fail verb
+
+"Every other verb survives it" above was wrong about one verb. `fail_task`
+was guarded by `guard_lease` alone, which refuses only a *foreign live*
+lease — so the worker's own retried failure passed. A failure is not
+idempotent the way a completion is: it leaves the item open. A retry whose
+first copy had landed found the item `available` and spent a second retry
+(two lost responses froze an instance on one real failure), and a stale one
+arriving after the same owner re-claimed the item ended that claim
+mid-handler. The model could not see it for the release reason and one more:
+`Fail` required `state = "locked"`, which the engine never did.
+
+`fail_task` now takes the claim's `lease_no` and lands only on `locked`,
+that owner, that epoch; anything else is `FailOutcome::Lost` (409
+`lockLost`, the release's vocabulary). The model's `FailWith(w, e)` and
+`FailReplay` mirror `ReleaseWith`/`ReleaseReplay` and share `issued`, and
+`FailSpendsOnlyTheLeaseItNamed` is the property: a failure that spends
+budget or closes the item was a `locked` claim failing under the epoch it
+named. `Lease_EpochlessFail.cfg` restores the old guard. The ownerless
+operator path (`/work-items/{id}/fail`, `FailOptions::lease = None`) is not
+a lease client and keeps the old semantics.
 ## Retention and the archive gap
 
 `Retention.tla` models the one place phase 7 is subtle: `plan` → archive →
@@ -375,6 +413,32 @@ reader above it loses events silently), and the floor may not sit above
 everything actually deleted (or readers get `CursorTruncated` for nothing).
 The second is exactly what `delete_records`' comment warns about, and
 `Retention_FloorFromPlan.cfg` is that mistake made on purpose.
+
+`DeleteInstance.tla` is the escape hatch with the same gap and one premise
+fewer. The sweep only ever selects `completed`/`terminated` records, which
+cannot change across it; `delete_instance` also takes `failed`, and `failed`
+is the one status a repair leaves. The first version probed the status,
+archived, and deleted under the row lock without looking again — a review
+found it deleting an instance a repair had thawed during the upload. Status
+alone is not enough either: thawed and frozen again, the instance is back at
+`failed` with history the archive never saw, which `_StatusOnly.cfg`
+demonstrates. The shipped re-check compares the event count of the record
+that was archived, because every transition writes an event and only a
+deletion removes one; it reads it in a second statement after the lock,
+since a sub-select in the locking statement keeps the snapshot from before
+the lock wait. The record itself is read in one REPEATABLE READ snapshot
+(two statements), closed before the sink is called. A first version compared
+against a separate probe taken before the record, which refused instances
+that had only changed before their record was read; a follow-up review
+caught it.
+
+A refused deletion archives again once before it answers
+`InstanceChanged`, so the sink can receive one id twice with different
+content, and can hold a record of an instance that was not deleted. That is
+the sink's contract (`RetentionArchive`: at-least-once, latest delivery
+supersedes, archived is not deleted) and it was already true of the sweep;
+the model's `archivedN` is overwritten by every delivery accordingly, and
+`NoEventDeletedUnarchived` is about the latest copy.
 
 TLC also found a bug in this spec while checking it: `undue' = undue \/ X`
 parses as `(undue' = undue) \/ X`, so the variable went unassigned whenever

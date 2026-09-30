@@ -230,6 +230,7 @@ tla:
     check "lease: double belief is reachable" Lease_DoubleBelief.cfg  Lease.tla     fail "Invariant DoubleBeliefIsReachable is violated" -deadlock
     check "lease: release without its owner check" Lease_UncheckedRelease.cfg Lease.tla fail "Action property LiveLeaseEndsOnlyByItsHolderOrTheProcess is violated" -deadlock
     check "lease: release without its lease epoch"  Lease_EpochlessRelease.cfg Lease.tla fail "Action property ReleaseFreesOnlyTheLeaseItNamed is violated" -deadlock
+    check "lease: fail without its lease epoch"     Lease_EpochlessFail.cfg    Lease.tla fail "Action property FailSpendsOnlyTheLeaseItNamed is violated" -deadlock
     # A cancelled item (interrupting boundary, terminate, teardown) is the
     # second terminal state the lease configs reach; same -deadlock reason.
     check "lease: completing a cancelled item"      Lease_CancelIgnoresGuard.cfg Lease.tla fail "Action property NoCompletionAfterCancel is violated" -deadlock
@@ -269,9 +270,20 @@ tla:
     check "boundary exit: no re-check under the lock" BoundaryExit_NoRecheck.cfg   BoundaryExit.tla fail "Invariant ExactlyOneExit is violated" -deadlock
     check "boundary exit: completion keeps the arm"   BoundaryExit_NoWithdraw.cfg  BoundaryExit.tla fail "Invariant ArmDiesWithTheWait is violated" -deadlock
     check "boundary exit: re-check of any row"        BoundaryExit_AnyRowRecheck.cfg BoundaryExit.tla fail "Invariant LateCallsAreTyped is violated" -deadlock
+    # Non-interrupting: a delivery re-arms instead of exiting, so a second
+    # delivery's re-check can fail while the re-armed row waits for it.
+    check "boundary exit: non-interrupting, concurrent deliveries" BoundaryExit_NonInterrupting.cfg BoundaryExit.tla hold "" -deadlock
+    check "boundary exit: non-interrupting, no re-resolve"  BoundaryExit_NonInterruptingNoReResolve.cfg BoundaryExit.tla fail "Invariant NoFalseNotFound is violated" -deadlock
     check "retention: floor and the archive gap" Retention.cfg              Retention.tla hold "" -deadlock
     check "retention: floor from the plan"       Retention_FloorFromPlan.cfg Retention.tla fail "Invariant FloorIsSomethingDeleted is violated" -deadlock
     check "retention: no DUE re-check"           Retention_NoRecheck.cfg     Retention.tla fail "Invariant OnlyDueRecordsDeleted is violated" -deadlock
+    # delete_instance: the sweep's archive gap, on an instance that is not
+    # terminal — `failed` thaws under a repair. -deadlock: a deleted instance
+    # is terminal.
+    check "delete instance: re-checked under the lock"   DeleteInstance.cfg                   DeleteInstance.tla hold "" -deadlock
+    check "delete instance: status-only re-check"        DeleteInstance_StatusOnly.cfg        DeleteInstance.tla fail "Invariant NoEventDeletedUnarchived is violated" -deadlock
+    check "delete instance: no re-check"                 DeleteInstance_NoRecheck.cfg         DeleteInstance.tla fail "Invariant NoLiveInstanceDeleted is violated" -deadlock
+    check "delete instance: a refused delete lands later" DeleteInstance_DeleteIsReachable.cfg DeleteInstance.tla fail "Invariant NeverDeleted is violated" -deadlock
 
 # Differential the FEEL subset against dsntk (the DMN-TCK-verified reference):
 # every condition we accept must evaluate identically there. Outside the
