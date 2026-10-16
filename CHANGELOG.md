@@ -3,6 +3,21 @@
 This file starts at 0.7.0. Earlier releases are described by their tags and
 commit history.
 
+## 0.7.1
+
+### Fixed
+
+**A retention pass no longer reads the whole event table.** Before deleting a
+batch, `delete_records` counts the batch's events and finds the newest of them
+for the floor. That lookup walked `rbpmn_event_stream` backwards from the
+newest event in the table. Retention takes the oldest instances, so the walk
+passed nearly every event before reaching one of theirs. On a 1.4 M-event
+table that was 156 s per batch of 200, inside the deletion transaction.
+
+The batch's events are now read once through `rbpmn_event_by_instance`, and
+the count and the floor both come from those rows. Same count, same floor; no
+API or schema change.
+
 ## 0.7.0
 
 Three concurrency bugs found by reading `spec/` against the code, each fixed

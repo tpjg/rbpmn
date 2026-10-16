@@ -308,6 +308,52 @@ async fn a_stuck_instance_does_not_block_its_neighbours() {
     db.drop().await;
 }
 
+/// What a pass reports is exactly what it removed: the events counted are the
+/// retired instances' own, and the floor is the highest `(txid, id)` among
+/// THEM — never an event of an instance that stays, however much newer.
+#[tokio::test]
+async fn the_floor_is_the_newest_event_retired_not_the_newest_event() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    deploy_task_kinds(&engine).await;
+
+    let a = completed_instance(&engine, &db.pool, "o-a").await;
+    let b = completed_instance(&engine, &db.pool, "o-b").await;
+    let fresh = completed_instance(&engine, &db.pool, "o-fresh").await;
+    backdate(&db.pool, a, 3600).await;
+    backdate(&db.pool, b, 3600).await;
+
+    let retired = events_of(&db.pool, a).await + events_of(&db.pool, b).await;
+    let (txid, id): (i64, i64) = sqlx::query_as(
+        "select txid::text::bigint, id from rbpmn_event where instance_id = any($1) \
+         order by txid desc, id desc limit 1",
+    )
+    .bind(vec![a, b])
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let newest: (i64, i64) = sqlx::query_as(
+        "select txid::text::bigint, id from rbpmn_event order by txid desc, id desc limit 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        newest > (txid, id),
+        "the instance that stays has newer events"
+    );
+
+    let report = engine
+        .sweep_retention_once(&options(after(60)))
+        .await
+        .unwrap();
+    assert_eq!(report.instances_deleted, 2);
+    assert_eq!(report.events_deleted, retired as u64);
+    assert_eq!(report.floor, EventCursor { txid, id });
+    assert!(events_of(&db.pool, fresh).await > 0);
+    db.drop().await;
+}
+
 /// The cursor contract survives retention: above the floor the stream is
 /// provably complete, below it the consumer is *told* rather than silently
 /// skipped past the gap.

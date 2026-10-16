@@ -1007,22 +1007,29 @@ async fn load_records(
 /// Delete records outright, floor advanced to the highest `(txid, id)`
 /// actually removed. Returns `(events, instances)`.
 async fn delete_records(conn: &mut PgConnection, ids: &[Uuid]) -> Result<(u64, u64), EngineError> {
-    // One aggregate, not a max-lookup plus a count: both walked the same rows
-    // inside the deletion transaction, which the design wants short. The
-    // ordering keys are the *raw* columns — `order by txid desc` on the
-    // `txid::text::bigint` output alias would bind to the cast and sort
-    // instead of walking `rbpmn_event_stream (txid, id)` backwards.
+    // The batch's events are read ONCE, through `rbpmn_event_by_instance`,
+    // and both the count and the top `(txid, id)` come from those rows. The
+    // CTE is `materialized` so the planner cannot push `order by txid desc
+    // limit 1` down onto `rbpmn_event_stream`: walked backwards from the
+    // newest event, that index meets a retired instance's rows only after
+    // passing everything newer — and retention always takes the OLDEST
+    // instances, so the walk read nearly the whole table on every pass (156 s
+    // per batch of 200 on a 1.4 M-event production table). Sorting the
+    // batch's own few thousand rows is cheap and does not depend on where in
+    // the stream they sit. `id` is unique, so the order has no ties.
     //
     // The floor comes from the rows being deleted *now*, not from the plan:
     // `skip locked` may have dropped instances between the two, and a floor
     // above anything actually deleted would truncate readers for nothing.
     let summary = sqlx::query(
-        "select count(*) as n, \
-                (select txid::text::bigint from rbpmn_event \
-                 where instance_id = any($1) order by txid desc, id desc limit 1) as top_txid, \
-                (select id from rbpmn_event \
-                 where instance_id = any($1) order by txid desc, id desc limit 1) as top_id \
-         from rbpmn_event where instance_id = any($1)",
+        "with batch as materialized ( \
+             select txid, id from rbpmn_event where instance_id = any($1) \
+         ) \
+         select (select count(*) from batch) as n, \
+                top.txid::text::bigint as top_txid, top.id as top_id \
+           from (select 1) one \
+                left join (select txid, id from batch \
+                           order by txid desc, id desc limit 1) top on true",
     )
     .bind(ids)
     .fetch_one(&mut *conn)
