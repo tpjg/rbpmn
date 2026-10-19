@@ -3,6 +3,27 @@
 This file starts at 0.7.0. Earlier releases are described by their tags and
 commit history.
 
+## 0.7.2
+
+### Added
+
+**A worker can claim a subset of the registered topics.**
+`Engine::run_worker_for(options, filter)` and `Engine::work_once_for(options,
+&filter)` take a `TopicFilter`: `All`, `Only(set)` or `Except(set)`. The filter
+narrows the registered handlers; a topic with no handler is still never claimed.
+It also applies to the wake-up: a `rbpmn_work` NOTIFY carries its topic, and a
+worker whose filter does not admit it keeps waiting to the same deadline instead
+of running an empty claim.
+
+That lets one engine register every handler, so the deploy's topic check and
+`check_active_definitions` see them all, and still give a slow topic workers of
+its own. Before, the only way was a second engine plus a persisted
+`declare_topic`, which kept the topic covered in the database whatever process
+ran.
+
+`run_worker` and `work_once` are `run_worker_for` and `work_once_for` with
+`TopicFilter::All`, unchanged. `WorkerOptions` is unchanged.
+
 ## 0.7.1
 
 ### Fixed

@@ -11,11 +11,18 @@
 //! Claims only touch items of *active* instances (an incident freezes its
 //! whole instance) whose retry backoff has elapsed. `LISTEN rbpmn_work`
 //! wakes the loop early; the poll interval is the safety net.
+//!
+//! A worker claims every registered topic, or the subset a [`TopicFilter`]
+//! names: one engine can then run a few workers on a slow topic and others on
+//! the rest, so an item that holds a worker for minutes never holds up the
+//! topics that take milliseconds. The filter applies to the wake-up as well: a
+//! NOTIFY carries its topic, and a worker that does not claim it keeps waiting.
 
 use crate::listen::Wakeup;
 use crate::runtime::FailOptions;
 use crate::{Engine, EngineError, WorkItem};
 use sqlx::Row;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 /// A spawned task that is cancelled when its handle goes out of scope —
@@ -49,13 +56,46 @@ impl Default for WorkerOptions {
     }
 }
 
+/// Which of the engine's registered topics a worker claims.
+///
+/// A topic the filter names but no handler is registered for is never claimed:
+/// the filter narrows the registered set, it does not widen it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TopicFilter {
+    /// Every registered topic.
+    #[default]
+    All,
+    /// Only these.
+    Only(BTreeSet<String>),
+    /// Every registered topic but these.
+    Except(BTreeSet<String>),
+}
+
+impl TopicFilter {
+    /// Whether a worker under this filter claims `topic`, given that a
+    /// handler for it is registered.
+    pub fn admits(&self, topic: &str) -> bool {
+        match self {
+            TopicFilter::All => true,
+            TopicFilter::Only(topics) => topics.contains(topic),
+            TopicFilter::Except(topics) => !topics.contains(topic),
+        }
+    }
+}
+
 impl Engine {
     /// Runs forever (spawn it; abort to stop). Transient errors back off and
     /// continue — the loop must survive database restarts.
     pub async fn run_worker(&self, options: WorkerOptions) {
+        self.run_worker_for(options, TopicFilter::All).await
+    }
+
+    /// [`run_worker`](Self::run_worker), claiming only the topics `filter`
+    /// admits, and woken only by their NOTIFY.
+    pub async fn run_worker_for(&self, options: WorkerOptions, filter: TopicFilter) {
         let mut wakeup = Wakeup::new("rbpmn_work");
         loop {
-            match self.work_once(&options).await {
+            match self.work_once_for(&options, &filter).await {
                 Ok(true) => continue,
                 Ok(false) => {
                     if wakeup.ensure(self.pool()).await {
@@ -64,13 +104,13 @@ impl Engine {
                     // Bound the wait by the earliest retry backoff: NOTIFY
                     // fires when the item *fails*, not when its retry_at
                     // elapses — without this, retries run poll_interval late.
-                    let wait = match self.next_retry_in().await {
+                    let wait = match self.next_retry_in(&filter).await {
                         Ok(Some(until_retry)) => until_retry
                             .max(Duration::from_millis(50))
                             .min(options.poll_interval),
                         _ => options.poll_interval,
                     };
-                    wakeup.park(wait).await;
+                    wakeup.park_for(wait, |topic| filter.admits(topic)).await;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "worker iteration failed; backing off");
@@ -83,7 +123,17 @@ impl Engine {
     /// Claim and execute at most one work item. Returns whether one was
     /// processed (the caller drains until false).
     pub async fn work_once(&self, options: &WorkerOptions) -> Result<bool, EngineError> {
-        let topics = self.handled_topics();
+        self.work_once_for(options, &TopicFilter::All).await
+    }
+
+    /// [`work_once`](Self::work_once), claiming only the topics `filter`
+    /// admits.
+    pub async fn work_once_for(
+        &self,
+        options: &WorkerOptions,
+        filter: &TopicFilter,
+    ) -> Result<bool, EngineError> {
+        let topics = self.claimed_topics(filter);
         if topics.is_empty() {
             return Ok(false);
         }
@@ -274,8 +324,8 @@ impl Engine {
 
     /// Time until the earliest backoff-parked retry on a handled topic —
     /// the worker's analog of the scheduler's `next_due_in`.
-    async fn next_retry_in(&self) -> Result<Option<Duration>, EngineError> {
-        let topics = self.handled_topics();
+    async fn next_retry_in(&self, filter: &TopicFilter) -> Result<Option<Duration>, EngineError> {
+        let topics = self.claimed_topics(filter);
         if topics.is_empty() {
             return Ok(None);
         }
@@ -289,5 +339,28 @@ impl Engine {
         .fetch_one(self.pool())
         .await?;
         Ok(secs.map(|s| Duration::from_secs_f64(s.max(0.0))))
+    }
+
+    /// The registered topics `filter` admits.
+    fn claimed_topics(&self, filter: &TopicFilter) -> Vec<String> {
+        self.handled_topics()
+            .into_iter()
+            .filter(|topic| filter.admits(topic))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TopicFilter;
+
+    #[test]
+    fn a_filter_admits_what_it_names() {
+        let set = |names: &[&str]| names.iter().map(|t| t.to_string()).collect();
+        assert!(TopicFilter::All.admits("any"));
+        assert!(TopicFilter::Only(set(&["a"])).admits("a"));
+        assert!(!TopicFilter::Only(set(&["a"])).admits("b"));
+        assert!(!TopicFilter::Except(set(&["a"])).admits("a"));
+        assert!(TopicFilter::Except(set(&["a"])).admits("b"));
     }
 }

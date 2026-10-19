@@ -62,6 +62,11 @@ is an RFC 7386 merge patch applied to the instance variables. Delivery is
 at-least-once and the state transition exactly-once, so handlers must be
 idempotent.
 
+A worker claims every registered topic. `run_worker_for(options,
+TopicFilter::Only(…))` runs one on a subset, and `TopicFilter::Except(…)` one on
+the rest, so a handler that takes minutes gets workers of its own and never holds
+up the topics that take milliseconds.
+
 Human work is pulled rather than pushed:
 
 ```rust

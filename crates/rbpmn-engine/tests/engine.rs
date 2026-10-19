@@ -9,7 +9,7 @@ use rbpmn_engine::testing::TestDb;
 use rbpmn_engine::{
     Completion, DeployError, Disposition, Engine, EngineError, FailOptions, FailOutcome,
     HandlerFailure, HttpPostHandler, InstanceStatus, Refusal, RepairKind, ServiceTaskHandler,
-    StepError, Takes, TaskIds, WorkItem, WorkerOptions,
+    StepError, Takes, TaskIds, TopicFilter, WorkItem, WorkerOptions,
 };
 use sqlx::{PgPool, Row};
 use std::fs;
@@ -1041,6 +1041,109 @@ async fn leases_renew_while_the_handler_runs() {
         1,
         "renewed lease must prevent concurrent re-execution"
     );
+    db.drop().await;
+}
+
+/// One instance per topic: the same one-step model deployed twice, `st` bound
+/// to `slow` in v1 and to `fast` in v2.
+async fn one_instance_per_topic(engine: &Engine) -> (uuid::Uuid, uuid::Uuid) {
+    let mut started = Vec::new();
+    for topic in ["slow", "fast"] {
+        engine
+            .deploy(
+                &fixture("accept/16-foreign-binding-warn.bpmn"),
+                &Bindings::new().topic("st", topic),
+            )
+            .await
+            .unwrap();
+        started.push(
+            engine
+                .start("p", None, serde_json::json!({}))
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    (started[0], started[1])
+}
+
+fn topics(names: &[&str]) -> std::collections::BTreeSet<String> {
+    names.iter().map(|t| t.to_string()).collect()
+}
+
+#[tokio::test]
+async fn a_topic_filter_narrows_what_a_worker_claims() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    for topic in ["slow", "fast"] {
+        engine.register_handler(
+            topic,
+            Arc::new(FnHandler(|_item| Ok(serde_json::json!({})))),
+        );
+    }
+    let (slow, fast) = one_instance_per_topic(&engine).await;
+    let options = worker_options();
+
+    let nobody = TopicFilter::Only(topics(&["unregistered"]));
+    assert!(
+        !engine.work_once_for(&options, &nobody).await.unwrap(),
+        "a filter widens nothing: a topic without a handler is never claimed"
+    );
+
+    let not_slow = TopicFilter::Except(topics(&["slow"]));
+    assert!(engine.work_once_for(&options, &not_slow).await.unwrap());
+    assert!(!engine.work_once_for(&options, &not_slow).await.unwrap());
+    wait_for_status(&db.pool, fast, "completed").await;
+
+    let only_slow = TopicFilter::Only(topics(&["slow"]));
+    assert!(engine.work_once_for(&options, &only_slow).await.unwrap());
+    wait_for_status(&db.pool, slow, "completed").await;
+    db.drop().await;
+}
+
+/// A filtered worker parks through another topic's NOTIFY and is still woken by
+/// its own, well inside a poll interval that would otherwise be the only way
+/// it sees the item.
+#[tokio::test]
+async fn a_filtered_worker_still_wakes_on_its_own_topic_after_another() {
+    let db = TestDb::create().await;
+    let engine = engine(&db).await;
+    engine.register_handler(
+        "slow",
+        Arc::new(FnHandler(|_item| Ok(serde_json::json!({})))),
+    );
+    engine
+        .deploy(
+            &fixture("accept/16-foreign-binding-warn.bpmn"),
+            &Bindings::new().topic("st", "slow"),
+        )
+        .await
+        .unwrap();
+    let worker = tokio::spawn({
+        let engine = engine.clone();
+        let options = WorkerOptions {
+            poll_interval: Duration::from_secs(60),
+            ..WorkerOptions::default()
+        };
+        async move {
+            engine
+                .run_worker_for(options, TopicFilter::Only(topics(&["slow"])))
+                .await
+        }
+    });
+    // Parked by now: nothing to claim, and LISTEN established.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    sqlx::query("select pg_notify('rbpmn_work', 'fast')")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = engine
+        .start("p", None, serde_json::json!({}))
+        .await
+        .unwrap();
+    wait_for_status(&db.pool, started.id, "completed").await;
+    worker.abort();
     db.drop().await;
 }
 

@@ -41,16 +41,28 @@ impl Wakeup {
     /// be established); a lost connection drops the listener so the next
     /// `ensure` rebuilds it.
     pub(crate) async fn park(&mut self, wait: Duration) {
-        match self.listener.as_mut() {
-            Some(l) => {
-                if tokio::time::timeout(wait, l.recv())
-                    .await
-                    .is_ok_and(|r| r.is_err())
-                {
+        self.park_for(wait, |_| true).await
+    }
+
+    /// [`park`](Self::park), woken only by a NOTIFY whose payload `wanted`
+    /// accepts; any other is consumed and the wait goes on, to the same
+    /// deadline.
+    pub(crate) async fn park_for(&mut self, wait: Duration, wanted: impl Fn(&str) -> bool) {
+        let Some(l) = self.listener.as_mut() else {
+            tokio::time::sleep(wait).await;
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            match tokio::time::timeout_at(deadline, l.recv()).await {
+                Err(_) => return,
+                Ok(Err(_)) => {
                     self.listener = None;
+                    return;
                 }
+                Ok(Ok(notification)) if wanted(notification.payload()) => return,
+                Ok(Ok(_)) => {}
             }
-            None => tokio::time::sleep(wait).await,
         }
     }
 }

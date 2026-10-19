@@ -66,7 +66,7 @@ pub use tasks::{
 };
 pub use timers::TIMER_VIEW;
 pub use work_items::{QueueDepth, WORK_ITEM_VIEW};
-pub use worker::WorkerOptions;
+pub use worker::{TopicFilter, WorkerOptions};
 
 /// Convenience: connect a pool for the engine (the URL comes from operator
 /// config — never from request data).
