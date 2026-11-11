@@ -76,9 +76,11 @@ jobs:
           rustup default stable
           rustc --version && cargo clippy --version && cargo fmt --version
 
+      # An LTS line (to 2029-04). bpmnlint 12 needs Node 24+, and npm 11.10+ is
+      # what honours `min-release-age` in each package's .npmrc.
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '26.13.1'
 
       - name: Cargo cache
         uses: actions/cache@v4
@@ -101,14 +103,22 @@ jobs:
         # is a *parse* error the whole file is unusable, so the failure
         # surfaced three recipes away from its cause. Raise it deliberately.
         #
-        # wasm-pack from its prebuilt installer: `cargo install` compiles it
-        # from source for minutes.
+        # wasm-pack as its release binary, pinned and checksummed like just:
+        # `cargo install` compiles it from source for minutes, and the old
+        # installer script ran whatever the archived rustwasm site served.
         run: |
           JUST_VERSION=1.36.0
-          curl -fsSL "https://github.com/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-            | tar xz -C /tmp just
+          JUST_SHA256=bc7c9f377944f8de9cd0418b11d2955adebfa25a488c0b5e3dd2d2c0e9d732da
+          curl -fsSLo /tmp/just.tar.gz "https://github.com/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          echo "${JUST_SHA256}  /tmp/just.tar.gz" | sha256sum -c -
+          tar xzf /tmp/just.tar.gz -C /tmp just
           sudo mv /tmp/just /usr/local/bin/
-          curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+          WASM_PACK_VERSION=0.15.0
+          WASM_PACK_SHA256=c09f971ecaed9a2efc80fdcea7a00ef6b53c7fadc8c57d1f61b53a6aa66b668a
+          curl -fsSLo /tmp/wasm-pack.tar.gz "https://github.com/wasm-bindgen/wasm-pack/releases/download/v${WASM_PACK_VERSION}/wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          echo "${WASM_PACK_SHA256}  /tmp/wasm-pack.tar.gz" | sha256sum -c -
+          tar xzf /tmp/wasm-pack.tar.gz -C /tmp
+          sudo install -m 0755 "/tmp/wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl/wasm-pack" /usr/local/bin/wasm-pack
           just --version && wasm-pack --version
 
       - name: Postgres role for $USER
@@ -127,7 +137,7 @@ jobs:
         # Its own step so the ~150 MB chromium download is visible as itself
         # rather than as part of a test that appears to hang.
         run: |
-          pip install --break-system-packages playwright
+          pip install --break-system-packages playwright==1.62.0
           playwright install --with-deps chromium
 
       # `just ui` MUST come before anything that builds rbpmn-ui — `just lint`
@@ -182,9 +192,8 @@ jobs:
 
       # The DI baker is idempotent, so a diff means a fixture landed without
       # the diagram interchange that makes it render in bpmn-js and any
-      # standard modeler. Scoped to the corpus: the recipe runs `npm install`
-      # first, which can rewrite a lockfile, and that must not read as a
-      # missing fixture.
+      # standard modeler. Scoped to the corpus, so only a fixture the baker
+      # had to change fails it.
       - name: just fixtures-di
         run: |
           just fixtures-di
@@ -241,8 +250,10 @@ jobs:
       - name: just
         run: |
           JUST_VERSION=1.36.0
-          curl -fsSL "https://github.com/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-            | tar xz -C /tmp just
+          JUST_SHA256=bc7c9f377944f8de9cd0418b11d2955adebfa25a488c0b5e3dd2d2c0e9d732da
+          curl -fsSLo /tmp/just.tar.gz "https://github.com/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          echo "${JUST_SHA256}  /tmp/just.tar.gz" | sha256sum -c -
+          tar xzf /tmp/just.tar.gz -C /tmp just
           sudo mv /tmp/just /usr/local/bin/
 
       # The pure-Rust decimal128 against the C library it replaces: 26 300
