@@ -12,20 +12,17 @@
  * grey) across the whole drop target and inverted the canvas.
  *
  * The libraries expose their palette as custom properties, so this overrides
- * **primitives** rather than selectors. diagram-js, bpmn-js and dmn-js all
- * define the same grey ramp on their own root element (`.djs-parent`,
- * `.bjs-container`, `.dmn-js-parent`), and everything else derives from it —
- * ~130 derived properties across five stylesheets, all of which follow from
- * the twenty below. Overriding selectors instead would mean chasing each new
- * one on every upgrade.
- *
- * The token *names* keep the light-mode lightness they were named for, so
- * after inversion `--color-grey-225-10-15` is a light grey. The name lies;
- * the alternative is not overriding them, and that is worse.
+ * **primitives** rather than selectors. diagram-js, bpmn-js and dmn-js share
+ * one design-token layer — the `--bio-*` tokens on `.bio-theme-parent`, the
+ * class every one of them puts on its root (diagram-js's Canvas, bpmn-js's
+ * container, each dmn-js view) — and every other colour property in their five
+ * stylesheets derives from it. Overriding the tokens re-themes all of those at
+ * once; overriding selectors instead would mean chasing each new one on every
+ * upgrade.
  *
  * Every selector here is prefixed `:root` purely for **specificity**. A media
- * query adds none, so a bare `.djs-parent` ties with the vendor's own rule and
- * source order decides — and source order here is a bundler's business, not
+ * query adds none, so a bare `.bio-theme-parent` ties with the vendor's own rule
+ * and source order decides — and source order here is a bundler's business, not
  * ours: `decisions.js` imports dmn-js, which ships its *own* copy of
  * diagram-js.css, and that copy landed after this file and silently won. The
  * palette stayed white with every variable set correctly. `:root` makes the
@@ -34,61 +31,55 @@
  */
 
 @media (prefers-color-scheme: dark) {
-  :root .djs-parent,
-  :root .bjs-container,
-  :root .dmn-js-parent {
-    /* The ramp, inverted about the midpoint. Hue and saturation are kept, so
-     * the chrome stays the same faintly-blue neutral it is in light mode. */
-    --color-grey-225-10-15: hsl(225, 10%, 92%);
-    --color-grey-225-10-35: hsl(225, 10%, 78%);
-    --color-grey-225-10-55: hsl(225, 10%, 62%);
-    --color-grey-225-10-75: hsl(225, 10%, 34%);
-    --color-grey-225-10-80: hsl(225, 10%, 30%);
-    --color-grey-225-10-85: hsl(225, 10%, 26%);
-    --color-grey-225-10-90: hsl(225, 10%, 22%);
-    --color-grey-225-10-95: hsl(225, 10%, 18%);
-    --color-grey-225-10-97: hsl(225, 10%, 15%);
+  :root .bio-theme-parent {
+    /* Surfaces, darkest to lightest, kept in the libraries' faintly-blue
+     * neutral. `--bio-surface` backs the context pad and the search; the
+     * overlay is popups. Both are `--panel` from the two documents'
+     * stylesheets, repeated because a custom property cannot be aliased across
+     * files without assuming load order. */
+    --bio-surface: #1d2026;
+    --bio-surface-overlay: #1d2026;
+    --bio-surface-subtle: hsl(225, 10%, 15%);
+    --bio-surface-medium: hsl(225, 10%, 18%);
 
-    /* Not "white" and "black": the surface colour and the ink colour. Both are
-     * only ever used as such — `--color-white` backs the canvas, the context
-     * pad, popups and the search container; `--color-black` is one crosshair.
-     * These are `--panel` and `--ink` from the two documents' stylesheets,
-     * repeated because a custom property cannot be aliased across files
-     * without assuming load order. */
-    --color-white: #1d2026;
-    --color-black: #e7e9ee;
+    /* Ink, and the inverted pair (tooltips): light on dark becomes dark on
+     * light. `--bio-text` is `--ink`. */
+    --bio-text: #e7e9ee;
+    --bio-text-subtle: hsl(225, 10%, 78%);
+    --bio-text-subtlest: hsl(225, 10%, 62%);
+    --bio-neutral: hsl(225, 10%, 78%);
+    --bio-surface-inverted: #e7e9ee;
+    --bio-surface-inverted-subtle: hsl(225, 10%, 78%);
+    --bio-text-on-inverted: #1d2026;
+
+    --bio-border: hsl(225, 10%, 34%);
+    --bio-border-disabled: hsl(225, 10%, 22%);
+
+    /* The pale tints are backgrounds, and at 95–97% lightness they read as
+     * white patches. Same hue, dark enough to sit under the ink. */
+    --bio-primary-surface: hsl(205, 45%, 22%);
+    --bio-focus-surface: hsl(205, 45%, 22%);
+    --bio-danger-surface-subtle: hsl(360, 45%, 18%);
+
+    /* Errors at 35–45% lightness disappear into the panel. */
+    --bio-danger: hsl(360, 85%, 72%);
+    --bio-danger-text: hsl(360, 85%, 68%);
 
     /* A 30%-black shadow is invisible against a dark ground. Shadows get
      * *stronger* here, not weaker — they are the only thing separating a
      * popup from the canvas behind it once both are dark. */
-    --color-black-opacity-05: hsla(0, 0%, 0%, 25%);
-    --color-black-opacity-10: hsla(0, 0%, 0%, 40%);
-    --color-black-opacity-30: hsla(0, 0%, 0%, 65%);
+    --bio-shadow: hsla(0, 0%, 0%, 65%);
+    --bio-shadow-subtle: hsla(0, 0%, 0%, 40%);
 
-    /* The pale tints are backgrounds, and at 92–97% lightness they read as
-     * white patches. Same hue, dark enough to sit under the ink. */
-    --color-blue-205-100-95: hsl(205, 45%, 22%);
-    --color-red-360-100-92: hsl(360, 45%, 26%);
-    --color-red-360-100-97: hsl(360, 45%, 18%);
+    /* Unchanged, deliberately: the blue accents read on dark as they are, and
+     * `--bio-text-on-primary` stays white — it is the `{}` drill-down glyph on
+     * a saturated blue chip. */
+  }
 
-    /* Errors at 40–45% lightness disappear into the panel. */
-    --color-red-360-100-40: hsl(360, 85%, 68%);
-    --color-red-360-100-45: hsl(360, 85%, 72%);
-
-    /* The canvas is the page, not a panel floating on it. */
+  /* The canvas is the page, not a panel floating on it: one step darker than
+   * `--bio-surface`, which it derives from by default. */
+  :root .djs-parent {
     --canvas-fill-color: #16181d;
-  }
-
-  /* Two exceptions where `--color-white` genuinely meant white: both sit on a
-   * saturated blue chip, where the ink colour would be dark-on-blue. These are
-   * the `{}` drill-down affordances — bpmn-js's into a collapsed subprocess,
-   * dmn-js's into a decision's logic. */
-  :root .bjs-container {
-    --drilldown-fill-color: #ffffff;
-  }
-
-  :root .dmn-drd-container {
-    --drill-down-overlay-color: #ffffff;
   }
 
   /* The definitions header — the model's name and id, editable in place, top

@@ -101,18 +101,24 @@ wasm:
 
 # Linter playground: fixture browser + live lint at http://localhost:5173.
 playground: wasm
-    cd playground && npm install && npm run dev
+    cd playground && npm ci --ignore-scripts && npm run dev
 
 # Build the two UI documents into crates/rbpmn-ui/assets/. Build output, so
 # gitignored: run this once after cloning, and again after touching ui/ or the
 # linter crates the editor embeds. rbpmn-ui's build.rs says so if you forget.
+#
+# Every npm step here is `npm ci --ignore-scripts`: exactly the committed
+# lockfile or a failure, and no package code at install time — these packages
+# are bundled into the editor a deployment serves. Changing a dependency is
+# `npm install <pkg>` in that directory, which its `.npmrc` holds to releases at
+# least a week old.
 ui:
-    cd ui && npm install && npm run build
+    cd ui && npm ci --ignore-scripts && npm run build
 
 # The UI's own unit tests: the pure modules (diagnosis, manifest parsing,
 # model facts, the L3 subtraction), no browser and no build artifacts needed.
 ui-test:
-    cd ui && npm install && npm test
+    cd ui && npm ci --ignore-scripts && npm test
 
 # Write both documents to disk so they can be opened directly — the editor is
 # usable with no server at all, and this is how you check that.
@@ -150,8 +156,8 @@ e2e-ui: ui-dist
 # bundled decisions instead of staying silent, so all 17 DMN fixtures differ
 # and parity fails per fixture. Verified by building one side each way.
 parity: wasm
-    cd playground && npm install && npm run parity
-    cd bpmnlint-plugin-rbpmn && npm install && npm test
+    cd playground && npm ci --ignore-scripts && npm run parity
+    cd bpmnlint-plugin-rbpmn && npm ci --ignore-scripts && npm test
 
 # TLA+ model checking of the concurrency protocol (spec/README.md). Needs
 # java; fetches tla2tools.jar into spec/ on first use (gitignored). The
@@ -374,14 +380,14 @@ dmn-tck *ARGS:
 
 # Bake DI into any fixture that lacks a BPMNDiagram section (idempotent).
 fixtures-di:
-    cd playground && npm install && node scripts/add-di.mjs
+    cd playground && npm ci --ignore-scripts && node scripts/add-di.mjs
 
 # Browser end-to-end tests with automatic screenshots (e2e/screenshots/,
 # gitignored): every fixture rendered, plus the full inspection stack when a
 # local Postgres is reachable. Needs python3 + playwright
 # (pip install playwright && playwright install chromium).
 e2e:
-    cd playground && npm install
+    cd playground && npm ci --ignore-scripts
     python3 e2e/run.py
 
 # ---------------------------------------------------------------- benchmarks

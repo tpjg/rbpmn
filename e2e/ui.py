@@ -61,16 +61,29 @@ def is_dark(css_color):
     token that stops being a hex string fails loudly rather than passing by
     accident.
     """
+    lum = luminance(css_color)
+    return lum is not None and lum < 128
+
+
+def is_light(css_color):
+    """The ink side of `is_dark`: luminance at or above the midpoint. Equally
+    strict — unparseable is *not* light."""
+    lum = luminance(css_color)
+    return lum is not None and lum >= 128
+
+
+def luminance(css_color):
+    """Relative luminance (0–255) of a #rgb/#rrggbb token, or None."""
     text = (css_color or "").strip().lstrip("#")
     if len(text) == 3:
         text = "".join(c * 2 for c in text)
     if len(text) != 6:
-        return False
+        return None
     try:
         r, g, b = (int(text[i : i + 2], 16) for i in (0, 2, 4))
     except ValueError:
-        return False
-    return (0.2126 * r + 0.7152 * g + 0.0722 * b) < 128
+        return None
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
 def check(condition, message):
@@ -880,6 +893,13 @@ def check_boundary_interrupting(page):
     check("always yes" in pane, f"and says why it cannot be anything else ({pane!r})")
 
 
+# Ink the chrome draws with, which must turn LIGHT. The surfaces derive from the
+# libraries' `--bio-surface*` tokens and the ink from `--bio-text`, so dark
+# surfaces alone do not show the override is whole: a dark palette can still
+# carry near-black entries.
+INK = ("--palette-entry-color",)
+
+
 def check_dark_mode(browser):
     """Legible on a dark desktop.
 
@@ -929,14 +949,15 @@ def check_dark_mode(browser):
                 "--palette-background-color",
                 "--context-pad-entry-background-color",
                 "--popup-background-color",
+                *INK,
             ],
         )
         check(chrome is not None, f"{name}: the diagram root exposes its colour tokens")
         for token, value in (chrome or {}).items():
-            check(
-                is_dark(value),
-                f"{name}: {token} is dark on a dark canvas ({value})",
-            )
+            if token in INK:
+                check(is_light(value), f"{name}: {token} is light on a dark canvas ({value})")
+            else:
+                check(is_dark(value), f"{name}: {token} is dark on a dark canvas ({value})")
         label = page.evaluate(
             "() => { const t = document.querySelector('.djs-label text, .djs-visual text');"
             " return t && (t.getAttribute('fill') || getComputedStyle(t).fill); }"
