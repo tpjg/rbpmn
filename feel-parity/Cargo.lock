@@ -112,7 +112,7 @@ dependencies = [
 [[package]]
 name = "dsntk-common"
 version = "0.3.1-dev"
-source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+source = "git+https://github.com/tpjg/dsntk?rev=514f8cb#514f8cba9a152a83f2a92adb8531ee9916e3e362"
 dependencies = [
  "dsntk-macros",
  "serde",
@@ -125,7 +125,7 @@ dependencies = [
 [[package]]
 name = "dsntk-feel"
 version = "0.3.1-dev"
-source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+source = "git+https://github.com/tpjg/dsntk?rev=514f8cb#514f8cba9a152a83f2a92adb8531ee9916e3e362"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -141,7 +141,7 @@ dependencies = [
 [[package]]
 name = "dsntk-feel-evaluator"
 version = "0.3.1-dev"
-source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+source = "git+https://github.com/tpjg/dsntk?rev=514f8cb#514f8cba9a152a83f2a92adb8531ee9916e3e362"
 dependencies = [
  "dsntk-common",
  "dsntk-feel",
@@ -157,7 +157,7 @@ dependencies = [
 [[package]]
 name = "dsntk-feel-grammar"
 version = "0.3.1-dev"
-source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+source = "git+https://github.com/tpjg/dsntk?rev=514f8cb#514f8cba9a152a83f2a92adb8531ee9916e3e362"
 dependencies = [
  "convert_case",
  "regex",
@@ -166,7 +166,7 @@ dependencies = [
 [[package]]
 name = "dsntk-feel-number"
 version = "0.3.1-dev"
-source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+source = "git+https://github.com/tpjg/dsntk?rev=514f8cb#514f8cba9a152a83f2a92adb8531ee9916e3e362"
 dependencies = [
  "dsntk-common",
  "dsntk-macros",
@@ -176,7 +176,7 @@ dependencies = [
 [[package]]
 name = "dsntk-feel-parser"
 version = "0.3.1-dev"
-source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+source = "git+https://github.com/tpjg/dsntk?rev=514f8cb#514f8cba9a152a83f2a92adb8531ee9916e3e362"
 dependencies = [
  "antex",
  "dsntk-common",
@@ -188,7 +188,7 @@ dependencies = [
 [[package]]
 name = "dsntk-feel-regex"
 version = "0.3.1-dev"
-source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+source = "git+https://github.com/tpjg/dsntk?rev=514f8cb#514f8cba9a152a83f2a92adb8531ee9916e3e362"
 dependencies = [
  "dsntk-common",
  "dsntk-macros",
@@ -198,7 +198,7 @@ dependencies = [
 [[package]]
 name = "dsntk-feel-temporal"
 version = "0.3.1-dev"
-source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+source = "git+https://github.com/tpjg/dsntk?rev=514f8cb#514f8cba9a152a83f2a92adb8531ee9916e3e362"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -211,7 +211,7 @@ dependencies = [
 [[package]]
 name = "dsntk-macros"
 version = "0.3.1-dev"
-source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+source = "git+https://github.com/tpjg/dsntk?rev=514f8cb#514f8cba9a152a83f2a92adb8531ee9916e3e362"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "rbpmn-model"
-version = "0.1.0"
+version = "0.7.2"
 dependencies = [
  "roxmltree",
  "serde",

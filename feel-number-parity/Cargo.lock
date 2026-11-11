@@ -74,7 +74,7 @@ dependencies = [
 [[package]]
 name = "dsntk-common"
 version = "0.3.1-dev"
-source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+source = "git+https://github.com/tpjg/dsntk?rev=514f8cb#514f8cba9a152a83f2a92adb8531ee9916e3e362"
 dependencies = [
  "dsntk-macros 0.3.1-dev",
  "serde",
@@ -98,7 +98,7 @@ dependencies = [
 [[package]]
 name = "dsntk-feel-number"
 version = "0.3.1-dev"
-source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+source = "git+https://github.com/tpjg/dsntk?rev=514f8cb#514f8cba9a152a83f2a92adb8531ee9916e3e362"
 dependencies = [
  "dsntk-common 0.3.1-dev",
  "dsntk-macros 0.3.1-dev",
@@ -119,7 +119,7 @@ dependencies = [
 [[package]]
 name = "dsntk-macros"
 version = "0.3.1-dev"
-source = "git+https://github.com/tpjg/dsntk?rev=37156c7#37156c76506de4e893588313cd1a0d029018452f"
+source = "git+https://github.com/tpjg/dsntk?rev=514f8cb#514f8cba9a152a83f2a92adb8531ee9916e3e362"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -43,13 +43,13 @@ serde_json.workspace = true
 # effectively single-maintainer, and moving it is a deliberate act that owes
 # `just number-parity` and `just dmn-tck`. All five entries must name the *same*
 # rev — `just dsntk-rev` checks that.
-dsntk-common = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
-dsntk-feel = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
-dsntk-feel-parser = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
-dsntk-model = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
-dsntk-model-evaluator = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
+dsntk-common = { git = "https://github.com/tpjg/dsntk", rev = "514f8cb" }
+dsntk-feel = { git = "https://github.com/tpjg/dsntk", rev = "514f8cb" }
+dsntk-feel-parser = { git = "https://github.com/tpjg/dsntk", rev = "514f8cb" }
+dsntk-model = { git = "https://github.com/tpjg/dsntk", rev = "514f8cb" }
+dsntk-model-evaluator = { git = "https://github.com/tpjg/dsntk", rev = "514f8cb" }
 
 [dev-dependencies]
 serde_json.workspace = true
 # The tests construct FEEL values directly to prove what the bridge refuses.
-dsntk-feel-temporal = { git = "https://github.com/tpjg/dsntk", rev = "37156c7" }
+dsntk-feel-temporal = { git = "https://github.com/tpjg/dsntk", rev = "514f8cb" }
