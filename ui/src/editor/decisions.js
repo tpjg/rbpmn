@@ -107,6 +107,26 @@ export function starterDecision(name) {
 /// cheap, and a modeler per artifact would multiply the listeners, the
 /// keyboard bindings and the ways two canvases can disagree about which one
 /// has focus.
+
+/// The types a modeler can pick, under the names the evaluator resolves.
+/// dmn-js offers the DMN 1.3 names by default — `date and time`, `days and time
+/// duration`, `years and months duration` — and dsntk resolves none of them, so
+/// deploy refuses each (`unresolved-type-ref`). Shown under those familiar
+/// labels, saved as the names that work. A model's own item definitions are
+/// added after these by dmn-js, as before.
+const BUILT_IN = { id: 'built-in', name: 'Built-ins' };
+const DATA_TYPES = [
+  { name: 'string', group: BUILT_IN },
+  { name: 'boolean', group: BUILT_IN },
+  { name: 'number', group: BUILT_IN },
+  { name: 'date', group: BUILT_IN },
+  { name: 'time', group: BUILT_IN },
+  { name: 'dateTime', label: 'date and time', group: BUILT_IN },
+  { name: 'dayTimeDuration', label: 'days and time duration', group: BUILT_IN },
+  { name: 'yearMonthDuration', label: 'years and months duration', group: BUILT_IN },
+  { name: 'Any', group: BUILT_IN },
+];
+
 export class DecisionEditor {
   constructor(container, { onChange, colors }) {
     this.container = container;
@@ -133,6 +153,7 @@ export class DecisionEditor {
     if (this.modeler) return this.modeler;
     this.modeler = new DmnModeler({
       container: this.container,
+      common: { dataTypes: DATA_TYPES },
       drd: {
         drdRenderer: this.colors,
         // Last wins in didi, and `additionalModules` is merged last — so this

@@ -15,8 +15,8 @@ serde_json = "1"
 # running against the FEEL an rbpmn condition will actually meet at deploy.
 # (`just dsntk-rev` does not police this one: it is deliberately allowed to lag
 # while a fork rev is being evaluated, and `just feel-parity` is not on CI.)
-dsntk-feel = { git = "https://github.com/tpjg/dsntk", rev = "514f8cb" }
-dsntk-feel-parser = { git = "https://github.com/tpjg/dsntk", rev = "514f8cb" }
-dsntk-feel-evaluator = { git = "https://github.com/tpjg/dsntk", rev = "514f8cb" }
+dsntk-feel = { git = "https://github.com/tpjg/dsntk", rev = "b735d3d" }
+dsntk-feel-parser = { git = "https://github.com/tpjg/dsntk", rev = "b735d3d" }
+dsntk-feel-evaluator = { git = "https://github.com/tpjg/dsntk", rev = "b735d3d" }
 
 [workspace]

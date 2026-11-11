@@ -24,9 +24,9 @@ crate-type = ["cdylib", "rlib"]
 # There is no `[patch.crates-io]` any more. That is itself part of what this
 # gate now proves: reaching wasm32 takes a plain dependency, not a
 # substitution a downstream consumer has to know to repeat.
-dsntk-model = { git = "https://github.com/tpjg/dsntk", rev = "514f8cb" }
-dsntk-model-evaluator = { git = "https://github.com/tpjg/dsntk", rev = "514f8cb" }
-dsntk-feel = { git = "https://github.com/tpjg/dsntk", rev = "514f8cb" }
+dsntk-model = { git = "https://github.com/tpjg/dsntk", rev = "b735d3d" }
+dsntk-model-evaluator = { git = "https://github.com/tpjg/dsntk", rev = "b735d3d" }
+dsntk-feel = { git = "https://github.com/tpjg/dsntk", rev = "b735d3d" }
 wasm-bindgen = "0.2"
 
 [workspace]

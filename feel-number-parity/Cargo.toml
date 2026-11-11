@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 # The replacement under test: the fork's `dsntk-feel-number` with its default
 # `use-fastnum` backend. Renamed, because...
-dsntk-feel-number-pure = { git = "https://github.com/tpjg/dsntk", rev = "514f8cb", package = "dsntk-feel-number", default-features = false, features = [
+dsntk-feel-number-pure = { git = "https://github.com/tpjg/dsntk", rev = "b735d3d", package = "dsntk-feel-number", default-features = false, features = [
   "use-fastnum",
 ] }
 # ...this is the *same package name* from a different source: upstream 0.3.0

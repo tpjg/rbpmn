@@ -16,6 +16,7 @@ Requires python3 with playwright; run via `just e2e-ui` (or e2e/run.py, which
 calls in here).
 """
 
+import colorsys
 import http.server
 import os
 import re
@@ -73,17 +74,45 @@ def is_light(css_color):
 
 
 def luminance(css_color):
-    """Relative luminance (0–255) of a #rgb/#rrggbb token, or None."""
-    text = (css_color or "").strip().lstrip("#")
-    if len(text) == 3:
-        text = "".join(c * 2 for c in text)
-    if len(text) != 6:
+    """Relative luminance (0–255) of a #rgb/#rrggbb, rgb() or hsl() token, or
+    None. A custom property reads back as written, so whether the build's
+    minifier rewrites a colour to hex must not decide what this can read."""
+    text = (css_color or "").strip()
+    rgb = parse_rgb(text) or parse_rgb_function(text) or parse_hsl(text)
+    if rgb is None:
+        return None
+    r, g, b = rgb
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def parse_rgb(text):
+    hex_ = text.lstrip("#") if text.startswith("#") else None
+    if hex_ is None:
+        return None
+    if len(hex_) == 3:
+        hex_ = "".join(c * 2 for c in hex_)
+    if len(hex_) != 6:
         return None
     try:
-        r, g, b = (int(text[i : i + 2], 16) for i in (0, 2, 4))
+        return tuple(int(hex_[i : i + 2], 16) for i in (0, 2, 4))
     except ValueError:
         return None
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def parse_rgb_function(text):
+    m = re.fullmatch(r"rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)(?:[\s,/]+[\d.%]+)?\s*\)", text)
+    return tuple(float(v) for v in m.groups()) if m else None
+
+
+def parse_hsl(text):
+    m = re.fullmatch(
+        r"hsla?\(\s*([\d.]+)(?:deg)?[\s,]+([\d.]+)%[\s,]+([\d.]+)%(?:[\s,/]+[\d.%]+)?\s*\)", text
+    )
+    if not m:
+        return None
+    h, s, l = float(m.group(1)) / 360, float(m.group(2)) / 100, float(m.group(3)) / 100
+    r, g, b = colorsys.hls_to_rgb(h, l, s)
+    return (r * 255, g * 255, b * 255)
 
 
 def check(condition, message):
@@ -900,6 +929,49 @@ def check_boundary_interrupting(page):
 INK = ("--palette-entry-color",)
 
 
+def check_type_picker(browser):
+    """The types a modeler can pick are ones deploy accepts.
+
+    dmn-js 18 offers the DMN 1.3 names by default — `date and time`, `days and
+    time duration`, `years and months duration` — and the evaluator resolves
+    none of them, so `unresolved-type-ref` refuses a model that picked one. The
+    editor configures dmn-js to save the evaluator's names under those labels;
+    this reads what the picker would write.
+    """
+    print("type picker")
+    page = browser.new_page()
+    problems = collect_problems(page)
+    page.goto((DIST / "editor.html").as_uri())
+    page.wait_for_selector(".djs-container", timeout=20000)
+    page.click("text=triage.dmn")
+    page.wait_for_selector(".dmn-drd-container", timeout=20000)
+    page.locator(".drill-down-overlay").first.click()
+    page.wait_for_selector(".dmn-decision-table-container", timeout=20000)
+    page.locator(".dmn-decision-table-container th.output-cell").first.dblclick()
+    page.wait_for_selector(".type-ref-edit-select", timeout=5000)
+    page.locator(".type-ref-edit-select .dms-input-select-icon").click()
+    page.wait_for_selector(".dms-select-options .option", timeout=5000)
+    saves = dict(
+        page.evaluate(
+            "() => [...document.querySelectorAll('.dms-select-options .option')]"
+            ".map(o => [o.textContent.trim(), o.dataset.value])"
+        )
+    )
+    for label, name in (
+        ("date and time", "dateTime"),
+        ("days and time duration", "dayTimeDuration"),
+        ("years and months duration", "yearMonthDuration"),
+    ):
+        check(saves.get(label) == name, f"'{label}' saves as {name} ({saves.get(label)!r})")
+    spec_names = {"date and time", "days and time duration", "years and months duration"}
+    check(
+        not spec_names & set(saves.values()),
+        f"no option saves a name the evaluator does not resolve ({sorted(saves.values())})",
+    )
+    check(not problems, f"no console errors in the type picker: {problems}")
+    page.close()
+
+
 def check_dark_mode(browser):
     """Legible on a dark desktop.
 
@@ -1239,6 +1311,7 @@ def main():
         check_inspector(browser)
         check_editor(browser)
         check_dark_mode(browser)
+        check_type_picker(browser)
         check_svg_export(browser)
         check_print_layout(browser)
         check_served(browser)

@@ -2,10 +2,11 @@
 <!-- expect-diagnostics:
   error dmn-validates @ 30-unresolved-parameter-type
 -->
-<!-- An unresolvable type on a function parameter (or a context entry) is one
-     the evaluator refuses to build at all, so it is `dmn-validates` rather than
-     `unresolved-type-ref`: loud already, and there is no built evaluator to
-     ask which name it was. The message says what to look for. -->
+<!-- An unresolvable type on a function parameter — or a context entry, a
+     function defined inside a context, an invocation binding with a formula —
+     is one the evaluator refuses to build at all, so it is `dmn-validates`
+     rather than `unresolved-type-ref`: loud already, and there is no built
+     evaluator to ask which name it was. The message says what to look for. -->
 <definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
              namespace="https://rbpmn.example/30-unresolved-parameter-type" name="30-unresolved-parameter-type" id="_30-unresolved-parameter-type">
   <businessKnowledgeModel name="Fee" id="fee">

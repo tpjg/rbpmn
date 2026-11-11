@@ -112,14 +112,15 @@ pub fn check(artifacts: &[String]) -> DecisionCheck {
 /// catch an upstream wording change.
 fn build_failure(parsed: &[Definitions], message: &str) -> Diagnostic {
     if !message.contains("ParserError") {
-        // dsntk refuses to build when a function parameter or a context entry
-        // names a type it cannot resolve, and its message names neither. The
-        // other slots build and are `unresolved-type-ref`; this one can only
-        // be pointed at. Keyed on the text like the classification above, and
+        // dsntk refuses to build when one of these slots names a type it
+        // cannot resolve, and its message names neither slot nor type. The
+        // other slots build and are `unresolved-type-ref`; these can only be
+        // pointed at. Keyed on the text like the classification above, and
         // as bounded: it changes the message, never the verdict.
         let hint = if message.contains("empty FEEL type") {
-            " — a function parameter or a context entry names a type that is neither \
-             a built-in type nor an item definition of this model"
+            " — a function parameter, a context entry, a function defined inside a \
+             context or an invocation binding with a formula names a type that does not \
+             resolve to a built-in type or an item definition"
         } else {
             ""
         };
@@ -156,33 +157,57 @@ fn build_failure(parsed: &[Definitions], message: &str) -> Diagnostic {
 }
 
 /// `unresolved-type-ref`: each type name the models carry, asked of the
-/// evaluator that was just built — the resolution its own evaluators apply,
-/// with the namespace they apply it in.
+/// evaluator that was just built, resolved the way it resolves that slot.
 fn type_diagnostics(parsed: &[Definitions], evaluator: &ModelEvaluator) -> Vec<Diagnostic> {
+    use crate::types::Kind;
     let mut diagnostics = Vec::new();
     for definitions in parsed {
+        // A reference to one of this model's own item definitions that does
+        // not resolve is that definition's fault, reported where it is
+        // defined; a second error at every use would send the modeler looking
+        // for a typo that is not there.
+        let own: Vec<&str> = definitions
+            .item_definitions()
+            .iter()
+            .map(|item| item.name())
+            .collect();
         for type_ref in crate::types::collect(definitions) {
-            if evaluator
-                .information_item_type(definitions.namespace(), &type_ref.name)
-                .is_some()
+            let resolves = match type_ref.kind {
+                Kind::ItemDefinition => evaluator
+                    .information_item_type(definitions.namespace(), &type_ref.name)
+                    .is_some(),
+                Kind::InputData | Kind::NotApplied => evaluator
+                    .variable_type(definitions, &type_ref.name)
+                    .is_some(),
+            };
+            if resolves
+                || (type_ref.kind != Kind::ItemDefinition && own.contains(&type_ref.name.as_str()))
             {
                 continue;
             }
+            let effect = match type_ref.kind {
+                Kind::InputData => "every value of this input evaluates to null",
+                Kind::ItemDefinition => {
+                    "input data of this type evaluates to null, and elsewhere the type is not applied"
+                }
+                Kind::NotApplied => {
+                    "the evaluator does not apply it, so the value is neither checked nor converted"
+                }
+            };
             let hint = match type_ref.name.as_str() {
                 "date and time" => {
-                    " — `date and time` is the DMN 1.3 name; the evaluator resolves `dateTime`"
+                    " (`date and time` is the DMN 1.3 name; the evaluator resolves `dateTime`)"
                 }
-                "days and time duration" => " — the evaluator resolves `dayTimeDuration`",
-                "years and months duration" => " — the evaluator resolves `yearMonthDuration`",
+                "days and time duration" => " (the evaluator resolves `dayTimeDuration`)",
+                "years and months duration" => " (the evaluator resolves `yearMonthDuration`)",
                 _ => "",
             };
             diagnostics.push(Diagnostic::error(
                 rule::UNRESOLVED_TYPE_REF,
                 &type_ref.element,
                 format!(
-                    "{} names type `{}`, which is neither a built-in type nor an item \
-                     definition of this model: the model would build, and every value of it \
-                     would evaluate to null{hint}",
+                    "{} names type `{}`, which does not resolve to a built-in type or an \
+                     item definition{hint}: {effect}",
                     type_ref.slot, type_ref.name
                 ),
             ));

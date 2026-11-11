@@ -77,7 +77,9 @@ jobs:
           rustc --version && cargo clippy --version && cargo fmt --version
 
       # An LTS line (to 2029-04). bpmnlint 12 needs Node 24+, and npm 11.10+ is
-      # what honours `min-release-age` in each package's .npmrc.
+      # what honours `min-release-age` in each package's .npmrc. 26.13.1 is
+      # younger than that week, deliberately: a security release (ten CVEs)
+      # from nodejs.org, checksummed, not a registry package.
       - uses: actions/setup-node@v4
         with:
           node-version: '26.13.1'

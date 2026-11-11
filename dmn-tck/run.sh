@@ -42,7 +42,7 @@ DSNTK_SHA256=d825c4d25e6b10d0393a606b2444a56c640cd137a0c1d465b29eff2e5e382d32
 # gate is worthless if it measures a dsntk nobody ships. `just dsntk-rev`
 # checks the two agree.
 DSNTK_FORK_URL=https://github.com/tpjg/dsntk
-DSNTK_FORK_REV=514f8cb
+DSNTK_FORK_REV=b735d3d
 TCK_COMMIT=20274cd2ba9cad805db6114f331c743f4b2603a1
 RUNNER_COMMIT=3276110236af1b9f1a0947a67bf421b283615c8f
 PATCHES_COMMIT=8dfc54e8ab137b6d3875d8dc649b77a2604cb8d2

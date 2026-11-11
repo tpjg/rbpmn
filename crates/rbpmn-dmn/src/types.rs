@@ -1,10 +1,20 @@
 //! Every place a DMN model names a type.
 //!
-//! `unresolved-type-ref` asks dsntk whether each of these resolves
-//! ([`dsntk_model_evaluator::ModelEvaluator::information_item_type`]), because
-//! a type it cannot resolve does not fail the build: the model compiles, and
-//! every value of that type evaluates to `null`. This walk only finds the
-//! names; which ones resolve is dsntk's answer, never a list kept here.
+//! `unresolved-type-ref` asks dsntk whether each of these resolves, because a
+//! type it cannot resolve mostly does not stop the build. What happens instead
+//! depends on the slot, measured against the evaluator: an input data value of
+//! that type — directly, or through an item definition whose base type does not
+//! resolve — evaluates to `null`; everywhere else the type is silently not
+//! applied, so the value is neither checked nor converted. Both are a model that
+//! means something other than what it says, which is what the rule refuses.
+//! This walk only finds the names; which ones resolve is dsntk's answer
+//! ([`dsntk_model_evaluator::ModelEvaluator::variable_type`] and
+//! `information_item_type`), never a list kept here.
+//!
+//! Where an unresolved type stops the build — a function parameter, a context
+//! entry, a function boxed in a context, an invocation binding with a formula —
+//! the slot is walked too and never reaches the rule: the build refuses first,
+//! as `dmn-validates`.
 //!
 //! Exhaustive like [`crate::expressions`], for the same reason: a dsntk upgrade
 //! that adds an expression kind breaks this build instead of leaving a corner
@@ -25,6 +35,23 @@ pub struct TypeRef {
     pub slot: &'static str,
     /// The type name as written.
     pub name: String,
+    /// How the evaluator resolves it, and what an unresolved one does.
+    pub kind: Kind,
+}
+
+/// The three ways the evaluator treats a type name, measured per slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// An input data variable: resolved as a variable (through the model's
+    /// imports); unresolved, every value of the input evaluates to `null`.
+    InputData,
+    /// An item definition's base type or a component's: resolved as written,
+    /// in the model's own namespace; unresolved, input data of this item
+    /// definition evaluates to `null`, and elsewhere the type is not applied.
+    ItemDefinition,
+    /// Every other slot: resolved as a variable; unresolved, the type is not
+    /// applied.
+    NotApplied,
 }
 
 /// Collect every type name in the artifact.
@@ -50,7 +77,12 @@ pub fn collect(definitions: &Definitions) -> Vec<TypeRef> {
                 }
             }
             DrgElement::InputData(input) => {
-                out.information_item(&locate(input), "variable", input.variable());
+                out.push(
+                    &locate(input),
+                    "variable",
+                    input.variable().type_ref(),
+                    Kind::InputData,
+                );
             }
             DrgElement::DecisionService(service) => {
                 out.information_item(&locate(service), "variable", service.variable());
@@ -68,30 +100,33 @@ struct Collector {
 }
 
 impl Collector {
-    fn push(&mut self, element: &str, slot: &'static str, name: &str) {
+    fn push(&mut self, element: &str, slot: &'static str, name: &str, kind: Kind) {
         self.out.push(TypeRef {
             element: element.to_string(),
             slot,
             name: name.to_string(),
+            kind,
         });
     }
 
     fn maybe(&mut self, element: &str, slot: &'static str, name: &Option<String>) {
         if let Some(name) = name {
-            self.push(element, slot, name);
+            self.push(element, slot, name, Kind::NotApplied);
         }
     }
 
     /// An information item always has a type: dsntk's parser writes `Any`
     /// where the document gave none.
     fn information_item(&mut self, element: &str, slot: &'static str, item: &InformationItem) {
-        self.push(element, slot, item.type_ref());
+        self.push(element, slot, item.type_ref(), Kind::NotApplied);
     }
 
     /// An item definition names its base type, or is a structure, a
     /// collection or a function signature built from others — and nests.
     fn item_definition(&mut self, element: &str, item: &ItemDefinition) {
-        self.maybe(element, "item definition", item.type_ref());
+        if let Some(name) = item.type_ref() {
+            self.push(element, "item definition", name, Kind::ItemDefinition);
+        }
         if let Some(function) = item.function_item() {
             self.maybe(element, "function output", function.output_type_ref());
             for parameter in function.parameters() {
