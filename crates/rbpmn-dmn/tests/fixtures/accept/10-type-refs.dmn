@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+
+-->
+<!-- Every built-in type name the evaluator resolves, and an item definition
+     reached through another one's component: none of these is refused by
+     unresolved-type-ref. -->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/10-type-refs" name="10-type-refs" id="_10-type-refs">
+  <itemDefinition name="Tier" id="tier">
+    <typeRef>string</typeRef>
+  </itemDefinition>
+  <itemDefinition name="Customer" id="customer">
+    <itemComponent name="tier" id="customerTier">
+      <typeRef>Tier</typeRef>
+    </itemComponent>
+    <itemComponent name="since" id="customerSince">
+      <typeRef>date</typeRef>
+    </itemComponent>
+  </itemDefinition>
+  <inputData name="A" id="a"><variable name="A" typeRef="Any"/></inputData>
+  <inputData name="B" id="b"><variable name="B" typeRef="string"/></inputData>
+  <inputData name="C" id="c"><variable name="C" typeRef="number"/></inputData>
+  <inputData name="D" id="d"><variable name="D" typeRef="boolean"/></inputData>
+  <inputData name="E" id="e"><variable name="E" typeRef="date"/></inputData>
+  <inputData name="F" id="f"><variable name="F" typeRef="time"/></inputData>
+  <inputData name="G" id="g"><variable name="G" typeRef="dateTime"/></inputData>
+  <inputData name="H" id="h"><variable name="H" typeRef="dayTimeDuration"/></inputData>
+  <inputData name="I" id="i"><variable name="I" typeRef="yearMonthDuration"/></inputData>
+  <inputData name="J" id="j"><variable name="J" typeRef="Customer"/></inputData>
+  <decision name="Echo" id="echo">
+    <variable name="Echo" typeRef="Tier"/>
+    <informationRequirement><requiredInput href="#j"/></informationRequirement>
+    <literalExpression typeRef="Tier"><text>J.tier</text></literalExpression>
+  </decision>
+</definitions>

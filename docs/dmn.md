@@ -234,7 +234,8 @@ patch site deep in dsntk's bifs, so it is a follow-up, not a prerequisite.
 ### D8 — new rule ids (stable public API from the day they land)
 
 `dmn-validates`, `feel-parses`, `feel-deterministic`, `decision-has-binding`,
-`unresolved-decision`. Rule ids are never renamed; new ones are always allowed.
+`unresolved-decision`, `unresolved-type-ref`. Rule ids are never renamed; new
+ones are always allowed.
 
 `no-unsupported-element` relaxes for `businessRuleTask` **only when the runtime
 lands** — the exact ordering ruling already taken for expression timers.

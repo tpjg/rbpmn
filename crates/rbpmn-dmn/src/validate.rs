@@ -6,6 +6,8 @@
 //! * `feel-parses` — every FEEL expression in it parses.
 //! * `feel-deterministic` — none of them reads a clock or calls out of the
 //!   process.
+//! * `unresolved-type-ref` — every type the model names resolves, asked of the
+//!   evaluator once it builds.
 //!
 //! Building the evaluator is what `deploy` does, so it is what validation
 //! does: `ModelEvaluator::new` parses every expression in the model **with the
@@ -23,7 +25,7 @@
 
 use crate::expressions::{self, Grammar};
 use dsntk_feel::FeelScope;
-use dsntk_model::{Definitions, NamedElement};
+use dsntk_model::{Definitions, DmnElement, NamedElement};
 use dsntk_model_evaluator::ModelEvaluator;
 use rbpmn_core::{DecisionCheck, DecisionValidator, Invocable};
 use rbpmn_model::{Diagnostic, has_errors, rule};
@@ -72,6 +74,7 @@ pub fn check(artifacts: &[String]) -> DecisionCheck {
 
     match ModelEvaluator::new(&parsed) {
         Ok(evaluator) => {
+            diagnostics.extend(type_diagnostics(&parsed, &evaluator));
             let mut invocables: Vec<Invocable> = evaluator
                 .invocables()
                 .list()
@@ -109,10 +112,21 @@ pub fn check(artifacts: &[String]) -> DecisionCheck {
 /// catch an upstream wording change.
 fn build_failure(parsed: &[Definitions], message: &str) -> Diagnostic {
     if !message.contains("ParserError") {
+        // dsntk refuses to build when a function parameter or a context entry
+        // names a type it cannot resolve, and its message names neither. The
+        // other slots build and are `unresolved-type-ref`; this one can only
+        // be pointed at. Keyed on the text like the classification above, and
+        // as bounded: it changes the message, never the verdict.
+        let hint = if message.contains("empty FEEL type") {
+            " — a function parameter or a context entry names a type that is neither \
+             a built-in type nor an item definition of this model"
+        } else {
+            ""
+        };
         return Diagnostic::error(
             rule::DMN_VALIDATES,
             model_label(parsed),
-            format!("decision logic does not build: {message}"),
+            format!("decision logic does not build: {message}{hint}"),
         );
     }
     // A FEEL syntax error. Try to say *where*: re-parse each expression and
@@ -139,6 +153,42 @@ fn build_failure(parsed: &[Definitions], message: &str) -> Diagnostic {
         }
     }
     Diagnostic::error(rule::FEEL_PARSES, model_label(parsed), message.to_string())
+}
+
+/// `unresolved-type-ref`: each type name the models carry, asked of the
+/// evaluator that was just built — the resolution its own evaluators apply,
+/// with the namespace they apply it in.
+fn type_diagnostics(parsed: &[Definitions], evaluator: &ModelEvaluator) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for definitions in parsed {
+        for type_ref in crate::types::collect(definitions) {
+            if evaluator
+                .information_item_type(definitions.namespace(), &type_ref.name)
+                .is_some()
+            {
+                continue;
+            }
+            let hint = match type_ref.name.as_str() {
+                "date and time" => {
+                    " — `date and time` is the DMN 1.3 name; the evaluator resolves `dateTime`"
+                }
+                "days and time duration" => " — the evaluator resolves `dayTimeDuration`",
+                "years and months duration" => " — the evaluator resolves `yearMonthDuration`",
+                _ => "",
+            };
+            diagnostics.push(Diagnostic::error(
+                rule::UNRESOLVED_TYPE_REF,
+                &type_ref.element,
+                format!(
+                    "{} names type `{}`, which is neither a built-in type nor an item \
+                     definition of this model: the model would build, and every value of it \
+                     would evaluate to null{hint}",
+                    type_ref.slot, type_ref.name
+                ),
+            ));
+        }
+    }
+    diagnostics
 }
 
 /// `feel-deterministic`, per expression.

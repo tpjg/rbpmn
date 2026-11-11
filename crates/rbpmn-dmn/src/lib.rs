@@ -34,6 +34,7 @@
 pub mod determinism;
 mod evaluate;
 pub mod expressions;
+pub mod types;
 mod validate;
 pub mod value;
 

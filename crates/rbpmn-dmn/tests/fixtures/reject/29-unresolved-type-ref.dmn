@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- expect-diagnostics:
+  error unresolved-type-ref @ money
+  error unresolved-type-ref @ customer
+  error unresolved-type-ref @ due
+  error unresolved-type-ref @ late
+  error unresolved-type-ref @ fee
+  error unresolved-type-ref @ band
+  error unresolved-type-ref @ echo
+-->
+<!-- Each slot where the evaluator builds the model and then evaluates every
+     value of an unresolvable type to null: an item definition's base type and
+     a component's, the variables of input data, a decision and a BKM, a
+     decision table's output, a literal expression's own type. `date and time`
+     is what dmn-js 18 writes for a new date-time selection. -->
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
+             namespace="https://rbpmn.example/29-unresolved-type-ref" name="29-unresolved-type-ref" id="_29-unresolved-type-ref">
+  <itemDefinition name="Money" id="money">
+    <typeRef>Currency</typeRef>
+  </itemDefinition>
+  <itemDefinition name="Customer" id="customer">
+    <itemComponent name="tier" id="customerTier"><typeRef>Tier</typeRef></itemComponent>
+  </itemDefinition>
+  <inputData name="Due" id="due">
+    <variable name="Due" typeRef="date and time"/>
+  </inputData>
+  <inputData name="Amount" id="amount">
+    <variable name="Amount" typeRef="number"/>
+  </inputData>
+  <decision name="Late" id="late">
+    <variable name="Late" typeRef="Lateness"/>
+    <informationRequirement><requiredInput href="#due"/></informationRequirement>
+    <literalExpression><text>Due</text></literalExpression>
+  </decision>
+  <businessKnowledgeModel name="Fee" id="fee">
+    <variable name="Fee" typeRef="Charge"/>
+    <encapsulatedLogic kind="FEEL">
+      <formalParameter name="p" typeRef="number"/>
+      <literalExpression><text>p * 0.02</text></literalExpression>
+    </encapsulatedLogic>
+  </businessKnowledgeModel>
+  <decision name="Band" id="band">
+    <variable name="Band" typeRef="string"/>
+    <informationRequirement><requiredInput href="#amount"/></informationRequirement>
+    <decisionTable hitPolicy="UNIQUE">
+      <input><inputExpression typeRef="number"><text>Amount</text></inputExpression></input>
+      <output typeRef="Grade"/>
+      <rule><inputEntry><text>&gt;= 100</text></inputEntry><outputEntry><text>"high"</text></outputEntry></rule>
+      <rule><inputEntry><text>&lt; 100</text></inputEntry><outputEntry><text>"low"</text></outputEntry></rule>
+    </decisionTable>
+  </decision>
+  <decision name="Echo" id="echo">
+    <variable name="Echo" typeRef="Any"/>
+    <informationRequirement><requiredInput href="#amount"/></informationRequirement>
+    <literalExpression typeRef="Quantity"><text>Amount</text></literalExpression>
+  </decision>
+</definitions>

@@ -128,6 +128,9 @@ pub mod rule {
     /// naming a decision the bundle actually exposes.
     pub const DECISION_HAS_BINDING: &str = "decision-has-binding";
     pub const UNRESOLVED_DECISION: &str = "unresolved-decision";
+    /// A type a DMN model names that dsntk cannot resolve: the model builds,
+    /// and every value of that type evaluates to `null`.
+    pub const UNRESOLVED_TYPE_REF: &str = "unresolved-type-ref";
 
     /// A manifest config entry: a JSON object, keyed by an element that
     /// produces a work item. Deploy-time (L2) like `decision-has-binding`,
@@ -286,6 +289,11 @@ pub const CATALOGUE: &[RuleInfo] = &[
         id: rule::UNRESOLVED_DECISION,
         severity: Severity::Error,
         summary: "Every bound decision must name exactly one invocable in the bundled DMN artifacts. Unlike unresolved-topic this needs no environment: decisions travel inside the deployment.",
+    },
+    RuleInfo {
+        id: rule::UNRESOLVED_TYPE_REF,
+        severity: Severity::Error,
+        summary: "Every type a DMN model names must resolve: a built-in type the evaluator knows, or an item definition of the same model. An unresolved one does not stop the model building; every value of it evaluates to null.",
     },
     RuleInfo {
         id: rule::FEEL_DETERMINISTIC,

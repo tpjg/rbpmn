@@ -44,7 +44,7 @@ pub struct FeelExpression {
 /// its name otherwise. DMN ids are optional (dsntk synthesises one when the
 /// document omits it), names are not — and a synthesised id means nothing to
 /// the person reading the diagnostic.
-fn locate<T: DmnElement + NamedElement>(element: &T) -> String {
+pub(crate) fn locate<T: DmnElement + NamedElement>(element: &T) -> String {
     match element.opt_id() {
         Some(id) if !id.is_empty() => id.clone(),
         _ => element.name().to_string(),

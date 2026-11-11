@@ -6,13 +6,13 @@
 <definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/"
              namespace="https://rbpmn.example/23-now-in-input-entry" name="23-now-in-input-entry" id="_23-now-in-input-entry">
   <inputData name="Due" id="due">
-    <variable name="Due" typeRef="date and time"/>
+    <variable name="Due" typeRef="dateTime"/>
   </inputData>
   <decision name="Expiring" id="expiring">
     <variable name="Expiring" typeRef="boolean"/>
     <informationRequirement><requiredInput href="#due"/></informationRequirement>
     <decisionTable hitPolicy="UNIQUE">
-      <input><inputExpression typeRef="date and time"><text>Due</text></inputExpression></input>
+      <input><inputExpression typeRef="dateTime"><text>Due</text></inputExpression></input>
       <output typeRef="boolean"/>
       <rule><inputEntry><text>&lt; now()</text></inputEntry><outputEntry><text>true</text></outputEntry></rule>
       <rule><inputEntry><text>&gt;= now()</text></inputEntry><outputEntry><text>false</text></outputEntry></rule>
