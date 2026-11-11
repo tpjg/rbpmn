@@ -3,6 +3,53 @@
 This file starts at 0.7.0. Earlier releases are described by their tags and
 commit history.
 
+## 0.7.3
+
+### Added
+
+**`unresolved-type-ref`: a type a DMN model names must resolve.** A built-in
+type the evaluator knows, or an item definition — of the same model, or of an
+imported one through its prefix. dsntk builds such a model anyway, and what it
+does instead depends on the slot: an input data value of an unresolved type is
+`null` (also through an item definition whose base type does not resolve), and
+everywhere else the type is silently not applied. Deploy now refuses both,
+naming the element. Which names resolve is asked of dsntk itself
+(`ModelEvaluator::variable_type` and `information_item_type`, added to the fork
+at `b735d3d`), slot by slot as it resolves them. A function parameter, a
+context entry, a function defined inside a context or an invocation binding
+with a formula with an unresolved type already stopped the build; that
+`dmn-validates` message now says so.
+
+A bundle that names a type which does not exist no longer deploys, where it did
+before.
+
+### Changed
+
+**The editor and inspector bundle bpmn-js 18.31, dmn-js 18 and diagram-js
+15.28.** diagram-js 15.28 themes all three libraries through one token layer,
+the `--bio-*` custom properties on `.bio-theme-parent`, and no longer reads the
+`--color-grey-*` ramp. Dark mode now overrides those tokens; the colours are
+unchanged.
+
+dmn-js 18 offers the DMN 1.3 type names — `date and time`, `days and time
+duration`, `years and months duration` — which the evaluator does not resolve.
+The editor shows those labels and saves `dateTime`, `dayTimeDuration` and
+`yearMonthDuration`. A model saved by another dmn-js 18 modeler with the DMN
+1.3 names is refused by `unresolved-type-ref`.
+
+**npm installs are `npm ci --ignore-scripts`, and resolve releases at least
+seven days old.** Every recipe installs exactly the committed lockfile and runs
+no package code at install time; each package's `.npmrc` sets
+`min-release-age=7` for the `npm install` that changes a dependency. CI runs
+Node 26, whose npm honours it.
+
+### Security
+
+The lockfiles move off the advisories `npm audit` and `cargo audit` reported:
+vite's dev-server issues (a build-time dependency; `vite build` never starts
+the server) and three in quinn-proto (in this repository's Cargo.lock only;
+a consumer resolves its own).
+
 ## 0.7.2
 
 ### Added
