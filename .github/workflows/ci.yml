@@ -115,8 +115,8 @@ jobs:
           echo "${JUST_SHA256}  /tmp/just.tar.gz" | sha256sum -c -
           tar xzf /tmp/just.tar.gz -C /tmp just
           sudo mv /tmp/just /usr/local/bin/
-          WASM_PACK_VERSION=0.15.0
-          WASM_PACK_SHA256=c09f971ecaed9a2efc80fdcea7a00ef6b53c7fadc8c57d1f61b53a6aa66b668a
+          WASM_PACK_VERSION=0.15.1
+          WASM_PACK_SHA256=410101009739b9d01c7d5affaaad6e9c9a24b4cba6791a4805db8e89b9bf7af2
           curl -fsSLo /tmp/wasm-pack.tar.gz "https://github.com/wasm-bindgen/wasm-pack/releases/download/v${WASM_PACK_VERSION}/wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl.tar.gz"
           echo "${WASM_PACK_SHA256}  /tmp/wasm-pack.tar.gz" | sha256sum -c -
           tar xzf /tmp/wasm-pack.tar.gz -C /tmp
@@ -139,7 +139,7 @@ jobs:
         # Its own step so the ~150 MB chromium download is visible as itself
         # rather than as part of a test that appears to hang.
         run: |
-          pip install --break-system-packages playwright==1.62.0
+          pip install --break-system-packages playwright==1.64.1
           playwright install --with-deps chromium
 
       # `just ui` MUST come before anything that builds rbpmn-ui — `just lint`
