@@ -187,10 +187,11 @@ Every physical relation (tables, indexes, and the migration ledger
 schema with the embedding application's business tables — that is the whole
 point of same-transaction stepping — so generic names like `instance` are
 not ours to claim. Prose below uses the short names; the DDL is prefixed.
-(The migration runner is hand-rolled for the same reason: sqlx's migrator
-keeps its ledger in `_sqlx_migrations` unless the *host* renames it through
-sqlx's opt-in `sqlx.toml`, so a library using it would collide with a host
-application running its own sqlx migrations in the shared schema.)
+(The migration runner is hand-rolled, so its ledger is `rbpmn_migrations` by
+construction and the engine needs no sqlx `migrate` feature. sqlx's migrator
+keeps `_sqlx_migrations` — the table a host running its own sqlx migrations in
+the shared schema uses — unless renamed with `Migrator::dangerous_set_table_name`;
+the runner here is the smaller thing to keep right.)
 
 - `definition` (id, key, **version**, bpmn_xml, parsed/validated model as JSONB cache,
   deployed_at) — (key, version) unique; instances pin a definition id.

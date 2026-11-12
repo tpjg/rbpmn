@@ -506,10 +506,10 @@ impl Engine {
 
     /// Run the schema migrations. Idempotent; call at startup.
     ///
-    /// Hand-rolled on purpose: sqlx's migrator hardcodes its
-    /// `_sqlx_migrations` ledger, which would collide with a host
-    /// application running its own sqlx migrations in the shared schema.
-    /// Every rbpmn relation — this ledger included — is `rbpmn_`-prefixed.
+    /// Hand-rolled: the ledger is `rbpmn_migrations`, `rbpmn_`-prefixed like
+    /// every rbpmn relation, and the engine needs no sqlx `migrate` feature.
+    /// sqlx's migrator keeps `_sqlx_migrations` — the host's, when the host
+    /// runs its own sqlx migrations in the shared schema — unless renamed.
     pub async fn migrate(&self) -> Result<(), EngineError> {
         let mut tx = self.inner.pool.begin().await?;
         // Serialize concurrent migrators (replicas booting together).
@@ -923,5 +923,17 @@ mod cache_tests {
             engine.cached_manifest(id).is_none(),
             "a manifest outlived the definition it belongs to"
         );
+    }
+}
+
+/// The `whoami` line in this crate's Cargo.toml exists for one effect: whoami
+/// built with `std`, so sqlx's default user is the OS user. Without it
+/// whoami's stub answers "anonymous" and a URL without a user connects as a
+/// role that does not exist. Fails when the feature drops out of the graph.
+#[cfg(test)]
+mod whoami_feature {
+    #[test]
+    fn the_os_user_is_not_the_stub() {
+        assert_ne!(whoami::username().as_deref().ok(), Some("anonymous"));
     }
 }

@@ -16,8 +16,11 @@ the graph. sqlx 0.9 no longer has `runtime-tokio-rustls`; the engine uses
 sqlx 0.9 refuses a query that is not a string literal unless it is wrapped in
 `AssertSqlSafe`. Every query the engine builds at runtime is wrapped where its
 SQL is built. What those queries splice is unchanged: view and table
-constants, placeholder numbers, and the definition key and variable names a
-task filter checks against `[A-Za-z0-9_.-]`. Every value is bound.
+constants, placeholder numbers, a definition key checked against
+`[A-Za-z0-9_.-]`, and variable names checked as single-segment FEEL names
+(`[A-Za-z_][A-Za-z0-9_]*`) — by a task filter, and by `declare_index` and
+`declare_shared_index`, which also build the index name and predicate from
+them. Every value is bound.
 
 A connection URL that names no user (`postgres:///rbpmn`, peer
 authentication) connects as the OS user, as it did with sqlx 0.8.

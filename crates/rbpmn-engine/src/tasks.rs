@@ -982,6 +982,10 @@ impl Engine {
     }
 }
 
+/// Spliced into DDL, which has no placeholders: `name`, `field` and
+/// `predicate` come only from `declare_index` and `declare_shared_index`,
+/// which validate the field and the definition key before building them.
+/// Private, so nothing else reaches it.
 async fn build_index(
     conn: &mut sqlx::PgConnection,
     name: &str,
