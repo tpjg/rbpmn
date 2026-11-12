@@ -217,7 +217,7 @@ const FSCK: &[(&str, &str)] = &[
 pub async fn fsck(pool: &PgPool) -> Vec<String> {
     let mut found = Vec::new();
     for (name, sql) in FSCK {
-        let rows = sqlx::query(sql)
+        let rows = sqlx::query(*sql)
             .fetch_all(pool)
             .await
             .unwrap_or_else(|e| panic!("fsck query '{name}' failed: {e}"));
@@ -461,7 +461,7 @@ pub fn with_process_id(xml: &str, id: &str) -> String {
         .replace("bpmnElement=\"p\"", &format!("bpmnElement=\"{id}\""))
 }
 
-pub async fn count(pool: &PgPool, sql: &str) -> i64 {
+pub async fn count(pool: &PgPool, sql: impl sqlx::SqlSafeStr) -> i64 {
     sqlx::query(sql).fetch_one(pool).await.unwrap().get(0)
 }
 

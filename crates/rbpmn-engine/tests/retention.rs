@@ -60,7 +60,7 @@ async fn backdate(pool: &PgPool, id: Uuid, secs: i64) {
     .unwrap();
 }
 
-async fn count(pool: &PgPool, sql: &str, id: Uuid) -> i64 {
+async fn count(pool: &PgPool, sql: impl sqlx::SqlSafeStr, id: Uuid) -> i64 {
     sqlx::query_scalar(sql)
         .bind(id)
         .fetch_one(pool)

@@ -67,6 +67,7 @@
 use crate::events::{EventCursor, EventRecord};
 use crate::runtime::ts;
 use crate::{Engine, EngineError};
+use sqlx::AssertSqlSafe;
 use sqlx::{PgConnection, Row};
 use std::future::Future;
 use std::pin::Pin;
@@ -455,12 +456,12 @@ impl Engine {
             // notices a mis-set age and calls `set_retention_policy(...,
             // forever())` while a sweep is blocked on an upload must have
             // that stop the in-flight batch too, not only the next one.
-            let locked: Vec<Uuid> = sqlx::query_scalar(&format!(
+            let locked: Vec<Uuid> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "select i.id from rbpmn_instance i \
                  left join rbpmn_retention_policy p on p.definition_key = i.definition_key \
                  where i.id = any($2) and {DUE} \
                  for update of i skip locked"
-            ))
+            )))
             .bind(options.default_policy.secs())
             .bind(&ids)
             .fetch_all(&mut *tx)
@@ -855,11 +856,11 @@ async fn plan_due(
     options: &RetentionOptions,
     with_events: bool,
 ) -> Result<(ArchiveBatch, u64), EngineError> {
-    let candidates: Vec<Uuid> = sqlx::query_scalar(&format!(
+    let candidates: Vec<Uuid> = sqlx::query_scalar(AssertSqlSafe(format!(
         "select i.id from rbpmn_instance i \
          left join rbpmn_retention_policy p on p.definition_key = i.definition_key \
          where {DUE} order by i.completed_at limit $2"
-    ))
+    )))
     .bind(options.default_policy.secs())
     .bind(i64::from(options.max_instances))
     .fetch_all(&mut *conn)
@@ -935,7 +936,7 @@ async fn load_records(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let headers = sqlx::query(&format!(
+    let headers = sqlx::query(AssertSqlSafe(format!(
         "select i.id, i.definition_id, i.definition_key, d.version, i.business_key, \
                 i.status, i.variables, \
                 {}, {} \
@@ -943,18 +944,18 @@ async fn load_records(
          where i.id = any($1)",
         ts("i.created_at", "created_at"),
         ts("i.completed_at", "completed_at"),
-    ))
+    )))
     .bind(ids)
     .fetch_all(&mut *conn)
     .await?;
 
     let event_rows = if with_events {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "select id, txid::text::bigint as txid, instance_id, definition_key, kind, \
                     element_id, payload, {} \
              from rbpmn_event where instance_id = any($1) order by instance_id, id",
             ts("at", "at"),
-        ))
+        )))
         .bind(ids)
         .fetch_all(&mut *conn)
         .await?

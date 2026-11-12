@@ -13,7 +13,13 @@ rbpmn-model = { path = "../rbpmn-model" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "json"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "json"] }
+# Only to turn on whoami's `std`. sqlx-postgres 0.9.0 takes whoami without it,
+# and whoami's stub then names every OS user "anonymous" — so a connection URL
+# without a user (`postgres:///db`, peer auth) logs in as a role that does not
+# exist. Fixed in sqlx after 0.9.0 (transact-rs/sqlx#4303); this line goes when
+# a release carries it.
+whoami = { version = "2", default-features = false, features = ["std"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["sync", "time", "macros"] }

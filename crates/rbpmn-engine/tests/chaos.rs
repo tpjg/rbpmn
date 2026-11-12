@@ -22,6 +22,7 @@ mod harness;
 use harness::*;
 use rbpmn_engine::testing::TestDb;
 use rbpmn_engine::{Engine, HandlerFailure, ServiceTaskHandler, WorkItem, WorkerOptions};
+use sqlx::AssertSqlSafe;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 use std::future::Future;
@@ -520,10 +521,10 @@ async fn the_engine_converges_through_chaos() {
     ] {
         let doubles = count(
             &db.pool,
-            &format!(
+            AssertSqlSafe(format!(
                 "select count(*) from (select instance_id, payload->>'id' as x \
                  from rbpmn_event where kind = '{kind}' group by 1, 2 having count(*) > 1) y"
-            ),
+            )),
         )
         .await;
         assert_eq!(doubles, 0, "{what}");

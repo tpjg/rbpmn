@@ -27,6 +27,7 @@ use rbpmn_engine::{
     Engine, EngineError, GetTaskOptions, HandlerFailure, SchedulerOptions, ServiceTaskHandler,
     TaskFilter, WorkItem, WorkerOptions,
 };
+use sqlx::AssertSqlSafe;
 use sqlx::{PgPool, Row};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -170,10 +171,10 @@ pub(crate) async fn truncate_all(pool: &PgPool) -> Result<u64, String> {
     // `restart identity` resets rbpmn_event's bigserial too: two runs of the
     // same scenario should produce the same event ids, not ids that depend
     // on how much ran before them.
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "truncate {} restart identity cascade",
         tables.join(", ")
-    ))
+    )))
     .execute(pool)
     .await
     .map_err(|e| format!("truncating for a fresh run: {e}"))?;
@@ -1259,7 +1260,7 @@ pub(crate) async fn apply_tuning(pool: &PgPool, root: &Path) -> Result<Option<St
     let Ok(sql) = std::fs::read_to_string(&path) else {
         return Ok(None);
     };
-    sqlx::raw_sql(&sql)
+    sqlx::raw_sql(AssertSqlSafe(sql.as_str()))
         .execute(pool)
         .await
         .map_err(|e| format!("{}: {e}", path.display()))?;

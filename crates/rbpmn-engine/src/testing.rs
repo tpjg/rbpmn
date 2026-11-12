@@ -1,6 +1,7 @@
 //! Test harness (feature `test-util`): throwaway databases against a local
 //! Postgres, shared by the engine's own integration tests and the server's.
 
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 
 /// The claim path's own SQL, exposed so a test can differential the published
@@ -35,7 +36,7 @@ impl TestDb {
              (set RBPMN_TEST_ADMIN_URL to override the default)",
         );
         let name = format!("rbpmn_test_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("create database {name}"))
+        sqlx::query(AssertSqlSafe(format!("create database {name}")))
             .execute(&admin)
             .await
             .unwrap();
@@ -71,10 +72,13 @@ impl TestDb {
     pub async fn drop(self) {
         self.pool.close().await;
         let admin = PgPool::connect(&self.admin_url).await.unwrap();
-        sqlx::query(&format!("drop database {} (force)", self.name))
-            .execute(&admin)
-            .await
-            .unwrap();
+        sqlx::query(AssertSqlSafe(format!(
+            "drop database {} (force)",
+            self.name
+        )))
+        .execute(&admin)
+        .await
+        .unwrap();
         admin.close().await;
     }
 }

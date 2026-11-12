@@ -21,6 +21,7 @@
 use crate::listen::Wakeup;
 use crate::runtime::FailOptions;
 use crate::{Engine, EngineError, WorkItem};
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -142,7 +143,7 @@ impl Engine {
         // Filters: handled topics, availability (or expired lease), retry
         // backoff elapsed, and — crucially — the instance still active, so
         // an incident-frozen instance's siblings are never re-executed.
-        let claim = format!(
+        let claim = AssertSqlSafe(format!(
             "update rbpmn_work_item set state = 'locked', lock_owner = $2, \
              lock_until = now() + make_interval(secs => $3), \
              lease_no = lease_no + 1 \
@@ -155,8 +156,8 @@ impl Engine {
                (select variables from rbpmn_instance i2 \
                  where i2.id = rbpmn_work_item.instance_id) as variables",
             claimable = crate::CLAIMABLE,
-        );
-        let Some(row) = sqlx::query(&claim)
+        ));
+        let Some(row) = sqlx::query(claim)
             .bind(&topics)
             .bind(&options.owner)
             .bind(options.lease.as_secs_f64())

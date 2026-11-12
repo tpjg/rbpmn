@@ -11,6 +11,7 @@ use rbpmn_engine::{
     HandlerFailure, HttpPostHandler, InstanceStatus, Refusal, RepairKind, ServiceTaskHandler,
     StepError, Takes, TaskIds, TopicFilter, WorkItem, WorkerOptions,
 };
+use sqlx::AssertSqlSafe;
 use sqlx::{PgPool, Row};
 use std::fs;
 use std::future::Future;
@@ -7818,10 +7819,12 @@ async fn timer_dues(pool: &PgPool, instance: uuid::Uuid) -> Vec<(i64, f64, Optio
 }
 
 async fn db_epoch(pool: &PgPool, expr: &str) -> f64 {
-    sqlx::query_scalar(&format!("select extract(epoch from {expr})::float8"))
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar(AssertSqlSafe(format!(
+        "select extract(epoch from {expr})::float8"
+    )))
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 /// Push every armed occurrence of an instance `ago` into the past. The golden
@@ -8158,17 +8161,22 @@ async fn a_bounded_cycle_exhausts() {
 /// session, so both run on one pinned connection. Parameterised deliberately:
 /// the shape an application actually issues is `definition_key = any($n)`, and
 /// a literal array would be a different question.
-async fn explain_prepared(pool: &PgPool, name: &str, prepare: &str, execute: &str) -> String {
+async fn explain_prepared(
+    pool: &PgPool,
+    name: &str,
+    prepare: impl sqlx::SqlSafeStr,
+    execute: &str,
+) -> String {
     let mut conn = pool.acquire().await.unwrap();
     // Pooled connections come back with their prepared statements intact, so
     // a second call in one test collides on the name. Drop just ours —
     // `deallocate all` would take sqlx's own statement cache with it and
     // break every later query on this connection.
-    let _ = sqlx::query(&format!("deallocate {name}"))
+    let _ = sqlx::query(AssertSqlSafe(format!("deallocate {name}")))
         .execute(&mut *conn)
         .await;
     sqlx::query(prepare).execute(&mut *conn).await.unwrap();
-    let rows = sqlx::query(&format!("explain (costs off) {execute}"))
+    let rows = sqlx::query(AssertSqlSafe(format!("explain (costs off) {execute}")))
         .fetch_all(&mut *conn)
         .await
         .unwrap();
@@ -8192,7 +8200,7 @@ fn plan_lines<'a>(plan: &'a str, needle: &str) -> Vec<&'a str> {
 /// finding `just bench` records for the claim path, one altitude down.
 async fn analyze(pool: &PgPool) {
     for table in ["rbpmn_instance", "rbpmn_work_item"] {
-        sqlx::query(&format!("analyze {table}"))
+        sqlx::query(AssertSqlSafe(format!("analyze {table}")))
             .execute(pool)
             .await
             .unwrap();
@@ -8938,12 +8946,12 @@ async fn a_recovery_stampede_leaves_one_valid_index() {
 
 /// `(waiting, in_progress)` straight from the view, the way a dashboard asks.
 async fn view_depth(pool: &PgPool, key: &str, topic: &str) -> (i64, i64) {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(AssertSqlSafe(format!(
         "select count(*) filter (where claimable) as waiting, \
                 count(*) filter (where in_progress) as in_progress \
            from {} where definition_key = $1 and topic = $2",
         rbpmn_engine::WORK_ITEM_VIEW
-    ))
+    )))
     .bind(key)
     .bind(topic)
     .fetch_one(pool)
@@ -9074,9 +9082,9 @@ async fn the_view_and_the_claim_predicate_cannot_drift() {
     )
     .await;
     for (i, state) in [(5, "completed"), (6, "cancelled"), (7, "failed")] {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "update rbpmn_work_item set state='{state}' where id=$1"
-        ))
+        )))
         .bind(ids[i])
         .execute(&db.pool)
         .await
@@ -9099,7 +9107,7 @@ async fn the_view_and_the_claim_predicate_cannot_drift() {
         .await
         .unwrap();
 
-    let disagreements: i64 = sqlx::query_scalar(&format!(
+    let disagreements: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "select count(*) from {view} v \
            join rbpmn_work_item w on w.id = v.id \
            join rbpmn_instance i on i.id = w.instance_id \
@@ -9108,7 +9116,7 @@ async fn the_view_and_the_claim_predicate_cannot_drift() {
         view = rbpmn_engine::WORK_ITEM_VIEW,
         claimable = rbpmn_engine::testing::CLAIMABLE_SQL,
         in_progress = rbpmn_engine::testing::IN_PROGRESS_SQL,
-    ))
+    )))
     .fetch_one(&db.pool)
     .await
     .unwrap();
@@ -9120,10 +9128,10 @@ async fn the_view_and_the_claim_predicate_cannot_drift() {
     // `is distinct from` above would pass if BOTH sides were NULL, so the
     // totality the read model promises is asserted separately: a boolean
     // column an application can trust to split the world in two.
-    let nulls: i64 = sqlx::query_scalar(&format!(
+    let nulls: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "select count(*) from {} where claimable is null or in_progress is null",
         rbpmn_engine::WORK_ITEM_VIEW
-    ))
+    )))
     .fetch_one(&db.pool)
     .await
     .unwrap();
@@ -9131,10 +9139,10 @@ async fn the_view_and_the_claim_predicate_cannot_drift() {
 
     // Disjoint by construction: a live lease is not claimable, a lapsed one
     // is not in progress.
-    let both: i64 = sqlx::query_scalar(&format!(
+    let both: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "select count(*) from {} where claimable and in_progress",
         rbpmn_engine::WORK_ITEM_VIEW
-    ))
+    )))
     .fetch_one(&db.pool)
     .await
     .unwrap();
@@ -9647,11 +9655,11 @@ async fn the_grouped_depth_query_is_index_driven() {
     let plan = explain_prepared(
         &db.pool,
         "depths",
-        &format!(
+        AssertSqlSafe(format!(
             "prepare depths as select definition_key, topic, count(*) \
                from {} where claimable group by 1, 2",
             rbpmn_engine::WORK_ITEM_VIEW
-        ),
+        )),
         "execute depths",
     )
     .await;
@@ -9683,11 +9691,11 @@ async fn the_grouped_depth_query_is_index_driven() {
     let filtered = explain_prepared(
         &db.pool,
         "depths_f",
-        &format!(
+        AssertSqlSafe(format!(
             "prepare depths_f(text[]) as select definition_key, topic, count(*) \
                from {} where claimable and definition_key = any($1) group by 1, 2",
             rbpmn_engine::WORK_ITEM_VIEW
-        ),
+        )),
         "execute depths_f(array['p'])",
     )
     .await;
@@ -9848,14 +9856,14 @@ async fn the_two_views_compose_on_instance_id() {
             .unwrap();
     }
 
-    let rows: Vec<(String, String, i64)> = sqlx::query_as(&format!(
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(AssertSqlSafe(format!(
         "select i.variables->>'tenant' as tenant, w.topic, count(*) as waiting \
            from {work} w join {inst} i on i.id = w.instance_id \
           where w.claimable \
           group by 1, 2 order by waiting desc",
         work = rbpmn_engine::WORK_ITEM_VIEW,
         inst = rbpmn_engine::INSTANCE_VIEW,
-    ))
+    )))
     .fetch_all(&db.pool)
     .await
     .unwrap();
@@ -9877,11 +9885,11 @@ async fn the_two_views_compose_on_instance_id() {
 /// way the scheduler's own candidate query is. `order by due_at limit 1`,
 /// never `min(due_at)` — see the migration comment.
 async fn view_next_due(pool: &PgPool) -> Option<(uuid::Uuid, i64)> {
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "select instance_id, timer_no from {} \
           where instance_status = 'active' order by due_at limit 1",
         rbpmn_engine::TIMER_VIEW
-    ))
+    )))
     .fetch_optional(pool)
     .await
     .unwrap()
@@ -9889,10 +9897,10 @@ async fn view_next_due(pool: &PgPool) -> Option<(uuid::Uuid, i64)> {
 }
 
 async fn timer_still_armed(pool: &PgPool, instance: uuid::Uuid, timer_no: i64) -> bool {
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(AssertSqlSafe(format!(
         "select count(*) from {} where instance_id = $1 and timer_no = $2",
         rbpmn_engine::TIMER_VIEW
-    ))
+    )))
     .bind(instance)
     .bind(timer_no)
     .fetch_one(pool)
@@ -9977,10 +9985,10 @@ async fn the_views_next_due_is_the_timer_the_scheduler_fires() {
     // agreeing means agreeing about `due_at`, not about insertion order.
     for (i, instance) in started.iter().enumerate() {
         let offset = ((i * 7) % 8) as i64 + 1;
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "update rbpmn_timer set due_at = now() - interval '{offset} hours' \
              where instance_id = $1"
-        ))
+        )))
         .bind(instance)
         .execute(&db.pool)
         .await
@@ -10040,10 +10048,10 @@ async fn a_frozen_instances_timer_is_armed_but_not_the_scheduler_being_behind() 
         .unwrap();
 
     // Still armed, still overdue, and still visible — support needs to see it.
-    let row: (String, bool) = sqlx::query_as(&format!(
+    let row: (String, bool) = sqlx::query_as(AssertSqlSafe(format!(
         "select instance_status, due_at < now() from {} where instance_id = $1",
         rbpmn_engine::TIMER_VIEW
-    ))
+    )))
     .bind(started.id)
     .fetch_one(&db.pool)
     .await
@@ -10064,15 +10072,16 @@ async fn a_cycle_shows_one_next_occurrence_not_a_series() {
     let db = TestDb::create().await;
     let (engine, instance) = late_fee_engine(&db).await;
 
-    let armed: Vec<(i64, f64, Option<i32>, String, String)> = sqlx::query_as(&format!(
-        "select timer_no, extract(epoch from due_at)::float8, remaining, due_kind, due_spec \
+    let armed: Vec<(i64, f64, Option<i32>, String, String)> =
+        sqlx::query_as(AssertSqlSafe(format!(
+            "select timer_no, extract(epoch from due_at)::float8, remaining, due_kind, due_spec \
            from {} where instance_id = $1 and element_id = 'late_fee_due'",
-        rbpmn_engine::TIMER_VIEW
-    ))
-    .bind(instance)
-    .fetch_all(&db.pool)
-    .await
-    .unwrap();
+            rbpmn_engine::TIMER_VIEW
+        )))
+        .bind(instance)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
     assert_eq!(armed.len(), 1, "one occurrence at a time: {armed:?}");
     let (first_no, _pre_backdate_due, remaining, kind, spec) = armed[0].clone();
     assert_eq!(kind, "cycle");
@@ -10084,11 +10093,11 @@ async fn a_cycle_shows_one_next_occurrence_not_a_series() {
     backdate_timers(&db.pool, instance).await;
     assert!(engine.fire_due_timer().await.unwrap());
 
-    let after: Vec<(i64, f64)> = sqlx::query_as(&format!(
+    let after: Vec<(i64, f64)> = sqlx::query_as(AssertSqlSafe(format!(
         "select timer_no, extract(epoch from due_at)::float8 from {} \
            where instance_id = $1 and element_id = 'late_fee_due'",
         rbpmn_engine::TIMER_VIEW
-    ))
+    )))
     .bind(instance)
     .fetch_all(&db.pool)
     .await
@@ -10133,10 +10142,10 @@ async fn a_timer_leaves_the_view_when_its_wait_ends() {
     let rows = |id: uuid::Uuid| {
         let pool = db.pool.clone();
         async move {
-            sqlx::query_scalar::<_, i64>(&format!(
+            sqlx::query_scalar::<_, i64>(AssertSqlSafe(format!(
                 "select count(*) from {} where instance_id = $1",
                 rbpmn_engine::TIMER_VIEW
-            ))
+            )))
             .bind(id)
             .fetch_one(&pool)
             .await
@@ -10199,11 +10208,11 @@ async fn the_timer_queries_are_index_driven() {
     let per_instance = explain_prepared(
         &db.pool,
         "armed",
-        &format!(
+        AssertSqlSafe(format!(
             "prepare armed(uuid) as select due_at, element_id, due_spec from {} \
                where instance_id = $1 order by due_at limit 1",
             rbpmn_engine::TIMER_VIEW
-        ),
+        )),
         &format!("execute armed('{}')", started.id),
     )
     .await;
@@ -10224,10 +10233,10 @@ async fn the_timer_queries_are_index_driven() {
     let overdue = explain_prepared(
         &db.pool,
         "overdue",
-        &format!(
+        AssertSqlSafe(format!(
             "prepare overdue as select count(*) from {} where due_at < now()",
             rbpmn_engine::TIMER_VIEW
-        ),
+        )),
         "execute overdue",
     )
     .await;
@@ -10267,13 +10276,13 @@ async fn the_timer_view_composes_with_the_instance_view() {
             .unwrap();
     }
 
-    let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+    let rows: Vec<(String, i64)> = sqlx::query_as(AssertSqlSafe(format!(
         "select i.variables->>'tenant' as tenant, count(*) as deadlines \
            from {timer} t join {inst} i on i.id = t.instance_id \
           where t.due_at > now() group by 1 order by 1",
         timer = rbpmn_engine::TIMER_VIEW,
         inst = rbpmn_engine::INSTANCE_VIEW,
-    ))
+    )))
     .fetch_all(&db.pool)
     .await
     .unwrap();
@@ -10291,11 +10300,11 @@ async fn the_timer_view_composes_with_the_instance_view() {
 /// How many live subscriptions the view shows for one (message, key) — the
 /// number `correlate`'s three-way answer turns on.
 async fn view_live_matches(pool: &PgPool, message: &str, key: &str) -> i64 {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(AssertSqlSafe(format!(
         "select count(*) from {} where message_name = $1 and correlation_key = $2 \
            and instance_status = 'active'",
         rbpmn_engine::SUBSCRIPTION_VIEW
-    ))
+    )))
     .bind(message)
     .bind(key)
     .fetch_one(pool)
@@ -10438,11 +10447,11 @@ async fn a_frozen_instances_subscription_is_visible_but_not_answering() {
         .unwrap();
 
     // Visible, with the reason attached.
-    let row: (uuid::Uuid, String, String) = sqlx::query_as(&format!(
+    let row: (uuid::Uuid, String, String) = sqlx::query_as(AssertSqlSafe(format!(
         "select instance_id, message_name, instance_status from {} \
            where correlation_key = $1",
         rbpmn_engine::SUBSCRIPTION_VIEW
-    ))
+    )))
     .bind("o-9")
     .fetch_one(&db.pool)
     .await
@@ -10493,10 +10502,10 @@ async fn the_ambiguity_query_names_exactly_what_correlate_refuses() {
     .await
     .unwrap();
 
-    let conflicts: Vec<(String, String, i64)> = sqlx::query_as(&format!(
+    let conflicts: Vec<(String, String, i64)> = sqlx::query_as(AssertSqlSafe(format!(
         "select message_name, correlation_key, waiting from ({}) q order by correlation_key",
         rbpmn_engine::Engine::AMBIGUOUS_CORRELATIONS_SQL
-    ))
+    )))
     .fetch_all(&db.pool)
     .await
     .unwrap();
@@ -10549,10 +10558,10 @@ async fn a_subscription_leaves_the_view_when_its_wait_ends() {
     let rows = |id: uuid::Uuid| {
         let pool = db.pool.clone();
         async move {
-            sqlx::query_scalar::<_, i64>(&format!(
+            sqlx::query_scalar::<_, i64>(AssertSqlSafe(format!(
                 "select count(*) from {} where instance_id = $1",
                 rbpmn_engine::SUBSCRIPTION_VIEW
-            ))
+            )))
             .bind(id)
             .fetch_one(&pool)
             .await
@@ -10617,10 +10626,10 @@ async fn the_business_identifier_lookup_is_index_driven() {
     let plan = explain_prepared(
         &db.pool,
         "waiting",
-        &format!(
+        AssertSqlSafe(format!(
             "prepare waiting(text) as {}",
             rbpmn_engine::Engine::WAITING_ON_KEY_SQL
-        ),
+        )),
         "execute waiting('ORD-1')",
     )
     .await;
@@ -10720,11 +10729,11 @@ async fn the_definition_view_returns_what_was_deployed() {
         String,
         serde_json::Value,
         i64,
-    ) = sqlx::query_as(&format!(
+    ) = sqlx::query_as(AssertSqlSafe(format!(
         "select id, key, version, content_hash, bpmn_xml, bindings, retired_instances \
                from {} where key = $1 and version = $2",
         rbpmn_engine::DEFINITION_VIEW
-    ))
+    )))
     .bind("p")
     .bind(1)
     .fetch_one(&db.pool)
@@ -10740,10 +10749,10 @@ async fn the_definition_view_returns_what_was_deployed() {
     // same bundle must not add a row, and the view must not show two.
     let again = engine.deploy(&xml, &bindings).await.unwrap();
     assert!(again.reused);
-    let versions: i64 = sqlx::query_scalar(&format!(
+    let versions: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "select count(*) from {} where key = 'p'",
         rbpmn_engine::DEFINITION_VIEW
-    ))
+    )))
     .fetch_one(&db.pool)
     .await
     .unwrap();
@@ -10763,11 +10772,11 @@ async fn the_decision_view_returns_the_artifacts_in_order() {
         rbpmn_engine::Bundle::new(fixture("accept/01-minimal.bpmn")).decision(DECISION_DMN);
     let first = engine.deploy_bundle(&bundle).await.unwrap();
 
-    let artifacts: Vec<(String, i32, i32, String)> = sqlx::query_as(&format!(
+    let artifacts: Vec<(String, i32, i32, String)> = sqlx::query_as(AssertSqlSafe(format!(
         "select definition_key, definition_version, ordinal, dmn_xml from {} \
            where definition_id = $1 order by ordinal",
         rbpmn_engine::DEFINITION_DECISION_VIEW
-    ))
+    )))
     .bind(first.definition_id)
     .fetch_all(&db.pool)
     .await
@@ -10786,11 +10795,11 @@ async fn the_decision_view_returns_the_artifacts_in_order() {
     let second = engine.deploy_bundle(&edited).await.unwrap();
     assert_eq!(second.version, first.version + 1);
 
-    let by_version: Vec<(i32, String)> = sqlx::query_as(&format!(
+    let by_version: Vec<(i32, String)> = sqlx::query_as(AssertSqlSafe(format!(
         "select definition_version, dmn_xml from {} where definition_key = 'p' \
           order by definition_version",
         rbpmn_engine::DEFINITION_DECISION_VIEW
-    ))
+    )))
     .fetch_all(&db.pool)
     .await
     .unwrap();
@@ -10800,10 +10809,10 @@ async fn the_decision_view_returns_the_artifacts_in_order() {
 
     // And they go with the definition when it goes.
     engine.delete_definition("p", 1).await.unwrap();
-    let left: i64 = sqlx::query_scalar(&format!(
+    let left: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
         "select count(*) from {} where definition_version = 1",
         rbpmn_engine::DEFINITION_DECISION_VIEW
-    ))
+    )))
     .fetch_one(&db.pool)
     .await
     .unwrap();
@@ -10837,10 +10846,10 @@ async fn the_deployed_now_query_reports_the_latest_of_every_key() {
         .await
         .unwrap();
 
-    let now: Vec<(String, i32)> = sqlx::query_as(&format!(
+    let now: Vec<(String, i32)> = sqlx::query_as(AssertSqlSafe(format!(
         "select key, version from ({}) q order by key",
         rbpmn_engine::Engine::DEPLOYED_NOW_SQL
-    ))
+    )))
     .fetch_all(&db.pool)
     .await
     .unwrap();
@@ -10871,14 +10880,14 @@ async fn an_instance_reaches_its_definition_through_the_stable_pair() {
         .await
         .unwrap();
 
-    let row: (uuid::Uuid, String, i32, String) = sqlx::query_as(&format!(
+    let row: (uuid::Uuid, String, i32, String) = sqlx::query_as(AssertSqlSafe(format!(
         "select i.id, d.key, d.version, d.content_hash \
            from {inst} i join {def} d \
              on d.key = i.definition_key and d.version = i.definition_version \
           where i.id = $1",
         inst = rbpmn_engine::INSTANCE_VIEW,
         def = rbpmn_engine::DEFINITION_VIEW,
-    ))
+    )))
     .bind(started.id)
     .fetch_one(&db.pool)
     .await
@@ -11649,9 +11658,9 @@ async fn the_columns_refuse_what_the_rule_refuses() {
         ("backoff_multiplier", 10.5),
         ("backoff_multiplier", 1e300),
     ] {
-        let refused = sqlx::query(&format!(
+        let refused = sqlx::query(AssertSqlSafe(format!(
             "update rbpmn_work_item set {column} = $2 where id = $1"
-        ))
+        )))
         .bind(item)
         .bind(value)
         .execute(&db.pool)
@@ -11668,9 +11677,9 @@ async fn the_columns_refuse_what_the_rule_refuses() {
         ("backoff_multiplier", 1.0),
         ("backoff_multiplier", 10.0),
     ] {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "update rbpmn_work_item set {column} = $2 where id = $1"
-        ))
+        )))
         .bind(item)
         .bind(value)
         .execute(&db.pool)

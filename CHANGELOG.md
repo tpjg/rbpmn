@@ -3,6 +3,28 @@
 This file starts at 0.7.0. Earlier releases are described by their tags and
 commit history.
 
+## 0.8.0
+
+### Changed
+
+**sqlx 0.9.** `rbpmn-engine` shares its sqlx types with the application that
+embeds it — the pool, `&mut PgConnection` for `start_in_tx` — so that
+application moves to sqlx 0.9 with this release, keeping one `sqlx_core` in
+the graph. sqlx 0.9 no longer has `runtime-tokio-rustls`; the engine uses
+`runtime-tokio` with `tls-rustls`, which is rustls on ring as before.
+
+sqlx 0.9 refuses a query that is not a string literal unless it is wrapped in
+`AssertSqlSafe`. Every query the engine builds at runtime is wrapped where its
+SQL is built. What those queries splice is unchanged: view and table
+constants, placeholder numbers, and the definition key and variable names a
+task filter checks against `[A-Za-z0-9_.-]`. Every value is bound.
+
+A connection URL that names no user (`postgres:///rbpmn`, peer
+authentication) connects as the OS user, as it did with sqlx 0.8.
+sqlx-postgres 0.9.0 builds `whoami` without its `std` feature, whose stub
+names every user `anonymous`; rbpmn-engine turns the feature on until a sqlx
+release carries the fix (transact-rs/sqlx#4303).
+
 ## 0.7.3
 
 ### Added

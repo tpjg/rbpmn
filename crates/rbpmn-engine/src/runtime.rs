@@ -19,6 +19,7 @@ use rbpmn_core::{
     InstanceStatus, ScopeId, ScopeState, SubscriptionId, SubscriptionState, TimerDue, TimerId,
     TimerState, Token, TokenId, WaitKind, WorkItemId, WorkItemState, WorkKind, step,
 };
+use sqlx::AssertSqlSafe;
 use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
@@ -1080,7 +1081,7 @@ pub(crate) async fn load_instance_under(
     )>,
     EngineError,
 > {
-    let sql = format!(
+    let sql = AssertSqlSafe(format!(
         "select i.definition_id, i.definition_key, i.definition_version, \
                 i.status, i.variables, \
                 i.next_token, i.next_work_item, i.next_timer, i.next_subscription, \
@@ -1091,12 +1092,8 @@ pub(crate) async fn load_instance_under(
             Lock::NoWait => " for update nowait",
             Lock::Snapshot => "",
         }
-    );
-    let inst = match sqlx::query(&sql)
-        .bind(instance_id)
-        .fetch_one(&mut *tx)
-        .await
-    {
+    ));
+    let inst = match sqlx::query(sql).bind(instance_id).fetch_one(&mut *tx).await {
         Ok(row) => row,
         // 55P03 lock_not_available: the NOWAIT caller moves on.
         Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("55P03") => {

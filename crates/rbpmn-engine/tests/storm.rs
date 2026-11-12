@@ -24,6 +24,7 @@ mod harness;
 use harness::*;
 use rbpmn_engine::EventCursor;
 use rbpmn_engine::testing::TestDb;
+use sqlx::AssertSqlSafe;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -711,10 +712,10 @@ async fn a_storm_holds_every_global_invariant() {
     for kind in ["retry", "advance", "abandon-instance"] {
         let landed = count(
             &db.pool,
-            &format!(
+            AssertSqlSafe(format!(
                 "select count(*) from rbpmn_event where kind = 'incident-repaired' \
                  and payload->>'disposition' = '{kind}'"
-            ),
+            )),
         )
         .await;
         assert!(landed > 0, "no {kind} repair landed through the storm");

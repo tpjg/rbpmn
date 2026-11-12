@@ -15,6 +15,7 @@
 //! group depths by its *own* dimensions in that same statement.
 
 use crate::{Engine, EngineError};
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 
 /// The published work-item view. Named here, beside
@@ -78,7 +79,7 @@ impl Engine {
         // `rbpmn_work_item_depth`, instead of aggregating over every work
         // item ever created. The `filter` clauses then split that candidate
         // set in one pass.
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(AssertSqlSafe(format!(
             "select definition_key, topic, \
                count(*) filter (where claimable) as waiting, \
                count(*) filter (where in_progress) as in_progress \
@@ -86,7 +87,7 @@ impl Engine {
              where (claimable or in_progress) and definition_key = any($1) \
              group by definition_key, topic \
              order by waiting desc, definition_key, topic"
-        ))
+        )))
         .bind(definition_keys)
         .fetch_all(self.pool())
         .await?;

@@ -34,6 +34,7 @@
 
 use crate::{Completion, Engine, EngineError, FailOptions, FailOutcome};
 use rbpmn_core::{IndexDeclaration, IndexScope};
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -457,7 +458,9 @@ impl Engine {
             Some(filter) => compile_filter(filter, &mut args, first_arg)?,
             None => String::new(),
         };
-        let sql = format!(
+        // Spliced: constants, placeholders, and compile_filter's validated
+        // definition key and field names. Every value is bound.
+        let sql = AssertSqlSafe(format!(
             "update rbpmn_work_item set state = 'locked', lock_owner = $2, \
              lock_until = now() + make_interval(secs => $3), \
              lease_no = lease_no + 1 \
@@ -473,8 +476,8 @@ impl Engine {
                (select variables from rbpmn_instance i2 \
                  where i2.id = rbpmn_work_item.instance_id) as variables",
             claimable = crate::CLAIMABLE,
-        );
-        let mut query = sqlx::query(&sql)
+        ));
+        let mut query = sqlx::query(sql)
             .bind(topic)
             .bind(&options.owner)
             .bind(options.ttl.as_secs_f64());
@@ -554,13 +557,14 @@ impl Engine {
             Some(filter) => compile_filter(filter, &mut args, first_arg)?,
             None => String::new(),
         };
-        let sql = format!(
+        // Spliced as in get_task: constants, placeholders, validated names.
+        let sql = AssertSqlSafe(format!(
             "select count(*) from rbpmn_work_item w \
              join rbpmn_instance i on i.id = w.instance_id \
              where w.topic = $1 and {claimable}{ids_sql}{filter_sql}",
             claimable = crate::CLAIMABLE,
-        );
-        let mut query = sqlx::query(&sql).bind(topic);
+        ));
+        let mut query = sqlx::query(sql).bind(topic);
         if !ids_sql.is_empty() {
             query = query.bind(ids.expect("a conjunct has ids").ids().to_vec());
         }
@@ -984,10 +988,10 @@ async fn build_index(
     field: &str,
     predicate: &str,
 ) -> Result<(), EngineError> {
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "create index concurrently if not exists {name} on rbpmn_instance \
          ((variables->>'{field}')) where {predicate}"
-    ))
+    )))
     .execute(&mut *conn)
     .await?;
     let valid: Option<bool> = sqlx::query_scalar(
@@ -1002,9 +1006,11 @@ async fn build_index(
         Some(false) => {
             // A previously interrupted concurrent build: drop the
             // corpse so the next call can rebuild, and say so.
-            sqlx::query(&format!("drop index concurrently if exists {name}"))
-                .execute(&mut *conn)
-                .await?;
+            sqlx::query(AssertSqlSafe(format!(
+                "drop index concurrently if exists {name}"
+            )))
+            .execute(&mut *conn)
+            .await?;
             Err(EngineError::InvalidVariables(format!(
                 "index '{name}' was left invalid by an interrupted build; \
                  it has been dropped — declare the index again"

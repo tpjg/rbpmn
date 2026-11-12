@@ -9,6 +9,7 @@
 //! call [`Engine::find_by_shared_index`] and write no SQL at all.
 
 use crate::{Engine, EngineError};
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -88,11 +89,11 @@ impl Engine {
         // The field is a literal for the same reason the filter compiler
         // embeds one: the planner needs it to match the index expression.
         // `validate_field` above is what makes that safe.
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(AssertSqlSafe(format!(
             "select id, definition_key, business_key from {INSTANCE_VIEW} \
              where variables->>'{field}' = $1 \
              order by created_at, id limit $2"
-        ))
+        )))
         .bind(value)
         .bind(i64::from(limit))
         .fetch_all(self.pool())

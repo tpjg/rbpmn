@@ -56,6 +56,7 @@
 //! sharing `*_in_tx` calls. Delayed means late, never lost or reordered.
 
 use crate::{Engine, EngineError};
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -132,7 +133,7 @@ impl Engine {
         // break. The one-row floor table is cross-joined so the floor comes
         // back even when the page is empty, which is precisely when a
         // truncation matters most.
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(AssertSqlSafe(format!(
             "select f.txid::text::bigint as floor_txid, f.id as floor_id, \
                     e.id, e.txid::text::bigint as txid, e.instance_id, e.definition_key, \
                     e.kind, e.element_id, e.payload, {} \
@@ -146,7 +147,7 @@ impl Engine {
              ) e on true \
              order by e.txid, e.id",
             crate::runtime::ts("e.at", "at"),
-        ))
+        )))
         .bind(after.txid.to_string())
         .bind(after.id)
         .bind(i64::from(limit.min(1000)))

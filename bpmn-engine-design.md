@@ -188,7 +188,8 @@ schema with the embedding application's business tables — that is the whole
 point of same-transaction stepping — so generic names like `instance` are
 not ours to claim. Prose below uses the short names; the DDL is prefixed.
 (The migration runner is hand-rolled for the same reason: sqlx's migrator
-hardcodes its `_sqlx_migrations` table, which would collide with a host
+keeps its ledger in `_sqlx_migrations` unless the *host* renames it through
+sqlx's opt-in `sqlx.toml`, so a library using it would collide with a host
 application running its own sqlx migrations in the shared schema.)
 
 - `definition` (id, key, **version**, bpmn_xml, parsed/validated model as JSONB cache,
